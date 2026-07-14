@@ -10,6 +10,7 @@ param(
     [string]$SessionName = "",
     [string]$Prompt = "",
     [string]$OutputBranch = "",
+    [string]$GitHubUser = "",
     [switch]$UseExisting,
     [switch]$NoWait
 )
@@ -35,6 +36,15 @@ Commit the bootstrap work and open a pull request. Keep the change small, clean,
 }
 
 $repository = "$Owner/$Name"
+
+if (-not $GitHubUser) {
+    $GitHubUser = $Owner
+}
+gh auth switch --user $GitHubUser 1>$null 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Could not switch gh auth to '$GitHubUser'. Continuing with the active GitHub account."
+}
+
 $existing = $false
 gh repo view $repository --json nameWithOwner 1>$null 2>$null
 if ($LASTEXITCODE -eq 0) {
@@ -48,6 +58,11 @@ if ($existing -and -not $UseExisting) {
 if (-not $existing) {
     $visibilityFlag = "--$Visibility"
     gh repo create $repository $visibilityFlag --add-readme --gitignore Node --description $Description
+}
+
+$createdNameWithOwner = gh repo view $repository --json nameWithOwner --jq .nameWithOwner 2>$null
+if ($LASTEXITCODE -ne 0 -or $createdNameWithOwner -ne $repository) {
+    throw "Expected GitHub repository '$repository' but could not verify it. Check the active gh account with 'gh auth status'."
 }
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
