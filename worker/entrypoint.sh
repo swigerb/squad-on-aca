@@ -141,7 +141,7 @@ case "${SQUAD_MODE:-smoke}" in
       @opentelemetry/sdk-logs \
       @opentelemetry/exporter-trace-otlp-proto \
       @opentelemetry/exporter-metrics-otlp-proto \
-      @opentelemetry/exporter-logs-otlp-proto
+      @opentelemetry/exporter-logs-otlp-grpc
     cat > telemetry-smoke.mjs <<'NODE'
 import { trace, metrics } from '@opentelemetry/api';
 import { logs, SeverityNumber } from '@opentelemetry/api-logs';
@@ -150,9 +150,10 @@ import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
 import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
-import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
+import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-grpc';
 
-const endpoint = process.env.ASPIRE_OTLP_HTTP_ENDPOINT;
+const httpEndpoint = process.env.ASPIRE_OTLP_HTTP_ENDPOINT;
+const grpcEndpoint = process.env.ASPIRE_OTLP_GRPC_ENDPOINT;
 const session = process.env.SESSION_NAME || 'telemetry-smoke';
 const headerText = process.env.OTEL_EXPORTER_OTLP_HEADERS || '';
 const headers = Object.fromEntries(
@@ -162,9 +163,9 @@ const headers = Object.fromEntries(
   }),
 );
 
-const traceExporter = new OTLPTraceExporter({ url: `${endpoint}/v1/traces`, headers });
-const metricExporter = new OTLPMetricExporter({ url: `${endpoint}/v1/metrics`, headers });
-const logExporter = new OTLPLogExporter({ url: `${endpoint}/v1/logs`, headers });
+const traceExporter = new OTLPTraceExporter({ url: `${httpEndpoint}/v1/traces`, headers });
+const metricExporter = new OTLPMetricExporter({ url: `${httpEndpoint}/v1/metrics`, headers });
+const logExporter = new OTLPLogExporter({ url: grpcEndpoint });
 const loggerProvider = new LoggerProvider({
   processors: [new SimpleLogRecordProcessor(logExporter)],
 });
