@@ -1,0 +1,5 @@
+.azure/
+.env
+deploy.outputs.json
+*.log
+node_modules/
