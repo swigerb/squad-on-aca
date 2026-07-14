@@ -141,20 +141,18 @@ case "${SQUAD_MODE:-smoke}" in
       @opentelemetry/sdk-logs \
       @opentelemetry/exporter-trace-otlp-proto \
       @opentelemetry/exporter-metrics-otlp-proto \
-      @opentelemetry/exporter-logs-otlp-grpc
+      @opentelemetry/exporter-logs-otlp-proto
     cat > telemetry-smoke.mjs <<'NODE'
 import { trace, metrics } from '@opentelemetry/api';
 import { logs, SeverityNumber } from '@opentelemetry/api-logs';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
-import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
+import { SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
-import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-grpc';
-import { Metadata } from '@grpc/grpc-js';
+import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
 
 const httpEndpoint = process.env.ASPIRE_OTLP_HTTP_ENDPOINT;
-const grpcEndpoint = process.env.ASPIRE_OTLP_GRPC_ENDPOINT;
 const session = process.env.SESSION_NAME || 'telemetry-smoke';
 const headerText = process.env.OTEL_EXPORTER_OTLP_HEADERS || '';
 const headers = Object.fromEntries(
@@ -163,18 +161,10 @@ const headers = Object.fromEntries(
     return idx === -1 ? [pair, ''] : [pair.slice(0, idx), pair.slice(idx + 1)];
   }),
 );
-const metadata = new Metadata();
-for (const [key, value] of Object.entries(headers)) {
-  metadata.set(key, value);
-}
 
 const traceExporter = new OTLPTraceExporter({ url: `${httpEndpoint}/v1/traces`, headers });
 const metricExporter = new OTLPMetricExporter({ url: `${httpEndpoint}/v1/metrics`, headers });
-const logExporter = new OTLPLogExporter({ url: grpcEndpoint, metadata });
-const loggerProvider = new LoggerProvider({
-  processors: [new SimpleLogRecordProcessor(logExporter)],
-});
-logs.setGlobalLoggerProvider(loggerProvider);
+const logExporter = new OTLPLogExporter({ url: `${httpEndpoint}/v1/logs`, headers });
 
 const sdk = new NodeSDK({
   traceExporter,
@@ -182,6 +172,7 @@ const sdk = new NodeSDK({
     exporter: metricExporter,
     exportIntervalMillis: 1000,
   }),
+  logRecordProcessors: [new SimpleLogRecordProcessor(logExporter)],
 });
 
 await sdk.start();
@@ -213,7 +204,6 @@ await tracer.startActiveSpan('squad-on-aca.telemetry-smoke', async span => {
   span.end();
 });
 
-await loggerProvider.forceFlush().catch(error => console.error('Logger forceFlush failed:', error.message));
 await sdk.shutdown().catch(error => console.error('OpenTelemetry SDK shutdown failed:', error.message));
 NODE
     node telemetry-smoke.mjs
