@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Repository,
     [string]$Ref = "main",
-    [ValidateSet("smoke", "prompt", "loop", "shell")]
+    [ValidateSet("smoke", "prompt", "new-project", "loop", "shell")]
     [string]$Mode = "smoke",
     [string]$Prompt = "",
     [string]$SubSquad = "",

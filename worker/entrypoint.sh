@@ -137,6 +137,18 @@ case "${SQUAD_MODE:-smoke}" in
       copilot -p "$SQUAD_PROMPT" $COPILOT_FLAGS
     commit_and_push_if_needed
     ;;
+  new-project)
+    SQUAD_PROMPT="${SQUAD_PROMPT:-Initialize this repository as a new project with Squad. Review the existing README, create a useful project structure, commit the initial .squad team state and starter files, and open a pull request with the bootstrap changes.}"
+    export PUSH_CHANGES="${PUSH_CHANGES:-true}"
+    export OUTPUT_BRANCH="${OUTPUT_BRANCH:-squad/bootstrap-${SESSION_NAME}}"
+    export PR_TITLE="${PR_TITLE:-Bootstrap project with Squad on ACA}"
+    log "Running new-project bootstrap Squad prompt."
+    OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+      COPILOT_OTEL_ENABLED=true \
+      COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
+      copilot -p "$SQUAD_PROMPT" $COPILOT_FLAGS
+    commit_and_push_if_needed
+    ;;
   loop)
     if [[ -n "${LOOP_MARKDOWN:-}" ]]; then
       printf '%s\n' "$LOOP_MARKDOWN" > loop.md

@@ -10,6 +10,7 @@ This project is the Azure Container Apps counterpart to the AKS pattern in `tami
 | Agent pods/jobs | ACA manual job executions from `caj-squad-aca-session`; each execution is a full Squad team session pod | Included |
 | One pod per work session | `caj-squad-aca-session` starts a new execution per `start-session.ps1` call | Included |
 | KEDA scale-to-zero | ACA jobs are zero-cost when idle; watcher app can scale to 0/1 | Included |
+| New project bootstrap | `scripts/new-project.ps1` creates/seeds a GitHub repo and starts `SQUAD_MODE=new-project` | Included |
 | ACR image build | `az acr build` from `worker/Dockerfile` | Included |
 | Managed image pull | User-assigned managed identity with `AcrPull` | Included |
 | Kubernetes secrets | ACA secrets | Included |

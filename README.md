@@ -27,6 +27,19 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 
 Open the Aspire login URL from `deploy.outputs.json` to see traces and logs grouped by `squad-<session-name>`.
 
+## Scale-to-zero model
+
+Squad on ACA is job-first, so most compute is zero when idle:
+
+| Component | Scales to zero? | Notes |
+| --- | --- | --- |
+| Session jobs (`caj-squad-aca-session`) | Yes | A job execution starts for a Squad session, then exits. No idle replica remains. |
+| Ralph (`caj-squad-aca-ralph`) | Yes between runs | A scheduled job wakes every 5 minutes, dispatches work, then exits. |
+| Watcher (`ca-squad-aca-watch`) | Yes when stopped | The optional watcher app is configured for 0/1 replicas. |
+| Aspire (`ca-squad-aca-aspire`) | No, by default | Kept at 1 replica so the dashboard is always available. Set it to 0 only if you are comfortable restarting it before viewing telemetry. |
+
+ACA does not need KEDA for per-session scale-to-zero. ACA Jobs already provide the same cost shape as Kubernetes Jobs: no execution, no running agent pod.
+
 ## Run a Squad session
 
 ```powershell
@@ -40,6 +53,19 @@ Open the Aspire login URL from `deploy.outputs.json` to see traces and logs grou
 ```
 
 Each execution schedules a new ACA job replica, sets `SQUAD_POD_ID=feature-123`, enables GitHub remote control, and exports telemetry to Aspire.
+
+## Start without an existing repo
+
+Use the new-project helper. It creates a GitHub repo with an initial default branch, then starts a remote Squad bootstrap session:
+
+```powershell
+.\scripts\new-project.ps1 `
+  -Owner swigerb `
+  -Name my-new-squad-project `
+  -Description "A new app bootstrapped by Squad on ACA"
+```
+
+The helper starts `SQUAD_MODE=new-project`, which initializes Squad state in the ACA session and opens a bootstrap PR from a `squad/bootstrap-*` branch.
 
 ## Ralph versus worker image
 

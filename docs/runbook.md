@@ -29,6 +29,19 @@ OTEL_SERVICE_NAME=squad-<session name>
 
 This matches Squad's containerized/Kubernetes pod-aware mode. The whole team you normally run from one CLI session lives inside that one ACA execution.
 
+## Scale-to-zero behavior
+
+ACA uses jobs for the expensive work, so idle cost is intentionally low:
+
+| Component | Idle behavior |
+| --- | --- |
+| `caj-squad-aca-session` | No running replica between executions. |
+| `caj-squad-aca-ralph` | No running replica between scheduled polls. |
+| `ca-squad-aca-watch` | Can be scaled to zero with `scripts/start-watch.ps1 -Stop`. |
+| `ca-squad-aca-aspire` | Kept running by default so the dashboard is always reachable. |
+
+This is the ACA equivalent of the AKS pattern where agents run as Kubernetes Jobs and Ralph runs as a CronJob. KEDA is not required for per-session scale-to-zero because ACA Jobs are already event/manual/schedule triggered.
+
 ## Ralph job runner
 
 Ralph is the scheduled poller, not the worker image. The worker image is shared by Ralph, on-demand sessions, and the watcher.
@@ -112,6 +125,26 @@ Loop session:
 ```powershell
 .\scripts\start-session.ps1 -Repository swigerb/your-repo -Mode loop -SessionName daily-loop
 ```
+
+## Start a project without a repo
+
+Use `scripts/new-project.ps1` when you have an idea but no GitHub repository yet:
+
+```powershell
+.\scripts\new-project.ps1 `
+  -Owner swigerb `
+  -Name my-new-squad-project `
+  -Description "A new app bootstrapped by Squad on ACA"
+```
+
+The helper:
+
+1. Creates `owner/name` on GitHub with README and `.gitignore`.
+2. Starts `caj-squad-aca-session` with `SQUAD_MODE=new-project`.
+3. Lets Squad initialize `.squad/` and starter project files.
+4. Pushes the work to `squad/<session-name>` and opens a PR.
+
+If the repo already exists, pass `-UseExisting`.
 
 ## Start a watcher
 
