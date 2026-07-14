@@ -4,7 +4,7 @@ param(
     [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
     [string]$NamePrefix = "squad-aca",
     [string]$AcrName = "acrsquadacabrswig",
-    [string]$ImageTag = "0.1.0",
+    [string]$ImageTag = "",
     [string]$GitHubToken = "",
     [string]$CopilotGitHubToken = "",
     [string]$DefaultRepository = "swigerb/squad-on-aca",
@@ -16,6 +16,14 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $azureDir = Join-Path $repoRoot ".azure"
 New-Item -ItemType Directory -Force -Path $azureDir | Out-Null
+
+if (-not $ImageTag) {
+    $ImageTag = try {
+        (git -C $repoRoot rev-parse --short HEAD).Trim()
+    } catch {
+        Get-Date -Format "yyyyMMddHHmmss"
+    }
+}
 
 function New-HexToken([int]$Bytes = 32) {
     $buffer = [byte[]]::new($Bytes)
@@ -57,8 +65,11 @@ if (-not (az identity show --name $identityName --resource-group $ResourceGroupN
 }
 $identityId = az identity show --name $identityName --resource-group $ResourceGroupName --query id -o tsv
 $identityPrincipalId = az identity show --name $identityName --resource-group $ResourceGroupName --query principalId -o tsv
+$identityClientId = az identity show --name $identityName --resource-group $ResourceGroupName --query clientId -o tsv
 $acrId = az acr show --name $AcrName --resource-group $ResourceGroupName --query id -o tsv
+$resourceGroupId = az group show --name $ResourceGroupName --query id -o tsv
 az role assignment create --assignee $identityPrincipalId --role AcrPull --scope $acrId 2>$null | Out-Null
+az role assignment create --assignee $identityPrincipalId --role Contributor --scope $resourceGroupId 2>$null | Out-Null
 
 $jobAndWatcherSecrets = @(
     "github-token=$GitHubToken",
@@ -168,7 +179,11 @@ $commonEnv = @(
     "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers",
     "SQUAD_DEPLOYMENT_MODE=squad-per-pod",
     "ENABLE_GITHUB_REMOTE=true",
-    "SQUAD_COPILOT_FLAGS=--yolo --agent squad --remote --no-auto-update"
+    "SQUAD_COPILOT_FLAGS=--yolo --agent squad --remote --no-auto-update",
+    "AZURE_SUBSCRIPTION_ID=$SubscriptionId",
+    "AZURE_RESOURCE_GROUP=$ResourceGroupName",
+    "AZURE_CLIENT_ID=$identityClientId",
+    "ACA_SESSION_JOB_NAME=$jobName"
 )
 
 $existingJobImage = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query "properties.template.containers[0].image" -o tsv 2>$null
@@ -213,7 +228,7 @@ if (-not $existingRalphJobImage) {
         --environment $envName `
         --trigger-type Schedule `
         --cron-expression "*/5 * * * *" `
-        --replica-timeout 180 `
+        --replica-timeout 240 `
         --replica-retry-limit 0 `
         --replica-completion-count 1 `
         --parallelism 1 `
@@ -224,9 +239,9 @@ if (-not $existingRalphJobImage) {
         --registry-server $loginServer `
         --registry-identity $identityId `
         --secrets @jobAndWatcherSecrets `
-        --env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=2" "RALPH_RUN_SECONDS=120" | Out-Null
+        --env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "RALPH_LABELS=squad" "RALPH_MAX_ISSUES=3" | Out-Null
 } else {
-    az containerapp job update --name $ralphJobName --resource-group $ResourceGroupName --image $image --cron-expression "*/5 * * * *" --replica-timeout 180 --set-env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=2" "RALPH_RUN_SECONDS=120" | Out-Null
+    az containerapp job update --name $ralphJobName --resource-group $ResourceGroupName --image $image --cron-expression "*/5 * * * *" --replica-timeout 240 --set-env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "RALPH_LABELS=squad" "RALPH_MAX_ISSUES=3" | Out-Null
     az containerapp job secret set --name $ralphJobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 

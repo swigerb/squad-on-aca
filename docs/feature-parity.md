@@ -5,8 +5,8 @@ This project is the Azure Container Apps counterpart to the AKS pattern in `tami
 | `squad-on-aks` feature | ACA equivalent in this repo | Status |
 | --- | --- | --- |
 | AKS cluster | Azure Container Apps environment | Included |
-| Ralph CronJob | Scheduled ACA Job `caj-squad-aca-ralph` with cron `*/5 * * * *`, `parallelism=1`, and a 180-second timeout | Included |
-| `concurrencyPolicy: Forbid` | ACA has no exact flag; this repo bounds Ralph runs to a 120-second poll window below the 5-minute cadence and keeps one replica per execution | Approximate ACA equivalent |
+| Ralph CronJob | Scheduled ACA Job `caj-squad-aca-ralph` with cron `*/5 * * * *`, `parallelism=1`, and a 240-second timeout | Included |
+| `concurrencyPolicy: Forbid` | ACA has no exact flag; Ralph is a short dispatcher that exits after starting session jobs, keeping runtime below the 5-minute cadence | Approximate ACA equivalent |
 | Agent pods/jobs | ACA manual job executions from `caj-squad-aca-session`; each execution is a full Squad team session pod | Included |
 | One pod per work session | `caj-squad-aca-session` starts a new execution per `start-session.ps1` call | Included |
 | KEDA scale-to-zero | ACA jobs are zero-cost when idle; watcher app can scale to 0/1 | Included |
@@ -34,7 +34,7 @@ This project is the Azure Container Apps counterpart to the AKS pattern in `tami
 
 ## Ralph and worker image
 
-Ralph is not a separate container image. The `squad-worker` image contains all runtime tools. Ralph is selected by setting `SQUAD_MODE=ralph`, which runs a bounded `squad watch --execute` poll from the scheduled ACA job.
+Ralph is not a separate container image. The `squad-worker` image contains all runtime tools. Ralph is selected by setting `SQUAD_MODE=ralph`, which polls GitHub issues and starts one `caj-squad-aca-session` execution per actionable issue.
 
 ## ACA job model
 
@@ -43,3 +43,5 @@ Ralph is not a separate container image. The `squad-worker` image contains all r
 | `caj-squad-aca-ralph` | Schedule, every 5 minutes | Ralph poller, equivalent to AKS CronJob |
 | `caj-squad-aca-session` | Manual | One full remote Squad team session per execution |
 | `ca-squad-aca-watch` | Container App, scale 0/1 | Optional long-running watcher |
+
+Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Contributor` on the resource group so it can start session jobs.

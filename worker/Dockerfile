@@ -15,6 +15,7 @@ RUN apt-get update \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh \
+    && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
     && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 \
     && useradd -m -s /bin/bash squad \
     && mkdir -p /workspace \

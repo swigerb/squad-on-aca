@@ -150,26 +150,77 @@ case "${SQUAD_MODE:-smoke}" in
     squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --copilot-flags "$COPILOT_FLAGS"
     ;;
   ralph)
-    log "Starting scheduled Ralph poll."
-    export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
-    export COPILOT_OTEL_ENABLED=false
-    ralph_run_seconds="${RALPH_RUN_SECONDS:-240}"
-    set +e
-    timeout --kill-after=20s "$ralph_run_seconds" squad watch \
-      --execute \
-      --interval "${WATCH_INTERVAL_MINUTES:-9999}" \
-      --timeout "${WATCH_TIMEOUT_MINUTES:-4}" \
-      --max-concurrent "${WATCH_MAX_CONCURRENT:-1}" \
-      --copilot-flags "$COPILOT_FLAGS" \
-      --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
-      --verbose
-    ralph_exit=$?
-    set -e
-    if [[ "$ralph_exit" -eq 124 || "$ralph_exit" -eq 137 || "$ralph_exit" -eq 143 ]]; then
-      log "Scheduled Ralph poll window complete."
+    log "Starting scheduled Ralph dispatcher."
+    require AZURE_RESOURCE_GROUP
+    require ACA_SESSION_JOB_NAME
+    require AZURE_CLIENT_ID
+
+    az login --identity --client-id "$AZURE_CLIENT_ID" --allow-no-subscriptions >/dev/null
+    if [[ -n "${AZURE_SUBSCRIPTION_ID:-}" ]]; then
+      az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+    fi
+
+    dispatch_label="${RALPH_DISPATCH_LABEL:-squad:dispatched}"
+    blocked_labels_regex='(^|,)(blocked|status:blocked|status:wontfix|status:on-hold)(,|$)'
+    gh label create "$dispatch_label" --repo "$GITHUB_REPOSITORY" --color 5319E7 --description "Dispatched by Squad on ACA Ralph" --force >/dev/null 2>&1 || true
+
+    issues_json="$(mktemp)"
+    gh issue list \
+      --repo "$GITHUB_REPOSITORY" \
+      --state open \
+      --label "${RALPH_LABELS:-squad}" \
+      --limit "${RALPH_MAX_ISSUES:-3}" \
+      --json number,title,url,labels,assignees > "$issues_json"
+
+    mapfile -t issue_rows < <(node - "$issues_json" "$dispatch_label" "$blocked_labels_regex" <<'NODE'
+const fs = require('fs');
+const [file, dispatchLabel, blockedRegexText] = process.argv.slice(2);
+const blockedRegex = new RegExp(blockedRegexText);
+const issues = JSON.parse(fs.readFileSync(file, 'utf8'));
+for (const issue of issues) {
+  const labels = (issue.labels || []).map(l => l.name);
+  const labelText = labels.join(',');
+  if ((issue.assignees || []).length > 0) continue;
+  if (labels.includes(dispatchLabel)) continue;
+  if (blockedRegex.test(labelText)) continue;
+  console.log([issue.number, issue.title.replace(/\t/g, ' '), issue.url].join('\t'));
+}
+NODE
+    )
+
+    if [[ "${#issue_rows[@]}" -eq 0 ]]; then
+      log "Ralph found no undispatched actionable issues."
       exit 0
     fi
-    exit "$ralph_exit"
+
+    for row in "${issue_rows[@]}"; do
+      IFS=$'\t' read -r issue_number issue_title issue_url <<< "$row"
+      session_name="issue-${issue_number}-$(date +%Y%m%d%H%M%S)"
+      prompt="Ralph dispatched GitHub issue #${issue_number}: ${issue_title}
+
+Issue URL: ${issue_url}
+
+Use Squad to inspect the repository, work the issue if it is actionable, create a branch, commit changes, and open a pull request. If blocked, comment on the issue with the blocker and stop."
+
+      log "Dispatching issue #${issue_number} to ACA session job ${session_name}."
+      gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$dispatch_label" >/dev/null || true
+      az containerapp job start \
+        --name "$ACA_SESSION_JOB_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --env-vars \
+          "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" \
+          "GITHUB_REF=${GITHUB_REF:-main}" \
+          "SQUAD_MODE=prompt" \
+          "SESSION_NAME=$session_name" \
+          "SQUAD_POD_ID=$session_name" \
+          "SQUAD_PROMPT=$prompt" \
+          "PUSH_CHANGES=true" \
+          "OUTPUT_BRANCH=squad/issue-${issue_number}" \
+          "PR_TITLE=Squad: issue #${issue_number}" \
+          "OTEL_SERVICE_NAME=squad-$session_name" >/dev/null
+    done
+
+    log "Ralph dispatched ${#issue_rows[@]} issue(s)."
     ;;
   watch|triage)
     log "Starting Squad watch."

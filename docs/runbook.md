@@ -41,7 +41,18 @@ SQUAD_DEPLOYMENT_MODE=squad-per-pod
 SQUAD_POD_ID=ralph-scheduled
 ```
 
-ACA does not expose Kubernetes `concurrencyPolicy: Forbid`. The deployment uses `parallelism=1`, `replicaCompletionCount=1`, `replicaTimeout=180`, and a 120-second Ralph poll window below the 5-minute schedule to avoid overlapping executions.
+ACA does not expose Kubernetes `concurrencyPolicy: Forbid`. The deployment uses `parallelism=1`, `replicaCompletionCount=1`, and `replicaTimeout=240`. Ralph is a short dispatcher that exits after starting session jobs, keeping runtime below the 5-minute schedule.
+
+Ralph polls GitHub issues labeled `squad`, skips blocked/assigned/already-dispatched issues, adds the `squad:dispatched` label, and starts `caj-squad-aca-session` with a prompt for that issue. The session job is the ACA equivalent of an agent Kubernetes Job.
+
+The user-assigned managed identity has:
+
+```text
+AcrPull on ACR
+Contributor on the resource group
+```
+
+The Contributor assignment lets Ralph start ACA session job executions. Scope it more narrowly if your tenant has a custom role for `Microsoft.App/jobs/start/action`.
 
 ## GitHub remote sessions
 
