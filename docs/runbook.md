@@ -41,7 +41,7 @@ SQUAD_DEPLOYMENT_MODE=squad-per-pod
 SQUAD_POD_ID=ralph-scheduled
 ```
 
-ACA does not expose Kubernetes `concurrencyPolicy: Forbid`. The deployment uses `parallelism=1`, `replicaCompletionCount=1`, `replicaTimeout=270`, and a bounded Ralph run window below the 5-minute schedule to avoid overlapping executions.
+ACA does not expose Kubernetes `concurrencyPolicy: Forbid`. The deployment uses `parallelism=1`, `replicaCompletionCount=1`, `replicaTimeout=180`, and a 120-second Ralph poll window below the 5-minute schedule to avoid overlapping executions.
 
 ## GitHub remote sessions
 

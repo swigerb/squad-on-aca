@@ -213,7 +213,7 @@ if (-not $existingRalphJobImage) {
         --environment $envName `
         --trigger-type Schedule `
         --cron-expression "*/5 * * * *" `
-        --replica-timeout 270 `
+        --replica-timeout 180 `
         --replica-retry-limit 0 `
         --replica-completion-count 1 `
         --parallelism 1 `
@@ -224,9 +224,9 @@ if (-not $existingRalphJobImage) {
         --registry-server $loginServer `
         --registry-identity $identityId `
         --secrets @jobAndWatcherSecrets `
-        --env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=4" "RALPH_RUN_SECONDS=240" | Out-Null
+        --env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=2" "RALPH_RUN_SECONDS=120" | Out-Null
 } else {
-    az containerapp job update --name $ralphJobName --resource-group $ResourceGroupName --image $image --cron-expression "*/5 * * * *" --replica-timeout 270 --set-env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=4" "RALPH_RUN_SECONDS=240" | Out-Null
+    az containerapp job update --name $ralphJobName --resource-group $ResourceGroupName --image $image --cron-expression "*/5 * * * *" --replica-timeout 180 --set-env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=2" "RALPH_RUN_SECONDS=120" | Out-Null
     az containerapp job secret set --name $ralphJobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 

@@ -155,7 +155,7 @@ case "${SQUAD_MODE:-smoke}" in
     export COPILOT_OTEL_ENABLED=false
     ralph_run_seconds="${RALPH_RUN_SECONDS:-240}"
     set +e
-    timeout "$ralph_run_seconds" squad watch \
+    timeout --kill-after=20s "$ralph_run_seconds" squad watch \
       --execute \
       --interval "${WATCH_INTERVAL_MINUTES:-9999}" \
       --timeout "${WATCH_TIMEOUT_MINUTES:-4}" \
@@ -165,7 +165,7 @@ case "${SQUAD_MODE:-smoke}" in
       --verbose
     ralph_exit=$?
     set -e
-    if [[ "$ralph_exit" -eq 124 || "$ralph_exit" -eq 143 ]]; then
+    if [[ "$ralph_exit" -eq 124 || "$ralph_exit" -eq 137 || "$ralph_exit" -eq 143 ]]; then
       log "Scheduled Ralph poll window complete."
       exit 0
     fi

@@ -5,8 +5,8 @@ This project is the Azure Container Apps counterpart to the AKS pattern in `tami
 | `squad-on-aks` feature | ACA equivalent in this repo | Status |
 | --- | --- | --- |
 | AKS cluster | Azure Container Apps environment | Included |
-| Ralph CronJob | Scheduled ACA Job `caj-squad-aca-ralph` with cron `*/5 * * * *`, `parallelism=1`, and a 270-second timeout | Included |
-| `concurrencyPolicy: Forbid` | ACA has no exact flag; this repo bounds Ralph runs below the 5-minute cadence and keeps one replica per execution | Approximate ACA equivalent |
+| Ralph CronJob | Scheduled ACA Job `caj-squad-aca-ralph` with cron `*/5 * * * *`, `parallelism=1`, and a 180-second timeout | Included |
+| `concurrencyPolicy: Forbid` | ACA has no exact flag; this repo bounds Ralph runs to a 120-second poll window below the 5-minute cadence and keeps one replica per execution | Approximate ACA equivalent |
 | Agent pods/jobs | ACA manual job executions from `caj-squad-aca-session`; each execution is a full Squad team session pod | Included |
 | One pod per work session | `caj-squad-aca-session` starts a new execution per `start-session.ps1` call | Included |
 | KEDA scale-to-zero | ACA jobs are zero-cost when idle; watcher app can scale to 0/1 | Included |
