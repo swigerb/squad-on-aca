@@ -128,6 +128,90 @@ case "${SQUAD_MODE:-smoke}" in
       log "Skipping Copilot prompt smoke. Set RUN_COPILOT_SMOKE=true to exercise Copilot."
     fi
     ;;
+  telemetry-smoke)
+    log "Running OpenTelemetry smoke signal."
+    tmpdir="$(mktemp -d)"
+    cd "$tmpdir"
+    npm init -y >/dev/null
+    npm install --silent \
+      @opentelemetry/api \
+      @opentelemetry/api-logs \
+      @opentelemetry/sdk-node \
+      @opentelemetry/sdk-metrics \
+      @opentelemetry/sdk-logs \
+      @opentelemetry/exporter-trace-otlp-proto \
+      @opentelemetry/exporter-metrics-otlp-proto \
+      @opentelemetry/exporter-logs-otlp-proto
+    cat > telemetry-smoke.mjs <<'NODE'
+import { trace, metrics } from '@opentelemetry/api';
+import { logs, SeverityNumber } from '@opentelemetry/api-logs';
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
+import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-proto';
+
+const endpoint = process.env.ASPIRE_OTLP_HTTP_ENDPOINT;
+const session = process.env.SESSION_NAME || 'telemetry-smoke';
+const headerText = process.env.OTEL_EXPORTER_OTLP_HEADERS || '';
+const headers = Object.fromEntries(
+  headerText.split(',').filter(Boolean).map(pair => {
+    const idx = pair.indexOf('=');
+    return idx === -1 ? [pair, ''] : [pair.slice(0, idx), pair.slice(idx + 1)];
+  }),
+);
+
+const traceExporter = new OTLPTraceExporter({ url: `${endpoint}/v1/traces`, headers });
+const metricExporter = new OTLPMetricExporter({ url: `${endpoint}/v1/metrics`, headers });
+const logExporter = new OTLPLogExporter({ url: `${endpoint}/v1/logs`, headers });
+const loggerProvider = new LoggerProvider();
+loggerProvider.addLogRecordProcessor(new SimpleLogRecordProcessor(logExporter));
+logs.setGlobalLoggerProvider(loggerProvider);
+
+const sdk = new NodeSDK({
+  traceExporter,
+  metricReader: new PeriodicExportingMetricReader({
+    exporter: metricExporter,
+    exportIntervalMillis: 1000,
+  }),
+});
+
+await sdk.start();
+
+const tracer = trace.getTracer('squad-on-aca-e2e');
+await tracer.startActiveSpan('squad-on-aca.telemetry-smoke', async span => {
+  span.setAttribute('squad.session', session);
+  span.setAttribute('squad.platform', 'azure-container-apps');
+  span.addEvent('telemetry smoke span emitted from ACA');
+
+  const meter = metrics.getMeter('squad-on-aca-e2e');
+  const counter = meter.createCounter('squad_aca_e2e_telemetry_smoke_total', {
+    description: 'E2E telemetry smoke signals emitted by Squad on ACA',
+  });
+  counter.add(1, { session, platform: 'aca' });
+
+  const logger = logs.getLogger('squad-on-aca-e2e');
+  logger.emit({
+    severityNumber: SeverityNumber.INFO,
+    severityText: 'Information',
+    body: `Squad on ACA telemetry smoke log for ${session}`,
+    attributes: {
+      'squad.session': session,
+      'squad.platform': 'azure-container-apps',
+    },
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  span.end();
+});
+
+await loggerProvider.shutdown();
+await sdk.shutdown();
+NODE
+    node telemetry-smoke.mjs
+    log "OpenTelemetry smoke signal emitted."
+    ;;
   prompt)
     require SQUAD_PROMPT
     log "Running one-shot Squad prompt."

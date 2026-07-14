@@ -126,8 +126,6 @@ properties:
   configuration:
     activeRevisionsMode: Single
     secrets:
-    - name: dashboard-browser-token
-      value: $dashboardToken
     - name: otlp-api-key
       value: $otlpApiKey
     ingress:
@@ -153,7 +151,7 @@ properties:
       - name: DASHBOARD__FRONTEND__AUTHMODE
         value: BrowserToken
       - name: DASHBOARD__FRONTEND__BROWSERTOKEN
-        secretRef: dashboard-browser-token
+        value: $dashboardToken
       - name: DASHBOARD__OTLP__AUTHMODE
         value: ApiKey
       - name: DASHBOARD__OTLP__PRIMARYAPIKEY
