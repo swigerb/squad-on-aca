@@ -151,6 +151,7 @@ import { LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-log
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-proto';
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-grpc';
+import { Metadata } from '@grpc/grpc-js';
 
 const httpEndpoint = process.env.ASPIRE_OTLP_HTTP_ENDPOINT;
 const grpcEndpoint = process.env.ASPIRE_OTLP_GRPC_ENDPOINT;
@@ -162,10 +163,14 @@ const headers = Object.fromEntries(
     return idx === -1 ? [pair, ''] : [pair.slice(0, idx), pair.slice(idx + 1)];
   }),
 );
+const metadata = new Metadata();
+for (const [key, value] of Object.entries(headers)) {
+  metadata.set(key, value);
+}
 
 const traceExporter = new OTLPTraceExporter({ url: `${httpEndpoint}/v1/traces`, headers });
 const metricExporter = new OTLPMetricExporter({ url: `${httpEndpoint}/v1/metrics`, headers });
-const logExporter = new OTLPLogExporter({ url: grpcEndpoint });
+const logExporter = new OTLPLogExporter({ url: grpcEndpoint, metadata });
 const loggerProvider = new LoggerProvider({
   processors: [new SimpleLogRecordProcessor(logExporter)],
 });
