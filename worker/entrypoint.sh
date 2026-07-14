@@ -216,10 +216,10 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
 
       log "Dispatching issue #${issue_number} to ACA session job ${session_name}."
       gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$dispatch_label" >/dev/null || true
-      az containerapp job start \
+      az containerapp job update \
         --name "$ACA_SESSION_JOB_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
-        --env-vars \
+        --set-env-vars \
           "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" \
           "GITHUB_REF=${GITHUB_REF:-main}" \
           "SQUAD_MODE=prompt" \
@@ -230,6 +230,9 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
           "OUTPUT_BRANCH=squad/issue-${issue_number}" \
           "PR_TITLE=Squad: issue #${issue_number}" \
           "OTEL_SERVICE_NAME=squad-$session_name" >/dev/null
+      az containerapp job start \
+        --name "$ACA_SESSION_JOB_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null
     done
 
     log "Ralph dispatched ${#issue_rows[@]} issue(s)."

@@ -40,13 +40,20 @@ if ($RunCopilotSmoke) { $envVars += "RUN_COPILOT_SMOKE=true" }
 if ($PushChanges) { $envVars += "PUSH_CHANGES=true" }
 if ($OutputBranch) { $envVars += "OUTPUT_BRANCH=$OutputBranch" }
 
+$updateArgs = @(
+    "containerapp", "job", "update",
+    "--name", $JobName,
+    "--resource-group", $ResourceGroupName,
+    "--set-env-vars"
+) + $envVars
+
+az @updateArgs | Out-Null
+
 $args = @(
     "containerapp", "job", "start",
     "--name", $JobName,
-    "--resource-group", $ResourceGroupName,
-    "--container-name", $JobName,
-    "--env-vars"
-) + $envVars
+    "--resource-group", $ResourceGroupName
+)
 
 if ($NoWait) { $args += "--no-wait" }
 
