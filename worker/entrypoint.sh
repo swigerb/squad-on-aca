@@ -207,8 +207,8 @@ await tracer.startActiveSpan('squad-on-aca.telemetry-smoke', async span => {
   span.end();
 });
 
-await loggerProvider.shutdown();
-await sdk.shutdown();
+await loggerProvider.forceFlush().catch(error => console.error('Logger forceFlush failed:', error.message));
+await sdk.shutdown().catch(error => console.error('OpenTelemetry SDK shutdown failed:', error.message));
 NODE
     node telemetry-smoke.mjs
     log "OpenTelemetry smoke signal emitted."
