@@ -3,7 +3,7 @@ param(
     [string]$Location = "eastus2",
     [string]$ResourceGroupName = "rg-squad-remote-dev-eastus2",
     [string]$NamePrefix = "squad-remote",
-    [string]$AcrName = "",
+    [string]$AcrName = "acrsquadremotebrswig",
     [string]$ImageTag = "0.1.0",
     [string]$GitHubToken = "",
     [string]$CopilotGitHubToken = "",
@@ -21,10 +21,6 @@ function New-HexToken([int]$Bytes = 32) {
     -join ($buffer | ForEach-Object { $_.ToString("x2") })
 }
 
-if (-not $AcrName) {
-    $AcrName = "acrsquadremote$((Get-Random -Minimum 10000 -Maximum 99999))"
-}
-
 if (-not $GitHubToken) {
     $GitHubToken = (& gh auth token).Trim()
 }
@@ -40,6 +36,7 @@ $envName = "cae-$NamePrefix"
 $aspireName = "ca-$NamePrefix-aspire"
 $jobName = "caj-$NamePrefix-session"
 $watchName = "ca-$NamePrefix-watch"
+$identityName = "uai-$NamePrefix-acrpull"
 $dashboardToken = New-HexToken
 $otlpApiKey = New-HexToken
 $otlpHeader = "x-otlp-api-key=$otlpApiKey"
@@ -51,6 +48,14 @@ $loginServer = az acr show --name $AcrName --resource-group $ResourceGroupName -
 
 az acr build --registry $AcrName --image "squad-worker:$ImageTag" (Join-Path $repoRoot "worker")
 $image = "$loginServer/squad-worker:$ImageTag"
+
+if (-not (az identity show --name $identityName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
+    az identity create --name $identityName --resource-group $ResourceGroupName --location $Location | Out-Null
+}
+$identityId = az identity show --name $identityName --resource-group $ResourceGroupName --query id -o tsv
+$identityPrincipalId = az identity show --name $identityName --resource-group $ResourceGroupName --query principalId -o tsv
+$acrId = az acr show --name $AcrName --resource-group $ResourceGroupName --query id -o tsv
+az role assignment create --assignee $identityPrincipalId --role AcrPull --scope $acrId 2>$null | Out-Null
 
 az monitor log-analytics workspace create --resource-group $ResourceGroupName --workspace-name $workspaceName --location $Location | Out-Null
 $workspaceId = az monitor log-analytics workspace show --resource-group $ResourceGroupName --workspace-name $workspaceName --query customerId -o tsv
@@ -130,7 +135,13 @@ $commonEnv = @(
     "SQUAD_COPILOT_FLAGS=--yolo --agent squad --no-remote --no-auto-update"
 )
 
-if (-not (az containerapp job show --name $jobName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
+$existingJobImage = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query "properties.template.containers[0].image" -o tsv 2>$null
+if ($existingJobImage -and $existingJobImage -ne $image) {
+    az containerapp job delete --name $jobName --resource-group $ResourceGroupName --yes | Out-Null
+    $existingJobImage = ""
+}
+
+if (-not $existingJobImage) {
     az containerapp job create `
         --name $jobName `
         --resource-group $ResourceGroupName `
@@ -143,19 +154,15 @@ if (-not (az containerapp job show --name $jobName --resource-group $ResourceGro
         --image $image `
         --cpu 1.0 `
         --memory 2.0Gi `
-        --mi-system-assigned `
+        --mi-user-assigned $identityId `
         --registry-server $loginServer `
-        --registry-identity system `
+        --registry-identity $identityId `
         --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" `
         --env-vars @commonEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" | Out-Null
 } else {
     az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --set-env-vars @commonEnv | Out-Null
     az containerapp job secret set --name $jobName --resource-group $ResourceGroupName --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" | Out-Null
 }
-
-$jobIdentity = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query identity.principalId -o tsv
-$acrId = az acr show --name $AcrName --resource-group $ResourceGroupName --query id -o tsv
-az role assignment create --assignee $jobIdentity --role AcrPull --scope $acrId 2>$null | Out-Null
 
 if (-not (az containerapp show --name $watchName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
     az containerapp create `
@@ -167,9 +174,9 @@ if (-not (az containerapp show --name $watchName --resource-group $ResourceGroup
         --memory 2.0Gi `
         --min-replicas 0 `
         --max-replicas 1 `
-        --mi-system-assigned `
+        --user-assigned $identityId `
         --registry-server $loginServer `
-        --registry-identity system `
+        --registry-identity $identityId `
         --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" `
         --env-vars @commonEnv "SQUAD_MODE=watch" "SESSION_NAME=watch-default" | Out-Null
 } else {
@@ -177,15 +184,13 @@ if (-not (az containerapp show --name $watchName --resource-group $ResourceGroup
     az containerapp secret set --name $watchName --resource-group $ResourceGroupName --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" | Out-Null
 }
 
-$watchIdentity = az containerapp show --name $watchName --resource-group $ResourceGroupName --query identity.principalId -o tsv
-az role assignment create --assignee $watchIdentity --role AcrPull --scope $acrId 2>$null | Out-Null
-
 $outputs = [ordered]@{
     subscriptionId = $SubscriptionId
     resourceGroup = $ResourceGroupName
     location = $Location
     containerAppsEnvironment = $envName
     acrName = $AcrName
+    pullIdentity = $identityName
     workerImage = $image
     aspireApp = $aspireName
     aspireUrl = "https://$aspireFqdn"
