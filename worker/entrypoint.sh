@@ -149,6 +149,28 @@ case "${SQUAD_MODE:-smoke}" in
     export COPILOT_OTEL_ENABLED=false
     squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --copilot-flags "$COPILOT_FLAGS"
     ;;
+  ralph)
+    log "Starting scheduled Ralph poll."
+    export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
+    export COPILOT_OTEL_ENABLED=false
+    ralph_run_seconds="${RALPH_RUN_SECONDS:-240}"
+    set +e
+    timeout "$ralph_run_seconds" squad watch \
+      --execute \
+      --interval "${WATCH_INTERVAL_MINUTES:-9999}" \
+      --timeout "${WATCH_TIMEOUT_MINUTES:-4}" \
+      --max-concurrent "${WATCH_MAX_CONCURRENT:-1}" \
+      --copilot-flags "$COPILOT_FLAGS" \
+      --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
+      --verbose
+    ralph_exit=$?
+    set -e
+    if [[ "$ralph_exit" -eq 124 || "$ralph_exit" -eq 143 ]]; then
+      log "Scheduled Ralph poll window complete."
+      exit 0
+    fi
+    exit "$ralph_exit"
+    ;;
   watch|triage)
     log "Starting Squad watch."
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"

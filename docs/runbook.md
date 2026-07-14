@@ -13,6 +13,7 @@ The deployment creates:
 | `cae-squad-aca` | Azure Container Apps environment. |
 | `ca-squad-aca-aspire` | Aspire Dashboard with browser-token UI auth and OTLP API-key auth. |
 | `caj-squad-aca-session` | Manual ACA job. Every execution is one remote Squad session pod. |
+| `caj-squad-aca-ralph` | Scheduled ACA job. Ralph polls every 5 minutes, like the AKS CronJob pattern. |
 | `ca-squad-aca-watch` | Long-running watcher app for issue-driven unattended work. |
 | `law-squad-aca` | Log Analytics workspace for ACA logs. |
 
@@ -27,6 +28,20 @@ OTEL_SERVICE_NAME=squad-<session name>
 ```
 
 This matches Squad's containerized/Kubernetes pod-aware mode. The whole team you normally run from one CLI session lives inside that one ACA execution.
+
+## Ralph job runner
+
+Ralph is the scheduled poller, not the worker image. The worker image is shared by Ralph, on-demand sessions, and the watcher.
+
+`caj-squad-aca-ralph` runs every 5 minutes with:
+
+```text
+SQUAD_MODE=ralph
+SQUAD_DEPLOYMENT_MODE=squad-per-pod
+SQUAD_POD_ID=ralph-scheduled
+```
+
+ACA does not expose Kubernetes `concurrencyPolicy: Forbid`. The deployment uses `parallelism=1`, `replicaCompletionCount=1`, `replicaTimeout=270`, and a bounded Ralph run window below the 5-minute schedule to avoid overlapping executions.
 
 ## GitHub remote sessions
 
@@ -143,6 +158,20 @@ squad-smoke-001
 squad-docs-001
 squad-watch-default
 ```
+
+## CI/CD
+
+The repo includes `.github/workflows/deploy-aca.yml`. Configure these GitHub secrets before running it:
+
+```text
+AZURE_CLIENT_ID
+AZURE_TENANT_ID
+AZURE_SUBSCRIPTION_ID
+SQUAD_GITHUB_TOKEN
+SQUAD_COPILOT_GITHUB_TOKEN
+```
+
+The Azure identity behind `AZURE_CLIENT_ID` needs rights to create/update resource groups, ACR, Container Apps, managed identities, role assignments, Log Analytics, and optional Key Vault resources.
 
 ## Security notes
 

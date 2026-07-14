@@ -7,6 +7,7 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Capability | ACA implementation |
 | --- | --- |
 | One Squad team per remote session | Manual ACA job execution (`caj-squad-aca-session`) |
+| Ralph scheduler | Scheduled ACA job (`caj-squad-aca-ralph`) runs every 5 minutes |
 | Pod/container mode | `SQUAD_DEPLOYMENT_MODE=squad-per-pod` and `SQUAD_POD_ID=<session>` by default |
 | GitHub `/remote` session access | Copilot CLI runs with `--remote` by default |
 | GitHub-backed code | Each session clones `owner/repo`, works in an isolated workspace, and can push a branch/PR |
@@ -14,6 +15,7 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Unattended work | ACA watcher app running `squad watch --execute` |
 | Secure image pulls | ACR plus user-assigned managed identity |
 | Token storage | ACA secrets by default; optional Key Vault references with `-UseKeyVault` |
+| CI/CD | GitHub Actions workflow with Azure OIDC login |
 
 ## Quick start
 
@@ -38,6 +40,10 @@ Open the Aspire login URL from `deploy.outputs.json` to see traces and logs grou
 ```
 
 Each execution schedules a new ACA job replica, sets `SQUAD_POD_ID=feature-123`, enables GitHub remote control, and exports telemetry to Aspire.
+
+## Ralph versus worker image
+
+The worker image contains Node.js, GitHub CLI, Copilot CLI, and Squad CLI. Ralph is not the image; Ralph is a scheduled job mode in that image. `caj-squad-aca-ralph` runs `SQUAD_MODE=ralph` every 5 minutes, polls GitHub issues, and uses the same telemetry and token setup as interactive sessions.
 
 ## Run a watcher
 

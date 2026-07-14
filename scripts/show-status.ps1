@@ -1,6 +1,7 @@
 param(
     [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
     [string]$JobName = "caj-squad-aca-session",
+    [string]$RalphJobName = "caj-squad-aca-ralph",
     [string]$WatchAppName = "ca-squad-aca-watch",
     [string]$AspireAppName = "ca-squad-aca-aspire",
     [switch]$Logs
@@ -13,6 +14,9 @@ az containerapp list --resource-group $ResourceGroupName --query "[].{name:name,
 
 Write-Output "`nRecent job executions:"
 az containerapp job execution list --name $JobName --resource-group $ResourceGroupName --query "[0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime}" -o table
+
+Write-Output "`nRecent Ralph executions:"
+az containerapp job execution list --name $RalphJobName --resource-group $ResourceGroupName --query "[0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime}" -o table
 
 $aspireFqdn = az containerapp show --name $AspireAppName --resource-group $ResourceGroupName --query properties.configuration.ingress.fqdn -o tsv
 Write-Output "`nAspire dashboard: https://$aspireFqdn"

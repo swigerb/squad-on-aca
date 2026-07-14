@@ -37,6 +37,7 @@ $workspaceName = "law-$NamePrefix"
 $envName = "cae-$NamePrefix"
 $aspireName = "ca-$NamePrefix-aspire"
 $jobName = "caj-$NamePrefix-session"
+$ralphJobName = "caj-$NamePrefix-ralph"
 $watchName = "ca-$NamePrefix-watch"
 $identityName = "uai-$NamePrefix-acrpull"
 $dashboardToken = New-HexToken
@@ -199,6 +200,36 @@ if (-not $existingJobImage) {
     az containerapp job secret set --name $jobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 
+$existingRalphJobImage = az containerapp job show --name $ralphJobName --resource-group $ResourceGroupName --query "properties.template.containers[0].image" -o tsv 2>$null
+if ($existingRalphJobImage -and $existingRalphJobImage -ne $image) {
+    az containerapp job delete --name $ralphJobName --resource-group $ResourceGroupName --yes | Out-Null
+    $existingRalphJobImage = ""
+}
+
+if (-not $existingRalphJobImage) {
+    az containerapp job create `
+        --name $ralphJobName `
+        --resource-group $ResourceGroupName `
+        --environment $envName `
+        --trigger-type Schedule `
+        --cron-expression "*/5 * * * *" `
+        --replica-timeout 270 `
+        --replica-retry-limit 0 `
+        --replica-completion-count 1 `
+        --parallelism 1 `
+        --image $image `
+        --cpu 1.0 `
+        --memory 2.0Gi `
+        --mi-user-assigned $identityId `
+        --registry-server $loginServer `
+        --registry-identity $identityId `
+        --secrets @jobAndWatcherSecrets `
+        --env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=4" "RALPH_RUN_SECONDS=240" | Out-Null
+} else {
+    az containerapp job update --name $ralphJobName --resource-group $ResourceGroupName --image $image --cron-expression "*/5 * * * *" --replica-timeout 270 --set-env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "WATCH_INTERVAL_MINUTES=9999" "WATCH_TIMEOUT_MINUTES=4" "RALPH_RUN_SECONDS=240" | Out-Null
+    az containerapp job secret set --name $ralphJobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
+}
+
 if (-not (az containerapp show --name $watchName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
     az containerapp create `
         --name $watchName `
@@ -233,6 +264,7 @@ $outputs = [ordered]@{
     aspireUrl = "https://$aspireFqdn"
     aspireLoginUrl = "https://$aspireFqdn/login?t=$dashboardToken"
     sessionJob = $jobName
+    ralphJob = $ralphJobName
     watchApp = $watchName
     defaultRepository = $DefaultRepository
 }
