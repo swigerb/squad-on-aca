@@ -1,13 +1,13 @@
 param(
-    [string]$SubscriptionId = "3898b8ea-c676-4b43-95fc-d38425627d74",
+    [string]$SubscriptionId = "",
     [string]$Location = "eastus2",
     [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
     [string]$NamePrefix = "squad-aca",
-    [string]$AcrName = "acrsquadacabrswig",
+    [string]$AcrName = "",
     [string]$ImageTag = "",
     [string]$GitHubToken = "",
     [string]$CopilotGitHubToken = "",
-    [string]$DefaultRepository = "swigerb/squad-on-aca",
+    [string]$DefaultRepository = "",
     [switch]$UseKeyVault,
     [string]$KeyVaultName = ""
 )
@@ -22,6 +22,25 @@ if (-not $ImageTag) {
         (git -C $repoRoot rev-parse --short HEAD).Trim()
     } catch {
         Get-Date -Format "yyyyMMddHHmmss"
+    }
+}
+
+if (-not $SubscriptionId) {
+    $SubscriptionId = (az account show --query id -o tsv).Trim()
+    if (-not $SubscriptionId) {
+        throw "No Azure subscription selected. Run 'az login' and 'az account set --subscription <id>', or pass -SubscriptionId."
+    }
+}
+
+if (-not $AcrName) {
+    $suffix = -join ((48..57) + (97..122) | Get-Random -Count 8 | ForEach-Object {[char]$_})
+    $AcrName = "acrsquadaca$suffix"
+}
+
+if (-not $DefaultRepository) {
+    $DefaultRepository = gh repo view --json nameWithOwner --jq .nameWithOwner 2>$null
+    if (-not $DefaultRepository) {
+        throw "Could not infer a default GitHub repository. Pass -DefaultRepository '<github-owner>/<repo>'."
     }
 }
 

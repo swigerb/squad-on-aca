@@ -1,5 +1,9 @@
 # Squad on Azure Container Apps
 
+<p align="center">
+  <img src="docs/images/squad-on-aca-logo.jpg" alt="Squad on Azure Container Apps logo" width="320">
+</p>
+
 Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job execution per Squad session, GitHub-hosted code and state, GitHub remote session access, and centralized Aspire telemetry.
 
 ## What you get
@@ -20,8 +24,8 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 ## Quick start
 
 ```powershell
-.\scripts\deploy.ps1
-.\scripts\start-session.ps1 -Repository swigerb/squad-on-aca -Mode smoke -RunCopilotSmoke -SessionName smoke-001
+.\scripts\deploy.ps1 -SubscriptionId "<azure-subscription-id>" -DefaultRepository "<github-owner>/<repo>"
+.\scripts\start-session.ps1 -Repository "<github-owner>/<repo>" -Mode smoke -RunCopilotSmoke -SessionName smoke-001
 .\scripts\show-status.ps1
 ```
 
@@ -44,7 +48,7 @@ ACA does not need KEDA for per-session scale-to-zero. ACA Jobs already provide t
 
 ```powershell
 .\scripts\start-session.ps1 `
-  -Repository swigerb/your-repo `
+  -Repository "<github-owner>/<repo>" `
   -Mode prompt `
   -SessionName feature-123 `
   -Prompt "Use Squad to implement issue #123. Create a branch and PR." `
@@ -60,7 +64,7 @@ Use the new-project helper. It creates a GitHub repo with an initial default bra
 
 ```powershell
 .\scripts\new-project.ps1 `
-  -Owner swigerb `
+  -Owner "<github-owner>" `
   -Name my-new-squad-project `
   -Description "A new app bootstrapped by Squad on ACA"
 ```
@@ -74,7 +78,7 @@ The worker image contains Node.js, Azure CLI, GitHub CLI, Copilot CLI, and Squad
 ## Run a watcher
 
 ```powershell
-.\scripts\start-watch.ps1 -Repository swigerb/your-repo -IntervalMinutes 5
+.\scripts\start-watch.ps1 -Repository "<github-owner>/<repo>" -IntervalMinutes 5
 ```
 
 Label work with `squad` or `squad:*`. For SubSquads, commit `.squad/streams.json` and pass `-SubSquad docs` or another stream name.

@@ -181,19 +181,19 @@ const sdk = new NodeSDK({
 
 await sdk.start();
 
-const tracer = trace.getTracer('squad-on-aca-e2e');
+const tracer = trace.getTracer('squad-on-aca');
 await tracer.startActiveSpan('squad-on-aca.telemetry-smoke', async span => {
   span.setAttribute('squad.session', session);
   span.setAttribute('squad.platform', 'azure-container-apps');
   span.addEvent('telemetry smoke span emitted from ACA');
 
-  const meter = metrics.getMeter('squad-on-aca-e2e');
+  const meter = metrics.getMeter('squad-on-aca');
   const counter = meter.createCounter('squad_aca_e2e_telemetry_smoke_total', {
     description: 'E2E telemetry smoke signals emitted by Squad on ACA',
   });
   counter.add(1, { session, platform: 'aca' });
 
-  const logger = logs.getLogger('squad-on-aca-e2e');
+  const logger = logs.getLogger('squad-on-aca');
   logger.emit({
     severityNumber: SeverityNumber.INFO,
     severityText: 'Information',

@@ -1,5 +1,6 @@
 param(
-    [string]$Owner = "swigerb",
+    [Parameter(Mandatory = $true)]
+    [string]$Owner,
     [Parameter(Mandatory = $true)]
     [string]$Name,
     [ValidateSet("private", "public", "internal")]

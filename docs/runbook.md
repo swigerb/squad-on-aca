@@ -8,7 +8,7 @@ The deployment creates:
 
 | Resource | Purpose |
 | --- | --- |
-| `acrsquadacabrswig` | ACR for the `squad-worker` image. |
+| `<acr-name>` | ACR for the `squad-worker` image. |
 | `uai-squad-aca-acrpull` | User-assigned identity used by ACA to pull from ACR and optionally read Key Vault secrets. |
 | `cae-squad-aca` | Azure Container Apps environment. |
 | `ca-squad-aca-aspire` | Aspire Dashboard with browser-token UI auth and OTLP API-key auth. |
@@ -80,16 +80,14 @@ Copilot CLI runs with:
 ## Deploy
 
 ```powershell
-.\scripts\deploy.ps1
+.\scripts\deploy.ps1 -SubscriptionId "<azure-subscription-id>" -DefaultRepository "<github-owner>/<repo>"
 ```
 
-Defaults:
+Common defaults:
 
 ```text
-Subscription: 3898b8ea-c676-4b43-95fc-d38425627d74
 Location: eastus2
 Resource group: rg-squad-aca-dev-eastus2
-Default repo: swigerb/squad-on-aca
 ```
 
 For production-style secret references:
@@ -105,14 +103,14 @@ Deployment output is written to ignored local file `deploy.outputs.json`.
 Smoke test:
 
 ```powershell
-.\scripts\start-session.ps1 -Repository swigerb/squad-on-aca -Mode smoke -RunCopilotSmoke -SessionName smoke-001
+.\scripts\start-session.ps1 -Repository "<github-owner>/<repo>" -Mode smoke -RunCopilotSmoke -SessionName smoke-001
 ```
 
 Prompt session:
 
 ```powershell
 .\scripts\start-session.ps1 `
-  -Repository swigerb/your-repo `
+  -Repository "<github-owner>/<repo>" `
   -Mode prompt `
   -SessionName docs-001 `
   -Prompt "Use Squad to improve the docs. Open a PR if changes are needed." `
@@ -123,7 +121,7 @@ Prompt session:
 Loop session:
 
 ```powershell
-.\scripts\start-session.ps1 -Repository swigerb/your-repo -Mode loop -SessionName daily-loop
+.\scripts\start-session.ps1 -Repository "<github-owner>/<repo>" -Mode loop -SessionName daily-loop
 ```
 
 ## Start a project without a repo
@@ -132,7 +130,7 @@ Use `scripts/new-project.ps1` when you have an idea but no GitHub repository yet
 
 ```powershell
 .\scripts\new-project.ps1 `
-  -Owner swigerb `
+  -Owner "<github-owner>" `
   -Name my-new-squad-project `
   -Description "A new app bootstrapped by Squad on ACA"
 ```
@@ -149,13 +147,13 @@ If the repo already exists, pass `-UseExisting`.
 ## Start a watcher
 
 ```powershell
-.\scripts\start-watch.ps1 -Repository swigerb/your-repo -IntervalMinutes 5 -TimeoutMinutes 45
+.\scripts\start-watch.ps1 -Repository "<github-owner>/<repo>" -IntervalMinutes 5 -TimeoutMinutes 45
 ```
 
 Stop the watcher:
 
 ```powershell
-.\scripts\start-watch.ps1 -Repository swigerb/your-repo -Stop
+.\scripts\start-watch.ps1 -Repository "<github-owner>/<repo>" -Stop
 ```
 
 ## Run SubSquads
@@ -185,8 +183,8 @@ Commit `.squad/streams.json` to the target repo:
 Start scoped sessions:
 
 ```powershell
-.\scripts\start-session.ps1 -Repository swigerb/your-repo -Mode prompt -SubSquad docs -SessionName docs-001 -Prompt "Work the next docs issue."
-.\scripts\start-watch.ps1 -Repository swigerb/your-repo -SubSquad platform
+.\scripts\start-session.ps1 -Repository "<github-owner>/<repo>" -Mode prompt -SubSquad docs -SessionName docs-001 -Prompt "Work the next docs issue."
+.\scripts\start-watch.ps1 -Repository "<github-owner>/<repo>" -SubSquad platform
 ```
 
 ## Monitor
