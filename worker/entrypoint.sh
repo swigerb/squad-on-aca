@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 log() {
-  printf '[remote-squad] %s\n' "$*"
+  printf '[squad-on-aca] %s\n' "$*"
 }
 
 require() {
@@ -39,6 +39,9 @@ fi
 require GITHUB_REPOSITORY
 
 SESSION_NAME="$(sanitize_name "${SESSION_NAME:-$(date +%Y%m%d-%H%M%S)}")"
+SQUAD_POD_ID="$(sanitize_name "${SQUAD_POD_ID:-${CONTAINER_APP_JOB_EXECUTION_NAME:-${CONTAINER_APP_REPLICA_NAME:-$SESSION_NAME}}}")"
+export SQUAD_DEPLOYMENT_MODE="${SQUAD_DEPLOYMENT_MODE:-squad-per-pod}"
+export SQUAD_POD_ID
 REPO_DIR="${WORKDIR:-/workspace}/${SESSION_NAME}/repo"
 mkdir -p "$(dirname "$REPO_DIR")"
 
@@ -47,6 +50,8 @@ log "Squad: $(squad version)"
 log "Copilot: $(copilot --version | head -n 1)"
 log "GitHub repository: ${GITHUB_REPOSITORY}"
 log "Session: ${SESSION_NAME}"
+log "Squad deployment mode: ${SQUAD_DEPLOYMENT_MODE}"
+log "Squad pod ID: ${SQUAD_POD_ID}"
 log "Mode: ${SQUAD_MODE:-smoke}"
 log "Squad OTLP endpoint: ${ASPIRE_OTLP_GRPC_ENDPOINT}"
 log "Copilot OTLP endpoint: ${ASPIRE_OTLP_HTTP_ENDPOINT}"
@@ -55,7 +60,7 @@ if [[ -n "${GH_TOKEN:-}" ]]; then
   git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
 fi
 git config --global user.name "${GIT_AUTHOR_NAME:-Remote Squad}"
-git config --global user.email "${GIT_AUTHOR_EMAIL:-remote-squad@users.noreply.github.com}"
+git config --global user.email "${GIT_AUTHOR_EMAIL:-squad-on-aca@users.noreply.github.com}"
 git config --global --add safe.directory "$REPO_DIR" || true
 
 rm -rf "$REPO_DIR"
@@ -77,7 +82,16 @@ if [[ -n "${SQUAD_TEAM:-}" ]]; then
   squad subsquads activate "$SQUAD_TEAM" || true
 fi
 
-COPILOT_FLAGS="${SQUAD_COPILOT_FLAGS:---yolo --agent squad --no-remote --no-auto-update}"
+if [[ -z "${SQUAD_COPILOT_FLAGS:-}" ]]; then
+  if [[ "${ENABLE_GITHUB_REMOTE:-true}" == "true" ]]; then
+    COPILOT_FLAGS="--yolo --agent squad --remote --no-auto-update"
+  else
+    COPILOT_FLAGS="--yolo --agent squad --no-remote --no-auto-update"
+  fi
+else
+  COPILOT_FLAGS="$SQUAD_COPILOT_FLAGS"
+fi
+log "Copilot flags: ${COPILOT_FLAGS}"
 
 commit_and_push_if_needed() {
   if [[ "${PUSH_CHANGES:-false}" != "true" ]]; then

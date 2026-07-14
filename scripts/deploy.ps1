@@ -1,13 +1,15 @@
 param(
     [string]$SubscriptionId = "3898b8ea-c676-4b43-95fc-d38425627d74",
     [string]$Location = "eastus2",
-    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus2",
-    [string]$NamePrefix = "squad-remote",
-    [string]$AcrName = "acrsquadremotebrswig",
+    [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
+    [string]$NamePrefix = "squad-aca",
+    [string]$AcrName = "acrsquadacabrswig",
     [string]$ImageTag = "0.1.0",
     [string]$GitHubToken = "",
     [string]$CopilotGitHubToken = "",
-    [string]$DefaultRepository = "swigerb/remote-squad-azure"
+    [string]$DefaultRepository = "swigerb/squad-on-aca",
+    [switch]$UseKeyVault,
+    [string]$KeyVaultName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,7 +31,7 @@ if (-not $CopilotGitHubToken) {
 }
 
 az account set --subscription $SubscriptionId
-az group create --name $ResourceGroupName --location $Location --tags workload=squad-remote purpose=remote-agent-dev | Out-Null
+az group create --name $ResourceGroupName --location $Location --tags workload=squad-on-aca purpose=remote-agent-dev | Out-Null
 
 $workspaceName = "law-$NamePrefix"
 $envName = "cae-$NamePrefix"
@@ -56,6 +58,37 @@ $identityId = az identity show --name $identityName --resource-group $ResourceGr
 $identityPrincipalId = az identity show --name $identityName --resource-group $ResourceGroupName --query principalId -o tsv
 $acrId = az acr show --name $AcrName --resource-group $ResourceGroupName --query id -o tsv
 az role assignment create --assignee $identityPrincipalId --role AcrPull --scope $acrId 2>$null | Out-Null
+
+$jobAndWatcherSecrets = @(
+    "github-token=$GitHubToken",
+    "copilot-github-token=$CopilotGitHubToken",
+    "otlp-headers=$otlpHeader"
+)
+$secretStore = "container-app-secrets"
+
+if ($UseKeyVault) {
+    if (-not $KeyVaultName) {
+        $KeyVaultName = "kv-squad-aca-$((Get-Random -Minimum 1000 -Maximum 9999))"
+    }
+    if (-not (az keyvault show --name $KeyVaultName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
+        az keyvault create --name $KeyVaultName --resource-group $ResourceGroupName --location $Location | Out-Null
+    }
+
+    $signedInObjectId = az ad signed-in-user show --query id -o tsv
+    az keyvault set-policy --name $KeyVaultName --object-id $signedInObjectId --secret-permissions get list set delete recover 2>$null | Out-Null
+    az keyvault set-policy --name $KeyVaultName --object-id $identityPrincipalId --secret-permissions get list 2>$null | Out-Null
+
+    $githubTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name github-token --value $GitHubToken --query id -o tsv
+    $copilotTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name copilot-github-token --value $CopilotGitHubToken --query id -o tsv
+    $otlpHeadersSecretId = az keyvault secret set --vault-name $KeyVaultName --name otlp-headers --value $otlpHeader --query id -o tsv
+
+    $jobAndWatcherSecrets = @(
+        "github-token=keyvaultref:$githubTokenSecretId,identityref:$identityId",
+        "copilot-github-token=keyvaultref:$copilotTokenSecretId,identityref:$identityId",
+        "otlp-headers=keyvaultref:$otlpHeadersSecretId,identityref:$identityId"
+    )
+    $secretStore = "key-vault"
+}
 
 az monitor log-analytics workspace create --resource-group $ResourceGroupName --workspace-name $workspaceName --location $Location | Out-Null
 $workspaceId = az monitor log-analytics workspace show --resource-group $ResourceGroupName --workspace-name $workspaceName --query customerId -o tsv
@@ -132,7 +165,9 @@ $commonEnv = @(
     "ASPIRE_OTLP_GRPC_ENDPOINT=http://$aspireName`:18889",
     "ASPIRE_OTLP_HTTP_ENDPOINT=http://$aspireName`:18890",
     "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers",
-    "SQUAD_COPILOT_FLAGS=--yolo --agent squad --no-remote --no-auto-update"
+    "SQUAD_DEPLOYMENT_MODE=squad-per-pod",
+    "ENABLE_GITHUB_REMOTE=true",
+    "SQUAD_COPILOT_FLAGS=--yolo --agent squad --remote --no-auto-update"
 )
 
 $existingJobImage = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query "properties.template.containers[0].image" -o tsv 2>$null
@@ -157,11 +192,11 @@ if (-not $existingJobImage) {
         --mi-user-assigned $identityId `
         --registry-server $loginServer `
         --registry-identity $identityId `
-        --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" `
-        --env-vars @commonEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" | Out-Null
+        --secrets @jobAndWatcherSecrets `
+        --env-vars @commonEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" "SQUAD_POD_ID=smoke-template" | Out-Null
 } else {
     az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --set-env-vars @commonEnv | Out-Null
-    az containerapp job secret set --name $jobName --resource-group $ResourceGroupName --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" | Out-Null
+    az containerapp job secret set --name $jobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 
 if (-not (az containerapp show --name $watchName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
@@ -177,11 +212,11 @@ if (-not (az containerapp show --name $watchName --resource-group $ResourceGroup
         --user-assigned $identityId `
         --registry-server $loginServer `
         --registry-identity $identityId `
-        --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" `
-        --env-vars @commonEnv "SQUAD_MODE=watch" "SESSION_NAME=watch-default" | Out-Null
+        --secrets @jobAndWatcherSecrets `
+        --env-vars @commonEnv "SQUAD_MODE=watch" "SESSION_NAME=watch-default" "SQUAD_POD_ID=watch-default" | Out-Null
 } else {
     az containerapp update --name $watchName --resource-group $ResourceGroupName --image $image --set-env-vars @commonEnv | Out-Null
-    az containerapp secret set --name $watchName --resource-group $ResourceGroupName --secrets "github-token=$GitHubToken" "copilot-github-token=$CopilotGitHubToken" "otlp-headers=$otlpHeader" | Out-Null
+    az containerapp secret set --name $watchName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 
 $outputs = [ordered]@{
@@ -191,6 +226,8 @@ $outputs = [ordered]@{
     containerAppsEnvironment = $envName
     acrName = $AcrName
     pullIdentity = $identityName
+    secretStore = $secretStore
+    keyVaultName = $KeyVaultName
     workerImage = $image
     aspireApp = $aspireName
     aspireUrl = "https://$aspireFqdn"

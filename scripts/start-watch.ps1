@@ -1,6 +1,6 @@
 param(
-    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus2",
-    [string]$WatchAppName = "ca-squad-remote-watch",
+    [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
+    [string]$WatchAppName = "ca-squad-aca-watch",
     [Parameter(Mandatory = $true)]
     [string]$Repository,
     [string]$Ref = "main",
@@ -25,13 +25,16 @@ $envVars = @(
     "GITHUB_REF=$Ref",
     "SQUAD_MODE=watch",
     "SESSION_NAME=$sessionName",
+    "SQUAD_DEPLOYMENT_MODE=squad-per-pod",
+    "SQUAD_POD_ID=$sessionName",
     "OTEL_SERVICE_NAME=squad-$sessionName",
     "WATCH_INTERVAL_MINUTES=$IntervalMinutes",
     "WATCH_TIMEOUT_MINUTES=$TimeoutMinutes",
     "WATCH_MAX_CONCURRENT=$MaxConcurrent",
     "GITHUB_TOKEN=secretref:github-token",
     "COPILOT_GITHUB_TOKEN=secretref:copilot-github-token",
-    "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers"
+    "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers",
+    "ENABLE_GITHUB_REMOTE=true"
 )
 if ($SubSquad) { $envVars += "SQUAD_TEAM=$SubSquad" }
 

@@ -1,8 +1,8 @@
 param(
-    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus2",
-    [string]$JobName = "caj-squad-remote-session",
-    [string]$WatchAppName = "ca-squad-remote-watch",
-    [string]$AspireAppName = "ca-squad-remote-aspire",
+    [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
+    [string]$JobName = "caj-squad-aca-session",
+    [string]$WatchAppName = "ca-squad-aca-watch",
+    [string]$AspireAppName = "ca-squad-aca-aspire",
     [switch]$Logs
 )
 

@@ -1,6 +1,6 @@
 param(
-    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus2",
-    [string]$JobName = "caj-squad-remote-session",
+    [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
+    [string]$JobName = "caj-squad-aca-session",
     [Parameter(Mandatory = $true)]
     [string]$Repository,
     [string]$Ref = "main",
@@ -25,10 +25,13 @@ $envVars = @(
     "GITHUB_REF=$Ref",
     "SQUAD_MODE=$Mode",
     "SESSION_NAME=$SessionName",
+    "SQUAD_DEPLOYMENT_MODE=squad-per-pod",
+    "SQUAD_POD_ID=$SessionName",
     "OTEL_SERVICE_NAME=squad-$SessionName",
     "GITHUB_TOKEN=secretref:github-token",
     "COPILOT_GITHUB_TOKEN=secretref:copilot-github-token",
-    "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers"
+    "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers",
+    "ENABLE_GITHUB_REMOTE=true"
 )
 
 if ($Prompt) { $envVars += "SQUAD_PROMPT=$Prompt" }

@@ -22,10 +22,10 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --chown=squad:squad entrypoint.sh /usr/local/bin/remote-squad
-RUN sed -i 's/\r$//' /usr/local/bin/remote-squad \
-    && chmod +x /usr/local/bin/remote-squad
+COPY --chown=squad:squad entrypoint.sh /usr/local/bin/squad-on-aca
+RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca \
+    && chmod +x /usr/local/bin/squad-on-aca
 
 USER squad
 WORKDIR /workspace
-ENTRYPOINT ["/usr/local/bin/remote-squad"]
+ENTRYPOINT ["/usr/local/bin/squad-on-aca"]
