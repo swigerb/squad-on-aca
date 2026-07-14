@@ -58,6 +58,7 @@ if (-not (az acr show --name $AcrName --resource-group $ResourceGroupName --quer
 $loginServer = az acr show --name $AcrName --resource-group $ResourceGroupName --query loginServer -o tsv
 
 az acr build --registry $AcrName --image "squad-worker:$ImageTag" (Join-Path $repoRoot "worker")
+az account set --subscription $SubscriptionId
 $image = "$loginServer/squad-worker:$ImageTag"
 
 if (-not (az identity show --name $identityName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
