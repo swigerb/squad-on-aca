@@ -165,8 +165,9 @@ const headers = Object.fromEntries(
 const traceExporter = new OTLPTraceExporter({ url: `${endpoint}/v1/traces`, headers });
 const metricExporter = new OTLPMetricExporter({ url: `${endpoint}/v1/metrics`, headers });
 const logExporter = new OTLPLogExporter({ url: `${endpoint}/v1/logs`, headers });
-const loggerProvider = new LoggerProvider();
-loggerProvider.addLogRecordProcessor(new SimpleLogRecordProcessor(logExporter));
+const loggerProvider = new LoggerProvider({
+  processors: [new SimpleLogRecordProcessor(logExporter)],
+});
 logs.setGlobalLoggerProvider(loggerProvider);
 
 const sdk = new NodeSDK({
