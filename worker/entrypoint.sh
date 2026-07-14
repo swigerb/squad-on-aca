@@ -172,7 +172,7 @@ const sdk = new NodeSDK({
     exporter: metricExporter,
     exportIntervalMillis: 1000,
   }),
-  logRecordProcessors: [new SimpleLogRecordProcessor(logExporter)],
+  logRecordProcessors: [new SimpleLogRecordProcessor({ exporter: logExporter })],
 });
 
 await sdk.start();
