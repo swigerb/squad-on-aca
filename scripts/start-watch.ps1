@@ -1,5 +1,5 @@
 param(
-    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus",
+    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus2",
     [string]$WatchAppName = "ca-squad-remote-watch",
     [Parameter(Mandatory = $true)]
     [string]$Repository,

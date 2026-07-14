@@ -1,7 +1,7 @@
 param(
     [string]$SubscriptionId = "3898b8ea-c676-4b43-95fc-d38425627d74",
-    [string]$Location = "eastus",
-    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus",
+    [string]$Location = "eastus2",
+    [string]$ResourceGroupName = "rg-squad-remote-dev-eastus2",
     [string]$NamePrefix = "squad-remote",
     [string]$AcrName = "",
     [string]$ImageTag = "0.1.0",
@@ -44,7 +44,9 @@ $dashboardToken = New-HexToken
 $otlpApiKey = New-HexToken
 $otlpHeader = "x-otlp-api-key=$otlpApiKey"
 
-az acr create --name $AcrName --resource-group $ResourceGroupName --location $Location --sku Basic --admin-enabled false | Out-Null
+if (-not (az acr show --name $AcrName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
+    az acr create --name $AcrName --resource-group $ResourceGroupName --location $Location --sku Basic --admin-enabled false | Out-Null
+}
 $loginServer = az acr show --name $AcrName --resource-group $ResourceGroupName --query loginServer -o tsv
 
 az acr build --registry $AcrName --image "squad-worker:$ImageTag" (Join-Path $repoRoot "worker")
@@ -54,7 +56,12 @@ az monitor log-analytics workspace create --resource-group $ResourceGroupName --
 $workspaceId = az monitor log-analytics workspace show --resource-group $ResourceGroupName --workspace-name $workspaceName --query customerId -o tsv
 $workspaceKey = az monitor log-analytics workspace get-shared-keys --resource-group $ResourceGroupName --workspace-name $workspaceName --query primarySharedKey -o tsv
 
-if (-not (az containerapp env show --name $envName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
+$existingEnvState = az containerapp env show --name $envName --resource-group $ResourceGroupName --query properties.provisioningState -o tsv 2>$null
+if ($existingEnvState -eq "Failed") {
+    az containerapp env delete --name $envName --resource-group $ResourceGroupName --yes | Out-Null
+    $existingEnvState = ""
+}
+if (-not $existingEnvState) {
     az containerapp env create --name $envName --resource-group $ResourceGroupName --location $Location --logs-workspace-id $workspaceId --logs-workspace-key $workspaceKey | Out-Null
 }
 $envId = az containerapp env show --name $envName --resource-group $ResourceGroupName --query id -o tsv
@@ -109,7 +116,7 @@ properties:
       maxReplicas: 1
 "@ | Set-Content -Path $aspireYaml -Encoding utf8
 
-az containerapp create --resource-group $ResourceGroupName --yaml $aspireYaml | Out-Null
+az containerapp create --name $aspireName --resource-group $ResourceGroupName --yaml $aspireYaml | Out-Null
 $aspireFqdn = az containerapp show --name $aspireName --resource-group $ResourceGroupName --query properties.configuration.ingress.fqdn -o tsv
 
 $commonEnv = @(

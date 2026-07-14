@@ -45,10 +45,10 @@ From this repo on a machine with Azure CLI and GitHub CLI authenticated:
 .\scripts\deploy.ps1
 ```
 
-The script targets subscription `3898b8ea-c676-4b43-95fc-d38425627d74` by default and creates:
+The script targets subscription `3898b8ea-c676-4b43-95fc-d38425627d74` and East US 2 by default and creates:
 
 ```text
-rg-squad-remote-dev-eastus
+rg-squad-remote-dev-eastus2
 cae-squad-remote
 ca-squad-remote-aspire
 caj-squad-remote-session
