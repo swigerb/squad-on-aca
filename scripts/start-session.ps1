@@ -44,6 +44,7 @@ $args = @(
     "containerapp", "job", "start",
     "--name", $JobName,
     "--resource-group", $ResourceGroupName,
+    "--container-name", $JobName,
     "--env-vars"
 ) + $envVars
 
