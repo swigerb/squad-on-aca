@@ -309,6 +309,25 @@ SQUAD_COPILOT_GITHUB_TOKEN
 
 The Azure identity behind `AZURE_CLIENT_ID` needs rights to create/update resource groups, ACR, Container Apps, managed identities, role assignments, Log Analytics, and optional Key Vault resources.
 
+## Rollback and recovery
+
+When a deploy, config change, or session goes wrong, use the ordered recovery
+procedures in [rollback.md](rollback.md). They run from least to most disruptive:
+
+1. **Optional .NET/Aspire path** — revert local scaffold changes; no Azure teardown.
+2. **ACA worker image / session job** — redeploy the last-known-good image and stop
+   failing executions.
+3. **Aspire token / secrets** — regenerate the OTLP API key and dashboard browser
+   token via `scripts/deploy.ps1`, and rotate GitHub/Copilot tokens with
+   `squad-aca secrets rotate`.
+4. **Ralph / watch** — `squad-aca ralph pause` and `squad-aca watch stop` to halt
+   unattended dispatch without touching the rest of the deployment.
+5. **Full resource-group destroy / redeploy** — `squad-aca destroy --yes` then
+   `scripts/deploy.ps1` as a last resort.
+
+Each procedure ends with the post-rollback verification checklist in
+[rollback.md](rollback.md#post-rollback-verification).
+
 ## Security notes
 
 - Use a separate GitHub token for GitHub API work and Copilot headless auth when your policy requires separation.

@@ -240,4 +240,4 @@ separation, rotation, public sync guard, image pinning).
 - `squad-aca sync --sync-all` runs a public repo secret guard that blocks obvious
   secret files and inline tokens before staging.
 
-See [docs/runbook.md](docs/runbook.md), [docs/architecture.md](docs/architecture.md), and [docs/feature-parity.md](docs/feature-parity.md).
+See [docs/runbook.md](docs/runbook.md), [docs/rollback.md](docs/rollback.md), [docs/architecture.md](docs/architecture.md), and [docs/feature-parity.md](docs/feature-parity.md).

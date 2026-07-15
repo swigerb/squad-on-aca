@@ -11,8 +11,10 @@
       1. PowerShell parse   - every scripts/*.ps1 is parsed with the PowerShell
                               language parser (syntax + tokenization).
       2. Bash syntax check  - `bash -n` on worker/entrypoint.sh when bash exists.
-      3. Secret scan        - scans tracked docs/ and scripts/ for credential
-                              file patterns and inline token signatures.
+      3. Secret scan        - scans tracked docs/, scripts/, and aspire/ for
+                              credential file patterns and inline token
+                              signatures. Generated build output (bin/, obj/)
+                              and binary files are skipped.
       4. .NET scaffold check- validates the optional aspire/ integration scaffold
                               structure (solution + AppHost project + README) and
                               optionally runs `dotnet build` with -RunDotnet.
@@ -90,9 +92,9 @@ if (-not (Test-Path $entrypoint)) {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Secret scan of tracked docs/ and scripts/
+# 3. Secret scan of tracked docs/, scripts/, and aspire/
 # ---------------------------------------------------------------------------
-Write-Section "Secret scan (docs + scripts)"
+Write-Section "Secret scan (docs + scripts + aspire)"
 $secretPatterns = @(
     @{ Name = "GitHub token";        Regex = 'gh[pousr]_[A-Za-z0-9]{30,}' },
     @{ Name = "GitHub fine PAT";     Regex = 'github_pat_[A-Za-z0-9_]{40,}' },
@@ -105,13 +107,23 @@ $secretPatterns = @(
 # Allow-listed placeholders that legitimately look token-ish in docs.
 $allowList = @('secretref:', 'keyvaultref:', 'identityref:', '<', '>')
 
-$scanRoots = @("docs", "scripts") | ForEach-Object { Join-Path $RepoRoot $_ }
+$scanRoots = @("docs", "scripts", "aspire") | ForEach-Object { Join-Path $RepoRoot $_ }
 $scanFiles = foreach ($root in $scanRoots) {
-    if (Test-Path $root) { Get-ChildItem -Path $root -File -Recurse }
+    if (Test-Path $root) {
+        # Skip generated build output (bin/, obj/) so the scan stays fast and
+        # only covers source-controlled, human-authored files.
+        Get-ChildItem -Path $root -File -Recurse |
+            Where-Object { $_.FullName -notmatch '\\(bin|obj)\\' }
+    }
 }
+# Extensions that are binary/compiled and never contain reviewable secrets.
+$binaryExtensions = @(
+    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.pfx', '.pem',
+    '.dll', '.exe', '.pdb', '.nupkg', '.zip', '.snk', '.cache', '.bin'
+)
 $secretHits = 0
 foreach ($file in $scanFiles) {
-    if ($file.Extension -in @('.png', '.jpg', '.jpeg', '.gif', '.ico', '.pfx', '.pem')) { continue }
+    if ($file.Extension -in $binaryExtensions) { continue }
     $content = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
     if (-not $content) { continue }
     foreach ($p in $secretPatterns) {
@@ -133,10 +145,10 @@ $badNames = $scanFiles | Where-Object {
 }
 foreach ($bad in $badNames) {
     $rel = $bad.FullName.Substring($RepoRoot.Length + 1)
-    Add-Fail "Credential-style file tracked under docs/scripts: $rel"
+    Add-Fail "Credential-style file tracked under docs/scripts/aspire: $rel"
     $secretHits++
 }
-if ($secretHits -eq 0) { Add-Pass "No secret patterns found in docs/ or scripts/" }
+if ($secretHits -eq 0) { Add-Pass "No secret patterns found in docs/, scripts/, or aspire/" }
 
 # ---------------------------------------------------------------------------
 # 4. Optional .NET/Aspire scaffold structure

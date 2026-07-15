@@ -75,7 +75,8 @@ This starts the standalone Aspire Dashboard (the default OTLP sink) with:
 
 - UI auth = **BrowserToken** (never `Unsecured`)
 - OTLP auth = **ApiKey** (never `Unsecured`)
-- OTLP ports (18889/18890) modeled as **internal-only** endpoints
+- ACA deployment keeps OTLP ports (18889/18890) **internal-only**. This local
+  AppHost exposes OTLP endpoints for developer smoke testing.
 
 To also start the `squad-worker` container wired to the dashboard, set
 `Squad:RunWorker=true` and provide a repository:

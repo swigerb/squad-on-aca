@@ -17,7 +17,8 @@
 // Security notes (mirrors scripts/deploy.ps1):
 //   * Dashboard UI auth  = BrowserToken (never Unsecured).
 //   * Dashboard OTLP auth = ApiKey (never Unsecured).
-//   * OTLP ports (18889/18890) are modeled as internal-only endpoints.
+//   * ACA deployment keeps OTLP ports (18889/18890) internal-only.
+//   * This local AppHost exposes OTLP endpoints for developer smoke testing.
 //   * No secrets are committed. Tokens are read from configuration/user-secrets
 //     /environment at run time and generated when absent.
 

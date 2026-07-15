@@ -23,7 +23,7 @@ pre-push hook.
 | --- | --- | --- |
 | PowerShell parse | Parses every `scripts/*.ps1` with the PowerShell language parser | Catches syntax errors without executing deploy/dispatch logic |
 | Worker `bash -n` | Runs `bash -n` on `worker/entrypoint.sh` (CRLF-normalized) | Catches shell syntax errors in the container entrypoint |
-| Secret scan | Scans tracked `docs/` and `scripts/` for token patterns and credential filenames | Keeps the public repo free of secrets |
+| Secret scan | Scans tracked `docs/`, `scripts/`, and `aspire/` for token patterns and credential filenames (skips `bin/`, `obj/`, and binary files) | Keeps the public repo free of secrets |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
 
 ## Sprint validation checklist
@@ -113,7 +113,7 @@ These map to the Security review items. Each has a concrete way to verify it.
 
 - **Verify no secrets are committed:**
   ```powershell
-  .\scripts\validate.ps1   # includes the docs/scripts secret scan
+  .\scripts\validate.ps1   # includes the docs/scripts/aspire secret scan
   git grep -nIE "gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
   ```
   Both should return nothing.
@@ -180,6 +180,15 @@ project files and `AppHost.cs` remain valid, reviewable scaffolding, and the
 static structure check in `validate.ps1` still passes. Document the restore
 failure reason in your sprint notes and keep the scaffold explicit rather than
 vendoring preview packages.
+
+## Rollback and recovery
+
+If validation fails after a deploy or config change, or a session/Ralph/watch run
+misbehaves, follow [rollback.md](rollback.md). It covers per-component recovery
+(optional .NET/Aspire path, ACA worker image/session job, Aspire token/secrets,
+Ralph/watch) and, as a last resort, a full resource-group destroy/redeploy. Each
+rollback ends with a post-rollback verification checklist that re-runs
+`scripts/validate.ps1` and `squad-aca doctor`.
 
 ## Known limitations
 
