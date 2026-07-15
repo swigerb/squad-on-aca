@@ -1,0 +1,36 @@
+# Example capability manifest for Squad on ACA.
+# Copy to the root of your repository as `squad-capabilities.yml`
+# (or point CAPABILITY_MANIFEST_PATH at a different location).
+# See ../capability-manifest.md for the full schema and behavior.
+
+version: 1
+
+tools:
+  - name: docker
+    check: docker --version
+    required: true
+    reason: Needed to build and test the container image
+  - name: pnpm
+    check: pnpm --version
+    required: false
+    reason: Only needed for the monorepo build; falls back to npm
+
+credentials:
+  - name: NPM_TOKEN
+    required: true
+    reason: Auth for a private npm registry used by this repo
+
+services:
+  - name: postgres
+    required: false
+    reason: Integration tests expect a local Postgres instance
+
+egress:
+  - host: registry.npmjs.org
+    reason: Package installs during build
+
+image:
+  hint: ghcr.io/example/squad-worker-python:latest
+  reason: Needs a pinned Python 3.12 + Poetry toolchain
+
+notes: Bootstrap notes for humans or agents working on this repo.

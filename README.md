@@ -86,6 +86,19 @@ To include all local working-tree changes, not just Squad state, add `--sync-all
 
 ## Direct script quick start
 
+## Capability-aware execution
+
+Every session runs in the same fixed worker image with a scoped managed
+identity, so repositories that need extra SDKs, browsers, databases, build
+tools, or private package feeds can hit late, confusing failures mid-task.
+Add an optional `squad-capabilities.yml` manifest to a repository to declare
+what it needs; the worker validates required tools/credentials right after
+clone and fails fast with an actionable message instead of letting Copilot
+discover the gap partway through the task. Repositories with no manifest are
+unaffected — see [`docs/capability-manifest.md`](docs/capability-manifest.md)
+for the schema, defaults, and how to extend the worker image for uncommon
+tooling.
+
 If you do not want to install the `squad-aca` command:
 
 ```powershell

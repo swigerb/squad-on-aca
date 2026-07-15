@@ -1,0 +1,6 @@
+version: 1
+tools:
+  - name: definitely-not-installed-binary
+    check: definitely-not-installed-binary --version
+    required: true
+    reason: Needed to build the project

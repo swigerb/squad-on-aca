@@ -1,0 +1,8 @@
+version: 1
+tools:
+  - name: git
+    check: git --version
+    required: true
+  - name: node
+    check: node --version
+    required: true
