@@ -75,8 +75,11 @@ transformer heredoc).
 
 The Ralph dispatcher (`SQUAD_MODE=ralph` in `worker/entrypoint.sh`) builds each
 session job execution's environment from an immutable snapshot of the session job
-template, stripping session-managed keys and overlaying fresh values. The Node
-transformer was exercised offline with a representative template snapshot:
+container template, stripping session-managed keys and overlaying fresh values. It
+also reads the image, CPU/memory, and container name from that same snapshot and
+echoes them back on `az containerapp job start` — required so ACA applies the
+per-execution `--env-vars` override at all — without mutating the shared template.
+The Node transformer was exercised offline with a representative template snapshot:
 
 Input template env (excerpt): a stale `GITHUB_REPOSITORY=old/repo`, a placeholder
 `SESSION_NAME=smoke-template`, a `GITHUB_TOKEN` secretRef, and durable common vars
@@ -167,8 +170,14 @@ ____ (paste: DASHBOARD__FRONTEND__AUTHMODE=BrowserToken, DASHBOARD__OTLP__AUTHMO
 
 ### L3. Session dispatch does not mutate the shared job template
 
-Capture the job template env before and after a dispatch; they must be identical
-(the dispatch used a per-execution `--env-vars` override, not `job update`).
+Capture the job template env before and after a dispatch; they must be identical.
+The dispatch uses a per-execution `--env-vars` override (not `job update`) and
+additionally echoes the template's stored image and CPU/memory back on
+`job start`. That echo is required so ACA actually applies the per-execution env
+override; echoing the image/resources is a read of the immutable template, so the
+template env itself stays unchanged. Also confirm the dispatched worker logs show
+the intended `SESSION_NAME` (for example `e2e-iso-1`) rather than a template
+placeholder such as `smoke-template`.
 
 ```powershell
 az containerapp job show -n caj-squad-aca-session -g <rg> `

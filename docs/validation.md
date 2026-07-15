@@ -53,8 +53,11 @@ orchestrator/operator against a real deployment).
       execution starts, clones the repo, and exits cleanly.
 - [ ] **Template non-mutation:** the `caj-squad-aca-session` template env is
       identical before and after a dispatch (dispatch uses a per-execution
-      `az containerapp job start --env-vars` override, never `job update`). See
-      [e2e-results.md](e2e-results.md) L3.
+      `az containerapp job start --env-vars` override, never `job update`). The
+      dispatch also echoes the template's image and CPU/memory back on `job start`
+      — a read of the immutable template, not a write — because ACA only applies
+      the per-execution env override when a complete execution container spec is
+      supplied. See [e2e-results.md](e2e-results.md) L3.
 - [ ] **Per-execution isolation:** a session that omits `SQUAD_PROMPT` does not
       inherit a previous session's prompt, and still carries the durable common
       env. See [e2e-results.md](e2e-results.md) L4.

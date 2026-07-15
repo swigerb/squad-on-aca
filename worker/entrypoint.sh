@@ -290,14 +290,48 @@ NODE
       exit 0
     fi
 
-    # Snapshot the session job's template env ONCE (immutable read). Each dispatch
-    # below builds a complete, isolated env override from this snapshot so the
-    # shared session job template is never mutated -- eliminating cross-session
-    # leakage and concurrent-dispatch races on the shared template.
-    session_job_env_json="$(az containerapp job show \
+    # Snapshot the session job's container template ONCE (immutable read):
+    # name, image, resources, and env. Each dispatch below builds a complete,
+    # isolated env override from this snapshot AND echoes the stored image and
+    # resources back on `job start`. In live ACA E2E, `job start --env-vars`
+    # alone does NOT apply the per-execution override (the worker still sees the
+    # template's baked-in values); ACA only applies it when a complete execution
+    # container spec (image + resources) is also supplied. Reading and echoing
+    # the stored image/resources does NOT mutate the shared session job template,
+    # so cross-session leakage and concurrent-dispatch races are still avoided.
+    session_job_container_json="$(az containerapp job show \
       --name "$ACA_SESSION_JOB_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
-      --query "properties.template.containers[0].env" -o json)"
+      --query "properties.template.containers[0]" -o json)"
+
+    mapfile -t session_job_spec < <(SJ_CONTAINER="$session_job_container_json" node - <<'NODE'
+let c = {};
+try { c = JSON.parse(process.env.SJ_CONTAINER || '{}') || {}; } catch { c = {}; }
+const name = String(c.name || '');
+const image = String(c.image || '');
+const cpu = c.resources && c.resources.cpu != null ? String(c.resources.cpu) : '';
+const memory = c.resources && c.resources.memory ? String(c.resources.memory) : '';
+process.stdout.write([name, image, cpu, memory, JSON.stringify(c.env || [])].join('\n'));
+NODE
+    )
+
+    session_job_name="${session_job_spec[0]:-}"
+    session_job_image="${session_job_spec[1]:-}"
+    session_job_cpu="${session_job_spec[2]:-}"
+    session_job_memory="${session_job_spec[3]:-}"
+    session_job_env_json="${session_job_spec[4]:-[]}"
+
+    # ACA only applies the per-execution --env-vars override when a complete
+    # execution container spec is supplied, so fail clearly if the immutable
+    # template is missing image or resources rather than dispatching a run that
+    # would silently ignore the env override.
+    if [[ -z "$session_job_image" || -z "$session_job_cpu" || -z "$session_job_memory" ]]; then
+      log "Session job container template is missing image/cpu/memory; ACA cannot apply per-execution env without a complete container spec. Aborting Ralph dispatch."
+      exit 1
+    fi
+    if [[ -z "$session_job_name" ]]; then
+      session_job_name="$ACA_SESSION_JOB_NAME"
+    fi
 
     for row in "${issue_rows[@]}"; do
       IFS=$'\t' read -r issue_number issue_title issue_url <<< "$row"
@@ -362,6 +396,10 @@ NODE
       az containerapp job start \
         --name "$ACA_SESSION_JOB_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
+        --image "$session_job_image" \
+        --cpu "$session_job_cpu" \
+        --memory "$session_job_memory" \
+        --container-name "$session_job_name" \
         --env-vars "${start_env[@]}" >/dev/null
     done
 

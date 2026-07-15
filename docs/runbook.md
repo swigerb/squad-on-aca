@@ -51,10 +51,16 @@ Dispatch never mutates the shared job template. `scripts/start-session.ps1` (and
 Ralph) read the job template's environment once (an immutable read), strip the
 session-managed keys, overlay the fresh session values, and pass the complete set
 to `az containerapp job start --env-vars`. That start override applies to a single
-execution only — image, CPU/memory, registry, and secrets are inherited from the
-stored template, which is never written. This eliminates two prior hazards:
-omitted variables persisting between sessions, and concurrent dispatches racing on
-a shared `job update`.
+execution only, and the stored template is never written. Dispatch also reads the
+image, CPU/memory, and container name from the same immutable template and echoes
+them back on `job start` — not because the template needs mutating, but because
+ACA only applies the per-execution `--env-vars` override reliably when the start
+call also supplies a complete execution container spec (image + resources).
+Without them, the worker still observes the template's baked-in values (for
+example a `smoke-template` placeholder). Registry and secrets continue to resolve
+from the stored template. This eliminates two prior hazards: omitted variables
+persisting between sessions, and concurrent dispatches racing on a shared
+`job update`.
 
 ## Scale-to-zero behavior
 

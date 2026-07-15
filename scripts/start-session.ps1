@@ -61,10 +61,20 @@ if ($OutputBranch) { $sessionEnv["OUTPUT_BRANCH"] = $OutputBranch }
 # and concurrent-dispatch races on the shared template.
 $envVars = New-SessionStartEnvVars -JobName $JobName -ResourceGroupName $ResourceGroupName -SessionEnv $sessionEnv
 
+# ACA only applies the per-execution --env-vars override reliably when the start
+# call also supplies a complete execution container spec. Read the immutable
+# template's container name, image, and resources and echo them back on start.
+# This does NOT mutate the stored template.
+$containerOptions = Get-JobStartContainerOptions -JobName $JobName -ResourceGroupName $ResourceGroupName
+
 $startArgs = @(
     "containerapp", "job", "start",
     "--name", $JobName,
     "--resource-group", $ResourceGroupName,
+    "--image", $containerOptions.Image,
+    "--cpu", $containerOptions.Cpu,
+    "--memory", $containerOptions.Memory,
+    "--container-name", $containerOptions.ContainerName,
     "--env-vars"
 ) + $envVars
 

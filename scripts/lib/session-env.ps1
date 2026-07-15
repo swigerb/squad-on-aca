@@ -8,9 +8,19 @@
     mutating the shared job template (which races under concurrent dispatch and
     lets omitted variables persist between sessions), dispatch uses
     `az containerapp job start --env-vars <complete-set>`. That start override
-    replaces the container's ENTIRE env array for one execution only; image,
-    resources, registry, and secrets are inherited from the stored template, and
-    the stored template is never written.
+    replaces the container's ENTIRE env array for one execution only, and the
+    stored template is never written.
+
+    Important behavior discovered in live ACA E2E: `az containerapp job start
+    --env-vars ...` on its own does NOT reliably apply the per-execution env
+    override in this Azure CLI/runtime path -- the worker still observes the
+    template's baked-in values (for example `SESSION_NAME=smoke-template`). ACA
+    only applies the per-execution env when the start call also supplies a
+    complete execution container spec. Dispatch therefore reads the image, CPU,
+    memory, and container name from the immutable job template and echoes them
+    back on `job start` alongside `--env-vars`. These values are read from the
+    stored template and re-supplied verbatim; the shared job template itself is
+    still never mutated. Get-JobStartContainerOptions performs that read.
 
     Because the override fully replaces env (it does not merge), the caller must
     supply every variable the worker needs. New-SessionStartEnvVars reads the job
@@ -125,4 +135,70 @@ function New-SessionStartEnvVars {
         $tokens += ("{0}={1}" -f $key, $merged[$key])
     }
     return $tokens
+}
+
+function Get-JobStartContainerOptions {
+    <#
+    .SYNOPSIS
+        Reads properties.template.containers[0] from the job and returns the
+        execution container spec (container name, image, cpu, memory) that must
+        be echoed back on `az containerapp job start` so ACA reliably applies the
+        per-execution `--env-vars` override.
+
+    .DESCRIPTION
+        In live ACA E2E, `az containerapp job start --env-vars ...` by itself does
+        NOT apply the per-execution env override -- the worker still sees the
+        template's baked-in values. Supplying the stored template's image and
+        resources on the same start call forces the override to apply. This helper
+        performs the immutable read of the stored template and returns those
+        values; it does not mutate the template. Fails clearly when image, cpu, or
+        memory cannot be read.
+
+    .OUTPUTS
+        A PSCustomObject with ContainerName, Image, Cpu, and Memory properties.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$JobName,
+        [Parameter(Mandatory = $true)][string]$ResourceGroupName
+    )
+
+    $json = az containerapp job show `
+        --name $JobName `
+        --resource-group $ResourceGroupName `
+        --query "properties.template.containers[0]" `
+        -o json 2>$null
+
+    if (-not $json) {
+        throw "Could not read the container template for job '$JobName' in resource group '$ResourceGroupName'. The per-execution env override requires the stored image and resources; refusing to dispatch."
+    }
+
+    $container = $null
+    try { $container = $json | ConvertFrom-Json } catch {
+        throw "Failed to parse the container template for job '$JobName': $($_.Exception.Message)"
+    }
+    if (-not $container) {
+        throw "The container template for job '$JobName' was empty. Refusing to dispatch without the stored image and resources."
+    }
+
+    $image = [string]$container.image
+    $cpu = if ($container.resources) { $container.resources.cpu } else { $null }
+    $memory = if ($container.resources) { [string]$container.resources.memory } else { $null }
+    $containerName = [string]$container.name
+
+    $missing = @()
+    if (-not $image) { $missing += "image" }
+    if ($null -eq $cpu -or "$cpu" -eq "") { $missing += "cpu" }
+    if (-not $memory) { $missing += "memory" }
+    if ($missing.Count -gt 0) {
+        throw "Job '$JobName' container template is missing required field(s): $($missing -join ', '). ACA only applies the per-execution --env-vars override when a complete execution container spec (image + resources) is supplied, so dispatch cannot proceed."
+    }
+
+    if (-not $containerName) { $containerName = $JobName }
+
+    return [PSCustomObject]@{
+        ContainerName = $containerName
+        Image         = $image
+        Cpu           = "$cpu"
+        Memory        = $memory
+    }
 }

@@ -737,10 +737,19 @@ function Invoke-Ralph {
             $sessionEnv = [ordered]@{}
             if ($repo) { $sessionEnv["GITHUB_REPOSITORY"] = $repo }
             $envVars = New-SessionStartEnvVars -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup -SessionEnv $sessionEnv
+            # ACA only applies the per-execution --env-vars override reliably when
+            # the start call also supplies the stored image and resources. Read
+            # them from the immutable template and echo them back; this does not
+            # mutate the shared template.
+            $containerOptions = Get-JobStartContainerOptions -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup
             $startArgs = @(
                 "containerapp", "job", "start",
                 "--name", $config.ralphJob,
                 "--resource-group", $config.resourceGroup,
+                "--image", $containerOptions.Image,
+                "--cpu", $containerOptions.Cpu,
+                "--memory", $containerOptions.Memory,
+                "--container-name", $containerOptions.ContainerName,
                 "--env-vars"
             ) + $envVars
             az @startArgs
