@@ -480,6 +480,25 @@ function Get-SessionExecutions {
     return $items
 }
 
+function Get-FirstPositional {
+    param([string[]]$Items, [string[]]$OptionsWithValues = @())
+    $skipNext = $false
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        if ($skipNext) {
+            $skipNext = $false
+            continue
+        }
+        $item = $Items[$i]
+        if ($OptionsWithValues -contains $item) {
+            $skipNext = $true
+            continue
+        }
+        if ($item.StartsWith("-")) { continue }
+        return $item
+    }
+    return ""
+}
+
 function Resolve-SessionExecution {
     param([object]$Config, [string]$Session)
     if (-not $Session) {
@@ -506,7 +525,7 @@ function Invoke-Sessions {
 function Invoke-Logs {
     param([string[]]$Items)
     $config = Assert-AcaConfigured
-    $session = ($Items | Where-Object { -not $_.StartsWith("-") } | Select-Object -First 1)
+    $session = Get-FirstPositional $Items @("--tail", "-Tail")
     $tail = [int](Get-OptionValue $Items @("--tail", "-Tail") "100")
     $execution = Resolve-SessionExecution -Config $config -Session $session
     az containerapp job logs show `
@@ -520,7 +539,7 @@ function Invoke-Logs {
 function Invoke-Open {
     param([string[]]$Items)
     $config = Assert-AcaConfigured
-    $session = ($Items | Where-Object { -not $_.StartsWith("-") } | Select-Object -First 1)
+    $session = Get-FirstPositional $Items
     if (-not $session) {
         if ($config.aspireLoginUrl) {
             Start-Process $config.aspireLoginUrl
@@ -567,7 +586,7 @@ function Invoke-Sync {
 function Invoke-Stop {
     param([string[]]$Items)
     $config = Assert-AcaConfigured
-    $session = ($Items | Where-Object { -not $_.StartsWith("-") } | Select-Object -First 1)
+    $session = Get-FirstPositional $Items
     $execution = Resolve-SessionExecution -Config $config -Session $session
     az containerapp job stop --name $config.sessionJob --resource-group $config.resourceGroup --job-execution-name $execution.Execution
 }
