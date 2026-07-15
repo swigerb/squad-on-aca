@@ -734,9 +734,12 @@ function Invoke-Ralph {
             $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
             # Dispatch as a single, self-contained execution override so the
             # shared Ralph job template is never mutated (no stale leak, no race).
-            $sessionEnv = [ordered]@{}
-            if ($repo) { $sessionEnv["GITHUB_REPOSITORY"] = $repo }
-            $envVars = New-SessionStartEnvVars -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup -SessionEnv $sessionEnv
+            # Unlike a fresh worker session, a manual Ralph run must INHERIT the
+            # template's Ralph config and secret refs (SQUAD_MODE=ralph,
+            # RALPH_LABELS, RALPH_MAX_ISSUES, tokens, Azure fields, Aspire
+            # endpoints). New-RalphRunEnvVars preserves them and overlays only the
+            # optional repository/run-identity values.
+            $envVars = New-RalphRunEnvVars -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup -Repository $repo
             # ACA only applies the per-execution --env-vars override reliably when
             # the start call also supplies the stored image and resources. Read
             # them from the immutable template and echo them back; this does not

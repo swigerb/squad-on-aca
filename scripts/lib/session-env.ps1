@@ -97,6 +97,33 @@ function Get-JobTemplateEnvVars {
     return $result
 }
 
+function ConvertTo-EnvVarTokens {
+    <#
+    .SYNOPSIS
+        Converts an ordered dictionary of name -> value/secretref into the
+        "NAME=VALUE" / "NAME=secretref:<ref>" token array expected by
+        `az containerapp job start --env-vars`.
+
+    .DESCRIPTION
+        Centralizes the single formatting rule so every dispatch path (fresh
+        worker session and manual Ralph run) emits identical token shapes and no
+        caller has to re-implement it.
+
+    .PARAMETER EnvVars
+        Ordered hashtable/dictionary of env name -> literal value or
+        "secretref:<name>" token.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$EnvVars
+    )
+
+    $tokens = @()
+    foreach ($key in $EnvVars.Keys) {
+        $tokens += ("{0}={1}" -f $key, $EnvVars[$key])
+    }
+    return $tokens
+}
+
 function New-SessionStartEnvVars {
     <#
     .SYNOPSIS
@@ -130,11 +157,67 @@ function New-SessionStartEnvVars {
         $merged[$key] = [string]$SessionEnv[$key]
     }
 
-    $tokens = @()
-    foreach ($key in $merged.Keys) {
-        $tokens += ("{0}={1}" -f $key, $merged[$key])
+    return ConvertTo-EnvVarTokens -EnvVars $merged
+}
+
+function New-RalphRunEnvVars {
+    <#
+    .SYNOPSIS
+        Builds the complete `--env-vars` token list for a manual `ralph run`
+        execution, preserving the Ralph job template's Ralph config and secret
+        refs.
+
+    .DESCRIPTION
+        A manual Ralph run is fundamentally different from a fresh worker session:
+        it must INHERIT the Ralph job template's baked-in configuration
+        (SQUAD_MODE=ralph, RALPH_LABELS, RALPH_MAX_ISSUES, secret refs, Azure
+        fields, Aspire endpoints) rather than stripping session-managed keys.
+        Stripping them (as New-SessionStartEnvVars does) drops SQUAD_MODE and the
+        Ralph config, so the worker falls back to `smoke` mode and loses its
+        dispatch configuration.
+
+        This helper reads the immutable template env verbatim, guarantees
+        SQUAD_MODE=ralph, and overlays only the small set of manual-run values
+        (repository override and, when a repo override is supplied, refreshed run
+        identity). The stored template is never mutated.
+
+    .PARAMETER Repository
+        Optional owner/repo to target. When set, overlays GITHUB_REPOSITORY and
+        refreshes run identity (SESSION_NAME, SQUAD_POD_ID, OTEL_SERVICE_NAME).
+
+    .PARAMETER SessionName
+        Optional run identity label. Defaults to a timestamped manual-ralph name.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$JobName,
+        [Parameter(Mandatory = $true)][string]$ResourceGroupName,
+        [string]$Repository = "",
+        [string]$SessionName = ""
+    )
+
+    $merged = Get-JobTemplateEnvVars -JobName $JobName -ResourceGroupName $ResourceGroupName
+    if ($merged.Count -eq 0) {
+        throw "Could not read the env for Ralph job '$JobName' in resource group '$ResourceGroupName'. A manual Ralph run must inherit the template's Ralph config and secret refs; refusing to dispatch."
     }
-    return $tokens
+
+    # Guard: a manual Ralph run must always start in ralph mode regardless of any
+    # stray template value.
+    $merged["SQUAD_MODE"] = "ralph"
+
+    if ($Repository) {
+        if (-not $SessionName) {
+            $SessionName = "manual-ralph-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        }
+        # Overlay only the repository and related run-identity values. Ralph
+        # config (RALPH_LABELS, RALPH_MAX_ISSUES), secret refs, Azure fields, and
+        # Aspire endpoints from the template are preserved untouched.
+        $merged["GITHUB_REPOSITORY"] = $Repository
+        $merged["SESSION_NAME"]      = $SessionName
+        $merged["SQUAD_POD_ID"]      = $SessionName
+        $merged["OTEL_SERVICE_NAME"] = "squad-$SessionName"
+    }
+
+    return ConvertTo-EnvVarTokens -EnvVars $merged
 }
 
 function Get-JobStartContainerOptions {
