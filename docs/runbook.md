@@ -100,6 +100,21 @@ Deployment output is written to ignored local file `deploy.outputs.json`.
 
 ## Start a session
 
+Recommended developer flow:
+
+```powershell
+squad-aca init --owner "<github-owner>" --name "my-app"
+squad-aca "Build the first feature and open a PR"
+```
+
+Copilot control-plane flow:
+
+```powershell
+copilot --agent squad-aca
+```
+
+Then ask Copilot for work normally. The installed `squad-aca` agent dispatches the actual Squad session to ACA.
+
 Smoke test:
 
 ```powershell
@@ -127,6 +142,12 @@ Loop session:
 ## Start a project without a repo
 
 Use `scripts/new-project.ps1` when you have an idea but no GitHub repository yet:
+
+```powershell
+squad-aca new --owner "<github-owner>" --name my-new-squad-project --description "A new app bootstrapped by Squad on ACA"
+```
+
+Direct script form:
 
 ```powershell
 .\scripts\new-project.ps1 `
@@ -190,6 +211,7 @@ Start scoped sessions:
 ## Monitor
 
 ```powershell
+squad-aca status
 .\scripts\show-status.ps1
 ```
 

@@ -25,6 +25,29 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 
 ```powershell
 .\scripts\deploy.ps1 -SubscriptionId "<azure-subscription-id>" -DefaultRepository "<github-owner>/<repo>"
+.\scripts\squad-aca.ps1 install-command
+```
+
+Open a new terminal after `install-command`, then from any repo:
+
+```powershell
+squad-aca init --owner "<github-owner>" --name "my-app"
+squad-aca "Build the first feature and open a PR"
+```
+
+Or use GitHub Copilot:
+
+```powershell
+copilot --agent squad-aca
+```
+
+The local Copilot session becomes the control plane. The actual Squad team runs in ACA.
+
+## Direct script quick start
+
+If you do not want to install the `squad-aca` command:
+
+```powershell
 .\scripts\start-session.ps1 -Repository "<github-owner>/<repo>" -Mode smoke -RunCopilotSmoke -SessionName smoke-001
 .\scripts\show-status.ps1
 ```
@@ -46,6 +69,14 @@ ACA does not need KEDA for per-session scale-to-zero. ACA Jobs already provide t
 
 ## Run a Squad session
 
+Simple command:
+
+```powershell
+squad-aca "Use Squad to implement issue #123. Create a branch and PR."
+```
+
+Explicit script command:
+
 ```powershell
 .\scripts\start-session.ps1 `
   -Repository "<github-owner>/<repo>" `
@@ -63,6 +94,12 @@ Each execution schedules a new ACA job replica, sets `SQUAD_POD_ID=feature-123`,
 Use the new-project helper. It creates a GitHub repo with an initial default branch, then starts a remote Squad bootstrap session:
 
 ```powershell
+squad-aca new --owner "<github-owner>" --name my-new-squad-project --description "A new app bootstrapped by Squad on ACA"
+```
+
+Direct script form:
+
+```powershell
 .\scripts\new-project.ps1 `
   -Owner "<github-owner>" `
   -Name my-new-squad-project `
@@ -78,6 +115,7 @@ The worker image contains Node.js, Azure CLI, GitHub CLI, Copilot CLI, and Squad
 ## Run a watcher
 
 ```powershell
+squad-aca status
 .\scripts\start-watch.ps1 -Repository "<github-owner>/<repo>" -IntervalMinutes 5
 ```
 
