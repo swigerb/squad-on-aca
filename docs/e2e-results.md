@@ -283,16 +283,16 @@ PASS
   the Aspire OTLP HTTP endpoint.
 ```
 
-### L7. Ralph dispatch (scheduled path)
+### L7a. Ralph dispatch — scheduled path
 
-Label an actionable issue `squad`, wait for the Ralph schedule (or run
-`squad-aca ralph run`), then confirm the issue gets `squad-aca:dispatched` and a
-session execution starts — and that the Ralph/session templates are unchanged
-afterward (same non-mutation check as L3).
+Label an actionable issue `squad`, wait for the Ralph cron schedule to fire the
+Ralph job, then confirm the issue gets `squad-aca:dispatched` and a session
+execution starts — and that the Ralph/session templates are unchanged afterward
+(same non-mutation check as L3).
 
 ```powershell
 gh issue create --repo <owner/repo> --title "E2E ralph test" --body "..." --label squad
-# wait up to 5 min or: squad-aca ralph run --repo <owner/repo>
+# wait up to 5 min for the Ralph cron trigger to fire
 gh issue view <n> --repo <owner/repo> --json labels
 az containerapp job execution list -n caj-squad-aca-session -g <rg> --query "[0:3].name" -o tsv
 ```
@@ -306,7 +306,44 @@ PASS
 - Ralph log: Dispatching issue #5 to ACA session job issue-5-20260715220550.
 - Session execution observed with prefix issue-5-.
 - Session template env diff count before/after Ralph dispatch: 0.
+- Temporary issue closed after validation.
+```
+
+### L7b. Ralph dispatch — manual CLI path
+
+Trigger the Ralph job on demand with `squad-aca ralph run`. Unlike the scheduled
+trigger, the manual path builds a complete per-execution `--env-vars` override.
+It must start the Ralph execution in `SQUAD_MODE=ralph` (not the worker `smoke`
+default) and preserve the Ralph job template's config and secret refs
+(`RALPH_LABELS`, `RALPH_MAX_ISSUES`, token/OTLP secretrefs, Azure fields, Aspire
+endpoints) while echoing the immutable template's `--image`, `--cpu`,
+`--memory`, and `--container-name` so ACA applies the override. The stored Ralph
+template must be unchanged afterward.
+
+```powershell
+gh issue create --repo <owner/repo> --title "E2E ralph manual test" --body "..." --label squad
+scripts\squad-aca.ps1 ralph run --repo <owner/repo>
+# Confirm the manual execution ran in ralph mode (not smoke) via Log Analytics:
+#   [squad-on-aca] Mode: ralph  and the Ralph dispatch log line.
+gh issue view <n> --repo <owner/repo> --json labels
+az containerapp job execution list -n caj-squad-aca-ralph -g <rg> --query "[0:3].name" -o tsv
+```
+
+Observed:
+
+```text
+PASS
+- Validation commit: 1fa2497.
+- Validation time (UTC): 2026-07-15T22:43:02Z.
+- Temporary issue: #8.
+- Manual Ralph container group: caj-squad-aca-ralph-c7mf049-4nndr.
+- Manual Ralph image: acrsquadacah81u42kq.azurecr.io/squad-worker:9ceca2e.
+- Worker log from that manual container: [squad-on-aca] Mode: ralph.
+- Worker log from that manual container: [squad-on-aca] Session: manual-ralph-20260715-184137.
+- Worker log from that manual container: Dispatching issue #8 to ACA session job issue-8-20260715224224.
+- Labels after manual Ralph: squad, squad:lead, go:needs-research, squad-aca:dispatched.
 - Ralph template env diff count before/after manual Ralph run: 0.
+- Session template env diff count before/after manual Ralph run: 0.
 - Temporary issue closed after validation.
 ```
 
@@ -315,4 +352,5 @@ PASS
 ## Result
 
 - Static evidence: **PASS** (recorded above).
-- Live-Azure evidence: **PASS** (L1-L7 recorded above).
+- Live-Azure evidence: **PASS** (L1-L6, L7a scheduled path, and L7b manual
+  `squad-aca ralph run` CLI path recorded above).
