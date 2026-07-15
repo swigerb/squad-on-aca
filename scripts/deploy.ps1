@@ -303,6 +303,23 @@ if (-not (az containerapp show --name $watchName --resource-group $ResourceGroup
     # A watcher created by an older deploy (or against a prior ACR) keeps stale registry
     # settings; updating the image alone then fails the pull with UNAUTHORIZED. Registry set
     # is idempotent, so this is safe to run every deploy.
+    #
+    # A watcher redeployed against a new ACR also accumulates *stale* registry entries for the
+    # prior login server(s). They don't block the pull once the current registry is set, but
+    # they leave the app in a messy, non-idempotent state (e.g. two registries listed by
+    # `az containerapp show`). Prune any entry whose server differs from the current one first.
+    $existingRegistries = az containerapp registry list --name $watchName --resource-group $ResourceGroupName --query "[].server" -o tsv 2>$null
+    if ($existingRegistries) {
+        foreach ($registryServer in ($existingRegistries -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            if ($registryServer -ne $loginServer) {
+                Write-Host "Removing stale watcher registry '$registryServer' (current is '$loginServer')."
+                az containerapp registry remove --name $watchName --resource-group $ResourceGroupName --server $registryServer | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "Failed to remove stale watcher registry '$registryServer'; continuing deployment."
+                }
+            }
+        }
+    }
     az containerapp registry set --name $watchName --resource-group $ResourceGroupName --server $loginServer --identity $identityId | Out-Null
     az containerapp update --name $watchName --resource-group $ResourceGroupName --image $image --set-env-vars @commonEnv | Out-Null
     az containerapp secret set --name $watchName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null

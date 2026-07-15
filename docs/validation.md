@@ -63,9 +63,13 @@ orchestrator/operator against a real deployment).
       failing on create. See [e2e-results.md](e2e-results.md) L1.
 - [ ] **Watcher registry idempotency:** re-running `scripts/deploy.ps1` against an
       existing `ca-<prefix>-watch` whose ACR changed (new `$loginServer`/ACR name)
-      updates the watcher registry config via `az containerapp registry set`
+      first removes stale registry entries whose server differs from `$loginServer`
+      (`az containerapp registry list`/`remove`), then updates the watcher registry
+      config via `az containerapp registry set`
       (`--server $loginServer --identity $identityId`) before the image update, so
-      the image pull does not fail with `UNAUTHORIZED`. Session/Ralph jobs get the
+      the image pull does not fail with `UNAUTHORIZED` and `az containerapp show`
+      lists only the current registry. A failed stale-entry removal logs a warning
+      but does not fail the deploy. Session/Ralph jobs get the
       same effect automatically: a changed login server changes the full image
       string, so deploy deletes and recreates them with the current
       `--registry-server`/`--registry-identity` (the job update path only runs when

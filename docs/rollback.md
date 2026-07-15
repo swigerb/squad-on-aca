@@ -69,9 +69,14 @@ Use this when a new worker image regresses sessions, Ralph, or the watcher.
   stopping it and re-dispatching a fresh session is the recovery path.
 - **Watcher image pull fails with `UNAUTHORIZED` after an ACR change:** an existing
   `ca-<prefix>-watch` created against an older ACR keeps stale registry settings.
-  Re-running `scripts/deploy.ps1` now self-heals this by calling
+  Re-running `scripts/deploy.ps1` now self-heals this by first pruning any stale
+  registry entries (`az containerapp registry list`/`remove` for every server that
+  differs from the current `<loginServer>`), then calling
   `az containerapp registry set --server <loginServer> --identity <identityId>`
-  before the image update. To repair manually without a full redeploy:
+  before the image update. The prune step keeps `az containerapp show` from listing
+  two registries; a failed removal only logs a warning and does not fail the deploy
+  as long as the current registry set and image update succeed. To repair manually
+  without a full redeploy:
   ```powershell
   az containerapp registry set -n ca-squad-aca-watch -g <rg> `
     --server <acr-name>.azurecr.io --identity <user-assigned-identity-resource-id>
