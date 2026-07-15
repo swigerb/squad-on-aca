@@ -43,6 +43,32 @@ copilot --agent squad-aca
 
 The local Copilot session becomes the control plane. The actual Squad team runs in ACA.
 
+## Existing Squad repo flow
+
+If you already have a repo with `.squad/` initialized:
+
+```powershell
+cd path\to\existing-squad-repo
+squad-aca "Use the existing Squad team to implement the next feature and open a PR"
+```
+
+Before dispatching, `squad-aca`:
+
+1. Verifies the ACA session job exists.
+2. Verifies `.squad/team.md` exists locally.
+3. Commits and pushes `.squad` state plus the `squad-aca` agent file if needed.
+4. Starts `caj-squad-aca-session` against the current GitHub repo and branch.
+
+If ACA has not been deployed or configured, it stops with a deploy/configure message instead of failing later in Azure.
+
+To point the command at an existing ACA deployment:
+
+```powershell
+squad-aca configure --resource-group <rg> --session-job <job> --subscription <azure-subscription-id>
+```
+
+To include all local working-tree changes, not just Squad state, add `--sync-all`.
+
 ## Direct script quick start
 
 If you do not want to install the `squad-aca` command:

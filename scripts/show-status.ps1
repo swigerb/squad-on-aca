@@ -18,10 +18,18 @@ az containerapp job execution list --name $JobName --resource-group $ResourceGro
 Write-Output "`nRecent Ralph executions:"
 az containerapp job execution list --name $RalphJobName --resource-group $ResourceGroupName --query "[0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime}" -o table
 
-$aspireFqdn = az containerapp show --name $AspireAppName --resource-group $ResourceGroupName --query properties.configuration.ingress.fqdn -o tsv
-Write-Output "`nAspire dashboard: https://$aspireFqdn"
+try {
+    $aspireFqdn = az containerapp show --name $AspireAppName --resource-group $ResourceGroupName --query properties.configuration.ingress.fqdn -o tsv
+    Write-Output "`nAspire dashboard: https://$aspireFqdn"
+} catch {
+    Write-Warning "Could not read Aspire dashboard FQDN right now: $($_.Exception.Message)"
+}
 
 if ($Logs) {
     Write-Output "`nWatcher logs:"
-    az containerapp logs show --name $WatchAppName --resource-group $ResourceGroupName --tail 80
+    try {
+        az containerapp logs show --name $WatchAppName --resource-group $ResourceGroupName --tail 80
+    } catch {
+        Write-Warning "Could not read watcher logs right now: $($_.Exception.Message)"
+    }
 }
