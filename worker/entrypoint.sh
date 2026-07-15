@@ -109,7 +109,7 @@ commit_and_push_if_needed() {
   git commit -m "${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}"
   git push --set-upstream origin "$branch"
   if [[ "${CREATE_PR:-true}" == "true" ]]; then
-    gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-main}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}" || true
+    gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}" || true
   fi
 }
 
@@ -302,7 +302,7 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
         --resource-group "$AZURE_RESOURCE_GROUP" \
         --set-env-vars \
           "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" \
-          "GITHUB_REF=${GITHUB_REF:-main}" \
+          "GITHUB_REF=${GITHUB_REF:-${GITHUB_BASE_BRANCH:-main}}" \
           "SQUAD_MODE=prompt" \
           "SESSION_NAME=$session_name" \
           "SQUAD_POD_ID=$session_name" \

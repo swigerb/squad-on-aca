@@ -3,7 +3,7 @@ param(
     [string]$WatchAppName = "ca-squad-aca-watch",
     [Parameter(Mandatory = $true)]
     [string]$Repository,
-    [string]$Ref = "main",
+    [string]$Ref = "",
     [string]$SubSquad = "",
     [int]$IntervalMinutes = 5,
     [int]$TimeoutMinutes = 45,
@@ -12,6 +12,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $Ref) {
+    $Ref = gh repo view $Repository --json defaultBranchRef --jq .defaultBranchRef.name 2>$null
+    if (-not $Ref) {
+        throw "Could not infer the default branch for '$Repository'. Pass -Ref '<branch>'."
+    }
+}
 
 if ($Stop) {
     az containerapp update --name $WatchAppName --resource-group $ResourceGroupName --min-replicas 0 --max-replicas 1 | Out-Null

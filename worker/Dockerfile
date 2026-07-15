@@ -16,6 +16,8 @@ RUN apt-get update \
     && apt-get update \
     && apt-get install -y --no-install-recommends gh \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
+    && npm config set fetch-retries 5 \
+    && npm config set fetch-retry-maxtimeout 120000 \
     && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 \
     && useradd -m -s /bin/bash squad \
     && mkdir -p /workspace \

@@ -3,7 +3,7 @@ param(
     [string]$JobName = "caj-squad-aca-session",
     [Parameter(Mandatory = $true)]
     [string]$Repository,
-    [string]$Ref = "main",
+    [string]$Ref = "",
     [ValidateSet("smoke", "telemetry-smoke", "prompt", "new-project", "loop", "shell")]
     [string]$Mode = "smoke",
     [string]$Prompt = "",
@@ -16,6 +16,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $Ref) {
+    $Ref = gh repo view $Repository --json defaultBranchRef --jq .defaultBranchRef.name 2>$null
+    if (-not $Ref) {
+        throw "Could not infer the default branch for '$Repository'. Pass -Ref '<branch>'."
+    }
+}
 if (-not $SessionName) {
     $SessionName = "session-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 }

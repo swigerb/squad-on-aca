@@ -8,6 +8,7 @@ param(
     [string]$GitHubToken = "",
     [string]$CopilotGitHubToken = "",
     [string]$DefaultRepository = "",
+    [string]$DefaultRef = "",
     [switch]$UseKeyVault,
     [string]$KeyVaultName = ""
 )
@@ -41,6 +42,12 @@ if (-not $DefaultRepository) {
     $DefaultRepository = gh repo view --json nameWithOwner --jq .nameWithOwner 2>$null
     if (-not $DefaultRepository) {
         throw "Could not infer a default GitHub repository. Pass -DefaultRepository '<github-owner>/<repo>'."
+    }
+}
+if (-not $DefaultRef) {
+    $DefaultRef = gh repo view $DefaultRepository --json defaultBranchRef --jq .defaultBranchRef.name 2>$null
+    if (-not $DefaultRef) {
+        throw "Could not infer the default branch for '$DefaultRepository'. Pass -DefaultRef '<branch>'."
     }
 }
 
@@ -189,7 +196,8 @@ $aspireFqdn = az containerapp show --name $aspireName --resource-group $Resource
 
 $commonEnv = @(
     "GITHUB_REPOSITORY=$DefaultRepository",
-    "GITHUB_REF=main",
+    "GITHUB_REF=$DefaultRef",
+    "GITHUB_BASE_BRANCH=$DefaultRef",
     "GITHUB_TOKEN=secretref:github-token",
     "COPILOT_GITHUB_TOKEN=secretref:copilot-github-token",
     "ASPIRE_OTLP_GRPC_ENDPOINT=http://$aspireName`:18889",
@@ -300,6 +308,7 @@ $outputs = [ordered]@{
     ralphJob = $ralphJobName
     watchApp = $watchName
     defaultRepository = $DefaultRepository
+    defaultRef = $DefaultRef
 }
 
 $outputsPath = Join-Path $repoRoot "deploy.outputs.json"
