@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "agentModelOverrides": {
+    "lead": "gpt-5.6-luna",
+    "engineer": "claude-opus-4.8"
+  },
+  "modelPolicy": {
+    "developmentWork": "Route development work through Squad.",
+    "leadModel": "gpt-5.6-luna",
+    "codeWritingModel": "claude-opus-4.8",
+    "notes": "Use the Lead for planning and coordination. Route implementation, tests, scripts, and refactoring to engineer using Opus 4.8."
+  }
+}
