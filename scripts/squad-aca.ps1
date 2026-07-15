@@ -93,6 +93,14 @@ function Get-PromptText {
 }
 
 function Get-CurrentRepo {
+    $origin = git remote get-url origin 2>$null
+    if ($LASTEXITCODE -eq 0 -and $origin) {
+        $origin = $origin.Trim()
+        if ($origin -match "github\.com[:/](?<repo>[^/]+/[^/]+?)(?:\.git)?$") {
+            return $Matches.repo
+        }
+    }
+
     $repo = gh repo view --json nameWithOwner --jq .nameWithOwner 2>$null
     if ($LASTEXITCODE -eq 0 -and $repo) {
         return $repo.Trim()
@@ -239,6 +247,14 @@ function Sync-LocalSquadState {
 
     git rev-parse --is-inside-work-tree 1>$null 2>$null
     if ($LASTEXITCODE -ne 0) { throw "This command must run inside a git repository." }
+    gh auth status 1>$null 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "GitHub CLI is not authenticated. Run 'gh auth login' and try again."
+    }
+    gh auth setup-git 1>$null 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not configure Git to use GitHub CLI credentials. Run 'gh auth setup-git' and try again."
+    }
 
     $branch = Get-CurrentBranch
     if ($SyncAll) {
@@ -257,6 +273,11 @@ function Sync-LocalSquadState {
     }
 
     git push -u origin $branch | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $repo = Get-CurrentRepo
+        $target = if ($repo) { $repo } else { "the origin remote" }
+        throw "Could not push '$branch' to $target. Verify access with 'gh repo view' and refresh authentication with 'gh auth login'."
+    }
 
     $dirty = git status --porcelain
     if ($dirty -and -not $SyncAll) {
@@ -281,6 +302,11 @@ function Install-CommandShim {
 param([Parameter(ValueFromRemainingArguments = `$true)][string[]]`$Args)
 & "$ScriptDir\squad-aca.ps1" @Args
 "@ | Set-Content $shim -Encoding utf8
+    $cmdShim = Join-Path $bin "squad-aca.cmd"
+    @"
+@echo off
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$shim" %*
+"@ | Set-Content $cmdShim -Encoding ascii
 
     Sync-AcaConfigFromOutputs
 
@@ -290,6 +316,7 @@ param([Parameter(ValueFromRemainingArguments = `$true)][string[]]`$Args)
         Write-Output "Added $bin to your user PATH. Open a new terminal before running 'squad-aca'."
     }
     Write-Output "Installed command shim: $shim"
+    Write-Output "Installed command shim: $cmdShim"
 }
 
 function Invoke-Configure {
@@ -372,7 +399,7 @@ function Invoke-Run {
         -SessionName $session `
         -Prompt $prompt `
         -SubSquad $subSquad `
-        -PushChanges:(!$Items.Contains("--no-push")) `
+        -PushChanges:(-not (Has-Option $Items @("--no-push"))) `
         -OutputBranch $branch
 }
 
@@ -485,8 +512,8 @@ function Invoke-Logs {
     az containerapp job logs show `
         --name $config.sessionJob `
         --resource-group $config.resourceGroup `
-        --job-execution-name $execution.Execution `
-        --container-name $config.sessionJob `
+        --execution $execution.Execution `
+        --container $config.sessionJob `
         --tail $tail
 }
 
