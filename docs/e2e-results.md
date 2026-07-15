@@ -21,7 +21,8 @@ Record for every run:
 ## Static evidence (executed)
 
 - **Environment:** Windows, PowerShell 5.1, Azure CLI 2.81.0, Node.js present.
-- **Commit at time of run:** `8a10f0d` (pre-commit of "Resolve final integration blockers").
+- **Code commit at time of final validation:** `1fa2497` (`Preserve Ralph config for manual runs`).
+- **Evidence commits after validation:** `7ebd8b7` and later documentation-only updates record the live evidence; no source code changed after the `1fa2497` validation run.
 - **Date (local):** 2026-07-15.
 
 ### 1. `scripts/validate.ps1 -RunDotnet`
