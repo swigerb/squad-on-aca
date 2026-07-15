@@ -61,6 +61,15 @@ orchestrator/operator against a real deployment).
 - [ ] **Idempotent deploy:** re-running `scripts/deploy.ps1` succeeds and updates
       the existing Aspire app (rotates OTLP key + browser token) instead of
       failing on create. See [e2e-results.md](e2e-results.md) L1.
+- [ ] **Watcher registry idempotency:** re-running `scripts/deploy.ps1` against an
+      existing `ca-<prefix>-watch` whose ACR changed (new `$loginServer`/ACR name)
+      updates the watcher registry config via `az containerapp registry set`
+      (`--server $loginServer --identity $identityId`) before the image update, so
+      the image pull does not fail with `UNAUTHORIZED`. Session/Ralph jobs get the
+      same effect automatically: a changed login server changes the full image
+      string, so deploy deletes and recreates them with the current
+      `--registry-server`/`--registry-identity` (the job update path only runs when
+      the login server is unchanged, so its registry config is already correct).
 - [ ] A `prompt` session opens a PR on `squad/<session>`.
 - [ ] Ralph dispatch: an actionable labeled issue gets the `squad:dispatched`
       label and a session job execution starts, with no shared-template mutation.

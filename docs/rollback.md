@@ -67,6 +67,17 @@ Use this when a new worker image regresses sessions, Ralph, or the watcher.
   ```
 - If a specific execution is stuck, it has no persistent replica between runs, so
   stopping it and re-dispatching a fresh session is the recovery path.
+- **Watcher image pull fails with `UNAUTHORIZED` after an ACR change:** an existing
+  `ca-<prefix>-watch` created against an older ACR keeps stale registry settings.
+  Re-running `scripts/deploy.ps1` now self-heals this by calling
+  `az containerapp registry set --server <loginServer> --identity <identityId>`
+  before the image update. To repair manually without a full redeploy:
+  ```powershell
+  az containerapp registry set -n ca-squad-aca-watch -g <rg> `
+    --server <acr-name>.azurecr.io --identity <user-assigned-identity-resource-id>
+  ```
+  Session/Ralph jobs self-heal on redeploy because a changed login server changes
+  the image string, forcing a delete + recreate with the current registry settings.
 
 ## 3. Aspire token / secrets
 

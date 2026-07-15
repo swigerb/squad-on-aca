@@ -299,6 +299,11 @@ if (-not (az containerapp show --name $watchName --resource-group $ResourceGroup
         --secrets @jobAndWatcherSecrets `
         --env-vars @commonEnv "SQUAD_MODE=watch" "SESSION_NAME=watch-default" "SQUAD_POD_ID=watch-default" | Out-Null
 } else {
+    # Ensure the existing watcher points at the current ACR/login server and pull identity.
+    # A watcher created by an older deploy (or against a prior ACR) keeps stale registry
+    # settings; updating the image alone then fails the pull with UNAUTHORIZED. Registry set
+    # is idempotent, so this is safe to run every deploy.
+    az containerapp registry set --name $watchName --resource-group $ResourceGroupName --server $loginServer --identity $identityId | Out-Null
     az containerapp update --name $watchName --resource-group $ResourceGroupName --image $image --set-env-vars @commonEnv | Out-Null
     az containerapp secret set --name $watchName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
