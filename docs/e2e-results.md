@@ -253,7 +253,7 @@ ____ (paste: trace/metric/log for squad-e2e-telemetry visible in the dashboard)
 ### L7. Ralph dispatch (scheduled path)
 
 Label an actionable issue `squad`, wait for the Ralph schedule (or run
-`squad-aca ralph run`), then confirm the issue gets `squad:dispatched` and a
+`squad-aca ralph run`), then confirm the issue gets `squad-aca:dispatched` and a
 session execution starts — and that the Ralph/session templates are unchanged
 afterward (same non-mutation check as L3).
 
@@ -267,7 +267,7 @@ az containerapp job execution list -n caj-squad-aca-session -g <rg> --query "[0:
 Observed:
 
 ```text
-____ (paste: squad:dispatched label added; new caj-squad-aca-session execution;
+____ (paste: squad-aca:dispatched label added; new caj-squad-aca-session execution;
       template env unchanged before/after)
 ```
 

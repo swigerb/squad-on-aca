@@ -253,7 +253,11 @@ NODE
       az account set --subscription "$AZURE_SUBSCRIPTION_ID"
     fi
 
-    dispatch_label="${RALPH_DISPATCH_LABEL:-squad:dispatched}"
+    # The `squad:*` namespace is reserved by Squad's member-routing workflows
+    # (.github/workflows/squad-issue-assign.yml treats any `squad:*` label as a
+    # member label), so Ralph uses the ACA-specific `squad-aca:dispatched` marker
+    # to avoid triggering member assignment.
+    dispatch_label="${RALPH_DISPATCH_LABEL:-squad-aca:dispatched}"
     blocked_labels_regex='(^|,)(blocked|status:blocked|status:wontfix|status:on-hold)(,|$)'
     gh label create "$dispatch_label" --repo "$GITHUB_REPOSITORY" --color 5319E7 --description "Dispatched by Squad on ACA Ralph" --force >/dev/null 2>&1 || true
 

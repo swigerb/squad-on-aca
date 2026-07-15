@@ -75,8 +75,10 @@ orchestrator/operator against a real deployment).
       `--registry-server`/`--registry-identity` (the job update path only runs when
       the login server is unchanged, so its registry config is already correct).
 - [ ] A `prompt` session opens a PR on `squad/<session>`.
-- [ ] Ralph dispatch: an actionable labeled issue gets the `squad:dispatched`
+- [ ] Ralph dispatch: an actionable labeled issue gets the `squad-aca:dispatched`
       label and a session job execution starts, with no shared-template mutation.
+      (The `squad:*` namespace is reserved by Squad member-routing workflows, so
+      Ralph uses `squad-aca:dispatched` to avoid triggering member assignment.)
 
 ## Security validation
 

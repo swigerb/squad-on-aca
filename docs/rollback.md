@@ -122,7 +122,7 @@ Use this to stop unattended dispatch without touching the rest of the deployment
   # or via the script:
   .\scripts\start-watch.ps1 -Repository "<github-owner>/<repo>" -Stop
   ```
-- If Ralph dispatched work from a mislabeled issue, remove the `squad:dispatched`
+- If Ralph dispatched work from a mislabeled issue, remove the `squad-aca:dispatched`
   label and stop the started session:
   ```powershell
   squad-aca stop <session-or-execution>
