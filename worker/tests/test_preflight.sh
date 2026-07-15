@@ -146,4 +146,57 @@ assert_eq "78" "$rc" "control-character identifier manifest: exits 78"
 assert_contains "$out" "unsupported characters" "control-character identifier manifest: is rejected during validation"
 rm -rf "$repo"
 
+# --- Blocker 1 regression: no predictable in-repo temp files; secure temp dir outside repo ---
+
+# 14. Attacker plants a symlink at a predictable in-repo temp path pointing at a
+#     sentinel victim file OUTSIDE the repo. Preflight must not follow it, must
+#     not write in the repo, and must clean up its secure external temp dir.
+repo="$(make_repo)"
+cp "${FIXTURES}/valid.yml" "${repo}/squad-capabilities.yml"
+sentinel_dir="$(make_repo)"
+sentinel="${sentinel_dir}/victim.txt"
+printf 'ORIGINAL_SENTINEL_CONTENT' > "$sentinel"
+# Predictable paths the OLD vulnerable code used inside the repo working tree.
+ln -s "$sentinel" "${repo}/.squad-capability-preflight-decoy"
+mkdir -p "${repo}/.squad-capability-preflight-$$"
+ln -s "$sentinel" "${repo}/.squad-capability-preflight-$$/manifest.json"
+# Snapshot secure-temp namespace before running to prove trap cleanup afterwards.
+tmp_base="${TMPDIR:-/tmp}"
+before_tmp="$(ls -d "${tmp_base%/}"/squad-capability-preflight.* 2>/dev/null | sort)"
+out="$(bash "$PREFLIGHT" "$repo" 2>&1)"
+rc=$?
+after_tmp="$(ls -d "${tmp_base%/}"/squad-capability-preflight.* 2>/dev/null | sort)"
+sentinel_after="$(cat "$sentinel")"
+assert_eq "ORIGINAL_SENTINEL_CONTENT" "$sentinel_after" "blocker1: attacker sentinel outside repo is never written via predictable symlink"
+assert_eq "$before_tmp" "$after_tmp" "blocker1: secure external temp dir is removed on exit (trap cleanup worked)"
+# Remove the planted decoys, then assert no *fresh* preflight temp path was created in the repo.
+rm -rf "${repo}/.squad-capability-preflight-decoy" "${repo}/.squad-capability-preflight-$$"
+leftover="$(find "$repo" -maxdepth 1 -name '.squad-capability-preflight*' -print 2>/dev/null)"
+assert_eq "" "$leftover" "blocker1: no predictable temp path is created inside the repo working tree"
+rm -rf "$repo" "$sentinel_dir"
+
+# 15. If a secure temp dir cannot be created (TMPDIR points nowhere), the script
+#     must FAIL safely instead of silently using a predictable fallback.
+repo="$(make_repo)"
+cp "${FIXTURES}/satisfied.yml" "${repo}/squad-capabilities.yml"
+out="$(TMPDIR="${repo}/definitely-not-a-real-tmpdir-xyz" bash "$PREFLIGHT" "$repo" 2>&1)"
+rc=$?
+assert_eq "78" "$rc" "blocker1: fails safely (78) when no secure temp dir can be created"
+assert_contains "$out" "secure private work directory" "blocker1: reports the secure-temp failure reason"
+leftover="$(find "$repo" -maxdepth 1 -name '.squad-capability-preflight*' -print 2>/dev/null)"
+assert_eq "" "$leftover" "blocker1: still creates nothing predictable in the repo on failure"
+rm -rf "$repo"
+
+# 16. A temp base that would resolve INSIDE the repo is refused (never lands a
+#     temp workspace in the working tree), and nothing is left behind there.
+repo="$(make_repo)"
+cp "${FIXTURES}/satisfied.yml" "${repo}/squad-capabilities.yml"
+mkdir -p "${repo}/inside-tmp"
+out="$(TMPDIR="${repo}/inside-tmp" bash "$PREFLIGHT" "$repo" 2>&1)"
+rc=$?
+assert_eq "78" "$rc" "blocker1: refuses a temp base that resolves inside the repo tree"
+inside_leftover="$(find "${repo}/inside-tmp" -mindepth 1 -print 2>/dev/null)"
+assert_eq "" "$inside_leftover" "blocker1: leaves nothing inside an in-repo temp base"
+rm -rf "$repo"
+
 test_summary

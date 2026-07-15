@@ -94,6 +94,12 @@ Validation is strict and fail-closed:
   against safe allowlists (`tools[].name`, `credentials[].name`,
   `services[].name`, `egress[].host`, `image.hint`) so control characters and
   delimiter-smuggling payloads are rejected.
+- Validation errors never echo raw manifest key names or values back to logs
+  or the terminal. Unknown/duplicate keys and invalid values are reported using
+  safe location info only (e.g. "unrecognized key (redacted) at line 12",
+  "duplicate key (redacted) ... first seen at line 4"), and every error string
+  is sanitized so control characters (ANSI escapes, CR/LF, BEL, etc.) cannot be
+  used for log/terminal injection.
 - A malformed manifest is a hard startup error, not a silent no-op.
 
 The parser (`worker/lib/parse-capabilities.js`) supports a deliberately
@@ -149,6 +155,15 @@ starts:
    the manifest file itself for the declared rationale. `entrypoint.sh` has
    `set -e`, so this exit code becomes the ACA job execution's exit code —
    visible in `squad-aca logs` and Aspire without any additional plumbing.
+
+Preflight never creates temp files or directories inside the repository
+working tree. Its scratch workspace is a fresh, unpredictable `0700` directory
+created with `mktemp -d` under `${TMPDIR:-/tmp}` (outside the repo), verified to
+be a real, self-owned directory outside the working tree, and removed by a
+`trap` cleanup handler on every exit path. If a secure workspace cannot be
+created and verified, preflight fails (`78`) rather than falling back to any
+predictable path — so a pre-planted file or symlink at a guessable in-repo path
+can never be followed by a redirect.
 
 ### Configuration
 

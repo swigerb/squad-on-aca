@@ -55,6 +55,36 @@ const SAFE_IMAGE_HINT_PATTERN = /^[A-Za-z0-9./:@_-]+$/;
 
 class CapabilityManifestError extends Error {}
 
+// Records the source line number where each object key was first seen, so
+// validation can report a *safe* location ("at line 12") for problems like
+// unknown keys without ever echoing the raw key text back to the user.
+const keyLineNumbers = new WeakMap();
+
+function recordKeyLocation(obj, key, lineNo) {
+  let lines = keyLineNumbers.get(obj);
+  if (!lines) {
+    lines = new Map();
+    keyLineNumbers.set(obj, lines);
+  }
+  if (!lines.has(key)) lines.set(key, lineNo);
+}
+
+function keyLineOf(obj, key) {
+  const lines = keyLineNumbers.get(obj);
+  return lines && lines.has(key) ? lines.get(key) : null;
+}
+
+// Neutralizes control characters (C0/C1, DEL, ANSI escapes, bell, tab, CR/LF)
+// in any text derived from manifest input before it reaches a log or terminal.
+// Prevents log/terminal injection: control bytes are rendered as visible,
+// inert "\xNN" escapes instead of being emitted raw.
+function sanitizeForError(text) {
+  return String(text).replace(
+    /[\u0000-\u001f\u007f-\u009f]/g,
+    (ch) => `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`
+  );
+}
+
 function stripComment(line) {
   let inQuotes = null;
   for (let i = 0; i < line.length; i += 1) {
@@ -111,15 +141,18 @@ function splitKeyValue(content, lineNo) {
 
 function assertUniqueKey(seenKeys, key, lineNo, context) {
   if (seenKeys.has(key)) {
-    throw new CapabilityManifestError(`Line ${lineNo}: duplicate key "${key}" in ${context}`);
+    const firstLine = seenKeys.get(key);
+    throw new CapabilityManifestError(
+      `Line ${lineNo}: duplicate key (redacted) in ${context} (first seen at line ${firstLine})`
+    );
   }
-  seenKeys.add(key);
+  seenKeys.set(key, lineNo);
 }
 
 function parseCapabilityManifest(source) {
   const rawLines = source.split(/\r?\n/);
   const result = {};
-  const topLevelKeys = new Set();
+  const topLevelKeys = new Map();
 
   let currentTopKey = null;
   let currentList = null;
@@ -138,7 +171,8 @@ function parseCapabilityManifest(source) {
 
     if (indent === 0) {
       const { key, value } = splitKeyValue(content, lineNo);
-      assertUniqueKey(topLevelKeys, key, lineNo, 'manifest');
+      assertUniqueKey(topLevelKeys, key, lineNo, 'the manifest');
+      recordKeyLocation(result, key, lineNo);
       currentTopKey = key;
       currentList = null;
       currentItem = null;
@@ -152,7 +186,7 @@ function parseCapabilityManifest(source) {
           result[key] = currentList;
         } else if (KNOWN_MAP_KEYS.has(key)) {
           currentMap = {};
-          currentMapKeys = new Set();
+          currentMapKeys = new Map();
           result[key] = currentMap;
         } else {
           result[key] = '';
@@ -166,14 +200,15 @@ function parseCapabilityManifest(source) {
     if (indent === 2 && content.startsWith('- ')) {
       if (!currentList) {
         throw new CapabilityManifestError(
-          `Line ${lineNo}: list item found under "${currentTopKey}", which is not a list block`
+          `Line ${lineNo}: list item found under a top-level key that is not a list block`
         );
       }
       const itemContent = content.slice(2);
       const { key, value } = splitKeyValue(itemContent, lineNo);
-      currentItemKeys = new Set();
+      currentItemKeys = new Map();
       assertUniqueKey(currentItemKeys, key, lineNo, `list item in "${currentTopKey}"`);
       currentItem = { [key]: parseScalar(value) };
+      recordKeyLocation(currentItem, key, lineNo);
       currentList.push(currentItem);
       continue;
     }
@@ -182,6 +217,7 @@ function parseCapabilityManifest(source) {
       const { key, value } = splitKeyValue(content, lineNo);
       assertUniqueKey(currentItemKeys, key, lineNo, `list item in "${currentTopKey}"`);
       currentItem[key] = parseScalar(value);
+      recordKeyLocation(currentItem, key, lineNo);
       continue;
     }
 
@@ -189,6 +225,7 @@ function parseCapabilityManifest(source) {
       const { key, value } = splitKeyValue(content, lineNo);
       assertUniqueKey(currentMapKeys, key, lineNo, `"${currentTopKey}"`);
       currentMap[key] = parseScalar(value);
+      recordKeyLocation(currentMap, key, lineNo);
       continue;
     }
 
@@ -205,7 +242,9 @@ function isPlainObject(value) {
 function addUnknownKeyErrors(target, allowedKeys, context, errors) {
   for (const key of Object.keys(target)) {
     if (!allowedKeys.has(key)) {
-      errors.push(`${context} contains unknown key "${key}"`);
+      const lineNo = keyLineOf(target, key);
+      const location = lineNo ? ` at line ${lineNo}` : '';
+      errors.push(`${context} contains an unrecognized key (redacted)${location}`);
     }
   }
 }
@@ -371,7 +410,7 @@ function main() {
   try {
     source = fs.readFileSync(filePath, 'utf8');
   } catch (err) {
-    process.stderr.write(`Cannot read manifest at ${filePath}: ${err.message}\n`);
+    process.stderr.write(`Cannot read manifest at ${sanitizeForError(filePath)}: ${sanitizeForError(err.message)}\n`);
     process.exit(66);
   }
 
@@ -379,15 +418,15 @@ function main() {
   try {
     manifest = parseCapabilityManifest(source);
   } catch (err) {
-    process.stderr.write(`Invalid capability manifest at ${filePath}: ${err.message}\n`);
+    process.stderr.write(`Invalid capability manifest at ${sanitizeForError(filePath)}: ${sanitizeForError(err.message)}\n`);
     process.exit(65);
   }
 
   const errors = validateManifest(manifest);
   if (errors.length > 0) {
-    process.stderr.write(`Invalid capability manifest at ${filePath}:\n`);
+    process.stderr.write(`Invalid capability manifest at ${sanitizeForError(filePath)}:\n`);
     for (const error of errors) {
-      process.stderr.write(`  - ${error}\n`);
+      process.stderr.write(`  - ${sanitizeForError(error)}\n`);
     }
     process.exit(65);
   }
@@ -399,4 +438,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { parseCapabilityManifest, validateManifest, CapabilityManifestError, SUPPORTED_MANIFEST_VERSION };
+module.exports = { parseCapabilityManifest, validateManifest, CapabilityManifestError, SUPPORTED_MANIFEST_VERSION, sanitizeForError };

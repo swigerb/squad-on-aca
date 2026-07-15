@@ -45,6 +45,63 @@ log() {
   printf '[capability-preflight] %s\n' "$*"
 }
 
+fail() {
+  log "$@"
+  exit 78
+}
+
+# Cleanup handler set once a secure work dir exists. Removes the temp dir
+# unconditionally on any exit path (normal, error, or signal).
+WORK_DIR=""
+cleanup_workdir() {
+  if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
+    rm -rf "$WORK_DIR"
+  fi
+}
+trap cleanup_workdir EXIT INT TERM
+
+# Creates an unpredictable, private (0700) work directory OUTSIDE the
+# repository working tree. Never falls back to a predictable path: if a
+# securely created directory cannot be verified, the caller fails hard.
+create_secure_workdir() {
+  local base created perms
+  base="${TMPDIR:-/tmp}"
+  base="${base%/}"
+
+  [[ -d "$base" ]] || return 1
+
+  # umask 077 + mktemp -d => a fresh dir readable/writable only by us.
+  created="$(umask 077; mktemp -d "${base}/squad-capability-preflight.XXXXXXXXXXXX" 2>/dev/null)" || return 1
+  [[ -n "$created" ]] || return 1
+
+  # Any verification failure past this point must remove the just-created dir so
+  # we never leave a partially-trusted temp path behind.
+  _reject_workdir() {
+    [[ -n "${created:-}" && -d "$created" ]] && rm -rf "$created"
+    return 1
+  }
+
+  # Must be a real directory, not a symlink, owned by us.
+  [[ -d "$created" && ! -L "$created" ]] || { _reject_workdir; return 1; }
+  [[ -O "$created" ]] || { _reject_workdir; return 1; }
+
+  # Must be exactly 0700.
+  perms="$(stat -c '%a' "$created" 2>/dev/null || stat -f '%Lp' "$created" 2>/dev/null || echo '')"
+  [[ "$perms" == "700" ]] || { _reject_workdir; return 1; }
+
+  # Must live OUTSIDE the repository working tree, even after resolving
+  # symlinks, so nothing inside the repo can be an attacker-writable target.
+  local real_work real_repo
+  real_work="$(cd "$created" 2>/dev/null && pwd -P)" || { _reject_workdir; return 1; }
+  real_repo="$(cd "$REPO_DIR" 2>/dev/null && pwd -P)" || { _reject_workdir; return 1; }
+  case "$real_work/" in
+    "$real_repo"/*) { _reject_workdir; return 1; } ;;
+  esac
+
+  WORK_DIR="$created"
+  return 0
+}
+
 check_tool() {
   local tool_name="$1"
   case "$tool_name" in
@@ -117,13 +174,6 @@ if [[ ! -d "$REPO_DIR" ]]; then
   exit 64
 fi
 
-WORK_DIR="${REPO_DIR}/.squad-capability-preflight-$$"
-MANIFEST_JSON="${WORK_DIR}/manifest.json"
-PARSER_STDERR="${WORK_DIR}/parser.stderr"
-ROWS_FILE="${WORK_DIR}/rows.tsv"
-FAILURES_FILE="${WORK_DIR}/failures.log"
-ADVISORIES_FILE="${WORK_DIR}/advisories.log"
-
 if ! manifest_resolution="$(
   node - "$REPO_DIR" "$MANIFEST_RELATIVE_PATH" <<'NODE'
 const fs = require('fs');
@@ -189,8 +239,15 @@ fi
 
 MANIFEST_PATH="$manifest_resolution"
 
-mkdir -p "$WORK_DIR"
-trap 'rm -rf "$WORK_DIR"' EXIT
+if ! create_secure_workdir; then
+  fail "Could not create a secure private work directory; refusing to run with a predictable temp path."
+fi
+
+MANIFEST_JSON="${WORK_DIR}/manifest.json"
+PARSER_STDERR="${WORK_DIR}/parser.stderr"
+ROWS_FILE="${WORK_DIR}/rows.tsv"
+FAILURES_FILE="${WORK_DIR}/failures.log"
+ADVISORIES_FILE="${WORK_DIR}/advisories.log"
 
 log "Found capability manifest at ${MANIFEST_RELATIVE_PATH}; validating..."
 
