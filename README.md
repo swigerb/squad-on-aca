@@ -43,6 +43,16 @@ copilot --agent squad-aca
 
 The local Copilot session becomes the control plane. The actual Squad team runs in ACA.
 
+Useful control-plane commands:
+
+```powershell
+squad-aca doctor            # validate local repo, GitHub, Azure, ACA, and Aspire config
+squad-aca sessions          # list recent ACA-hosted Squad sessions
+squad-aca logs <session>    # stream logs for a session name or execution id
+squad-aca open <session>    # open the session PR when available, otherwise Aspire
+squad-aca sync              # push local .squad state before dispatch
+```
+
 ## Existing Squad repo flow
 
 If you already have a repo with `.squad/` initialized:

@@ -111,6 +111,17 @@ squad-aca "Use the existing Squad team to implement the next feature and open a 
 
 The command validates the ACA deployment, verifies `.squad/team.md`, syncs `.squad` state to GitHub, and starts an ACA-hosted session against the current repository and branch. If local non-Squad files are uncommitted, the command warns that ACA will not see them. Add `--sync-all` to commit and push the full working tree before dispatch.
 
+Control-plane commands:
+
+```powershell
+squad-aca doctor
+squad-aca sessions --limit 20
+squad-aca logs <session-or-execution> --tail 200
+squad-aca open <session-or-execution>
+squad-aca sync --dry-run
+squad-aca sync --sync-all
+```
+
 If ACA is not configured:
 
 ```powershell

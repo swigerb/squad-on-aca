@@ -22,6 +22,11 @@ Usage:
   squad-aca new --owner <github-owner> --name <repo-name> [--description "..."]
   squad-aca smoke [--repo <owner/repo>]
   squad-aca status
+  squad-aca doctor
+  squad-aca sessions [--limit 10]
+  squad-aca logs <session-or-execution> [--tail 100]
+  squad-aca open [session-or-execution]
+  squad-aca sync [--sync-all|--dry-run]
   squad-aca dashboard
   squad-aca configure --resource-group <rg> --session-job <job> [--subscription <id>]
   squad-aca install-agent
@@ -358,14 +363,180 @@ function Invoke-Run {
         -OutputBranch $branch
 }
 
+function Test-Command {
+    param([string]$Name)
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Invoke-Doctor {
+    $checks = @()
+    $config = Get-AcaConfig
+
+    $checks += [pscustomobject]@{ Check = "git"; Status = if (Test-Command "git") { "ok" } else { "missing" }; Detail = "Required for repo and Squad state sync" }
+    $checks += [pscustomobject]@{ Check = "gh"; Status = if (Test-Command "gh") { "ok" } else { "missing" }; Detail = "Required for GitHub repo/PR/issue access" }
+    $checks += [pscustomobject]@{ Check = "az"; Status = if (Test-Command "az") { "ok" } else { "missing" }; Detail = "Required for ACA job control" }
+    $checks += [pscustomobject]@{ Check = "squad"; Status = if (Test-Command "squad") { "ok" } else { "optional" }; Detail = "Used by init; npx fallback is available" }
+
+    $repo = Get-CurrentRepo
+    $checks += [pscustomobject]@{ Check = "GitHub repo"; Status = if ($repo) { "ok" } else { "missing" }; Detail = if ($repo) { $repo } else { "Run squad-aca init or pass --repo" } }
+    $checks += [pscustomobject]@{ Check = ".squad"; Status = if (Test-Path ".squad\team.md") { "ok" } else { "missing" }; Detail = "Required for existing-repo dispatch" }
+
+    try {
+        gh auth status 1>$null 2>$null
+        $checks += [pscustomobject]@{ Check = "GitHub auth"; Status = "ok"; Detail = "gh auth status succeeded" }
+    } catch {
+        $checks += [pscustomobject]@{ Check = "GitHub auth"; Status = "failed"; Detail = $_.Exception.Message }
+    }
+
+    try {
+        if ($config.subscriptionId) { az account set --subscription $config.subscriptionId 1>$null }
+        $account = az account show --query "{name:name,id:id}" -o json | ConvertFrom-Json
+        $checks += [pscustomobject]@{ Check = "Azure auth"; Status = "ok"; Detail = "$($account.name)" }
+    } catch {
+        $checks += [pscustomobject]@{ Check = "Azure auth"; Status = "failed"; Detail = $_.Exception.Message }
+    }
+
+    try {
+        Assert-AcaConfigured | Out-Null
+        $checks += [pscustomobject]@{ Check = "ACA session job"; Status = "ok"; Detail = "$($config.resourceGroup)/$($config.sessionJob)" }
+    } catch {
+        $checks += [pscustomobject]@{ Check = "ACA session job"; Status = "failed"; Detail = $_.Exception.Message }
+    }
+
+    if ($config.ralphJob) {
+        try {
+            az containerapp job show --name $config.ralphJob --resource-group $config.resourceGroup --query id -o tsv 1>$null
+            $checks += [pscustomobject]@{ Check = "Ralph job"; Status = "ok"; Detail = $config.ralphJob }
+        } catch {
+            $checks += [pscustomobject]@{ Check = "Ralph job"; Status = "warning"; Detail = "Not found or not configured" }
+        }
+    }
+
+    $checks += [pscustomobject]@{ Check = "Aspire URL"; Status = if ($config.aspireLoginUrl) { "ok" } else { "missing" }; Detail = if ($config.aspireLoginUrl) { $config.aspireLoginUrl } else { "Run deploy or squad-aca configure --dashboard-url" } }
+    $checks | Format-Table -AutoSize
+}
+
+function Get-SessionExecutions {
+    param([object]$Config, [int]$Limit = 10)
+    $names = az containerapp job execution list --name $Config.sessionJob --resource-group $Config.resourceGroup --query "[0:$Limit].name" -o json | ConvertFrom-Json
+    $items = @()
+    foreach ($name in $names) {
+        $execution = az containerapp job execution show --name $Config.sessionJob --resource-group $Config.resourceGroup --job-execution-name $name -o json | ConvertFrom-Json
+        $env = @{}
+        foreach ($e in $execution.properties.template.containers[0].env) {
+            if ($e.name) { $env[$e.name] = $e.value }
+        }
+        $items += [pscustomobject]@{
+            Execution = $name
+            Status = $execution.properties.status
+            Session = $env["SESSION_NAME"]
+            Mode = $env["SQUAD_MODE"]
+            Repository = $env["GITHUB_REPOSITORY"]
+            Branch = $env["GITHUB_REF"]
+            Started = $execution.properties.startTime
+            Ended = $execution.properties.endTime
+        }
+    }
+    return $items
+}
+
+function Resolve-SessionExecution {
+    param([object]$Config, [string]$Session)
+    if (-not $Session) {
+        $latest = Get-SessionExecutions -Config $Config -Limit 1
+        if ($latest) { return $latest[0] }
+        throw "No session executions found."
+    }
+    $items = Get-SessionExecutions -Config $Config -Limit 50
+    $match = $items | Where-Object { $_.Execution -eq $Session -or $_.Session -eq $Session } | Select-Object -First 1
+    if (-not $match) {
+        throw "Could not find session or execution '$Session'. Run 'squad-aca sessions' to list recent sessions."
+    }
+    return $match
+}
+
+function Invoke-Sessions {
+    param([string[]]$Items)
+    $config = Assert-AcaConfigured
+    $limitText = Get-OptionValue $Items @("--limit", "-Limit") "10"
+    $limit = [int]$limitText
+    Get-SessionExecutions -Config $config -Limit $limit | Format-Table -AutoSize
+}
+
+function Invoke-Logs {
+    param([string[]]$Items)
+    $config = Assert-AcaConfigured
+    $session = ($Items | Where-Object { -not $_.StartsWith("-") } | Select-Object -First 1)
+    $tail = [int](Get-OptionValue $Items @("--tail", "-Tail") "100")
+    $execution = Resolve-SessionExecution -Config $config -Session $session
+    az containerapp job logs show `
+        --name $config.sessionJob `
+        --resource-group $config.resourceGroup `
+        --job-execution-name $execution.Execution `
+        --container-name $config.sessionJob `
+        --tail $tail
+}
+
+function Invoke-Open {
+    param([string[]]$Items)
+    $config = Assert-AcaConfigured
+    $session = ($Items | Where-Object { -not $_.StartsWith("-") } | Select-Object -First 1)
+    if (-not $session) {
+        if ($config.aspireLoginUrl) {
+            Start-Process $config.aspireLoginUrl
+            Write-Output $config.aspireLoginUrl
+            return
+        }
+        throw "No session supplied and no Aspire dashboard URL configured."
+    }
+    $execution = Resolve-SessionExecution -Config $config -Session $session
+    $opened = $false
+    if ($execution.Repository -and $execution.Branch) {
+        $prs = gh pr list --repo $execution.Repository --head $execution.Branch --json url --limit 1 2>$null | ConvertFrom-Json
+        if ($prs -and $prs[0].url) {
+            Start-Process $prs[0].url
+            Write-Output $prs[0].url
+            $opened = $true
+        }
+    }
+    if (-not $opened -and $config.aspireLoginUrl) {
+        Start-Process $config.aspireLoginUrl
+        Write-Output $config.aspireLoginUrl
+    }
+}
+
+function Invoke-Sync {
+    param([string[]]$Items)
+    if (Has-Option $Items @("--dry-run")) {
+        Write-Output "Files that would be considered for Squad state sync:"
+        if (-not (Test-Path ".squad\team.md")) {
+            Write-Warning "No .squad/team.md found in this directory."
+        }
+        foreach ($path in @(".squad", ".github/agents/squad-aca.agent.md", ".mcp.json")) {
+            if (Test-Path $path) { Write-Output "  $path" }
+        }
+        Write-Output "`nCurrent git status:"
+        git status --short
+        return
+    }
+    Ensure-ExistingSquad
+    $branch = Sync-LocalSquadState -SyncAll:(Has-Option $Items @("--sync-all", "--all"))
+    Write-Output "Synced to branch: $branch"
+}
+
 switch ($Command.ToLowerInvariant()) {
     "help" { Show-Help }
     "--help" { Show-Help }
     "-h" { Show-Help }
     "configure" { Invoke-Configure $Arguments }
     "config" { Invoke-Configure $Arguments }
+    "doctor" { Invoke-Doctor }
     "init" { Invoke-Init $Arguments }
     "run" { Invoke-Run $Arguments }
+    "sessions" { Invoke-Sessions $Arguments }
+    "logs" { Invoke-Logs $Arguments }
+    "open" { Invoke-Open $Arguments }
+    "sync" { Invoke-Sync $Arguments }
     "new" {
         Assert-AcaConfigured | Out-Null
         $owner = Get-OptionValue $Arguments @("--owner", "-Owner")
