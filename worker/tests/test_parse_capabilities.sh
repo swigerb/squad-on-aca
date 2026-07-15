@@ -45,7 +45,19 @@ assert_contains "$out" 'missing required top-level "version" field' "missing-ver
 out="$(node "$PARSER" "${FIXTURES}/invalid-version.yml" 2>&1)"
 rc=$?
 assert_eq "65" "$rc" "invalid-version.yml is rejected"
-assert_contains "$out" 'unsupported manifest version 2' "invalid-version.yml reports supported versions"
+assert_contains "$out" 'unsupported manifest version (redacted); supported versions: 1' "invalid-version.yml reports supported versions safely"
+assert_not_contains "$out" '2' "invalid-version.yml does not echo the raw manifest version"
+
+large_version_manifest="${TEST_TMP_ROOT}/oversized-version.yml"
+large_version_raw="90071992547409919551"
+large_version_rounded="$(node -e 'process.stdout.write(String(Number(process.argv[1])))' "$large_version_raw")"
+printf 'version: %s\ntools:\n  - name: git\n    required: true\n' "$large_version_raw" > "$large_version_manifest"
+out="$(node "$PARSER" "$large_version_manifest" 2>&1)"
+rc=$?
+assert_eq "65" "$rc" "oversized version manifest is rejected"
+assert_not_contains "$out" "$large_version_raw" "oversized version manifest does not echo the raw manifest version"
+assert_not_contains "$out" "$large_version_rounded" "oversized version manifest does not echo the rounded JS value"
+assert_contains "$out" 'unsupported manifest version (redacted); supported versions: 1' "oversized version manifest still reports supported versions safely"
 
 out="$(node "$PARSER" "${FIXTURES}/invalid-required-type.yml" 2>&1)"
 rc=$?

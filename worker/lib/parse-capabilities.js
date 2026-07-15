@@ -305,7 +305,7 @@ function validateManifest(manifest) {
   } else if (!Number.isInteger(manifest.version)) {
     errors.push('"version" must be an integer');
   } else if (manifest.version !== SUPPORTED_MANIFEST_VERSION) {
-    errors.push(`unsupported manifest version ${manifest.version}; supported versions: ${SUPPORTED_MANIFEST_VERSION}`);
+    errors.push(`unsupported manifest version (redacted); supported versions: ${SUPPORTED_MANIFEST_VERSION}`);
   }
 
   errors.push(
