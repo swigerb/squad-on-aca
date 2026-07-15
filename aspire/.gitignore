@@ -1,0 +1,9 @@
+# Build output
+bin/
+obj/
+
+# Local-only settings that may contain tokens or environment-specific values.
+# Never commit these — they are covered by the public repo secret guard too.
+appsettings.Development.json
+appsettings.*.Development.json
+*.user

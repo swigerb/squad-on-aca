@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Optional .NET Aspire AppHost for Squad on ACA.
+
+    This project is an OPTIONAL integration path. It does not replace the ACA
+    Jobs architecture in scripts/deploy.ps1. It uses .NET Aspire to *model* the
+    Squad runtime resources (the Aspire Dashboard OTLP sink and the squad-worker
+    container) so you can run a local, telemetry-wired smoke of the worker and
+    reason about resources as code. Azure Container Apps remains the production
+    execution substrate; Squad remains the orchestration system.
+
+    The Aspire.AppHost.Sdk import below turns this into an Aspire AppHost. If the
+    preview/GA package restore is not feasible in your environment, the project
+    and AppHost.cs still serve as explicit, reviewable scaffolding. See
+    ../README.md and ../../docs/validation.md for restore guidance.
+  -->
+  <Sdk Name="Aspire.AppHost.Sdk" Version="9.4.0" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsAspireHost>true</IsAspireHost>
+    <UserSecretsId>squad-aca-apphost</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="9.4.0" />
+  </ItemGroup>
+
+</Project>

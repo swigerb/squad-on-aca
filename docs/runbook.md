@@ -2,6 +2,24 @@
 
 This runbook explains how to deploy and operate Squad on Azure Container Apps.
 
+## Assumptions and prerequisites
+
+- **Azure**: `az` CLI signed in with rights to create resource groups, ACR,
+  Container Apps, user-assigned identities, role assignments, Log Analytics, and
+  optional Key Vault. A selected subscription (`az account set`).
+- **GitHub**: `gh` CLI authenticated and `gh auth setup-git` configured. Tokens
+  valid for GitHub API work and Copilot CLI headless auth (optionally separate).
+- **Local tooling**: PowerShell 5.1+ (Windows PowerShell or PowerShell 7), Git,
+  Node.js/npm. `bash` (Git Bash or WSL) only for `scripts/validate.ps1`'s worker
+  entrypoint check.
+- **Telemetry sink**: the current default is a **standalone Aspire Dashboard**
+  deployed as a Container App (`ca-squad-aca-aspire`). It is the OTLP sink for all
+  sessions, with browser-token UI auth and OTLP API-key auth, and internal-only
+  OTLP ports.
+- **Optional .NET/Aspire path**: requires .NET SDK 9.0+ and a .NET 9 runtime; it
+  is opt-in and not required for the default ACA flow. See
+  [../aspire/README.md](../aspire/README.md) and [architecture.md](architecture.md).
+
 ## Architecture
 
 The deployment creates:
@@ -295,5 +313,18 @@ The Azure identity behind `AZURE_CLIENT_ID` needs rights to create/update resour
 
 - Use a separate GitHub token for GitHub API work and Copilot headless auth when your policy requires separation.
 - Use `-UseKeyVault` for Key Vault-backed Container Apps secrets.
-- Keep `deploy.outputs.json` private; it contains the Aspire browser token.
+- Keep `deploy.outputs.json` private; it contains the Aspire browser token. It is gitignored along with `.azure/` and `.env`.
 - `.squad/` should live in the target GitHub repo when you want Squad memory and team state to travel with code.
+- **RBAC (existing risk):** the user-assigned managed identity holds `Contributor`
+  on the resource group so Ralph can start session job executions. This is broader
+  than required. Do not broaden it further. A custom-role hardening path (limited
+  to `Microsoft.App/jobs/start/action` + read) is documented in
+  [validation.md](validation.md#rbac--identity-scope); adopt it only if it does not
+  break deployment.
+- **OTLP auth is preserved:** BrowserToken for the UI, ApiKey for OTLP, never
+  `Unsecured`. OTLP ports stay internal to the ACA environment.
+- **Public sync guard:** `squad-aca sync --sync-all` blocks obvious secret files
+  and inline tokens before staging. Override only for known-private repos with
+  `SQUAD_ACA_ALLOW_UNSAFE_SYNC=1`.
+- **Validation:** run `scripts/validate.ps1` and follow
+  [validation.md](validation.md) for the full security validation checklist.

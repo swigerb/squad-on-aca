@@ -13,3 +13,17 @@ node_modules/
 .squad/.cache/
 # Squad: SubSquad activation file (local to this machine)
 .squad-workstream
+
+# .NET / Aspire optional integration path build output
+bin/
+obj/
+appsettings.Development.json
+appsettings.*.Development.json
+
+# Defense-in-depth: never commit obvious credential material
+*.pfx
+*.p12
+id_rsa
+id_ed25519
+id_dsa
+id_ecdsa

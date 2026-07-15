@@ -15,7 +15,7 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Pod/container mode | `SQUAD_DEPLOYMENT_MODE=squad-per-pod` and `SQUAD_POD_ID=<session>` by default |
 | GitHub `/remote` session access | Copilot CLI runs with `--remote` by default |
 | GitHub-backed code | Each session clones `owner/repo`, works in an isolated workspace, and can push a branch/PR |
-| Monitoring | Aspire Dashboard on ACA with OTLP API-key auth and browser-token UI auth |
+| Monitoring | Standalone Aspire Dashboard on ACA as the default OTLP sink, with OTLP API-key auth and browser-token UI auth |
 | Unattended work | ACA watcher app running `squad watch --execute` |
 | Secure image pulls | ACR plus user-assigned managed identity |
 | Token storage | ACA secrets by default; optional Key Vault references with `-UseKeyVault` |
@@ -42,6 +42,29 @@ copilot --agent squad-aca
 ```
 
 The local Copilot session becomes the control plane. The actual Squad team runs in ACA.
+
+## Assumptions and prerequisites
+
+Before deploying or dispatching, this project assumes:
+
+- **Azure**: an Azure subscription and `az` CLI signed in (`az login`), with rights
+  to create resource groups, ACR, Container Apps, managed identities, role
+  assignments, Log Analytics, and (optionally) Key Vault.
+- **GitHub**: `gh` CLI authenticated (`gh auth login`) and `gh auth setup-git`
+  configured, plus a token valid for Copilot CLI headless auth. A separate
+  `COPILOT_GITHUB_TOKEN` is supported when your policy requires token separation.
+- **Local tooling**: PowerShell 5.1+ (Windows PowerShell or PowerShell 7), Git,
+  and Node.js/npm for the Squad and Copilot CLIs. `bash` (Git Bash or WSL) is
+  needed only to run the worker entrypoint syntax check in `scripts/validate.ps1`.
+- **Telemetry**: the current default OTLP sink is a **standalone Aspire Dashboard**
+  running as a Container App. It uses browser-token UI auth and OTLP API-key auth;
+  the OTLP ports are internal to the ACA environment.
+- **Optional .NET/Aspire path**: the `aspire/` scaffold additionally requires the
+  .NET SDK 9.0+ and a .NET 9 runtime. It is opt-in and not needed for the default
+  ACA flow. See [aspire/README.md](aspire/README.md).
+
+Deployment writes secrets/tokens to the local, gitignored `deploy.outputs.json`;
+keep it private and never commit it.
 
 Useful control-plane commands:
 
@@ -170,4 +193,51 @@ Use Key Vault-backed Container Apps secrets:
 .\scripts\deploy.ps1 -UseKeyVault -KeyVaultName kv-your-squad-aca
 ```
 
-See [docs/runbook.md](docs/runbook.md) and [docs/feature-parity.md](docs/feature-parity.md).
+## Optional .NET / Aspire integration path
+
+`squad-aca` stays a thin ACA remote-runner / control plane. For teams that want
+to model resources as code or expose a session as an agent, the repo includes an
+**optional, opt-in** .NET/Aspire scaffold under [`aspire/`](aspire/). It does not
+replace the ACA Jobs architecture:
+
+- **Aspire** models resources (the standalone Aspire Dashboard OTLP sink and the
+  `squad-worker` container).
+- **Agent Framework** exposes the Squad session as an agent abstraction (a
+  compile-safe seam; preview packages are not referenced by default).
+- **ACA** remains the production execution substrate.
+- **Squad** remains the orchestration system.
+
+```powershell
+cd aspire
+dotnet build .\Squad.Aca.sln
+cd Squad.Aca.AppHost
+dotnet run   # brings up the Aspire Dashboard OTLP sink locally
+```
+
+See [aspire/README.md](aspire/README.md) and [docs/architecture.md](docs/architecture.md).
+
+## Validation
+
+Run the static validation gate before pushing:
+
+```powershell
+.\scripts\validate.ps1            # PS parse, worker bash -n, secret scan, scaffold check
+.\scripts\validate.ps1 -RunDotnet # also build the optional aspire scaffold
+```
+
+See [docs/validation.md](docs/validation.md) for the full sprint/E2E checklist and
+security validation steps (OTLP auth, exposure, RBAC, secret scans, token
+separation, rotation, public sync guard, image pinning).
+
+## Security notes
+
+- The user-assigned managed identity currently holds **Contributor** on the
+  resource group so Ralph can start session job executions. This is broader than
+  strictly required and is documented as an existing risk with a custom-role
+  hardening path in [docs/validation.md](docs/validation.md#rbac--identity-scope).
+- OTLP auth is preserved: **BrowserToken** for the UI and **ApiKey** for OTLP,
+  never `Unsecured`. OTLP ports stay internal to the ACA environment.
+- `squad-aca sync --sync-all` runs a public repo secret guard that blocks obvious
+  secret files and inline tokens before staging.
+
+See [docs/runbook.md](docs/runbook.md), [docs/architecture.md](docs/architecture.md), and [docs/feature-parity.md](docs/feature-parity.md).
