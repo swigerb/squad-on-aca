@@ -117,9 +117,29 @@ Control-plane commands:
 squad-aca doctor
 squad-aca sessions --limit 20
 squad-aca logs <session-or-execution> --tail 200
+squad-aca stop <session-or-execution>
 squad-aca open <session-or-execution>
 squad-aca sync --dry-run
 squad-aca sync --sync-all
+squad-aca watch start --repo "<github-owner>/<repo>"
+squad-aca watch stop
+squad-aca ralph status
+squad-aca ralph run --repo "<github-owner>/<repo>"
+squad-aca ralph pause
+squad-aca ralph resume
+squad-aca subsquad list
+squad-aca subsquad run docs "Update the docs and open a PR"
+squad-aca upgrade --deploy
+squad-aca telemetry smoke
+squad-aca secrets rotate
+squad-aca export squad-export.json
+squad-aca import squad-export.json
+```
+
+Destructive command:
+
+```powershell
+squad-aca destroy --yes
 ```
 
 If ACA is not configured:

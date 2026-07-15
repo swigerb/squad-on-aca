@@ -49,8 +49,13 @@ Useful control-plane commands:
 squad-aca doctor            # validate local repo, GitHub, Azure, ACA, and Aspire config
 squad-aca sessions          # list recent ACA-hosted Squad sessions
 squad-aca logs <session>    # stream logs for a session name or execution id
+squad-aca stop <session>    # stop a running ACA session
 squad-aca open <session>    # open the session PR when available, otherwise Aspire
 squad-aca sync              # push local .squad state before dispatch
+squad-aca watch status      # inspect optional watcher app
+squad-aca ralph status      # inspect scheduled Ralph dispatcher
+squad-aca subsquad list     # list configured SubSquads
+squad-aca telemetry smoke   # emit known-good logs/traces/metrics to Aspire
 ```
 
 ## Existing Squad repo flow

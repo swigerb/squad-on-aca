@@ -25,8 +25,18 @@ Usage:
   squad-aca doctor
   squad-aca sessions [--limit 10]
   squad-aca logs <session-or-execution> [--tail 100]
+  squad-aca stop <session-or-execution>
   squad-aca open [session-or-execution]
   squad-aca sync [--sync-all|--dry-run]
+  squad-aca watch <start|stop|status> [--repo <owner/repo>]
+  squad-aca ralph <status|run|pause|resume>
+  squad-aca subsquad <list|activate|run> [name] ["prompt"]
+  squad-aca upgrade [--deploy]
+  squad-aca telemetry smoke
+  squad-aca secrets rotate [--github-token <token>] [--copilot-token <token>]
+  squad-aca destroy --yes
+  squad-aca export [file]
+  squad-aca import <file>
   squad-aca dashboard
   squad-aca configure --resource-group <rg> --session-job <job> [--subscription <id>]
   squad-aca install-agent
@@ -150,6 +160,7 @@ function Get-AcaConfig {
         sessionJob = "caj-squad-aca-session"
         ralphJob = "caj-squad-aca-ralph"
         watchApp = "ca-squad-aca-watch"
+        aspireApp = "ca-squad-aca-aspire"
         aspireLoginUrl = ""
     }
 
@@ -208,6 +219,7 @@ function Sync-AcaConfigFromOutputs {
         sessionJob = $outputs.sessionJob
         ralphJob = $outputs.ralphJob
         watchApp = $outputs.watchApp
+        aspireApp = $outputs.aspireApp
         aspireLoginUrl = $outputs.aspireLoginUrl
     }
     Save-AcaConfig ([pscustomobject]$config)
@@ -289,6 +301,7 @@ function Invoke-Configure {
         sessionJob = Get-OptionValue $Items @("--session-job", "-SessionJob") $existing.sessionJob
         ralphJob = Get-OptionValue $Items @("--ralph-job", "-RalphJob") $existing.ralphJob
         watchApp = Get-OptionValue $Items @("--watch-app", "-WatchApp") $existing.watchApp
+        aspireApp = Get-OptionValue $Items @("--aspire-app", "-AspireApp") $existing.aspireApp
         aspireLoginUrl = Get-OptionValue $Items @("--dashboard-url", "-DashboardUrl") $existing.aspireLoginUrl
     }
     if (-not $config.resourceGroup -or -not $config.sessionJob) {
@@ -524,6 +537,195 @@ function Invoke-Sync {
     Write-Output "Synced to branch: $branch"
 }
 
+function Invoke-Stop {
+    param([string[]]$Items)
+    $config = Assert-AcaConfigured
+    $session = ($Items | Where-Object { -not $_.StartsWith("-") } | Select-Object -First 1)
+    $execution = Resolve-SessionExecution -Config $config -Session $session
+    az containerapp job stop --name $config.sessionJob --resource-group $config.resourceGroup --job-execution-name $execution.Execution
+}
+
+function Invoke-Watch {
+    param([string[]]$Items)
+    $config = Assert-AcaConfigured
+    $sub = if ($Items.Count -gt 0) { $Items[0].ToLowerInvariant() } else { "status" }
+    switch ($sub) {
+        "start" {
+            $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
+            if (-not $repo) { throw "No GitHub repo detected. Pass --repo <owner/repo>." }
+            $ref = Get-OptionValue $Items @("--ref", "-Ref") (Get-CurrentBranch)
+            $subSquad = Get-OptionValue $Items @("--sub-squad", "-SubSquad")
+            & (Join-Path $ScriptDir "start-watch.ps1") -ResourceGroupName $config.resourceGroup -WatchAppName $config.watchApp -Repository $repo -Ref $ref -SubSquad $subSquad
+        }
+        "stop" {
+            $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
+            if (-not $repo) { $repo = "unused/unused" }
+            & (Join-Path $ScriptDir "start-watch.ps1") -ResourceGroupName $config.resourceGroup -WatchAppName $config.watchApp -Repository $repo -Stop
+        }
+        "status" {
+            az containerapp show --name $config.watchApp --resource-group $config.resourceGroup --query "{name:name,provisioningState:properties.provisioningState,runningStatus:properties.runningStatus,minReplicas:properties.template.scale.minReplicas,maxReplicas:properties.template.scale.maxReplicas}" -o table
+        }
+        default { throw "Usage: squad-aca watch <start|stop|status> [--repo <owner/repo>]" }
+    }
+}
+
+function Invoke-Ralph {
+    param([string[]]$Items)
+    $config = Assert-AcaConfigured
+    $sub = if ($Items.Count -gt 0) { $Items[0].ToLowerInvariant() } else { "status" }
+    switch ($sub) {
+        "status" {
+            az containerapp job show --name $config.ralphJob --resource-group $config.resourceGroup --query "{name:name,trigger:properties.configuration.triggerType,cron:properties.configuration.scheduleTriggerConfig.cronExpression,image:properties.template.containers[0].image}" -o table
+            az containerapp job execution list --name $config.ralphJob --resource-group $config.resourceGroup --query "[0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime}" -o table
+        }
+        "run" {
+            $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
+            $env = @()
+            if ($repo) { $env += "GITHUB_REPOSITORY=$repo" }
+            if ($env.Count -gt 0) {
+                az containerapp job update --name $config.ralphJob --resource-group $config.resourceGroup --set-env-vars @env | Out-Null
+            }
+            az containerapp job start --name $config.ralphJob --resource-group $config.resourceGroup
+        }
+        "pause" {
+            az containerapp job update --name $config.ralphJob --resource-group $config.resourceGroup --cron-expression "0 0 1 1 *" | Out-Null
+            Write-Output "Paused Ralph by moving its cron schedule to yearly."
+        }
+        "resume" {
+            $cron = Get-OptionValue $Items @("--cron") "*/5 * * * *"
+            az containerapp job update --name $config.ralphJob --resource-group $config.resourceGroup --cron-expression $cron | Out-Null
+            Write-Output "Resumed Ralph with cron: $cron"
+        }
+        default { throw "Usage: squad-aca ralph <status|run|pause|resume>" }
+    }
+}
+
+function Invoke-SubSquad {
+    param([string[]]$Items)
+    $sub = if ($Items.Count -gt 0) { $Items[0].ToLowerInvariant() } else { "list" }
+    switch ($sub) {
+        "list" {
+            if (Get-Command squad -ErrorAction SilentlyContinue) {
+                squad subsquads list
+            } elseif (Test-Path ".squad\streams.json") {
+                Get-Content ".squad\streams.json" -Raw
+            } else {
+                Write-Output "No .squad/streams.json found."
+            }
+        }
+        "activate" {
+            $name = if ($Items.Count -gt 1) { $Items[1] } else { "" }
+            if (-not $name) { throw "Usage: squad-aca subsquad activate <name>" }
+            if (Get-Command squad -ErrorAction SilentlyContinue) {
+                squad subsquads activate $name
+            } else {
+                Set-Content ".squad-workstream" "$name`n" -Encoding utf8
+                Write-Output "Activated SubSquad: $name"
+            }
+        }
+        "run" {
+            $name = if ($Items.Count -gt 1) { $Items[1] } else { "" }
+            if (-not $name) { throw "Usage: squad-aca subsquad run <name> `"prompt`"" }
+            $remaining = @()
+            if ($Items.Count -gt 2) { $remaining = $Items[2..($Items.Count - 1)] }
+            $prompt = Get-PromptText "" $remaining
+            if (-not $prompt) { throw "Provide a prompt for the SubSquad run." }
+            Invoke-Run (@("--sub-squad", $name, $prompt))
+        }
+        default { throw "Usage: squad-aca subsquad <list|activate|run> [name] [prompt]" }
+    }
+}
+
+function Invoke-Upgrade {
+    param([string[]]$Items)
+    if (Get-Command squad -ErrorAction SilentlyContinue) {
+        squad upgrade
+    } else {
+        npx -y @bradygaster/squad-cli@latest upgrade
+    }
+    Install-CopilotAgent
+    if (Has-Option $Items @("--deploy")) {
+        & (Join-Path $ScriptDir "deploy.ps1")
+    }
+    Invoke-Doctor
+}
+
+function Invoke-Telemetry {
+    param([string[]]$Items)
+    $sub = if ($Items.Count -gt 0) { $Items[0].ToLowerInvariant() } else { "smoke" }
+    if ($sub -ne "smoke") { throw "Usage: squad-aca telemetry smoke" }
+    $config = Assert-AcaConfigured
+    $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
+    if (-not $repo) { throw "No GitHub repo detected. Pass --repo <owner/repo>." }
+    & (Join-Path $ScriptDir "start-session.ps1") -ResourceGroupName $config.resourceGroup -JobName $config.sessionJob -Repository $repo -Mode telemetry-smoke -SessionName "telemetry-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    if ($config.aspireLoginUrl) { Write-Output "Aspire: $($config.aspireLoginUrl)" }
+}
+
+function Invoke-Secrets {
+    param([string[]]$Items)
+    $sub = if ($Items.Count -gt 0) { $Items[0].ToLowerInvariant() } else { "" }
+    if ($sub -ne "rotate") { throw "Usage: squad-aca secrets rotate [--github-token <token>] [--copilot-token <token>]" }
+    $config = Assert-AcaConfigured
+    $githubToken = Get-OptionValue $Items @("--github-token") (gh auth token)
+    $copilotToken = Get-OptionValue $Items @("--copilot-token") $githubToken
+    $bytes = [byte[]]::new(32)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $otlpKey = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $dashboardToken = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+    $otlpHeader = "x-otlp-api-key=$otlpKey"
+
+    foreach ($job in @($config.sessionJob, $config.ralphJob)) {
+        if ($job) {
+            az containerapp job secret set --name $job --resource-group $config.resourceGroup --secrets "github-token=$githubToken" "copilot-github-token=$copilotToken" "otlp-headers=$otlpHeader" | Out-Null
+        }
+    }
+    if ($config.watchApp) {
+        az containerapp secret set --name $config.watchApp --resource-group $config.resourceGroup --secrets "github-token=$githubToken" "copilot-github-token=$copilotToken" "otlp-headers=$otlpHeader" | Out-Null
+    }
+    if ($config.aspireApp) {
+        az containerapp secret set --name $config.aspireApp --resource-group $config.resourceGroup --secrets "otlp-api-key=$otlpKey" | Out-Null
+        az containerapp update --name $config.aspireApp --resource-group $config.resourceGroup --set-env-vars "DASHBOARD__FRONTEND__BROWSERTOKEN=$dashboardToken" | Out-Null
+        $fqdn = az containerapp show --name $config.aspireApp --resource-group $config.resourceGroup --query properties.configuration.ingress.fqdn -o tsv
+        $config.aspireLoginUrl = "https://$fqdn/login?t=$dashboardToken"
+        Save-AcaConfig $config
+    }
+    Write-Output "Rotated ACA secrets."
+    if ($config.aspireLoginUrl) { Write-Output "Aspire: $($config.aspireLoginUrl)" }
+}
+
+function Invoke-Destroy {
+    param([string[]]$Items)
+    if (-not (Has-Option $Items @("--yes"))) { throw "This deletes the ACA resource group. Re-run with --yes to confirm." }
+    $config = Assert-AcaConfigured
+    az group delete --name $config.resourceGroup --yes --no-wait
+    Write-Output "Delete started for resource group: $($config.resourceGroup)"
+}
+
+function Invoke-Export {
+    param([string[]]$Items)
+    Ensure-ExistingSquad
+    $file = if ($Items.Count -gt 0 -and -not $Items[0].StartsWith("-")) { $Items[0] } else { "squad-export.json" }
+    if (Get-Command squad -ErrorAction SilentlyContinue) {
+        squad export --out $file
+    } else {
+        npx -y @bradygaster/squad-cli@latest export --out $file
+    }
+    Write-Output "Exported Squad state to $file"
+}
+
+function Invoke-Import {
+    param([string[]]$Items)
+    $file = if ($Items.Count -gt 0 -and -not $Items[0].StartsWith("-")) { $Items[0] } else { "" }
+    if (-not $file) { throw "Usage: squad-aca import <file>" }
+    if (Get-Command squad -ErrorAction SilentlyContinue) {
+        squad import $file
+    } else {
+        npx -y @bradygaster/squad-cli@latest import $file
+    }
+    Sync-LocalSquadState
+}
+
 switch ($Command.ToLowerInvariant()) {
     "help" { Show-Help }
     "--help" { Show-Help }
@@ -535,8 +737,19 @@ switch ($Command.ToLowerInvariant()) {
     "run" { Invoke-Run $Arguments }
     "sessions" { Invoke-Sessions $Arguments }
     "logs" { Invoke-Logs $Arguments }
+    "stop" { Invoke-Stop $Arguments }
     "open" { Invoke-Open $Arguments }
     "sync" { Invoke-Sync $Arguments }
+    "watch" { Invoke-Watch $Arguments }
+    "ralph" { Invoke-Ralph $Arguments }
+    "subsquad" { Invoke-SubSquad $Arguments }
+    "subsquads" { Invoke-SubSquad $Arguments }
+    "upgrade" { Invoke-Upgrade $Arguments }
+    "telemetry" { Invoke-Telemetry $Arguments }
+    "secrets" { Invoke-Secrets $Arguments }
+    "destroy" { Invoke-Destroy $Arguments }
+    "export" { Invoke-Export $Arguments }
+    "import" { Invoke-Import $Arguments }
     "new" {
         Assert-AcaConfigured | Out-Null
         $owner = Get-OptionValue $Arguments @("--owner", "-Owner")
