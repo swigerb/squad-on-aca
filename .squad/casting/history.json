@@ -1,0 +1,21 @@
+{
+  "assignment_cast_snapshots": {
+    "preset-preset:default-2026-07-15T15:35:16.808Z": {
+      "created_at": "2026-07-15T15:35:16.808Z",
+      "agents": [
+        "lead",
+        "reviewer",
+        "devrel",
+        "security",
+        "docs"
+      ],
+      "universe": "preset:default"
+    }
+  },
+  "universe_usage_history": [
+    {
+      "universe": "preset:default",
+      "used_at": "2026-07-15T15:35:16.808Z"
+    }
+  ]
+}
