@@ -111,7 +111,12 @@ fi
 
 REPO_DIR="$1"
 MANIFEST_RELATIVE_PATH="${CAPABILITY_MANIFEST_PATH:-squad-capabilities.yml}"
-MANIFEST_PATH="${REPO_DIR}/${MANIFEST_RELATIVE_PATH}"
+
+if [[ ! -d "$REPO_DIR" ]]; then
+  log "Repository directory does not exist: ${REPO_DIR}"
+  exit 64
+fi
+
 WORK_DIR="${REPO_DIR}/.squad-capability-preflight-$$"
 MANIFEST_JSON="${WORK_DIR}/manifest.json"
 PARSER_STDERR="${WORK_DIR}/parser.stderr"
@@ -119,10 +124,70 @@ ROWS_FILE="${WORK_DIR}/rows.tsv"
 FAILURES_FILE="${WORK_DIR}/failures.log"
 ADVISORIES_FILE="${WORK_DIR}/advisories.log"
 
-if [[ ! -f "$MANIFEST_PATH" ]]; then
+if ! manifest_resolution="$(
+  node - "$REPO_DIR" "$MANIFEST_RELATIVE_PATH" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+
+const repoDir = process.argv[2];
+const manifestRelativePath = process.argv[3];
+
+function realpath(value) {
+  return typeof fs.realpathSync.native === 'function' ? fs.realpathSync.native(value) : fs.realpathSync(value);
+}
+
+function isWithin(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+if (!manifestRelativePath || path.isAbsolute(manifestRelativePath) || /[\u0000-\u001f\u007f]/.test(manifestRelativePath)) {
+  process.exit(2);
+}
+
+const repoRoot = realpath(repoDir);
+if (!fs.statSync(repoRoot).isDirectory()) {
+  process.exit(3);
+}
+
+const candidatePath = path.resolve(repoRoot, manifestRelativePath);
+if (!isWithin(repoRoot, candidatePath)) {
+  process.exit(2);
+}
+
+if (!fs.existsSync(candidatePath)) {
+  process.stdout.write('__ABSENT__\n');
+  process.exit(0);
+}
+
+const candidateLstat = fs.lstatSync(candidatePath);
+if (candidateLstat.isSymbolicLink()) {
+  process.exit(2);
+}
+
+const resolvedPath = realpath(candidatePath);
+if (!isWithin(repoRoot, resolvedPath)) {
+  process.exit(2);
+}
+
+if (!fs.statSync(resolvedPath).isFile()) {
+  process.exit(2);
+}
+
+process.stdout.write(`${resolvedPath}\n`);
+NODE
+)"; then
+  log "Capability manifest path is invalid or unsafe; refusing to read it."
+  log "Check CAPABILITY_MANIFEST_PATH and ensure it points to a regular file inside the repository."
+  exit 78
+fi
+
+if [[ "$manifest_resolution" == "__ABSENT__" ]]; then
   log "No capability manifest at ${MANIFEST_RELATIVE_PATH}; skipping (safe default)."
   exit 0
 fi
+
+MANIFEST_PATH="$manifest_resolution"
 
 mkdir -p "$WORK_DIR"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -143,26 +208,26 @@ const fs = require('fs');
 const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const rows = [];
 for (const tool of manifest.tools || []) {
-  rows.push(['tool', tool.name, tool.required ? '1' : '0', tool.reason || ''].join('\t'));
+  rows.push(['tool', tool.name, tool.required ? '1' : '0'].join('\t'));
 }
 for (const credential of manifest.credentials || []) {
-  rows.push(['credential', credential.name, credential.required ? '1' : '0', credential.reason || ''].join('\t'));
+  rows.push(['credential', credential.name, credential.required ? '1' : '0'].join('\t'));
 }
 for (const service of manifest.services || []) {
-  rows.push(['service', service.name, service.required ? '1' : '0', service.reason || ''].join('\t'));
+  rows.push(['service', service.name, service.required ? '1' : '0'].join('\t'));
 }
 for (const egress of manifest.egress || []) {
-  rows.push(['egress', egress.host, '0', egress.reason || ''].join('\t'));
+  rows.push(['egress', egress.host, '0'].join('\t'));
 }
 if (manifest.image && manifest.image.hint) {
-  rows.push(['image', manifest.image.hint, '0', manifest.image.reason || ''].join('\t'));
+  rows.push(['image', manifest.image.hint, '0'].join('\t'));
 }
 process.stdout.write(rows.join('\n'));
 if (rows.length > 0) process.stdout.write('\n');
 NODE
 
 FAILED=0
-while IFS=$'\t' read -r kind name required reason; do
+while IFS=$'\t' read -r kind name required; do
   [[ -z "$kind" ]] && continue
   case "$kind" in
     tool)
@@ -182,14 +247,14 @@ while IFS=$'\t' read -r kind name required reason; do
             echo "Missing required tool: ${name}"
             echo "  fix: bake ${name} into a custom worker image (see docs/capability-manifest.md#extending-the-worker-image) or remove/relax this requirement."
           fi
-          [[ -n "$reason" ]] && echo "  reason: ${reason}"
+          echo "  details: inspect ${MANIFEST_RELATIVE_PATH} for the manifest entry."
         } >>"$FAILURES_FILE"
         FAILED=1
       else
         if [[ "$tool_rc" -eq 2 ]]; then
-          echo "Unsupported optional tool: ${name}${reason:+ (${reason})}" >>"$ADVISORIES_FILE"
+          echo "Unsupported optional tool: ${name}" >>"$ADVISORIES_FILE"
         else
-          echo "Optional tool not present: ${name}${reason:+ (${reason})}" >>"$ADVISORIES_FILE"
+          echo "Optional tool not present: ${name}" >>"$ADVISORIES_FILE"
         fi
       fi
       ;;
@@ -210,14 +275,14 @@ while IFS=$'\t' read -r kind name required reason; do
             echo "Missing required credential: ${name}"
             echo "  fix: provide ${name} as an ACA secret/env var for this session (see docs/capability-manifest.md#credentials)."
           fi
-          [[ -n "$reason" ]] && echo "  reason: ${reason}"
+          echo "  details: inspect ${MANIFEST_RELATIVE_PATH} for the manifest entry."
         } >>"$FAILURES_FILE"
         FAILED=1
       else
         if [[ "$credential_rc" -eq 2 ]]; then
-          echo "Unsupported optional credential: ${name}${reason:+ (${reason})}" >>"$ADVISORIES_FILE"
+          echo "Unsupported optional credential: ${name}" >>"$ADVISORIES_FILE"
         else
-          echo "Optional credential not set: ${name}${reason:+ (${reason})}" >>"$ADVISORIES_FILE"
+          echo "Optional credential not set: ${name}" >>"$ADVISORIES_FILE"
         fi
       fi
       ;;
@@ -225,19 +290,19 @@ while IFS=$'\t' read -r kind name required reason; do
       if [[ "$required" == "1" ]]; then
         {
           echo "Required external service declared but cannot be auto-validated: ${name}"
-          [[ -n "$reason" ]] && echo "  reason: ${reason}"
+          echo "  details: inspect ${MANIFEST_RELATIVE_PATH} for the manifest entry."
           echo "  fix: confirm ${name} is reachable from this session, or mark it required: false if it is optional."
         } >>"$FAILURES_FILE"
         FAILED=1
       else
-        echo "Declared optional service (not validated): ${name}${reason:+ (${reason})}" >>"$ADVISORIES_FILE"
+        echo "Declared optional service (not validated): ${name}" >>"$ADVISORIES_FILE"
       fi
       ;;
     egress)
-      echo "Declared egress dependency (advisory only, not enforced yet): ${name}${reason:+ (${reason})}" >>"$ADVISORIES_FILE"
+      echo "Declared egress dependency (advisory only, not enforced yet); inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
       ;;
     image)
-      echo "Manifest suggests worker image '${name}'${reason:+ (${reason})}; current worker image is fixed. See docs/capability-manifest.md#future-per-task-images-and-sandboxgroups." >>"$ADVISORIES_FILE"
+      echo "Manifest declares a custom worker image hint; current worker image is fixed. See docs/capability-manifest.md#future-per-task-images-and-sandboxgroups and inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
       ;;
   esac
 done <"$ROWS_FILE"

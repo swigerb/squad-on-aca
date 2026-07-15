@@ -32,6 +32,20 @@ assert_contains() {
   echo "ok - ${msg}"
 }
 
+assert_not_contains() {
+  local haystack="$1" needle="$2" msg="${3:-}"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$haystack" == *"$needle"* ]]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo "FAIL: ${msg} (expected output to omit: '${needle}')"
+    echo "--- actual output ---"
+    echo "$haystack"
+    echo "---------------------"
+    return 0
+  fi
+  echo "ok - ${msg}"
+}
+
 test_summary() {
   echo ""
   echo "${TESTS_RUN} assertions run, ${TESTS_FAILED} failed."

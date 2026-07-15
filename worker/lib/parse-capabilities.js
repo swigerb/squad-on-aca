@@ -49,6 +49,9 @@ const SUPPORTED_MANIFEST_VERSION = 1;
 const KNOWN_LIST_KEYS = new Set(['tools', 'credentials', 'services', 'egress']);
 const KNOWN_MAP_KEYS = new Set(['image']);
 const ALLOWED_TOP_LEVEL_KEYS = new Set(['version', 'tools', 'credentials', 'services', 'egress', 'image', 'notes']);
+const SAFE_IDENTIFIER_PATTERN = /^[A-Za-z0-9._-]+$/;
+const SAFE_HOST_PATTERN = /^[A-Za-z0-9.-]+(?::\d+)?$/;
+const SAFE_IMAGE_HINT_PATTERN = /^[A-Za-z0-9./:@_-]+$/;
 
 class CapabilityManifestError extends Error {}
 
@@ -96,24 +99,34 @@ function indentOf(line) {
 function splitKeyValue(content, lineNo) {
   const idx = content.indexOf(':');
   if (idx === -1) {
-    throw new CapabilityManifestError(`Line ${lineNo}: expected "key: value", got "${content}"`);
+    throw new CapabilityManifestError(`Line ${lineNo}: expected a "key: value" pair`);
   }
   const key = content.slice(0, idx).trim();
   const value = content.slice(idx + 1).trim();
   if (!key) {
-    throw new CapabilityManifestError(`Line ${lineNo}: empty key in "${content}"`);
+    throw new CapabilityManifestError(`Line ${lineNo}: encountered an empty key`);
   }
   return { key, value };
+}
+
+function assertUniqueKey(seenKeys, key, lineNo, context) {
+  if (seenKeys.has(key)) {
+    throw new CapabilityManifestError(`Line ${lineNo}: duplicate key "${key}" in ${context}`);
+  }
+  seenKeys.add(key);
 }
 
 function parseCapabilityManifest(source) {
   const rawLines = source.split(/\r?\n/);
   const result = {};
+  const topLevelKeys = new Set();
 
   let currentTopKey = null;
   let currentList = null;
   let currentItem = null;
+  let currentItemKeys = null;
   let currentMap = null;
+  let currentMapKeys = null;
 
   for (let i = 0; i < rawLines.length; i += 1) {
     const lineNo = i + 1;
@@ -125,10 +138,13 @@ function parseCapabilityManifest(source) {
 
     if (indent === 0) {
       const { key, value } = splitKeyValue(content, lineNo);
+      assertUniqueKey(topLevelKeys, key, lineNo, 'manifest');
       currentTopKey = key;
       currentList = null;
       currentItem = null;
+      currentItemKeys = null;
       currentMap = null;
+      currentMapKeys = null;
 
       if (value === '') {
         if (KNOWN_LIST_KEYS.has(key)) {
@@ -136,6 +152,7 @@ function parseCapabilityManifest(source) {
           result[key] = currentList;
         } else if (KNOWN_MAP_KEYS.has(key)) {
           currentMap = {};
+          currentMapKeys = new Set();
           result[key] = currentMap;
         } else {
           result[key] = '';
@@ -154,6 +171,8 @@ function parseCapabilityManifest(source) {
       }
       const itemContent = content.slice(2);
       const { key, value } = splitKeyValue(itemContent, lineNo);
+      currentItemKeys = new Set();
+      assertUniqueKey(currentItemKeys, key, lineNo, `list item in "${currentTopKey}"`);
       currentItem = { [key]: parseScalar(value) };
       currentList.push(currentItem);
       continue;
@@ -161,17 +180,19 @@ function parseCapabilityManifest(source) {
 
     if (indent >= 4 && currentItem) {
       const { key, value } = splitKeyValue(content, lineNo);
+      assertUniqueKey(currentItemKeys, key, lineNo, `list item in "${currentTopKey}"`);
       currentItem[key] = parseScalar(value);
       continue;
     }
 
     if (indent === 2 && currentMap) {
       const { key, value } = splitKeyValue(content, lineNo);
+      assertUniqueKey(currentMapKeys, key, lineNo, `"${currentTopKey}"`);
       currentMap[key] = parseScalar(value);
       continue;
     }
 
-    throw new CapabilityManifestError(`Line ${lineNo}: unexpected indentation in "${content}"`);
+    throw new CapabilityManifestError(`Line ${lineNo}: unexpected indentation`);
   }
 
   return result;
@@ -189,7 +210,13 @@ function addUnknownKeyErrors(target, allowedKeys, context, errors) {
   }
 }
 
-function validateNamedList(manifest, sectionName, nameKey) {
+function validateSafeString(value, pattern, context, errors, description) {
+  if (typeof value === 'string' && !pattern.test(value)) {
+    errors.push(`${context} contains unsupported characters; allowed characters: ${description}`);
+  }
+}
+
+function validateNamedList(manifest, sectionName, nameKey, pattern, description) {
   const errors = [];
   const section = manifest[sectionName];
   if (section === undefined) return errors;
@@ -211,6 +238,8 @@ function validateNamedList(manifest, sectionName, nameKey) {
 
     if (typeof item[nameKey] !== 'string' || item[nameKey].trim() === '') {
       errors.push(`${context} must include a non-empty string "${nameKey}"`);
+    } else {
+      validateSafeString(item[nameKey], pattern, `${context}.${nameKey}`, errors, description);
     }
     if (Object.prototype.hasOwnProperty.call(item, 'required') && typeof item.required !== 'boolean') {
       errors.push(`${context}.required must be a boolean`);
@@ -240,9 +269,33 @@ function validateManifest(manifest) {
     errors.push(`unsupported manifest version ${manifest.version}; supported versions: ${SUPPORTED_MANIFEST_VERSION}`);
   }
 
-  errors.push(...validateNamedList(manifest, 'tools', 'name'));
-  errors.push(...validateNamedList(manifest, 'credentials', 'name'));
-  errors.push(...validateNamedList(manifest, 'services', 'name'));
+  errors.push(
+    ...validateNamedList(
+      manifest,
+      'tools',
+      'name',
+      SAFE_IDENTIFIER_PATTERN,
+      'letters, digits, ".", "_", and "-"'
+    )
+  );
+  errors.push(
+    ...validateNamedList(
+      manifest,
+      'credentials',
+      'name',
+      SAFE_IDENTIFIER_PATTERN,
+      'letters, digits, ".", "_", and "-"'
+    )
+  );
+  errors.push(
+    ...validateNamedList(
+      manifest,
+      'services',
+      'name',
+      SAFE_IDENTIFIER_PATTERN,
+      'letters, digits, ".", "_", and "-"'
+    )
+  );
 
   if (manifest.egress !== undefined) {
     if (!Array.isArray(manifest.egress)) {
@@ -258,6 +311,14 @@ function validateManifest(manifest) {
         addUnknownKeyErrors(item, allowedKeys, context, errors);
         if (typeof item.host !== 'string' || item.host.trim() === '') {
           errors.push(`${context} must include a non-empty string "host"`);
+        } else {
+          validateSafeString(
+            item.host,
+            SAFE_HOST_PATTERN,
+            `${context}.host`,
+            errors,
+            'letters, digits, ".", "-", and an optional ":<port>" suffix'
+          );
         }
         if (Object.prototype.hasOwnProperty.call(item, 'reason') && typeof item.reason !== 'string') {
           errors.push(`${context}.reason must be a string`);
@@ -274,6 +335,14 @@ function validateManifest(manifest) {
       addUnknownKeyErrors(manifest.image, allowedKeys, '"image"', errors);
       if (typeof manifest.image.hint !== 'string' || manifest.image.hint.trim() === '') {
         errors.push('"image.hint" must be a non-empty string');
+      } else {
+        validateSafeString(
+          manifest.image.hint,
+          SAFE_IMAGE_HINT_PATTERN,
+          '"image.hint"',
+          errors,
+          'letters, digits, ".", "_", "-", "/", ":", and "@"'
+        );
       }
       if (Object.prototype.hasOwnProperty.call(manifest.image, 'reason') && typeof manifest.image.reason !== 'string') {
         errors.push('"image.reason" must be a string');

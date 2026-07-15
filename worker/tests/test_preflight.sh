@@ -104,4 +104,46 @@ assert_eq "0" "$rc" "custom manifest path: exits 0"
 assert_contains "$out" "config/capabilities.yml" "custom manifest path: is reflected in logs"
 rm -rf "$repo"
 
+# 10. Manifest symlinks that escape the repo are rejected safely.
+repo="$(make_repo)"
+outside_dir="$(make_repo)"
+secret_payload="OUTSIDE_SECRET_SHOULD_NEVER_APPEAR_456"
+printf 'version: 1\nnotes: %s\n' "$secret_payload" > "${outside_dir}/outside.yml"
+ln -s "${outside_dir}/outside.yml" "${repo}/squad-capabilities.yml"
+out="$(bash "$PREFLIGHT" "$repo" 2>&1)"
+rc=$?
+assert_eq "78" "$rc" "symlink escape manifest: exits 78"
+assert_contains "$out" "invalid or unsafe" "symlink escape manifest: reports a generic safe error"
+assert_not_contains "$out" "$secret_payload" "symlink escape manifest: does not leak target content"
+rm -rf "$repo" "$outside_dir"
+
+# 11. Malformed manifest content is redacted from preflight output.
+repo="$(make_repo)"
+leak_token="MANIFEST_SECRET_SHOULD_NEVER_APPEAR_789"
+printf 'version: 1\nbad line %s\n' "$leak_token" > "${repo}/squad-capabilities.yml"
+out="$(bash "$PREFLIGHT" "$repo" 2>&1)"
+rc=$?
+assert_eq "78" "$rc" "malformed manifest redaction: exits 78"
+assert_contains "$out" "Capability manifest is malformed" "malformed manifest redaction: remains actionable"
+assert_not_contains "$out" "$leak_token" "malformed manifest redaction: does not leak raw manifest content"
+rm -rf "$repo"
+
+# 12. Tab-bearing identifiers are rejected before any delimiter-based serialization.
+repo="$(make_repo)"
+printf 'version: 1\ntools:\n  - name: "git\t0\toptional-smuggle"\n    required: true\n' > "${repo}/squad-capabilities.yml"
+out="$(bash "$PREFLIGHT" "$repo" 2>&1)"
+rc=$?
+assert_eq "78" "$rc" "tab-bearing identifier manifest: exits 78"
+assert_contains "$out" "unsupported characters" "tab-bearing identifier manifest: is rejected during validation"
+rm -rf "$repo"
+
+# 13. Control-character identifiers are rejected before any downstream handling.
+repo="$(make_repo)"
+printf 'version: 1\ntools:\n  - name: "git\vsneaky"\n    required: true\n' > "${repo}/squad-capabilities.yml"
+out="$(bash "$PREFLIGHT" "$repo" 2>&1)"
+rc=$?
+assert_eq "78" "$rc" "control-character identifier manifest: exits 78"
+assert_contains "$out" "unsupported characters" "control-character identifier manifest: is rejected during validation"
+rm -rf "$repo"
+
 test_summary

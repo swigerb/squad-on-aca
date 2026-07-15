@@ -84,10 +84,16 @@ notes: Bootstrap notes for humans or agents working on this repo.
 Validation is strict and fail-closed:
 
 - `version` is required and must be supported.
+- Duplicate keys are rejected at every mapping level (top-level and nested
+  entries); the parser never allows "last one wins" overwrites.
 - Top-level keys outside the schema above are rejected.
 - Field types are enforced strictly (`required` must be a boolean, arrays must
   actually be arrays, strings must be strings).
 - Unknown keys inside list items/maps are rejected.
+- Manifest identifiers that cross execution/logging boundaries are validated
+  against safe allowlists (`tools[].name`, `credentials[].name`,
+  `services[].name`, `egress[].host`, `image.hint`) so control characters and
+  delimiter-smuggling payloads are rejected.
 - A malformed manifest is a hard startup error, not a silent no-op.
 
 The parser (`worker/lib/parse-capabilities.js`) supports a deliberately
@@ -138,10 +144,11 @@ starts:
      services, so treating these as hard failures would produce false
      negatives.
 4. On a blocking failure, preflight prints one actionable line per gap
-   (what's missing, why it's needed if a `reason` was given, and how to fix
-   it) and exits `78` (`EX_CONFIG`). `entrypoint.sh` has `set -e`, so this
-   exit code becomes the ACA job execution's exit code — visible in
-   `squad-aca logs` and Aspire without any additional plumbing.
+   (what's missing and how to fix it) and exits `78` (`EX_CONFIG`).
+   Free-form manifest values are not echoed back in startup errors/logs; check
+   the manifest file itself for the declared rationale. `entrypoint.sh` has
+   `set -e`, so this exit code becomes the ACA job execution's exit code —
+   visible in `squad-aca logs` and Aspire without any additional plumbing.
 
 ### Configuration
 
