@@ -72,6 +72,13 @@ if [[ -n "${GITHUB_REF:-}" ]]; then
   git checkout "${GITHUB_REF}" || git checkout -B "${GITHUB_REF}" "origin/${GITHUB_REF}"
 fi
 
+CAPABILITY_PREFLIGHT_SCRIPT="/usr/local/lib/squad-on-aca/squad-capability-preflight.sh"
+if [[ -x "$CAPABILITY_PREFLIGHT_SCRIPT" ]]; then
+  "$CAPABILITY_PREFLIGHT_SCRIPT" "$REPO_DIR"
+else
+  log "Capability preflight script not found at ${CAPABILITY_PREFLIGHT_SCRIPT}; skipping."
+fi
+
 if [[ ! -f ".squad/team.md" ]]; then
   log "No .squad/team.md found; initializing a default Squad in the ephemeral workspace."
   squad init --preset "${SQUAD_PRESET:-default}" --no-workflows

@@ -46,3 +46,18 @@ Ralph is not a separate container image. The `squad-worker` image contains all r
 | `ca-squad-aca-watch` | Container App, scale 0/1 | Optional long-running watcher |
 
 Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Contributor` on the resource group so it can start session jobs.
+
+## Capability-aware execution
+
+The worker image is fixed and its managed identity is intentionally
+scoped — it does not grant GitHub credentials beyond what's wired in,
+extra binaries, or open network egress. See
+[`docs/capability-manifest.md`](capability-manifest.md) for the capability
+manifest and preflight validation that surface unsupported repository
+requirements (extra SDKs, browsers, databases, private feeds, external
+services) as a fast, actionable failure instead of a mid-task surprise.
+That document also lists deferred follow-up work — per-task ACA
+SandboxGroup/image selection, generated egress rules, and short-lived
+least-privilege credentials — that the manifest is designed to feed but
+that this repo does not implement yet.
+

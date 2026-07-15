@@ -1,0 +1,211 @@
+# Capability-aware execution
+
+Squad on ACA runs every session in the same fixed `squad-worker` image and
+with a scoped user-assigned managed identity. That identity buys ACR pulls,
+optional Key Vault reads, and (for Ralph) permission to start ACA job
+executions. **It does not, and should not, buy GitHub credentials beyond
+what's already wired in, arbitrary binaries, or open egress.**
+
+Real repositories frequently need more than that fixed image provides:
+language-specific SDKs and linters, browsers for UI tests, databases for
+integration tests, private package feeds, or other external services. When a
+session hits one of those gaps mid-task, the failure shows up late — after
+Copilot has already spent time and tokens on a task that could never
+succeed in this environment.
+
+This document describes the capability manifest and preflight validation
+that catches that class of failure at session start, with a clear,
+actionable error, instead of Squad and the RAI/QA loop it drives.
+
+## What ships in this phase
+
+- A declarative **capability manifest** (`squad-capabilities.yml`, path
+  configurable) that a repository can commit to describe what it needs from
+  its execution environment.
+- A **preflight validation step** that runs after the repository is cloned
+  and before Squad/Copilot starts working, so unsupported tools/capabilities
+  fail fast with an actionable message instead of failing mid-task.
+- **Backward compatibility by default**: repositories with no manifest are
+  completely unaffected. Nothing changes for existing sessions.
+- Documented **extension points** for the harder, deliberately out-of-scope
+  problems: per-task ACA SandboxGroup/image selection, controlled egress,
+  short-lived credentials, and least-privilege per-task identities. These
+  are not implemented here — this phase adds the seams they will plug into.
+
+## The manifest
+
+Add `squad-capabilities.yml` to the root of a repository that Squad on ACA
+works on:
+
+```yaml
+version: 1
+
+tools:
+  - name: docker
+    required: true
+    reason: Needed to build and test the container image
+  - name: pnpm
+    required: false
+    reason: Only needed for the monorepo build; falls back to npm
+
+credentials:
+  - name: NPM_TOKEN
+    required: true
+    reason: Auth for a private npm registry used by this repo
+
+services:
+  - name: postgres
+    required: false
+    reason: Integration tests expect a local Postgres instance
+
+egress:
+  - host: registry.npmjs.org
+    reason: Package installs during build
+
+image:
+  hint: ghcr.io/example/squad-worker-python:latest
+  reason: Needs a pinned Python 3.12 + Poetry toolchain
+
+notes: Bootstrap notes for humans or agents working on this repo.
+```
+
+### Schema
+
+| Key | Shape | Meaning |
+| --- | --- | --- |
+| `version` | integer | Manifest schema version. Required. Currently only literal `1` is supported. |
+| `tools[]` | `name`, `required`, `reason` | A tool identifier matched against a **built-in allowlist** of fixed preflight checks. The manifest does not carry shell commands. |
+| `credentials[]` | `name`, `required`, `reason` | An allowlisted environment variable name whose **presence** is checked. Values are never printed. |
+| `services[]` | `name`, `required`, `reason` | An external service the task depends on (for example a database). The worker cannot safely auto-provision or reach arbitrary services, so these are documented dependencies. |
+| `egress[]` | `host`, `reason` | A network destination the task needs to reach. Advisory only today. |
+| `image` | `hint`, `reason` | Advisory pointer to a worker image that would satisfy this repo's needs. Not auto-applied today. |
+| `notes` | string | Free-form guidance for humans or agents. |
+
+Validation is strict and fail-closed:
+
+- `version` is required and must be supported.
+- Top-level keys outside the schema above are rejected.
+- Field types are enforced strictly (`required` must be a boolean, arrays must
+  actually be arrays, strings must be strings).
+- Unknown keys inside list items/maps are rejected.
+- A malformed manifest is a hard startup error, not a silent no-op.
+
+The parser (`worker/lib/parse-capabilities.js`) supports a deliberately
+restricted YAML subset — one level of list-of-maps or map nesting under a
+top-level key — so it can be parsed reliably without a third-party YAML
+dependency in the worker image. See the parser's header comment for the
+exact grammar, and `worker/tests/` for coverage.
+
+### Built-in allowlists
+
+Current tool identifiers with built-in checks:
+
+- `az`, `bash`, `cargo`, `curl`, `docker`, `dotnet`, `gh`, `git`, `go`,
+  `java`, `javac`, `jq`, `kubectl`, `make`, `mvn`, `node`, `npm`, `pip`,
+  `pip3`, `pnpm`, `python`, `python3`, `rustc`, `sh`, `terraform`, `yarn`
+
+Current credential identifiers with built-in presence checks:
+
+- `ACA_SESSION_JOB_NAME`, `ACR_PASSWORD`, `ACR_USERNAME`,
+  `AZURE_CLIENT_ID`, `AZURE_RESOURCE_GROUP`, `AZURE_SUBSCRIPTION_ID`,
+  `AZURE_TENANT_ID`, `COPILOT_GITHUB_TOKEN`, `DOCKER_PASSWORD`,
+  `DOCKER_USERNAME`, `GH_TOKEN`, `GITHUB_TOKEN`, `NODE_AUTH_TOKEN`,
+  `NPM_TOKEN`
+
+Unknown tool/credential names are never executed. Required unknown names fail
+preflight with an actionable error; optional unknown names are surfaced as
+advisories.
+
+## Preflight validation
+
+`worker/lib/squad-capability-preflight.sh` runs from `entrypoint.sh`
+immediately after the repository clone/checkout and before Squad/Copilot
+starts:
+
+1. If no manifest is present at the configured path (default:
+   `squad-capabilities.yml`), preflight is a no-op. This is what keeps the
+   feature fully backward compatible.
+2. If a manifest is present but malformed, preflight fails fast (exit `78`)
+   with a parser error pointing at the offending field.
+3. For each declared item:
+   - **`tools` and `credentials` marked `required: true`** are checked
+     against the running worker using fixed, internally-defined checks.
+     Any gap is a **blocking failure**.
+   - **Everything else** — optional tools/credentials, `services`,
+     `egress`, and `image` hints — is **advisory only**. It's printed so the
+     session log makes the gap visible, but it never blocks the session.
+     The worker cannot safely guarantee network reachability or spin up
+     services, so treating these as hard failures would produce false
+     negatives.
+4. On a blocking failure, preflight prints one actionable line per gap
+   (what's missing, why it's needed if a `reason` was given, and how to fix
+   it) and exits `78` (`EX_CONFIG`). `entrypoint.sh` has `set -e`, so this
+   exit code becomes the ACA job execution's exit code — visible in
+   `squad-aca logs` and Aspire without any additional plumbing.
+
+### Configuration
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `CAPABILITY_MANIFEST_PATH` | `squad-capabilities.yml` | Path to the manifest, relative to the repository root. |
+| `SKIP_CAPABILITY_PREFLIGHT` | `false` | Set to `true` to bypass validation entirely (for example while iterating on a manifest). Bypassing is logged. |
+
+## Extending the worker image
+
+If a repository needs tools the fixed `squad-worker` image doesn't carry
+(a language SDK, a browser, a database client, a build tool), the supported
+path today is a **custom worker image that extends the published one**:
+
+```dockerfile
+FROM <your-acr>.azurecr.io/squad-worker:latest
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+USER squad
+```
+
+Build and push it with `az acr build`, then point the ACA session/Ralph/watch
+jobs at the new image tag (see `docs/runbook.md` for the job resource names).
+Reference the custom image in `image.hint` in the manifest so the gap is
+self-documenting even before automatic image selection exists (see below).
+
+## What's deliberately out of scope in this phase
+
+These are real, valuable next steps that the manifest is designed to feed,
+but they need more design/security review than fits in one PR:
+
+### Future: per-task images and SandboxGroups
+
+ACA SandboxGroups (or a fleet of prebuilt, purpose-specific worker images)
+could let a task's declared `image.hint` or `tools[]` list drive **automatic
+selection** of the execution environment, instead of a human manually
+rebuilding and repointing jobs. The manifest's `image` field and `tools[]`
+list are the intended input to that selection logic once it exists.
+
+### Future: controlled egress
+
+`egress[]` entries are advisory today because the worker's network policy
+is not manifest-driven. A follow-up could generate scoped egress rules (for
+example, ACA environment network rules or a proxy allowlist) from the
+declared `egress[]` hosts, so a task gets exactly the network access it
+declared needing — no more, no less.
+
+### Future: short-lived, least-privilege credentials
+
+Today, GitHub access is a long-lived `GITHUB_TOKEN`/`COPILOT_GITHUB_TOKEN`
+pair provisioned once at deploy time, and Azure access is the same
+user-assigned managed identity for every session. The `credentials[]` list
+is a natural input to a future design that mints **short-lived, per-task
+GitHub App installation tokens** scoped to only what a task's manifest
+declares needing, and/or a **per-task Azure identity** with only the
+permissions that task's declared `services`/`tools` require. This PR does
+not change the managed identity's permissions or introduce any new Azure
+role assignments — it only adds the declarative input those future changes
+would consume.
+
+None of the above is implemented by this PR. This PR only adds the manifest
+schema, the preflight check, and the documented seams above so future work
+has a concrete, tested foundation to extend rather than needing to
+retrofit one.

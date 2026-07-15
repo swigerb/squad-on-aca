@@ -1,0 +1,22 @@
+version: 1
+tools:
+  - name: git
+    required: true
+  - name: some-tool-that-does-not-exist-xyz
+    required: false
+    reason: Optional helper, only needed for a niche build step
+credentials:
+  - name: NPM_TOKEN
+    required: false
+    reason: Only needed for optional integration tests
+services:
+  - name: postgres
+    required: false
+    reason: Integration tests expect a local Postgres instance
+egress:
+  - host: registry.npmjs.org
+    reason: Package installs
+image:
+  hint: ghcr.io/example/squad-worker-python:latest
+  reason: Needs a pinned Python 3.12 toolchain
+notes: Free-form guidance for humans/agents.

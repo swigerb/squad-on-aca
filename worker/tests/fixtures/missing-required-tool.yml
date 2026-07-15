@@ -1,0 +1,5 @@
+version: 1
+tools:
+  - name: definitely-not-installed-binary
+    required: true
+    reason: This fixture should fail deterministically

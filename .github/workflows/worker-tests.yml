@@ -1,0 +1,29 @@
+name: Worker Tests
+
+on:
+  pull_request:
+    paths:
+      - 'worker/**'
+      - 'docs/capability-manifest.md'
+      - 'docs/examples/squad-capabilities.example.yml'
+      - '.github/workflows/worker-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'worker/**'
+      - 'docs/capability-manifest.md'
+      - 'docs/examples/squad-capabilities.example.yml'
+      - '.github/workflows/worker-tests.yml'
+
+jobs:
+  worker-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run worker capability tests
+        run: |
+          node --check worker/lib/parse-capabilities.js
+          bash -n worker/lib/squad-capability-preflight.sh
+          bash -n worker/entrypoint.sh
+          bash worker/tests/run-tests.sh
