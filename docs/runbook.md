@@ -47,6 +47,15 @@ OTEL_SERVICE_NAME=squad-<session name>
 
 This matches Squad's containerized/Kubernetes pod-aware mode. The whole team you normally run from one CLI session lives inside that one ACA execution.
 
+Dispatch never mutates the shared job template. `scripts/start-session.ps1` (and
+Ralph) read the job template's environment once (an immutable read), strip the
+session-managed keys, overlay the fresh session values, and pass the complete set
+to `az containerapp job start --env-vars`. That start override applies to a single
+execution only — image, CPU/memory, registry, and secrets are inherited from the
+stored template, which is never written. This eliminates two prior hazards:
+omitted variables persisting between sessions, and concurrent dispatches racing on
+a shared `job update`.
+
 ## Scale-to-zero behavior
 
 ACA uses jobs for the expensive work, so idle cost is intentionally low:
@@ -74,7 +83,7 @@ SQUAD_POD_ID=ralph-scheduled
 
 ACA does not expose Kubernetes `concurrencyPolicy: Forbid`. The deployment uses `parallelism=1`, `replicaCompletionCount=1`, and `replicaTimeout=240`. Ralph is a short dispatcher that exits after starting session jobs, keeping runtime below the 5-minute schedule.
 
-Ralph polls GitHub issues labeled `squad`, skips blocked/assigned/already-dispatched issues, adds the `squad:dispatched` label, and starts `caj-squad-aca-session` with a prompt for that issue. The session job is the ACA equivalent of an agent Kubernetes Job.
+Ralph polls GitHub issues labeled `squad`, skips blocked/assigned/already-dispatched issues, adds the `squad:dispatched` label, and starts `caj-squad-aca-session` with a prompt for that issue. Each dispatch builds a complete, isolated environment from an immutable snapshot of the session job template and passes it to `az containerapp job start --env-vars`, so the shared session job template is never mutated (no stale-value leak, no concurrent-dispatch race). The session job is the ACA equivalent of an agent Kubernetes Job.
 
 The user-assigned managed identity has:
 
@@ -115,6 +124,14 @@ For production-style secret references:
 ```
 
 Deployment output is written to ignored local file `deploy.outputs.json`.
+
+`deploy.ps1` is idempotent and safe to re-run for upgrades, token rotation, and
+recovery. The Aspire dashboard app is created on first deploy and updated in place
+on subsequent runs (`az containerapp update --yaml`), so re-running rotates the
+OTLP API key and dashboard browser token and rolls a new revision instead of
+failing because the app already exists. BrowserToken UI auth, ApiKey OTLP auth,
+and internal-only OTLP ports are defined in the deployment YAML and preserved on
+every run.
 
 ## Start a session
 

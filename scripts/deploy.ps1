@@ -191,7 +191,19 @@ properties:
       maxReplicas: 1
 "@ | Set-Content -Path $aspireYaml -Encoding utf8
 
-az containerapp create --name $aspireName --resource-group $ResourceGroupName --yaml $aspireYaml | Out-Null
+# Create the Aspire dashboard on first deploy; on subsequent deploys update the
+# existing app in place. `az containerapp create --yaml` fails if the app already
+# exists, which broke documented token/OTLP-key rotation and recovery (both
+# regenerate secrets and re-run this script). `update --yaml` performs a full
+# create-or-update PUT of the app definition (secrets, ingress, and template),
+# so it rotates the OTLP API key and dashboard browser token and rolls a new
+# revision. BrowserToken UI auth, ApiKey OTLP auth, and internal-only OTLP ports
+# all live in $aspireYaml, so they are preserved on every run.
+if (az containerapp show --name $aspireName --resource-group $ResourceGroupName --query id -o tsv 2>$null) {
+    az containerapp update --name $aspireName --resource-group $ResourceGroupName --yaml $aspireYaml | Out-Null
+} else {
+    az containerapp create --name $aspireName --resource-group $ResourceGroupName --yaml $aspireYaml | Out-Null
+}
 $aspireFqdn = az containerapp show --name $aspireName --resource-group $ResourceGroupName --query properties.configuration.ingress.fqdn -o tsv
 
 $commonEnv = @(

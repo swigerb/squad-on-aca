@@ -21,7 +21,7 @@ pre-push hook.
 
 | Check | What it does | Why |
 | --- | --- | --- |
-| PowerShell parse | Parses every `scripts/*.ps1` with the PowerShell language parser | Catches syntax errors without executing deploy/dispatch logic |
+| PowerShell parse | Parses every `scripts/*.ps1` (including `scripts/lib/`) with the PowerShell language parser | Catches syntax errors without executing deploy/dispatch logic |
 | Worker `bash -n` | Runs `bash -n` on `worker/entrypoint.sh` (CRLF-normalized) | Catches shell syntax errors in the container entrypoint |
 | Secret scan | Scans tracked `docs/`, `scripts/`, and `aspire/` for token patterns and credential filenames (skips `bin/`, `obj/`, and binary files) | Keeps the public repo free of secrets |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
@@ -40,6 +40,10 @@ Run these in order. Static checks first (fast, no Azure), then E2E.
 
 ### 2. E2E (requires an ACA deployment)
 
+Record real command output in [e2e-results.md](e2e-results.md) (static evidence is
+already captured there; the live-Azure sections L1–L7 are filled by the
+orchestrator/operator against a real deployment).
+
 - [ ] `squad-aca doctor` — validates local repo, GitHub, Azure, ACA, and Aspire
       config.
 - [ ] `squad-aca telemetry smoke` (or `SQUAD_MODE=telemetry-smoke`) — emits
@@ -47,9 +51,19 @@ Run these in order. Static checks first (fast, no Azure), then E2E.
       grouped by `squad-<session>`.
 - [ ] `scripts/start-session.ps1 -Mode smoke -RunCopilotSmoke` — a session job
       execution starts, clones the repo, and exits cleanly.
+- [ ] **Template non-mutation:** the `caj-squad-aca-session` template env is
+      identical before and after a dispatch (dispatch uses a per-execution
+      `az containerapp job start --env-vars` override, never `job update`). See
+      [e2e-results.md](e2e-results.md) L3.
+- [ ] **Per-execution isolation:** a session that omits `SQUAD_PROMPT` does not
+      inherit a previous session's prompt, and still carries the durable common
+      env. See [e2e-results.md](e2e-results.md) L4.
+- [ ] **Idempotent deploy:** re-running `scripts/deploy.ps1` succeeds and updates
+      the existing Aspire app (rotates OTLP key + browser token) instead of
+      failing on create. See [e2e-results.md](e2e-results.md) L1.
 - [ ] A `prompt` session opens a PR on `squad/<session>`.
 - [ ] Ralph dispatch: an actionable labeled issue gets the `squad:dispatched`
-      label and a session job execution starts.
+      label and a session job execution starts, with no shared-template mutation.
 
 ## Security validation
 
@@ -138,8 +152,12 @@ These map to the Security review items. Each has a concrete way to verify it.
   squad-aca secrets rotate --github-token <token> --copilot-token <token>
   ```
 - **Rotate OTLP API key / dashboard browser token:** re-run `scripts/deploy.ps1`;
-  both are regenerated with `New-HexToken` and re-applied. Confirm old values no
-  longer authenticate.
+  both are regenerated with `New-HexToken` and re-applied. Re-running is
+  **idempotent**: the Aspire app is updated in place via
+  `az containerapp update --yaml` (a full create-or-update PUT that rotates the
+  secret and browser token and rolls a new revision), not recreated, so rotation
+  and recovery no longer fail on an existing app. Confirm old values no longer
+  authenticate.
 
 ### Public repo sync guard
 

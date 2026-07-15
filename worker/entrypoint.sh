@@ -286,6 +286,15 @@ NODE
       exit 0
     fi
 
+    # Snapshot the session job's template env ONCE (immutable read). Each dispatch
+    # below builds a complete, isolated env override from this snapshot so the
+    # shared session job template is never mutated -- eliminating cross-session
+    # leakage and concurrent-dispatch races on the shared template.
+    session_job_env_json="$(az containerapp job show \
+      --name "$ACA_SESSION_JOB_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --query "properties.template.containers[0].env" -o json)"
+
     for row in "${issue_rows[@]}"; do
       IFS=$'\t' read -r issue_number issue_title issue_url <<< "$row"
       session_name="issue-${issue_number}-$(date +%Y%m%d%H%M%S)"
@@ -297,23 +306,59 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
 
       log "Dispatching issue #${issue_number} to ACA session job ${session_name}."
       gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$dispatch_label" >/dev/null || true
-      az containerapp job update \
-        --name "$ACA_SESSION_JOB_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --set-env-vars \
-          "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" \
-          "GITHUB_REF=${GITHUB_REF:-${GITHUB_BASE_BRANCH:-main}}" \
-          "SQUAD_MODE=prompt" \
-          "SESSION_NAME=$session_name" \
-          "SQUAD_POD_ID=$session_name" \
-          "SQUAD_PROMPT=$prompt" \
-          "PUSH_CHANGES=true" \
-          "OUTPUT_BRANCH=squad/issue-${issue_number}" \
-          "PR_TITLE=Squad: issue #${issue_number}" \
-          "OTEL_SERVICE_NAME=squad-$session_name" >/dev/null
+
+      # Build the complete env set for THIS execution. Session-managed keys are
+      # stripped from the template snapshot and replaced with fresh values; all
+      # other template variables (Aspire endpoints, Azure identity, secret refs,
+      # Copilot flags) are carried forward. NUL-delimited so multi-line prompts
+      # survive intact.
+      mapfile -d '' -t start_env < <(
+        SJ_ENV="$session_job_env_json" \
+        OV_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+        OV_GITHUB_REF="${GITHUB_REF:-${GITHUB_BASE_BRANCH:-main}}" \
+        OV_SQUAD_MODE="prompt" \
+        OV_SESSION_NAME="$session_name" \
+        OV_SQUAD_POD_ID="$session_name" \
+        OV_SQUAD_DEPLOYMENT_MODE="squad-per-pod" \
+        OV_OTEL_SERVICE_NAME="squad-$session_name" \
+        OV_ENABLE_GITHUB_REMOTE="true" \
+        OV_GITHUB_TOKEN="secretref:github-token" \
+        OV_COPILOT_GITHUB_TOKEN="secretref:copilot-github-token" \
+        OV_OTEL_EXPORTER_OTLP_HEADERS="secretref:otlp-headers" \
+        OV_SQUAD_PROMPT="$prompt" \
+        OV_PUSH_CHANGES="true" \
+        OV_OUTPUT_BRANCH="squad/issue-${issue_number}" \
+        OV_PR_TITLE="Squad: issue #${issue_number}" \
+        node - <<'NODE'
+const managed = new Set([
+  'GITHUB_REPOSITORY','GITHUB_REF','SQUAD_MODE','SESSION_NAME','SQUAD_DEPLOYMENT_MODE',
+  'SQUAD_POD_ID','OTEL_SERVICE_NAME','ENABLE_GITHUB_REMOTE','GITHUB_TOKEN',
+  'COPILOT_GITHUB_TOKEN','OTEL_EXPORTER_OTLP_HEADERS','SQUAD_PROMPT','SQUAD_TEAM',
+  'RUN_COPILOT_SMOKE','PUSH_CHANGES','OUTPUT_BRANCH','PR_TITLE','PR_BODY',
+  'COMMIT_MESSAGE','RALPH_LABELS','RALPH_MAX_ISSUES',
+]);
+const merged = new Map();
+let template = [];
+try { template = JSON.parse(process.env.SJ_ENV || '[]') || []; } catch { template = []; }
+for (const e of template) {
+  if (!e || !e.name) continue;
+  if (managed.has(e.name)) continue;
+  merged.set(e.name, e.secretRef ? `secretref:${e.secretRef}` : String(e.value ?? ''));
+}
+for (const [k, v] of Object.entries(process.env)) {
+  if (!k.startsWith('OV_')) continue;
+  merged.set(k.slice(3), String(v ?? ''));
+}
+const out = [];
+for (const [k, v] of merged) out.push(`${k}=${v}`);
+process.stdout.write(out.join('\0'));
+NODE
+      )
+
       az containerapp job start \
         --name "$ACA_SESSION_JOB_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --env-vars "${start_env[@]}" >/dev/null
     done
 
     log "Ralph dispatched ${#issue_rows[@]} issue(s)."

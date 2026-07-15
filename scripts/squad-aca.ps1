@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
+. (Join-Path $ScriptDir "lib\session-env.ps1")
 $UserConfigDir = Join-Path $HOME ".squad-on-aca"
 $UserConfigPath = Join-Path $UserConfigDir "config.json"
 
@@ -731,12 +732,18 @@ function Invoke-Ralph {
         }
         "run" {
             $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
-            $env = @()
-            if ($repo) { $env += "GITHUB_REPOSITORY=$repo" }
-            if ($env.Count -gt 0) {
-                az containerapp job update --name $config.ralphJob --resource-group $config.resourceGroup --set-env-vars @env | Out-Null
-            }
-            az containerapp job start --name $config.ralphJob --resource-group $config.resourceGroup
+            # Dispatch as a single, self-contained execution override so the
+            # shared Ralph job template is never mutated (no stale leak, no race).
+            $sessionEnv = [ordered]@{}
+            if ($repo) { $sessionEnv["GITHUB_REPOSITORY"] = $repo }
+            $envVars = New-SessionStartEnvVars -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup -SessionEnv $sessionEnv
+            $startArgs = @(
+                "containerapp", "job", "start",
+                "--name", $config.ralphJob,
+                "--resource-group", $config.resourceGroup,
+                "--env-vars"
+            ) + $envVars
+            az @startArgs
         }
         "pause" {
             az containerapp job update --name $config.ralphJob --resource-group $config.resourceGroup --cron-expression "0 0 1 1 *" | Out-Null
