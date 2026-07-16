@@ -14,6 +14,14 @@
 - Implementation, tests, scripts, Dockerfiles, and refactoring route to `engineer`.
 - Review work still routes to `reviewer`, and security-sensitive changes route to `security`.
 
+### 2026-07-16: SandboxGroups feasibility remains Sprint-0-only
+
+**By:** lead
+
+**What:** Recorded a conditional GO for Sprints 0-2 only, with SandboxGroups runtime work beyond Sprint 2 blocked on Sprint 0 evidence gaps around API consistency, region/quota visibility, delete/recovery semantics, and identity isolation.
+
+**Why:** Official ACA Sandbox docs confirm preview status and useful lifecycle/networking primitives, but the published API story is still inconsistent and several validation gates remain UNKNOWN.
+
 ## Governance
 
 - All meaningful changes require team consensus
