@@ -1,0 +1,19 @@
+version: "1"
+tools:
+  - name: git
+    required: true
+  - name: docker
+    required: false
+credentials:
+  - name: github-token
+    required: true
+services:
+  - name: github-api
+    required: true
+egress:
+  - name: github.com
+    required: true
+image:
+  hint: container-build
+  required: false
+notes: "Capability requests are advisory unless marked required."

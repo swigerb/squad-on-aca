@@ -72,6 +72,13 @@ if [[ -n "${GITHUB_REF:-}" ]]; then
   git checkout "${GITHUB_REF}" || git checkout -B "${GITHUB_REF}" "origin/${GITHUB_REF}"
 fi
 
+CAPABILITY_PRE_FLIGHT="${SQUAD_ON_ACA_HOME:-/opt/squad-on-aca}/lib/squad-capability-preflight.sh"
+export SANDBOX_CLASSES_PATH="${SANDBOX_CLASSES_PATH:-${SQUAD_ON_ACA_HOME:-/opt/squad-on-aca}/config/sandbox-classes.json}"
+if [[ -x "$CAPABILITY_PRE_FLIGHT" ]]; then
+  SQUAD_CAPABILITY_RESOLUTION="$($CAPABILITY_PRE_FLIGHT "$REPO_DIR")"
+  export SQUAD_CAPABILITY_RESOLUTION
+fi
+
 if [[ ! -f ".squad/team.md" ]]; then
   log "No .squad/team.md found; initializing a default Squad in the ephemeral workspace."
   squad init --preset "${SQUAD_PRESET:-default}" --no-workflows

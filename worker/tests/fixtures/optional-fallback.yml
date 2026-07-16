@@ -1,0 +1,7 @@
+version: "1"
+credentials:
+  - name: azure-tenant-id
+    required: false
+services:
+  - name: github-api
+    required: true

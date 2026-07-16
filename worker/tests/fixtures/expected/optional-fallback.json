@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "1",
+  "route": "aca-job",
+  "sandboxClass": null,
+  "requiredCapabilities": [
+    "services:github-api"
+  ],
+  "optionalCapabilities": [
+    "credentials:azure-tenant-id"
+  ],
+  "unsatisfiedRequired": [],
+  "fallbackReason": "optional capabilities are unavailable in approved sandbox classes; using aca-job",
+  "manifestPresent": true,
+  "manifestVersion": "1",
+  "defaultImageSufficient": false
+}

@@ -1,0 +1,3 @@
+tools:
+  - name: git
+    required: true

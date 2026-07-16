@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "1",
+  "description": "Design placeholder only for Sprints 0-2. No class in this file is production-approved until Sprint 0 feasibility gates pass.",
+  "classes": [
+    {
+      "name": "placeholder-container-build",
+      "approvedForProduction": false,
+      "description": "Illustrative only: container-oriented sandbox class request target.",
+      "imageHints": ["container-build", "placeholder-container-build"],
+      "capabilities": {
+        "tools": ["docker", "python3", "make"],
+        "credentials": ["github-token", "copilot-github-token", "azure-client-id"],
+        "services": ["github-api", "azure-management"],
+        "egress": ["github.com", "api.github.com", "management.azure.com", "packages.github.com"]
+      }
+    },
+    {
+      "name": "placeholder-python-build",
+      "approvedForProduction": false,
+      "description": "Illustrative only: Python build sandbox class request target.",
+      "imageHints": ["placeholder-python-build"],
+      "capabilities": {
+        "tools": ["python3", "make"],
+        "credentials": ["github-token", "copilot-github-token"],
+        "services": ["github-api"],
+        "egress": ["github.com", "api.github.com", "packages.github.com"]
+      }
+    }
+  ]
+}

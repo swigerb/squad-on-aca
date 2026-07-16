@@ -46,3 +46,22 @@ Ralph is not a separate container image. The `squad-worker` image contains all r
 | `ca-squad-aca-watch` | Container App, scale 0/1 | Optional long-running watcher |
 
 Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Contributor` on the resource group so it can start session jobs.
+
+## SandboxGroups feasibility (Sprint 0)
+
+SandboxGroups are under **feasibility review only** in this repo.
+
+- ADR: [`docs/adr/0001-sandboxgroups-feasibility.md`](adr/0001-sandboxgroups-feasibility.md)
+- Engineer-facing summary: [`docs/sandboxgroups-feasibility.md`](sandboxgroups-feasibility.md)
+
+Current scope:
+
+- **Authorized:** Sprint 0 research plus Sprints 1-2 design work only
+- **Not authorized:** Sprint 3+ SandboxGroups execution and production security rollout
+- **Current runtime:** ACA Jobs remain the only implemented execution plane and rollback path
+
+## Provider abstraction note (Sprints 1-2)
+
+Session execution now goes through a provider-neutral contract in `scripts/lib/squad-aca-provider.ps1`. The contract exposes create, wait, status, logs, cancel, and terminate operations behind opaque execution handles so `scripts/squad-aca.ps1` and `scripts/start-session.ps1` no longer depend directly on ACA execution names.
+
+The live ACA Jobs adapter keeps existing CLI behavior while switching session starts to per-execution `az containerapp job start --env-vars` overrides instead of mutating the base job template. A filesystem-backed fake provider is included for deterministic offline tests; no SandboxGroups provider is implemented or enabled in this sprint.

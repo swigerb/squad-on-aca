@@ -1,0 +1,13 @@
+version: "1"
+tools:
+  - name: docker
+    required: true
+credentials:
+  - name: github-token
+    required: true
+services:
+  - name: github-api
+    required: true
+image:
+  hint: container-build
+  required: true

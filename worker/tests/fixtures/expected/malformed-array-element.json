@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1",
+  "route": "fail-closed",
+  "sandboxClass": null,
+  "requiredCapabilities": [],
+  "optionalCapabilities": [],
+  "unsatisfiedRequired": [],
+  "fallbackReason": "unexpected indentation at line 4",
+  "manifestPresent": true,
+  "manifestVersion": null,
+  "defaultImageSufficient": false
+}

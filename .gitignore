@@ -3,6 +3,8 @@
 deploy.outputs.json
 *.log
 node_modules/
+worker/tests/.tools/
+worker/tests/.work/
 # Squad: ignore runtime state (logs, inbox, sessions)
 # Note: .squad/casting/* is identity and MUST be committed to main, not ignored
 .squad/orchestration-log/

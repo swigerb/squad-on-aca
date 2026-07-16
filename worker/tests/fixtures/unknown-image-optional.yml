@@ -1,0 +1,4 @@
+version: "1"
+image:
+  hint: experimental-image
+  required: false

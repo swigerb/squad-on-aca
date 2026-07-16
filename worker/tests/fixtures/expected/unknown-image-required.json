@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "1",
+  "route": "fail-closed",
+  "sandboxClass": null,
+  "requiredCapabilities": [
+    "image:[redacted]"
+  ],
+  "optionalCapabilities": [],
+  "unsatisfiedRequired": [
+    "image:[redacted]"
+  ],
+  "fallbackReason": "required image hint is not approved",
+  "manifestPresent": true,
+  "manifestVersion": "1",
+  "defaultImageSufficient": false
+}

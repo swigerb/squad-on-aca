@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "1",
+  "route": "aca-job",
+  "sandboxClass": null,
+  "requiredCapabilities": [],
+  "optionalCapabilities": [
+    "image:[redacted]"
+  ],
+  "unsatisfiedRequired": [],
+  "fallbackReason": "optional image hint is not approved; using aca-job",
+  "manifestPresent": true,
+  "manifestVersion": "1",
+  "defaultImageSufficient": false
+}

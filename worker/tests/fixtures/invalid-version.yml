@@ -1,0 +1,4 @@
+version: "9"
+tools:
+  - name: git
+    required: true

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1",
+  "route": "aca-job",
+  "sandboxClass": null,
+  "requiredCapabilities": [],
+  "optionalCapabilities": [],
+  "unsatisfiedRequired": [],
+  "fallbackReason": null,
+  "manifestPresent": false,
+  "manifestVersion": null,
+  "defaultImageSufficient": true
+}

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1",
+  "route": "fail-closed",
+  "sandboxClass": null,
+  "requiredCapabilities": [],
+  "optionalCapabilities": [],
+  "unsatisfiedRequired": [],
+  "fallbackReason": "missing required version field at line 1",
+  "manifestPresent": true,
+  "manifestVersion": null,
+  "defaultImageSufficient": false
+}

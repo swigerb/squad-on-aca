@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1",
+  "route": "sandbox",
+  "sandboxClass": "placeholder-container-build",
+  "requiredCapabilities": [
+    "credentials:github-token",
+    "services:github-api"
+  ],
+  "optionalCapabilities": [
+    "tools:docker"
+  ],
+  "unsatisfiedRequired": [],
+  "fallbackReason": null,
+  "manifestPresent": true,
+  "manifestVersion": "1",
+  "defaultImageSufficient": false
+}

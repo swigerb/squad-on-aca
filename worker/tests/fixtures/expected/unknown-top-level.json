@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1",
+  "route": "fail-closed",
+  "sandboxClass": null,
+  "requiredCapabilities": [],
+  "optionalCapabilities": [],
+  "unsatisfiedRequired": [],
+  "fallbackReason": "unrecognized top-level key (redacted) at line 2",
+  "manifestPresent": true,
+  "manifestVersion": null,
+  "defaultImageSufficient": false
+}

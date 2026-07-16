@@ -5,7 +5,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     COPILOT_AUTO_UPDATE=false \
     COPILOT_ALLOW_ALL=true \
     SQUAD_MODE=smoke \
-    WORKDIR=/workspace
+    WORKDIR=/workspace \
+    SQUAD_ON_ACA_HOME=/opt/squad-on-aca
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg openssh-client \
@@ -20,14 +21,17 @@ RUN apt-get update \
     && npm config set fetch-retry-maxtimeout 120000 \
     && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 \
     && useradd -m -s /bin/bash squad \
-    && mkdir -p /workspace \
-    && chown -R squad:squad /workspace /home/squad \
+    && mkdir -p /workspace "$SQUAD_ON_ACA_HOME" \
+    && chown -R squad:squad /workspace /home/squad "$SQUAD_ON_ACA_HOME" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --chown=squad:squad entrypoint.sh /usr/local/bin/squad-on-aca
+COPY --chown=squad:squad worker/lib "$SQUAD_ON_ACA_HOME/lib"
+COPY --chown=squad:squad config "$SQUAD_ON_ACA_HOME/config"
+COPY --chown=squad:squad worker/entrypoint.sh /usr/local/bin/squad-on-aca
 RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca \
-    && chmod +x /usr/local/bin/squad-on-aca
+    && find "$SQUAD_ON_ACA_HOME/lib" -type f -exec sed -i 's/\r$//' {} + \
+    && chmod +x /usr/local/bin/squad-on-aca "$SQUAD_ON_ACA_HOME/lib/resolve-capabilities.js" "$SQUAD_ON_ACA_HOME/lib/squad-capability-preflight.sh"
 
 USER squad
 WORKDIR /workspace

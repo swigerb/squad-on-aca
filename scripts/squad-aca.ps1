@@ -10,6 +10,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 $UserConfigDir = Join-Path $HOME ".squad-on-aca"
 $UserConfigPath = Join-Path $UserConfigDir "config.json"
+. (Join-Path $ScriptDir "lib\squad-aca-provider.ps1")
 
 function Show-Help {
     @"
@@ -17,7 +18,7 @@ Squad on ACA
 
 Usage:
   squad-aca init [--owner <github-owner>] [--name <repo-name>] [--public|--private]
-  squad-aca run "prompt" [--repo <owner/repo>] [--name <session>] [--branch <branch>] [--no-push]
+  squad-aca run "prompt" [--repo <owner/repo>] [--name <session>] [--branch <branch>] [--no-push] [--dry-run]
   squad-aca "prompt"
   squad-aca new --owner <github-owner> --name <repo-name> [--description "..."]
   squad-aca smoke [--repo <owner/repo>]
@@ -27,6 +28,7 @@ Usage:
   squad-aca logs <session-or-execution> [--tail 100]
   squad-aca stop <session-or-execution>
   squad-aca open [session-or-execution]
+  squad-aca resolve [--manifest <path>]
   squad-aca sync [--sync-all|--dry-run]
   squad-aca watch <start|stop|status> [--repo <owner/repo>]
   squad-aca ralph <status|run|pause|resume>
@@ -191,6 +193,24 @@ function Save-AcaConfig {
     Write-Output "Saved ACA config: $UserConfigPath"
 }
 
+function Invoke-CapabilityResolve {
+    param([string[]]$Items)
+    $manifest = Get-OptionValue $Items @("--manifest") ""
+    $resolver = Join-Path $RepoRoot "worker\lib\resolve-capabilities.js"
+    if (-not (Test-Path $resolver)) {
+        throw "Capability resolver was not found at '$resolver'."
+    }
+    $cwd = (Get-Location).Path
+    $args = @($resolver, "--cwd", $cwd)
+    if ($manifest) {
+        $args += @("--manifest", $manifest)
+    }
+    & node @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "Capability resolver failed."
+    }
+}
+
 function Assert-AcaConfigured {
     $config = Get-AcaConfig
     if (-not $config.resourceGroup -or -not $config.sessionJob) {
@@ -204,6 +224,10 @@ Run one of:
   2. Configure an existing deployment:
      squad-aca configure --resource-group <rg> --session-job <job> --subscription <azure-subscription-id>
 "@
+    }
+
+    if ((Get-SquadProviderMode) -eq "fake") {
+        return $config
     }
 
     if ($config.subscriptionId) {
@@ -377,12 +401,18 @@ function Invoke-Init {
 
 function Invoke-Run {
     param([string[]]$Items, [string]$FirstPrompt = "")
+    if (Has-Option $Items @("--dry-run")) {
+        Ensure-ExistingSquad
+        Invoke-CapabilityResolve $Items
+        return
+    }
+
     $config = Assert-AcaConfigured
     Ensure-ExistingSquad
 
     $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
-    if (-not $repo) { throw "No GitHub repo detected. Run 'squad-aca init' first or pass --repo <owner/repo>." }
-    $session = Get-OptionValue $Items @("--name", "-SessionName") "session-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    if (-not $repo) { throw "No GitHub repo detected. Run squad-aca init first or pass --repo <owner/repo>." }
+    $session = Get-OptionValue $Items @("--name", "-SessionName") "session-$(Get-Date -Format yyyyMMdd-HHmmss)"
     $branch = Get-OptionValue $Items @("--branch", "-OutputBranch") "squad/$session"
     $subSquad = Get-OptionValue $Items @("--sub-squad", "-SubSquad")
     $prompt = Get-PromptText $FirstPrompt $Items
@@ -458,26 +488,8 @@ function Invoke-Doctor {
 
 function Get-SessionExecutions {
     param([object]$Config, [int]$Limit = 10)
-    $names = az containerapp job execution list --name $Config.sessionJob --resource-group $Config.resourceGroup --query "[0:$Limit].name" -o json | ConvertFrom-Json
-    $items = @()
-    foreach ($name in $names) {
-        $execution = az containerapp job execution show --name $Config.sessionJob --resource-group $Config.resourceGroup --job-execution-name $name -o json | ConvertFrom-Json
-        $env = @{}
-        foreach ($e in $execution.properties.template.containers[0].env) {
-            if ($e.name) { $env[$e.name] = $e.value }
-        }
-        $items += [pscustomobject]@{
-            Execution = $name
-            Status = $execution.properties.status
-            Session = $env["SESSION_NAME"]
-            Mode = $env["SQUAD_MODE"]
-            Repository = $env["GITHUB_REPOSITORY"]
-            Branch = $env["GITHUB_REF"]
-            Started = $execution.properties.startTime
-            Ended = $execution.properties.endTime
-        }
-    }
-    return $items
+    $provider = Get-SquadExecutionProvider -Config $Config
+    return Get-SquadExecutions -Provider $provider -Limit $Limit
 }
 
 function Get-FirstPositional {
@@ -501,17 +513,8 @@ function Get-FirstPositional {
 
 function Resolve-SessionExecution {
     param([object]$Config, [string]$Session)
-    if (-not $Session) {
-        $latest = Get-SessionExecutions -Config $Config -Limit 1
-        if ($latest) { return $latest[0] }
-        throw "No session executions found."
-    }
-    $items = Get-SessionExecutions -Config $Config -Limit 50
-    $match = $items | Where-Object { $_.Execution -eq $Session -or $_.Session -eq $Session } | Select-Object -First 1
-    if (-not $match) {
-        throw "Could not find session or execution '$Session'. Run 'squad-aca sessions' to list recent sessions."
-    }
-    return $match
+    $provider = Get-SquadExecutionProvider -Config $Config
+    return Resolve-SquadExecution -Provider $provider -SessionOrExecution $Session -Limit 50
 }
 
 function Invoke-Sessions {
@@ -519,7 +522,9 @@ function Invoke-Sessions {
     $config = Assert-AcaConfigured
     $limitText = Get-OptionValue $Items @("--limit", "-Limit") "10"
     $limit = [int]$limitText
-    Get-SessionExecutions -Config $config -Limit $limit | Format-Table -AutoSize
+    Get-SquadExecutions -Provider (Get-SquadExecutionProvider -Config $config) -Limit $limit |
+        Select-Object Execution, Status, Session, Mode, Repository, Branch, Started, Ended |
+        Format-Table -AutoSize
 }
 
 function Invoke-Logs {
@@ -528,12 +533,8 @@ function Invoke-Logs {
     $session = Get-FirstPositional $Items @("--tail", "-Tail")
     $tail = [int](Get-OptionValue $Items @("--tail", "-Tail") "100")
     $execution = Resolve-SessionExecution -Config $config -Session $session
-    az containerapp job logs show `
-        --name $config.sessionJob `
-        --resource-group $config.resourceGroup `
-        --execution $execution.Execution `
-        --container $config.sessionJob `
-        --tail $tail
+    $provider = Get-SquadExecutionProvider -Config $config
+    Get-SquadExecutionLogs -Provider $provider -Id $execution.Id -Tail $tail
 }
 
 function Invoke-Open {
@@ -588,7 +589,16 @@ function Invoke-Stop {
     $config = Assert-AcaConfigured
     $session = Get-FirstPositional $Items
     $execution = Resolve-SessionExecution -Config $config -Session $session
-    az containerapp job stop --name $config.sessionJob --resource-group $config.resourceGroup --job-execution-name $execution.Execution
+    $provider = Get-SquadExecutionProvider -Config $config
+    if ($provider.Name -eq "aca-job") {
+        Stop-SquadExecution -Provider $provider -Id $execution.Id
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+        return
+    }
+    Stop-SquadExecution -Provider $provider -Id $execution.Id | Out-Null
+    Write-Output "Stopped $($execution.Execution)"
 }
 
 function Invoke-Watch {
@@ -785,6 +795,7 @@ switch ($Command.ToLowerInvariant()) {
     "logs" { Invoke-Logs $Arguments }
     "stop" { Invoke-Stop $Arguments }
     "open" { Invoke-Open $Arguments }
+    "resolve" { Invoke-CapabilityResolve $Arguments }
     "sync" { Invoke-Sync $Arguments }
     "watch" { Invoke-Watch $Arguments }
     "ralph" { Invoke-Ralph $Arguments }

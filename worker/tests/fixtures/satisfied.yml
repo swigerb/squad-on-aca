@@ -1,0 +1,16 @@
+version: "1"
+tools:
+  - name: git
+    required: true
+  - name: bash
+    required: false
+credentials:
+  - name: github-token
+    required: true
+services:
+  - name: github-api
+    required: true
+egress:
+  - name: github.com
+    required: true
+notes: "Default worker should satisfy this manifest."

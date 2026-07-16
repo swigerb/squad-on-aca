@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "1",
+  "route": "aca-job",
+  "sandboxClass": null,
+  "requiredCapabilities": [
+    "credentials:github-token",
+    "egress:github.com",
+    "services:github-api",
+    "tools:git"
+  ],
+  "optionalCapabilities": [
+    "tools:bash"
+  ],
+  "unsatisfiedRequired": [],
+  "fallbackReason": null,
+  "manifestPresent": true,
+  "manifestVersion": "1",
+  "defaultImageSufficient": true
+}
