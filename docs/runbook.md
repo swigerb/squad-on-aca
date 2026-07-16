@@ -91,6 +91,8 @@ ACA does not expose Kubernetes `concurrencyPolicy: Forbid`. The deployment uses 
 
 Ralph polls GitHub issues labeled `squad`, skips blocked/assigned/already-dispatched issues, adds the `squad-aca:dispatched` label (the `squad:*` namespace is reserved by Squad member-routing workflows, so Ralph uses the ACA-specific `squad-aca:dispatched` marker to avoid triggering member assignment), and starts `caj-squad-aca-session` with a prompt for that issue. Each dispatch builds a complete, isolated environment from an immutable snapshot of the session job template and passes it to `az containerapp job start --env-vars`, so the shared session job template is never mutated (no stale-value leak, no concurrent-dispatch race). The session job is the ACA equivalent of an agent Kubernetes Job.
 
+Dispatch is transactional and isolated per issue (see `worker/lib/ralph-dispatch.sh`). For each issue Ralph builds and validates the env, starts the ACA session job, and adds the `squad-aca:dispatched` label **only after a confirmed start**. If env building or the job start fails, the issue is left **unlabeled** so the next scheduled run retries it rather than skipping it permanently, and Ralph logs the failure and continues to the next issue — a single bad issue never aborts the rest of the batch. Prompts and secret references are never written to logs. The set of session-managed env keys stripped from the template snapshot is mirrored in `scripts/lib/session-env.ps1` and `worker/lib/ralph-dispatch.sh`; `scripts/validate.ps1` fails on any drift between the two.
+
 The user-assigned managed identity has:
 
 ```text

@@ -73,7 +73,8 @@ foreach ($file in $psFiles) {
 Write-Section "Worker bash scripts (bash -n)"
 $bashScripts = @(
     (Join-Path $RepoRoot "worker\entrypoint.sh"),
-    (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh")
+    (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"),
+    (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
@@ -210,6 +211,146 @@ if (-not (Test-Path $aspireDir)) {
         }
     } else {
         Write-Host "  [SKIP] dotnet build (pass -RunDotnet to enable)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 5. Session-managed env key parity (PowerShell vs worker)
+# ---------------------------------------------------------------------------
+# Session isolation depends on dispatch stripping the SAME set of session-managed
+# keys from the job template in both dispatch paths: the PowerShell control plane
+# (scripts/lib/session-env.ps1) and the in-container worker (worker/lib/
+# ralph-dispatch.sh). If the two lists drift, one path could leak a stale
+# template value into a new session. Fail on any drift.
+Write-Section "Session-managed env key parity"
+$psEnvFile = Join-Path $RepoRoot "scripts\lib\session-env.ps1"
+$shEnvFile = Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh"
+
+function Get-QuotedListBlock([string]$Text, [string]$StartMarker) {
+    $idx = $Text.IndexOf($StartMarker)
+    if ($idx -lt 0) { return $null }
+    $rest = $Text.Substring($idx + $StartMarker.Length)
+    $close = $rest.IndexOf(')')
+    if ($close -lt 0) { return $null }
+    return $rest.Substring(0, $close)
+}
+
+if (-not (Test-Path $psEnvFile)) {
+    Add-Fail "scripts/lib/session-env.ps1 not found for env parity check"
+} elseif (-not (Test-Path $shEnvFile)) {
+    Add-Fail "worker/lib/ralph-dispatch.sh not found for env parity check"
+} else {
+    $psText = Get-Content -LiteralPath $psEnvFile -Raw
+    $shText = Get-Content -LiteralPath $shEnvFile -Raw
+
+    # PowerShell: keys are double-quoted inside $script:SessionManagedEnvKeys = @( ... )
+    $psBlock = Get-QuotedListBlock $psText 'SessionManagedEnvKeys = @('
+    $psKeys = @()
+    if ($psBlock) {
+        $psKeys = [regex]::Matches($psBlock, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+    }
+
+    # Bash: keys are bare, whitespace-separated inside RALPH_MANAGED_ENV_KEYS=( ... )
+    $shBlock = Get-QuotedListBlock $shText 'RALPH_MANAGED_ENV_KEYS=('
+    $shKeys = @()
+    if ($shBlock) {
+        $shKeys = ($shBlock -split '\s+') | Where-Object { $_ -and ($_ -notmatch '^#') }
+    }
+
+    if ($psKeys.Count -eq 0) {
+        Add-Fail "Could not parse SessionManagedEnvKeys from session-env.ps1"
+    } elseif ($shKeys.Count -eq 0) {
+        Add-Fail "Could not parse RALPH_MANAGED_ENV_KEYS from ralph-dispatch.sh"
+    } else {
+        $psSet = $psKeys | Sort-Object -Unique
+        $shSet = $shKeys | Sort-Object -Unique
+        $onlyPs = $psSet | Where-Object { $_ -notin $shSet }
+        $onlySh = $shSet | Where-Object { $_ -notin $psSet }
+        if ($onlyPs.Count -gt 0 -or $onlySh.Count -gt 0) {
+            if ($onlyPs.Count -gt 0) {
+                Add-Fail "Session-managed env keys only in session-env.ps1 (missing from ralph-dispatch.sh): $($onlyPs -join ', ')"
+            }
+            if ($onlySh.Count -gt 0) {
+                Add-Fail "Session-managed env keys only in ralph-dispatch.sh (missing from session-env.ps1): $($onlySh -join ', ')"
+            }
+        } else {
+            Add-Pass "Session-managed env keys match across session-env.ps1 and ralph-dispatch.sh ($($psSet.Count) keys)"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 6. Sync guard uses -uall (nested untracked secrets cannot evade the scan)
+# ---------------------------------------------------------------------------
+# Regression guard for the public-repo sync guard: `git status --porcelain`
+# collapses a brand-new directory to a single entry, so nested secrets inside it
+# would never be scanned even though `git add -A` (run by --sync-all) still
+# stages them. Test-SyncSafety MUST enumerate with `-uall`. Assert the source
+# still uses it, then run the real guard against a throwaway repo containing
+# nested secrets to prove nested detection and ignored-file exclusion.
+Write-Section "Sync guard secret enumeration (-uall)"
+$syncSafetyFile = Join-Path $RepoRoot "scripts\lib\sync-safety.ps1"
+if (-not (Test-Path $syncSafetyFile)) {
+    Add-Fail "scripts/lib/sync-safety.ps1 not found"
+} else {
+    $syncText = Get-Content -LiteralPath $syncSafetyFile -Raw
+    if ($syncText -match 'git status --porcelain -uall') {
+        Add-Pass "Test-SyncSafety enumerates untracked files with -uall"
+    } else {
+        Add-Fail "Test-SyncSafety does not use 'git status --porcelain -uall' (nested untracked secrets could evade the scan)"
+    }
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) {
+        Write-Host "  [SKIP] git not available for functional sync-guard test"
+    } else {
+        . $syncSafetyFile
+        $tmpRepo = Join-Path ([System.IO.Path]::GetTempPath()) ("sync-guard-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Force -Path $tmpRepo | Out-Null
+        $prevAllow = $env:SQUAD_ACA_ALLOW_UNSAFE_SYNC
+        $env:SQUAD_ACA_ALLOW_UNSAFE_SYNC = $null
+        Push-Location $tmpRepo
+        try {
+            git init -q 2>$null | Out-Null
+            git config user.email "test@example.com" 2>$null | Out-Null
+            git config user.name "Sync Guard Test" 2>$null | Out-Null
+
+            # Ignored file that would otherwise trip the guard -> must be excluded.
+            Set-Content -Path (Join-Path $tmpRepo ".gitignore") -Value "ignored/`n" -NoNewline
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "ignored") | Out-Null
+            Set-Content -Path (Join-Path $tmpRepo "ignored\secrets.json") -Value '{"token":"should-be-ignored"}'
+
+            # Nested UNTRACKED secrets inside brand-new directories. Plain
+            # --porcelain would collapse these to their top-level dir and miss them.
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "nested\deep") | Out-Null
+            Set-Content -Path (Join-Path $tmpRepo "nested\deep\secrets.json") -Value '{"api":"value"}'
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "certs\sub") | Out-Null
+            Set-Content -Path (Join-Path $tmpRepo "certs\sub\server.pem") -Value "placeholder-cert-material"
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "src\app") | Out-Null
+            # PAT-like token embedded in nested source (constructed so this file is not itself a secret filename).
+            $pat = 'ghp_' + ('A' * 36)
+            Set-Content -Path (Join-Path $tmpRepo "src\app\config.txt") -Value "token = $pat"
+
+            $reasons = Test-SyncSafety
+
+            $hasNestedJson = @($reasons | Where-Object { $_ -match 'nested/deep/secrets\.json' }).Count -gt 0
+            $hasPem = @($reasons | Where-Object { $_ -match 'certs/sub/server\.pem' }).Count -gt 0
+            $hasPat = @($reasons | Where-Object { $_ -match 'src/app/config\.txt' }).Count -gt 0
+            $leakedIgnored = @($reasons | Where-Object { $_ -match 'ignored/secrets\.json' }).Count -gt 0
+
+            if ($hasNestedJson) { Add-Pass "Sync guard flags nested untracked secrets.json" }
+            else { Add-Fail "Sync guard missed nested untracked secrets.json (--porcelain -uall regression)" }
+            if ($hasPem) { Add-Pass "Sync guard flags nested untracked .pem" }
+            else { Add-Fail "Sync guard missed nested untracked .pem" }
+            if ($hasPat) { Add-Pass "Sync guard flags nested source containing a PAT-like token" }
+            else { Add-Fail "Sync guard missed nested source containing a PAT-like token" }
+            if (-not $leakedIgnored) { Add-Pass "Sync guard excludes git-ignored files" }
+            else { Add-Fail "Sync guard flagged a git-ignored file (should be excluded)" }
+        } finally {
+            Pop-Location
+            $env:SQUAD_ACA_ALLOW_UNSAFE_SYNC = $prevAllow
+            Remove-Item -Recurse -Force $tmpRepo -ErrorAction SilentlyContinue
+        }
     }
 }
 

@@ -22,10 +22,12 @@ pre-push hook.
 | Check | What it does | Why |
 | --- | --- | --- |
 | PowerShell parse | Parses every `scripts/*.ps1` (including `scripts/lib/`) with the PowerShell language parser | Catches syntax errors without executing deploy/dispatch logic |
-| Worker `bash -n` | Runs `bash -n` on `worker/entrypoint.sh` and `worker/lib/squad-capability-preflight.sh` (CRLF-normalized) | Catches shell syntax errors in the container entrypoint and capability preflight |
+| Worker `bash -n` | Runs `bash -n` on `worker/entrypoint.sh`, `worker/lib/squad-capability-preflight.sh`, and `worker/lib/ralph-dispatch.sh` (CRLF-normalized) | Catches shell syntax errors in the container entrypoint, capability preflight, and Ralph dispatch library |
 | Secret scan | Scans tracked `docs/`, `scripts/`, `worker/`, and `aspire/` for token patterns and credential filenames (skips `bin/`, `obj/`, `node_modules/`, and binary files) | Keeps the public repo free of secrets |
+| Session-managed env parity | Compares the session-managed env key lists in `scripts/lib/session-env.ps1` and `worker/lib/ralph-dispatch.sh` | Fails on drift so both dispatch paths strip the same keys and session isolation cannot regress |
+| Sync guard `-uall` | Asserts `Test-SyncSafety` (`scripts/lib/sync-safety.ps1`) enumerates with `git status --porcelain -uall`, then runs the real guard against a throwaway repo with nested untracked secrets | Proves nested untracked secrets are scanned before `--sync-all` and git-ignored files stay excluded |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
-| Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser and preflight contract |
+| Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, preflight contract, and Ralph transactional dispatch |
 
 The capability manifest contract itself is documented in
 [capability-manifest.md](capability-manifest.md): manifest schema, built-in

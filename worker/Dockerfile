@@ -26,8 +26,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --chown=squad:squad entrypoint.sh /usr/local/bin/squad-on-aca
-COPY --chown=squad:squad lib/squad-capability-preflight.sh lib/parse-capabilities.js /usr/local/lib/squad-on-aca/
-RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh \
+COPY --chown=squad:squad lib/squad-capability-preflight.sh lib/parse-capabilities.js lib/ralph-dispatch.sh /usr/local/lib/squad-on-aca/
+RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh \
     && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh
 
 USER squad

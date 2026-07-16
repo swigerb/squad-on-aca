@@ -21,9 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - name: Run worker capability tests
         run: |
           node --check worker/lib/parse-capabilities.js
           bash -n worker/lib/squad-capability-preflight.sh
+          bash -n worker/lib/ralph-dispatch.sh
           bash -n worker/entrypoint.sh
           bash worker/tests/run-tests.sh

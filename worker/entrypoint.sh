@@ -269,6 +269,14 @@ NODE
     require ACA_SESSION_JOB_NAME
     require AZURE_CLIENT_ID
 
+    RALPH_DISPATCH_LIB="${RALPH_DISPATCH_LIB:-/usr/local/lib/squad-on-aca/ralph-dispatch.sh}"
+    if [[ ! -f "$RALPH_DISPATCH_LIB" ]]; then
+      log "Ralph dispatch library not found at ${RALPH_DISPATCH_LIB}; cannot dispatch."
+      exit 70
+    fi
+    # shellcheck source=lib/ralph-dispatch.sh
+    source "$RALPH_DISPATCH_LIB"
+
     az login --identity --client-id "$AZURE_CLIENT_ID" --allow-no-subscriptions >/dev/null
     if [[ -n "${AZURE_SUBSCRIPTION_ID:-}" ]]; then
       az account set --subscription "$AZURE_SUBSCRIPTION_ID"
@@ -278,9 +286,9 @@ NODE
     # (.github/workflows/squad-issue-assign.yml treats any `squad:*` label as a
     # member label), so Ralph uses the ACA-specific `squad-aca:dispatched` marker
     # to avoid triggering member assignment.
-    dispatch_label="${RALPH_DISPATCH_LABEL:-squad-aca:dispatched}"
+    RALPH_DISPATCH_LABEL="${RALPH_DISPATCH_LABEL:-squad-aca:dispatched}"
     blocked_labels_regex='(^|,)(blocked|status:blocked|status:wontfix|status:on-hold)(,|$)'
-    gh label create "$dispatch_label" --repo "$GITHUB_REPOSITORY" --color 5319E7 --description "Dispatched by Squad on ACA Ralph" --force >/dev/null 2>&1 || true
+    gh label create "$RALPH_DISPATCH_LABEL" --repo "$GITHUB_REPOSITORY" --color 5319E7 --description "Dispatched by Squad on ACA Ralph" --force >/dev/null 2>&1 || true
 
     issues_json="$(mktemp)"
     gh issue list \
@@ -290,7 +298,7 @@ NODE
       --limit "${RALPH_MAX_ISSUES:-3}" \
       --json number,title,url,labels,assignees > "$issues_json"
 
-    mapfile -t issue_rows < <(node - "$issues_json" "$dispatch_label" "$blocked_labels_regex" <<'NODE'
+    mapfile -t issue_rows < <(node - "$issues_json" "$RALPH_DISPATCH_LABEL" "$blocked_labels_regex" <<'NODE'
 const fs = require('fs');
 const [file, dispatchLabel, blockedRegexText] = process.argv.slice(2);
 const blockedRegex = new RegExp(blockedRegexText);
@@ -336,95 +344,29 @@ process.stdout.write([name, image, cpu, memory, JSON.stringify(c.env || [])].joi
 NODE
     )
 
-    session_job_name="${session_job_spec[0]:-}"
-    session_job_image="${session_job_spec[1]:-}"
-    session_job_cpu="${session_job_spec[2]:-}"
-    session_job_memory="${session_job_spec[3]:-}"
-    session_job_env_json="${session_job_spec[4]:-[]}"
+    RALPH_SESSION_JOB_CONTAINER="${session_job_spec[0]:-}"
+    RALPH_SESSION_JOB_IMAGE="${session_job_spec[1]:-}"
+    RALPH_SESSION_JOB_CPU="${session_job_spec[2]:-}"
+    RALPH_SESSION_JOB_MEMORY="${session_job_spec[3]:-}"
+    RALPH_SESSION_JOB_ENV_JSON="${session_job_spec[4]:-[]}"
 
     # ACA only applies the per-execution --env-vars override when a complete
     # execution container spec is supplied, so fail clearly if the immutable
     # template is missing image or resources rather than dispatching a run that
     # would silently ignore the env override.
-    if [[ -z "$session_job_image" || -z "$session_job_cpu" || -z "$session_job_memory" ]]; then
+    if [[ -z "$RALPH_SESSION_JOB_IMAGE" || -z "$RALPH_SESSION_JOB_CPU" || -z "$RALPH_SESSION_JOB_MEMORY" ]]; then
       log "Session job container template is missing image/cpu/memory; ACA cannot apply per-execution env without a complete container spec. Aborting Ralph dispatch."
       exit 1
     fi
-    if [[ -z "$session_job_name" ]]; then
-      session_job_name="$ACA_SESSION_JOB_NAME"
+    if [[ -z "$RALPH_SESSION_JOB_CONTAINER" ]]; then
+      RALPH_SESSION_JOB_CONTAINER="$ACA_SESSION_JOB_NAME"
     fi
 
-    for row in "${issue_rows[@]}"; do
-      IFS=$'\t' read -r issue_number issue_title issue_url <<< "$row"
-      session_name="issue-${issue_number}-$(date +%Y%m%d%H%M%S)"
-      prompt="Ralph dispatched GitHub issue #${issue_number}: ${issue_title}
-
-Issue URL: ${issue_url}
-
-Use Squad to inspect the repository, work the issue if it is actionable, create a branch, commit changes, and open a pull request. If blocked, comment on the issue with the blocker and stop."
-
-      log "Dispatching issue #${issue_number} to ACA session job ${session_name}."
-      gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$dispatch_label" >/dev/null || true
-
-      # Build the complete env set for THIS execution. Session-managed keys are
-      # stripped from the template snapshot and replaced with fresh values; all
-      # other template variables (Aspire endpoints, Azure identity, secret refs,
-      # Copilot flags) are carried forward. NUL-delimited so multi-line prompts
-      # survive intact.
-      mapfile -d '' -t start_env < <(
-        SJ_ENV="$session_job_env_json" \
-        OV_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
-        OV_GITHUB_REF="${GITHUB_REF:-${GITHUB_BASE_BRANCH:-main}}" \
-        OV_SQUAD_MODE="prompt" \
-        OV_SESSION_NAME="$session_name" \
-        OV_SQUAD_POD_ID="$session_name" \
-        OV_SQUAD_DEPLOYMENT_MODE="squad-per-pod" \
-        OV_OTEL_SERVICE_NAME="squad-$session_name" \
-        OV_ENABLE_GITHUB_REMOTE="true" \
-        OV_GITHUB_TOKEN="secretref:github-token" \
-        OV_COPILOT_GITHUB_TOKEN="secretref:copilot-github-token" \
-        OV_OTEL_EXPORTER_OTLP_HEADERS="secretref:otlp-headers" \
-        OV_SQUAD_PROMPT="$prompt" \
-        OV_PUSH_CHANGES="true" \
-        OV_OUTPUT_BRANCH="squad/issue-${issue_number}" \
-        OV_PR_TITLE="Squad: issue #${issue_number}" \
-        node - <<'NODE'
-const managed = new Set([
-  'GITHUB_REPOSITORY','GITHUB_REF','SQUAD_MODE','SESSION_NAME','SQUAD_DEPLOYMENT_MODE',
-  'SQUAD_POD_ID','OTEL_SERVICE_NAME','ENABLE_GITHUB_REMOTE','GITHUB_TOKEN',
-  'COPILOT_GITHUB_TOKEN','OTEL_EXPORTER_OTLP_HEADERS','SQUAD_PROMPT','SQUAD_TEAM',
-  'RUN_COPILOT_SMOKE','PUSH_CHANGES','OUTPUT_BRANCH','PR_TITLE','PR_BODY',
-  'COMMIT_MESSAGE','RALPH_LABELS','RALPH_MAX_ISSUES',
-]);
-const merged = new Map();
-let template = [];
-try { template = JSON.parse(process.env.SJ_ENV || '[]') || []; } catch { template = []; }
-for (const e of template) {
-  if (!e || !e.name) continue;
-  if (managed.has(e.name)) continue;
-  merged.set(e.name, e.secretRef ? `secretref:${e.secretRef}` : String(e.value ?? ''));
-}
-for (const [k, v] of Object.entries(process.env)) {
-  if (!k.startsWith('OV_')) continue;
-  merged.set(k.slice(3), String(v ?? ''));
-}
-const out = [];
-for (const [k, v] of merged) out.push(`${k}=${v}`);
-process.stdout.write(out.join('\0'));
-NODE
-      )
-
-      az containerapp job start \
-        --name "$ACA_SESSION_JOB_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --image "$session_job_image" \
-        --cpu "$session_job_cpu" \
-        --memory "$session_job_memory" \
-        --container-name "$session_job_name" \
-        --env-vars "${start_env[@]}" >/dev/null
-    done
-
-    log "Ralph dispatched ${#issue_rows[@]} issue(s)."
+    # Dispatch each issue transactionally and in isolation: env is built and
+    # validated, the ACA session job is started, and the dispatch label is added
+    # ONLY after a confirmed start. A failure on one issue is logged and skipped
+    # so the rest of the batch still runs. See worker/lib/ralph-dispatch.sh.
+    run_ralph_dispatch
     ;;
   watch|triage)
     log "Starting Squad watch."
