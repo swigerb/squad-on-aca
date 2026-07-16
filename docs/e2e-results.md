@@ -21,9 +21,8 @@ Record for every run:
 ## Static evidence (executed)
 
 - **Environment:** Windows, PowerShell 5.1, Azure CLI 2.81.0, Node.js present.
-- **Code commit at time of final validation:** `1fa2497` (`Preserve Ralph config for manual runs`).
-- **Evidence commits after validation:** `7ebd8b7` and later documentation-only updates record the live evidence; no source code changed after the `1fa2497` validation run.
-- **Date (local):** 2026-07-15.
+- **Latest code commit at time of validation:** `a388d7e` (`Fix worker checkout for fetched refs`).
+- **Date (local):** 2026-07-16.
 
 ### 1. `scripts/validate.ps1 -RunDotnet`
 
@@ -45,10 +44,14 @@ Observed (summary):
   [PASS] start-watch.ps1 parsed clean
   [PASS] validate.ps1 parsed clean
   [PASS] session-env.ps1 parsed clean
-=== Worker entrypoint (bash -n) ===
-  [PASS] worker/entrypoint.sh passed bash -n
-=== Secret scan (docs + scripts + aspire) ===
-  [PASS] No secret patterns found in docs/, scripts/, or aspire/
+  [PASS] sync-safety.ps1 parsed clean
+=== Worker bash scripts (bash -n) ===
+  [PASS] worker\entrypoint.sh passed bash -n
+  [PASS] worker\lib\squad-capability-preflight.sh passed bash -n
+  [PASS] worker\lib\ralph-dispatch.sh passed bash -n
+  [PASS] worker\lib\git-checkout.sh passed bash -n
+=== Secret scan (docs + scripts + worker + aspire) ===
+  [PASS] No secret patterns found in docs/, scripts/, worker/, or aspire/
 === .NET/Aspire scaffold ===
   [PASS] aspire/Squad.Aca.sln present
   [PASS] aspire/Squad.Aca.AppHost\Squad.Aca.AppHost.csproj present
@@ -56,17 +59,25 @@ Observed (summary):
   [PASS] aspire/README.md present
   [PASS] Squad.Aca.AppHost.csproj is valid XML
   [PASS] dotnet build succeeded
+=== Session-managed env key parity ===
+  [PASS] Session-managed env keys match across session-env.ps1 and ralph-dispatch.sh (21 keys)
+=== Sync guard secret enumeration (-uall) ===
+  [PASS] Test-SyncSafety enumerates untracked files with -uall
+  [PASS] Sync guard flags nested untracked secrets.json
+  [PASS] Sync guard flags nested untracked .pem
+  [PASS] Sync guard flags nested source containing a PAT-like token
+  [PASS] Sync guard excludes git-ignored files
 === Summary ===
-  Passed: 16
+  Passed: 26
   Failed: 0
 All validation checks passed.
 ```
 
 ### 2. Worker entrypoint bash syntax
 
-`bash -n worker/entrypoint.sh` — **PASS** (also covered by `validate.ps1` above,
-including the new Ralph per-execution dispatch block and its inline Node
-transformer heredoc).
+`bash -n worker/entrypoint.sh`, `worker/lib/squad-capability-preflight.sh`,
+`worker/lib/ralph-dispatch.sh`, and `worker/lib/git-checkout.sh` — **PASS**
+(also covered by `validate.ps1` above).
 
 ### 3. Ralph env-transformer unit check (offline)
 
@@ -109,6 +120,22 @@ Expected and present in `scripts/deploy.ps1`:
 OTLP additional ports `18889`/`18890` mapped with `external: false`, and **no**
 `Unsecured`. The idempotent create-or-`update --yaml` path uses the same
 `$aspireYaml`, so these are preserved on both first deploy and rotation/recovery.
+
+### 5. Worker test suite
+
+The Linux worker test suite was run under WSL with Node.js 24 on `a388d7e`:
+
+```text
+test_git_checkout.sh: 11 assertions run, 0 failed.
+test_parse_capabilities.sh: 62 assertions run, 0 failed.
+test_preflight.sh: 40 assertions run, 0 failed.
+test_ralph_dispatch.sh: 23 assertions run, 0 failed.
+
+All worker capability tests passed.
+```
+
+This covers the capability parser, preflight contract, transactional Ralph
+dispatch, and the shallow-clone checkout fallback for slash-bearing refs.
 
 ---
 
@@ -348,10 +375,39 @@ PASS
 - Temporary issue closed after validation.
 ```
 
+### L8. Review-fix and capability regression pass
+
+This pass validates the full code-review fix set: nested secret guard hardening,
+transactional Ralph dispatch, managed-env parity enforcement, pinned worker CI
+runtime, and the checkout fallback for fetched refs with slashes.
+
+```text
+PASS
+- Validation commit: a388d7e.
+- Validation time (UTC): 2026-07-16T16:09:39Z.
+- Worker image: acrsquadacah81u42kq.azurecr.io/squad-worker:a388d7e.
+- Smoke session: review-smoke-20260716120935.
+- Capability success session: review-cap-ok-20260716120935.
+- Capability success container: caj-squad-aca-session-9b8zaav-gx5bd.
+- Capability success log: [capability-preflight] Capability preflight passed.
+- Capability failure session: review-cap-fail-20260716120935.
+- Capability failure container: caj-squad-aca-session-nhbrspt-8dtqn.
+- Capability failure log: Unsupported required tool: definitely-not-installed-binary.
+- Telemetry session: review-telemetry-20260716120935.
+- Telemetry log: [squad-on-aca] OpenTelemetry smoke signal emitted.
+- Manual Ralph temporary issue: #11.
+- Ralph labels after dispatch: squad, squad:lead, go:needs-research, squad-aca:dispatched.
+- Ralph log: dispatched issue #11 to ACA session job issue-11-20260716162014.
+- Ralph template env diff count before/after manual run: 0.
+- Session template env diff count before/after manual run: 0.
+- Temporary capability branches and temporary issue were cleaned up after validation.
+```
+
 ---
 
 ## Result
 
 - Static evidence: **PASS** (recorded above).
-- Live-Azure evidence: **PASS** (L1-L6, L7a scheduled path, and L7b manual
-  `squad-aca ralph run` CLI path recorded above).
+- Live-Azure evidence: **PASS** (L1-L6, L7a scheduled path, L7b manual
+  `squad-aca ralph run` CLI path, and L8 review-fix/capability regression pass
+  recorded above).
