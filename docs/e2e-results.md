@@ -61,7 +61,6 @@ Observed (summary):
   [PASS] dotnet build succeeded
 === Session-managed env key parity ===
   [PASS] Session-managed env keys match across session-env.ps1 and ralph-dispatch.sh (21 keys)
-=== Sync guard secret enumeration (-uall) ===
 === Sync guard secret enumeration (NUL-delimited) ===
   [PASS] Test-SyncSafety enumerates candidates with NUL-delimited (-z) git output
   [PASS] Test-SyncSafety no longer invokes quote-prone 'git status --porcelain'
