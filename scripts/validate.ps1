@@ -312,6 +312,53 @@ if (-not (Test-Path $syncSafetyFile)) {
         Add-Pass "Test-SyncSafety no longer invokes quote-prone 'git status --porcelain'"
     }
 
+    # Bypass #1 (root-relative coverage): enumeration must be rooted at the repo
+    # top level so a nested invocation still sees the whole working tree.
+    if ($syncText -match 'rev-parse --show-toplevel') {
+        Add-Pass "Test-SyncSafety discovers the repo root (rev-parse --show-toplevel) so nested invocations cover the whole tree"
+    } else {
+        Add-Fail "Test-SyncSafety does not discover the repo root; a nested invocation could miss root-level/sibling files git add -A stages"
+    }
+
+    # Bypass #2 (byte-safe NUL parsing): git output must be read as raw bytes via
+    # a redirected process stream, never line-split by the PowerShell pipeline.
+    if ($syncText -match 'RedirectStandardOutput' -and $syncText -match 'BaseStream') {
+        Add-Pass "Test-SyncSafety reads git output byte-safely (redirected process BaseStream), avoiding pipeline newline splitting"
+    } else {
+        Add-Fail "Test-SyncSafety relies on pipeline splitting of native output; filenames containing newlines could bypass content scanning"
+    }
+
+    # Bypass #3 (case-sensitive dedupe): candidates must be de-duplicated with an
+    # ordinal comparer, not PowerShell's case-insensitive Sort-Object -Unique.
+    if ($syncText -match 'StringComparer\]::Ordinal') {
+        Add-Pass "Test-SyncSafety de-duplicates candidates with case-sensitive ordinal semantics (distinct case-only paths preserved)"
+    } else {
+        Add-Fail "Test-SyncSafety de-duplicates candidates case-insensitively; distinct case-only paths could collapse and leave one unscanned"
+    }
+
+    # Deterministic unit test for the raw NUL parser. A filename that contains a
+    # newline is legal on Linux/macOS; the parser must split ONLY on NUL so such a
+    # path survives intact rather than being torn apart the way the PowerShell
+    # pipeline would tear native command output. Feed synthetic UTF-8 bytes so the
+    # test is platform-independent (Windows cannot create a newline-named file).
+    . $syncSafetyFile
+    if (Get-Command ConvertFrom-NulDelimitedByte -ErrorAction SilentlyContinue) {
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        # Two entries: "dir/we<LF>ird.txt" and "plain.txt", NUL-terminated.
+        $synthetic = "dir/we`nird.txt`0plain.txt`0caf$([char]0x00E9)/x.env`0"
+        $parsed = ConvertFrom-NulDelimitedByte -Bytes ($utf8.GetBytes($synthetic))
+        $parsedCount = @($parsed).Count
+        $keptNewline = @($parsed | Where-Object { $_ -eq "dir/we`nird.txt" }).Count -eq 1
+        $keptNonAscii = @($parsed | Where-Object { $_ -eq "caf$([char]0x00E9)/x.env" }).Count -eq 1
+        if ($parsedCount -eq 3 -and $keptNewline -and $keptNonAscii) {
+            Add-Pass "Raw NUL parser splits only on NUL: newline-containing and non-ASCII paths survive intact"
+        } else {
+            Add-Fail "Raw NUL parser mishandled synthetic input (count=$parsedCount, newline kept=$keptNewline, non-ASCII kept=$keptNonAscii)"
+        }
+    } else {
+        Add-Fail "ConvertFrom-NulDelimitedByte helper not defined; cannot unit test byte-safe NUL parsing"
+    }
+
     $git = Get-Command git -ErrorAction SilentlyContinue
     if (-not $git) {
         Write-Host "  [SKIP] git not available for functional sync-guard test"
@@ -360,6 +407,11 @@ if (-not (Test-Path $syncSafetyFile)) {
             $pat0 = 'ghp_' + ('A' * 36)
             Set-Content -LiteralPath (Join-Path $tmpRepo "src\app\config.txt") -Value "token = $pat0"
 
+            # Root-level denylisted secret. Used by the nested-invocation test
+            # below: a guard run from a deep subdirectory must still catch this
+            # root file that `git add -A` stages.
+            Set-Content -LiteralPath (Join-Path $tmpRepo ".env") -Value "API_KEY=root-level-secret"
+
             # Denylisted secret filename at a QUOTED/ESCAPED non-ASCII path.
             New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo $nonAsciiDir) | Out-Null
             Set-Content -LiteralPath (Join-Path $tmpRepo "$nonAsciiDir\secrets.json") -Value '{"api":"value"}'
@@ -390,6 +442,29 @@ if (-not (Test-Path $syncSafetyFile)) {
             else { Add-Fail "Sync guard missed PAT-like token at a quoted/escaped non-ASCII path (content skipped due to unescaped path)" }
             if (-not $leakedIgnored) { Add-Pass "Sync guard excludes git-ignored files (including non-ASCII paths)" }
             else { Add-Fail "Sync guard flagged a git-ignored file (should be excluded)" }
+
+            # Bypass #1 regression: run the guard from a DEEP nested subdirectory.
+            # `git add -A` stages the whole tree, but git scopes diff/ls-files
+            # output to the current directory -- so a guard that enumerated from
+            # cwd would only see files under nested/deep and miss the root-level
+            # .env and the sibling certs/sub/server.pem. Repo-root-rooted
+            # enumeration must still catch both.
+            $nestedDir = Join-Path $tmpRepo "nested\deep"
+            Push-Location $nestedDir
+            try {
+                $nestedReasons = Test-SyncSafety
+                $nestedCatchesRoot = @($nestedReasons | Where-Object { $_ -match 'Blocked file: \.env ' }).Count -gt 0
+                $nestedCatchesSibling = @($nestedReasons | Where-Object { $_ -match 'certs/sub/server\.pem' }).Count -gt 0
+                $nestedCatchesLocal = @($nestedReasons | Where-Object { $_ -match 'nested/deep/secrets\.json' }).Count -gt 0
+                if ($nestedCatchesRoot) { Add-Pass "Sync guard run from a nested dir still catches the root-level .env" }
+                else { Add-Fail "Sync guard run from a nested dir missed the root-level .env (nested-cwd enumeration regression)" }
+                if ($nestedCatchesSibling) { Add-Pass "Sync guard run from a nested dir still catches a sibling nested secret (certs/sub/server.pem)" }
+                else { Add-Fail "Sync guard run from a nested dir missed a sibling nested secret (nested-cwd enumeration regression)" }
+                if ($nestedCatchesLocal) { Add-Pass "Sync guard run from a nested dir reports paths repo-root-relative (nested/deep/secrets.json)" }
+                else { Add-Fail "Sync guard run from a nested dir did not report the local nested secret repo-relative" }
+            } finally {
+                Pop-Location
+            }
         } finally {
             Pop-Location
             $env:SQUAD_ACA_ALLOW_UNSAFE_SYNC = $prevAllow
