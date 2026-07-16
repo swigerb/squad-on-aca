@@ -13,12 +13,27 @@
     scripts/validate.ps1's regression check. Dot-sourcing it has no side effects
     beyond defining Test-SyncSafety, which keeps the guard independently testable.
 
-    Untracked enumeration MUST use `git status --porcelain -uall`. Plain
-    `git status --porcelain` collapses a newly added directory to a single entry
-    (for example `secrets/`), so nested secret files inside a brand-new directory
-    would never be scanned even though `git add -A` would still stage them. The
-    `-uall` flag forces git to list every individual untracked file so nested
-    secrets cannot evade the scan.
+    Candidate enumeration MUST be NUL-delimited (`-z`). Plain
+    `git status --porcelain` returns human-readable paths: a newly added
+    directory collapses to a single entry (so nested secrets could evade the
+    scan) AND non-ASCII / special-character paths are C-quoted and octal-escaped
+    (for example `"caf\303\251/secret.txt"`). A quoted, escaped path fails
+    Test-Path, so its content is never scanned even though `git add -A` still
+    stages the real file -- a secret-guard bypass. Using `-z` output avoids all
+    quote decoding: git emits the raw path bytes terminated by NUL. We read those
+    bytes as UTF-8 so PowerShell gets a real filesystem path it can Test-Path and
+    Get-Content.
+
+    Coverage of everything `git add -A` would stage is assembled from three
+    NUL-delimited sources instead of a single porcelain call, which also sidesteps
+    the ambiguous `old\0new` rename record shape:
+      * `git diff --name-only -z`            -> unstaged tracked modifications
+      * `git diff --cached --name-only -z`   -> already-staged changes
+      * `git ls-files --others --exclude-standard -z` -> untracked, non-ignored
+    `--exclude-standard` honors .gitignore so ignored files stay excluded, and
+    ls-files --others lists every nested untracked file individually (replacing
+    the old `-uall`). Renames are handled naturally: the new path is scanned and
+    the deleted old path is skipped by the Test-Path/Get-Content content check.
 #>
 
 function Test-SyncSafety {
@@ -32,15 +47,40 @@ function Test-SyncSafety {
 
     # Candidate paths: modified/untracked working-tree files plus anything
     # already staged. --sync-all runs `git add -A`, so all of these could ship.
-    # `-uall` lists every individual untracked file (not just the top-level
-    # directory) so nested secrets inside a new directory are still scanned.
+    # Every source below is NUL-delimited (`-z`) so paths with spaces, brackets,
+    # or non-ASCII characters arrive as real, un-escaped filesystem paths that
+    # PowerShell can Test-Path/Get-Content. git emits path bytes as UTF-8; the
+    # console decoder is temporarily switched to UTF-8 so those bytes round-trip.
     $candidates = @()
-    $porcelain = git status --porcelain -uall 2>$null
-    foreach ($line in $porcelain) {
-        if (-not $line) { continue }
-        $path = $line.Substring(3).Trim().Trim('"')
-        if ($path -match ' -> ') { $path = ($path -split ' -> ')[-1].Trim().Trim('"') }
-        if ($path) { $candidates += $path }
+    $gitArgLists = @(
+        @('diff', '--name-only', '-z'),                        # unstaged tracked modifications
+        @('diff', '--cached', '--name-only', '-z'),            # already-staged changes
+        @('ls-files', '--others', '--exclude-standard', '-z')  # untracked, non-ignored
+    )
+    $prevOutputEncoding = $null
+    $encodingSwitched = $false
+    try {
+        try {
+            $prevOutputEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+            $encodingSwitched = $true
+        } catch {
+            # No console handle (e.g. fully redirected host); fall back to the
+            # existing decoder. ASCII paths are unaffected either way.
+        }
+        foreach ($argList in $gitArgLists) {
+            $out = & git @argList 2>$null
+            foreach ($chunk in @($out)) {
+                if ($null -eq $chunk) { continue }
+                foreach ($p in ($chunk -split "`0")) {
+                    if ($p) { $candidates += $p }
+                }
+            }
+        }
+    } finally {
+        if ($encodingSwitched) {
+            try { [Console]::OutputEncoding = $prevOutputEncoding } catch { }
+        }
     }
     $candidates = $candidates | Sort-Object -Unique
 

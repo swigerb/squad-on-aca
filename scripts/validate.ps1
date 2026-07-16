@@ -280,24 +280,36 @@ if (-not (Test-Path $psEnvFile)) {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Sync guard uses -uall (nested untracked secrets cannot evade the scan)
+# 6. Sync guard covers every file `git add -A` would stage (NUL-delimited)
 # ---------------------------------------------------------------------------
-# Regression guard for the public-repo sync guard: `git status --porcelain`
-# collapses a brand-new directory to a single entry, so nested secrets inside it
-# would never be scanned even though `git add -A` (run by --sync-all) still
-# stages them. Test-SyncSafety MUST enumerate with `-uall`. Assert the source
-# still uses it, then run the real guard against a throwaway repo containing
-# nested secrets to prove nested detection and ignored-file exclusion.
-Write-Section "Sync guard secret enumeration (-uall)"
+# Regression guard for the public-repo sync guard. Two historical bypasses are
+# covered here:
+#   1. Plain `git status --porcelain` collapses a brand-new directory to a
+#      single entry, so nested secrets inside it would never be scanned even
+#      though `git add -A` still stages them.
+#   2. Non-ASCII / special-character paths are C-quoted and octal-escaped by
+#      porcelain (e.g. "caf\303\251/config.txt"). The escaped string fails
+#      Test-Path, so the file's content is never scanned -- a secret-guard
+#      bypass -- even though `git add -A` stages the real file.
+# Test-SyncSafety MUST enumerate with NUL-delimited git output. Assert the
+# source uses `-z` (and no longer the escape-prone porcelain path), then run the
+# real guard against a throwaway repo containing nested secrets AND quoted/
+# escaped/non-ASCII paths to prove detection and ignored-file exclusion.
+Write-Section "Sync guard secret enumeration (NUL-delimited)"
 $syncSafetyFile = Join-Path $RepoRoot "scripts\lib\sync-safety.ps1"
 if (-not (Test-Path $syncSafetyFile)) {
     Add-Fail "scripts/lib/sync-safety.ps1 not found"
 } else {
     $syncText = Get-Content -LiteralPath $syncSafetyFile -Raw
-    if ($syncText -match 'git status --porcelain -uall') {
-        Add-Pass "Test-SyncSafety enumerates untracked files with -uall"
+    if ($syncText -match 'ls-files --others --exclude-standard -z' -and $syncText -match "diff', '--name-only', '-z'") {
+        Add-Pass "Test-SyncSafety enumerates candidates with NUL-delimited (-z) git output"
     } else {
-        Add-Fail "Test-SyncSafety does not use 'git status --porcelain -uall' (nested untracked secrets could evade the scan)"
+        Add-Fail "Test-SyncSafety does not use NUL-delimited (-z) enumeration (quoted/escaped paths could evade the scan)"
+    }
+    if ($syncText -match '=\s*git status --porcelain') {
+        Add-Fail "Test-SyncSafety still invokes escape-prone 'git status --porcelain' (non-ASCII paths get octal-escaped and skip content scanning)"
+    } else {
+        Add-Pass "Test-SyncSafety no longer invokes quote-prone 'git status --porcelain'"
     }
 
     $git = Get-Command git -ErrorAction SilentlyContinue
@@ -315,36 +327,68 @@ if (-not (Test-Path $syncSafetyFile)) {
             git config user.email "test@example.com" 2>$null | Out-Null
             git config user.name "Sync Guard Test" 2>$null | Out-Null
 
-            # Ignored file that would otherwise trip the guard -> must be excluded.
-            Set-Content -Path (Join-Path $tmpRepo ".gitignore") -Value "ignored/`n" -NoNewline
-            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "ignored") | Out-Null
-            Set-Content -Path (Join-Path $tmpRepo "ignored\secrets.json") -Value '{"token":"should-be-ignored"}'
-
-            # Nested UNTRACKED secrets inside brand-new directories. Plain
-            # --porcelain would collapse these to their top-level dir and miss them.
-            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "nested\deep") | Out-Null
-            Set-Content -Path (Join-Path $tmpRepo "nested\deep\secrets.json") -Value '{"api":"value"}'
-            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "certs\sub") | Out-Null
-            Set-Content -Path (Join-Path $tmpRepo "certs\sub\server.pem") -Value "placeholder-cert-material"
-            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "src\app") | Out-Null
-            # PAT-like token embedded in nested source (constructed so this file is not itself a secret filename).
+            # Tricky path segments that git C-quotes/escapes in plain porcelain.
+            # Built from char codes so the test does not depend on this file's
+            # source encoding. Windows forbids " * : < > ? | in names, so we use
+            # spaces, brackets, and non-ASCII (é / Cyrillic) which are the real
+            # triggers for git's octal-escaped quoting.
+            $eacute = [char]0x00E9          # é
+            $cyrKa  = [char]0x043A          # к
+            $nonAsciiDir = "caf$eacute dir [x]"   # non-ASCII + space + brackets
+            $cyrDir      = "$($cyrKa)eys sub"     # Cyrillic + space
             $pat = 'ghp_' + ('A' * 36)
-            Set-Content -Path (Join-Path $tmpRepo "src\app\config.txt") -Value "token = $pat"
+
+            # Ignored file (non-ASCII path) that would otherwise trip the guard.
+            # .gitignore MUST be written UTF-8: git compares the pattern bytes
+            # against UTF-8-encoded paths, so an ANSI-encoded non-ASCII pattern
+            # would silently fail to match and the file would leak into the scan.
+            $ignoredDir = "ignored-$eacute"
+            [System.IO.File]::WriteAllText(
+                (Join-Path $tmpRepo ".gitignore"),
+                "$ignoredDir/`n",
+                (New-Object System.Text.UTF8Encoding $false))
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo $ignoredDir) | Out-Null
+            Set-Content -LiteralPath (Join-Path $tmpRepo "$ignoredDir\secrets.json") -Value '{"token":"should-be-ignored"}'
+
+            # Nested UNTRACKED secrets inside brand-new directories (plain
+            # --porcelain would collapse these to their top-level dir).
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "nested\deep") | Out-Null
+            Set-Content -LiteralPath (Join-Path $tmpRepo "nested\deep\secrets.json") -Value '{"api":"value"}'
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "certs\sub") | Out-Null
+            Set-Content -LiteralPath (Join-Path $tmpRepo "certs\sub\server.pem") -Value "placeholder-cert-material"
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo "src\app") | Out-Null
+            $pat0 = 'ghp_' + ('A' * 36)
+            Set-Content -LiteralPath (Join-Path $tmpRepo "src\app\config.txt") -Value "token = $pat0"
+
+            # Denylisted secret filename at a QUOTED/ESCAPED non-ASCII path.
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo $nonAsciiDir) | Out-Null
+            Set-Content -LiteralPath (Join-Path $tmpRepo "$nonAsciiDir\secrets.json") -Value '{"api":"value"}'
+            # PAT-like token in a text file at a QUOTED/ESCAPED non-ASCII path
+            # (filename itself is not a secret name, so only content scanning
+            # catches it -- exactly the path the old escaped-string bug skipped).
+            New-Item -ItemType Directory -Force -Path (Join-Path $tmpRepo $cyrDir) | Out-Null
+            Set-Content -LiteralPath (Join-Path $tmpRepo "$cyrDir\config.txt") -Value "token = $pat"
 
             $reasons = Test-SyncSafety
 
             $hasNestedJson = @($reasons | Where-Object { $_ -match 'nested/deep/secrets\.json' }).Count -gt 0
             $hasPem = @($reasons | Where-Object { $_ -match 'certs/sub/server\.pem' }).Count -gt 0
             $hasPat = @($reasons | Where-Object { $_ -match 'src/app/config\.txt' }).Count -gt 0
-            $leakedIgnored = @($reasons | Where-Object { $_ -match 'ignored/secrets\.json' }).Count -gt 0
+            $leakedIgnored = @($reasons | Where-Object { $_ -match 'secrets\.json' -and $_ -match [regex]::Escape($ignoredDir) }).Count -gt 0
+            $hasNonAsciiDeny = @($reasons | Where-Object { $_ -match [regex]::Escape("$nonAsciiDir/secrets.json") }).Count -gt 0
+            $hasNonAsciiPat  = @($reasons | Where-Object { $_ -match [regex]::Escape("$cyrDir/config.txt") }).Count -gt 0
 
             if ($hasNestedJson) { Add-Pass "Sync guard flags nested untracked secrets.json" }
-            else { Add-Fail "Sync guard missed nested untracked secrets.json (--porcelain -uall regression)" }
+            else { Add-Fail "Sync guard missed nested untracked secrets.json (nested-enumeration regression)" }
             if ($hasPem) { Add-Pass "Sync guard flags nested untracked .pem" }
             else { Add-Fail "Sync guard missed nested untracked .pem" }
             if ($hasPat) { Add-Pass "Sync guard flags nested source containing a PAT-like token" }
             else { Add-Fail "Sync guard missed nested source containing a PAT-like token" }
-            if (-not $leakedIgnored) { Add-Pass "Sync guard excludes git-ignored files" }
+            if ($hasNonAsciiDeny) { Add-Pass "Sync guard flags denylisted secret at a quoted/escaped non-ASCII path" }
+            else { Add-Fail "Sync guard missed denylisted secret at a quoted/escaped non-ASCII path (porcelain-escape regression)" }
+            if ($hasNonAsciiPat) { Add-Pass "Sync guard flags PAT-like token in a text file at a quoted/escaped non-ASCII path" }
+            else { Add-Fail "Sync guard missed PAT-like token at a quoted/escaped non-ASCII path (content skipped due to unescaped path)" }
+            if (-not $leakedIgnored) { Add-Pass "Sync guard excludes git-ignored files (including non-ASCII paths)" }
             else { Add-Fail "Sync guard flagged a git-ignored file (should be excluded)" }
         } finally {
             Pop-Location
