@@ -68,8 +68,16 @@ git clone --depth "${GIT_CLONE_DEPTH:-1}" "https://github.com/${GITHUB_REPOSITOR
 cd "$REPO_DIR"
 
 if [[ -n "${GITHUB_REF:-}" ]]; then
-  git fetch --depth "${GIT_CLONE_DEPTH:-1}" origin "${GITHUB_REF}" || true
-  git checkout "${GITHUB_REF}" || git checkout -B "${GITHUB_REF}" "origin/${GITHUB_REF}"
+  GIT_CHECKOUT_LIB="${GIT_CHECKOUT_LIB:-/usr/local/lib/squad-on-aca/git-checkout.sh}"
+  if [[ -f "$GIT_CHECKOUT_LIB" ]]; then
+    # shellcheck source=lib/git-checkout.sh
+    source "$GIT_CHECKOUT_LIB"
+    checkout_github_ref "${GITHUB_REF}"
+  else
+    log "Git checkout helper not found at ${GIT_CHECKOUT_LIB}; falling back to inline checkout."
+    git fetch --depth "${GIT_CLONE_DEPTH:-1}" origin "${GITHUB_REF}" || true
+    git checkout "${GITHUB_REF}" || git checkout -B "${GITHUB_REF}" "origin/${GITHUB_REF}"
+  fi
 fi
 
 CAPABILITY_PREFLIGHT_SCRIPT="/usr/local/lib/squad-on-aca/squad-capability-preflight.sh"

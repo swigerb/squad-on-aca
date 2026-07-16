@@ -10,9 +10,8 @@
 
       1. PowerShell parse   - every scripts/*.ps1 is parsed with the PowerShell
                               language parser (syntax + tokenization).
-      2. Bash syntax check  - `bash -n` on worker/entrypoint.sh and
-                              worker/lib/squad-capability-preflight.sh when bash
-                              exists.
+      2. Bash syntax check  - `bash -n` on worker/entrypoint.sh and the
+                              worker/lib/*.sh helpers when bash exists.
       3. Secret scan        - scans tracked docs/, scripts/, worker/, and
                               aspire/ for credential file patterns and inline
                               token signatures. Generated build output
@@ -74,7 +73,8 @@ Write-Section "Worker bash scripts (bash -n)"
 $bashScripts = @(
     (Join-Path $RepoRoot "worker\entrypoint.sh"),
     (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"),
-    (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh")
+    (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh"),
+    (Join-Path $RepoRoot "worker\lib\git-checkout.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
