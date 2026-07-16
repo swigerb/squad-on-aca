@@ -21,7 +21,7 @@ Record for every run:
 ## Static evidence (executed)
 
 - **Environment:** Windows, PowerShell 5.1, Azure CLI 2.81.0, Node.js present.
-- **Latest code commit at time of validation:** `a388d7e` (`Fix worker checkout for fetched refs`).
+- **Latest code commit at time of validation:** `a10821b` (`Handle quoted paths in sync guard`).
 - **Date (local):** 2026-07-16.
 
 ### 1. `scripts/validate.ps1 -RunDotnet`
@@ -62,13 +62,17 @@ Observed (summary):
 === Session-managed env key parity ===
   [PASS] Session-managed env keys match across session-env.ps1 and ralph-dispatch.sh (21 keys)
 === Sync guard secret enumeration (-uall) ===
-  [PASS] Test-SyncSafety enumerates untracked files with -uall
+=== Sync guard secret enumeration (NUL-delimited) ===
+  [PASS] Test-SyncSafety enumerates candidates with NUL-delimited (-z) git output
+  [PASS] Test-SyncSafety no longer invokes quote-prone 'git status --porcelain'
   [PASS] Sync guard flags nested untracked secrets.json
   [PASS] Sync guard flags nested untracked .pem
   [PASS] Sync guard flags nested source containing a PAT-like token
-  [PASS] Sync guard excludes git-ignored files
+  [PASS] Sync guard flags denylisted secret at a quoted/escaped non-ASCII path
+  [PASS] Sync guard flags PAT-like token in a text file at a quoted/escaped non-ASCII path
+  [PASS] Sync guard excludes git-ignored files (including non-ASCII paths)
 === Summary ===
-  Passed: 26
+  Passed: 29
   Failed: 0
 All validation checks passed.
 ```
