@@ -21,7 +21,7 @@ Record for every run:
 ## Static evidence (executed)
 
 - **Environment:** Windows, PowerShell 5.1, Azure CLI 2.81.0, Node.js present.
-- **Latest code commit at time of validation:** `a10821b` (`Handle quoted paths in sync guard`).
+- **Latest code commit at time of validation:** `3bf003c` (`Close sync guard path edge cases`).
 - **Date (local):** 2026-07-16.
 
 ### 1. `scripts/validate.ps1 -RunDotnet`
@@ -64,14 +64,21 @@ Observed (summary):
 === Sync guard secret enumeration (NUL-delimited) ===
   [PASS] Test-SyncSafety enumerates candidates with NUL-delimited (-z) git output
   [PASS] Test-SyncSafety no longer invokes quote-prone 'git status --porcelain'
+  [PASS] Test-SyncSafety discovers the repo root (rev-parse --show-toplevel) so nested invocations cover the whole tree
+  [PASS] Test-SyncSafety reads git output byte-safely (redirected process BaseStream), avoiding pipeline newline splitting
+  [PASS] Test-SyncSafety de-duplicates candidates with case-sensitive ordinal semantics (distinct case-only paths preserved)
+  [PASS] Raw NUL parser splits only on NUL: newline-containing and non-ASCII paths survive intact
   [PASS] Sync guard flags nested untracked secrets.json
   [PASS] Sync guard flags nested untracked .pem
   [PASS] Sync guard flags nested source containing a PAT-like token
   [PASS] Sync guard flags denylisted secret at a quoted/escaped non-ASCII path
   [PASS] Sync guard flags PAT-like token in a text file at a quoted/escaped non-ASCII path
   [PASS] Sync guard excludes git-ignored files (including non-ASCII paths)
+  [PASS] Sync guard run from a nested dir still catches the root-level .env
+  [PASS] Sync guard run from a nested dir still catches a sibling nested secret (certs/sub/server.pem)
+  [PASS] Sync guard run from a nested dir reports paths repo-root-relative (nested/deep/secrets.json)
 === Summary ===
-  Passed: 29
+  Passed: 36
   Failed: 0
 All validation checks passed.
 ```
