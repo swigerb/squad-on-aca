@@ -33,21 +33,6 @@ This project is the Azure Container Apps counterpart to the AKS pattern in `tami
 - The scheduled Ralph job is the CronJob equivalent. The watcher app is an optional always-on monitor for teams that prefer continuous watch mode.
 - Aspire is hosted as a Container App instead of a local Docker container.
 
-## Aspire: telemetry sink vs. optional AppHost
-
-There are two distinct Aspire concepts in this repo. Keep them separate:
-
-| Concept | What it is | Required? | Where |
-| --- | --- | --- | --- |
-| Standalone Aspire Dashboard | The default OTLP **sink** deployed as a Container App (`ca-squad-aca-aspire`) with BrowserToken UI auth and ApiKey OTLP auth | Yes (default telemetry path) | `scripts/deploy.ps1` |
-| .NET Aspire **AppHost** | An **optional** integration path that models resources as code and can run a local telemetry-wired worker smoke | No (opt-in) | `aspire/` |
-
-The AppHost does not replace the ACA Jobs architecture and does not orchestrate
-the Squad team. It layers on top: Aspire models resources, the Agent Framework
-seam exposes the agent abstraction, ACA remains the execution substrate, and
-Squad remains the orchestration system. See
-[architecture.md](architecture.md#optional-netaspire-integration-path).
-
 ## Ralph and worker image
 
 Ralph is not a separate container image. The `squad-worker` image contains all runtime tools. Ralph is selected by setting `SQUAD_MODE=ralph`, which polls GitHub issues and starts one `caj-squad-aca-session` execution per actionable issue.
@@ -61,3 +46,17 @@ Ralph is not a separate container image. The `squad-worker` image contains all r
 | `ca-squad-aca-watch` | Container App, scale 0/1 | Optional long-running watcher |
 
 Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Contributor` on the resource group so it can start session jobs. The broad `Contributor` grant is a documented existing risk; see [validation.md](validation.md#rbac--identity-scope) for a narrower custom-role hardening path.
+
+## Capability-aware execution
+
+The worker image is fixed and its managed identity is intentionally
+scoped — it does not grant GitHub credentials beyond what's wired in,
+extra binaries, or open network egress. See
+[`docs/capability-manifest.md`](capability-manifest.md) for the capability
+manifest and preflight validation that surface unsupported repository
+requirements (extra SDKs, browsers, databases, private feeds, external
+services) as a fast, actionable failure instead of a mid-task surprise.
+That document also lists deferred follow-up work — per-task ACA
+SandboxGroup/image selection, generated egress rules, and short-lived
+least-privilege credentials — that the manifest is designed to feed but
+that this repo does not implement yet.

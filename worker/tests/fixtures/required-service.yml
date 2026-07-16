@@ -1,0 +1,5 @@
+version: 1
+services:
+  - name: postgres
+    required: true
+    reason: This fixture must be rejected; required external services are unsupported

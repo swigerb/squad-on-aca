@@ -10,11 +10,14 @@
 
       1. PowerShell parse   - every scripts/*.ps1 is parsed with the PowerShell
                               language parser (syntax + tokenization).
-      2. Bash syntax check  - `bash -n` on worker/entrypoint.sh when bash exists.
-      3. Secret scan        - scans tracked docs/, scripts/, and aspire/ for
-                              credential file patterns and inline token
-                              signatures. Generated build output (bin/, obj/)
-                              and binary files are skipped.
+      2. Bash syntax check  - `bash -n` on worker/entrypoint.sh and
+                              worker/lib/squad-capability-preflight.sh when bash
+                              exists.
+      3. Secret scan        - scans tracked docs/, scripts/, worker/, and
+                              aspire/ for credential file patterns and inline
+                              token signatures. Generated build output
+                              (bin/, obj/, node_modules/) and binary files are
+                              skipped.
       4. .NET scaffold check- validates the optional aspire/ integration scaffold
                               structure (solution + AppHost project + README) and
                               optionally runs `dotnet build` with -RunDotnet.
@@ -67,26 +70,34 @@ foreach ($file in $psFiles) {
 # ---------------------------------------------------------------------------
 # 2. Bash syntax check for the worker entrypoint
 # ---------------------------------------------------------------------------
-Write-Section "Worker entrypoint (bash -n)"
-$entrypoint = Join-Path $RepoRoot "worker\entrypoint.sh"
-if (-not (Test-Path $entrypoint)) {
-    Add-Fail "worker/entrypoint.sh not found"
-} elseif ($SkipBash) {
+Write-Section "Worker bash scripts (bash -n)"
+$bashScripts = @(
+    (Join-Path $RepoRoot "worker\entrypoint.sh"),
+    (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh")
+)
+if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
 } else {
     $bash = Get-Command bash -ErrorAction SilentlyContinue
     if (-not $bash) {
         Write-Host "  [SKIP] bash not available on PATH"
     } else {
-        # Pipe CRLF-normalized content to `bash -n` via stdin so we avoid any
-        # Windows<->bash path translation differences (WSL vs Git Bash).
-        $raw = Get-Content -LiteralPath $entrypoint -Raw
-        $lf = $raw -replace "`r`n", "`n"
-        $lf | & $bash.Source -n
-        if ($LASTEXITCODE -eq 0) {
-            Add-Pass "worker/entrypoint.sh passed bash -n"
-        } else {
-            Add-Fail "worker/entrypoint.sh failed bash -n (exit $LASTEXITCODE)"
+        foreach ($script in $bashScripts) {
+            $rel = if ($script.StartsWith($RepoRoot)) { $script.Substring($RepoRoot.Length + 1) } else { $script }
+            if (-not (Test-Path $script)) {
+                Add-Fail "$rel not found"
+                continue
+            }
+            # Pipe CRLF-normalized content to `bash -n` via stdin so we avoid any
+            # Windows<->bash path translation differences (WSL vs Git Bash).
+            $raw = Get-Content -LiteralPath $script -Raw
+            $lf = $raw -replace "`r`n", "`n"
+            $lf | & $bash.Source -n
+            if ($LASTEXITCODE -eq 0) {
+                Add-Pass "$rel passed bash -n"
+            } else {
+                Add-Fail "$rel failed bash -n (exit $LASTEXITCODE)"
+            }
         }
     }
 }
@@ -94,7 +105,7 @@ if (-not (Test-Path $entrypoint)) {
 # ---------------------------------------------------------------------------
 # 3. Secret scan of tracked docs/, scripts/, and aspire/
 # ---------------------------------------------------------------------------
-Write-Section "Secret scan (docs + scripts + aspire)"
+Write-Section "Secret scan (docs + scripts + worker + aspire)"
 $secretPatterns = @(
     @{ Name = "GitHub token";        Regex = 'gh[pousr]_[A-Za-z0-9]{30,}' },
     @{ Name = "GitHub fine PAT";     Regex = 'github_pat_[A-Za-z0-9_]{40,}' },
@@ -107,13 +118,14 @@ $secretPatterns = @(
 # Allow-listed placeholders that legitimately look token-ish in docs.
 $allowList = @('secretref:', 'keyvaultref:', 'identityref:', '<', '>')
 
-$scanRoots = @("docs", "scripts", "aspire") | ForEach-Object { Join-Path $RepoRoot $_ }
+$scanRoots = @("docs", "scripts", "worker", "aspire") | ForEach-Object { Join-Path $RepoRoot $_ }
 $scanFiles = foreach ($root in $scanRoots) {
     if (Test-Path $root) {
-        # Skip generated build output (bin/, obj/) so the scan stays fast and
-        # only covers source-controlled, human-authored files.
+        # Skip generated build output (bin/, obj/) and installed dependencies
+        # (node_modules/) so the scan stays fast and only covers
+        # source-controlled, human-authored files.
         Get-ChildItem -Path $root -File -Recurse |
-            Where-Object { $_.FullName -notmatch '\\(bin|obj)\\' }
+            Where-Object { $_.FullName -notmatch '\\(bin|obj|node_modules)\\' }
     }
 }
 # Extensions that are binary/compiled and never contain reviewable secrets.
@@ -148,7 +160,7 @@ foreach ($bad in $badNames) {
     Add-Fail "Credential-style file tracked under docs/scripts/aspire: $rel"
     $secretHits++
 }
-if ($secretHits -eq 0) { Add-Pass "No secret patterns found in docs/, scripts/, or aspire/" }
+if ($secretHits -eq 0) { Add-Pass "No secret patterns found in docs/, scripts/, worker/, or aspire/" }
 
 # ---------------------------------------------------------------------------
 # 4. Optional .NET/Aspire scaffold structure

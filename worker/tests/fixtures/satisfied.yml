@@ -1,0 +1,6 @@
+version: 1
+tools:
+  - name: git
+    required: true
+  - name: node
+    required: true

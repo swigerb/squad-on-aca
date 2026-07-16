@@ -229,6 +229,26 @@ See [docs/validation.md](docs/validation.md) for the full sprint/E2E checklist a
 security validation steps (OTLP auth, exposure, RBAC, secret scans, token
 separation, rotation, public sync guard, image pinning).
 
+The worker's capability-aware preflight has its own dependency-free test suite.
+When `bash` and `node` are available, run it directly:
+
+```bash
+bash worker/tests/run-tests.sh   # parser + preflight unit/integration tests
+node --check worker/lib/parse-capabilities.js
+```
+
+The same suite runs in CI via [`.github/workflows/worker-tests.yml`](.github/workflows/worker-tests.yml).
+
+## Capability-aware execution
+
+Repositories can commit a `squad-capabilities.yml` manifest declaring the
+tools, credentials, services, and egress a session needs. A preflight step runs
+after clone and before Squad/Copilot starts, failing fast with an actionable
+error when a required tool or credential is missing instead of failing mid-task.
+The manifest never carries shell commands, and the check adds no network, RBAC,
+or egress. See [docs/capability-manifest.md](docs/capability-manifest.md) for the
+manifest contract, built-in allowlists, security posture, and configuration.
+
 ## Security notes
 
 - The user-assigned managed identity currently holds **Contributor** on the

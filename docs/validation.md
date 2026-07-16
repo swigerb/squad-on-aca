@@ -22,9 +22,16 @@ pre-push hook.
 | Check | What it does | Why |
 | --- | --- | --- |
 | PowerShell parse | Parses every `scripts/*.ps1` (including `scripts/lib/`) with the PowerShell language parser | Catches syntax errors without executing deploy/dispatch logic |
-| Worker `bash -n` | Runs `bash -n` on `worker/entrypoint.sh` (CRLF-normalized) | Catches shell syntax errors in the container entrypoint |
-| Secret scan | Scans tracked `docs/`, `scripts/`, and `aspire/` for token patterns and credential filenames (skips `bin/`, `obj/`, and binary files) | Keeps the public repo free of secrets |
+| Worker `bash -n` | Runs `bash -n` on `worker/entrypoint.sh` and `worker/lib/squad-capability-preflight.sh` (CRLF-normalized) | Catches shell syntax errors in the container entrypoint and capability preflight |
+| Secret scan | Scans tracked `docs/`, `scripts/`, `worker/`, and `aspire/` for token patterns and credential filenames (skips `bin/`, `obj/`, `node_modules/`, and binary files) | Keeps the public repo free of secrets |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
+| Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser and preflight contract |
+
+The capability manifest contract itself is documented in
+[capability-manifest.md](capability-manifest.md): manifest schema, built-in
+tool/credential allowlists, the advisory-only handling of `services`/`egress`
+(required services are rejected at validation), and the entrypoint fail-closed
+behavior when the packaged preflight script is missing.
 
 ## Sprint validation checklist
 
@@ -34,6 +41,8 @@ Run these in order. Static checks first (fast, no Azure), then E2E.
 
 - [ ] `.\scripts\validate.ps1` passes.
 - [ ] `bash -n worker/entrypoint.sh` passes (also covered by validate.ps1).
+- [ ] `node --check worker/lib/parse-capabilities.js` passes.
+- [ ] `bash worker/tests/run-tests.sh` passes (capability parser + preflight suite).
 - [ ] `git grep` finds no personal subscription IDs, tenant IDs, tokens, or user
       handles in tracked files (see [Secret scans](#secret-scans)).
 - [ ] Optional: `.\scripts\validate.ps1 -RunDotnet` builds `aspire/Squad.Aca.sln`.

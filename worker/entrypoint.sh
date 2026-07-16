@@ -72,6 +72,27 @@ if [[ -n "${GITHUB_REF:-}" ]]; then
   git checkout "${GITHUB_REF}" || git checkout -B "${GITHUB_REF}" "origin/${GITHUB_REF}"
 fi
 
+CAPABILITY_PREFLIGHT_SCRIPT="/usr/local/lib/squad-on-aca/squad-capability-preflight.sh"
+CAPABILITY_MANIFEST_RELATIVE="${CAPABILITY_MANIFEST_PATH:-squad-capabilities.yml}"
+capability_preflight_disabled=false
+case "${SQUAD_CAPABILITY_PREFLIGHT:-}" in
+  disabled|disable|off|false|0) capability_preflight_disabled=true ;;
+esac
+if [[ "${SKIP_CAPABILITY_PREFLIGHT:-false}" == "true" ]]; then
+  capability_preflight_disabled=true
+fi
+if [[ -x "$CAPABILITY_PREFLIGHT_SCRIPT" ]]; then
+  "$CAPABILITY_PREFLIGHT_SCRIPT" "$REPO_DIR"
+elif [[ "$capability_preflight_disabled" == "true" ]]; then
+  log "Capability preflight script not found at ${CAPABILITY_PREFLIGHT_SCRIPT}; preflight explicitly disabled, continuing."
+elif [[ -f "${REPO_DIR}/${CAPABILITY_MANIFEST_RELATIVE}" ]]; then
+  log "Capability preflight script missing at ${CAPABILITY_PREFLIGHT_SCRIPT} but this repository declares a capability manifest (${CAPABILITY_MANIFEST_RELATIVE}); failing closed so unsupported requirements are not silently ignored."
+  log "Set SQUAD_CAPABILITY_PREFLIGHT=disabled (or SKIP_CAPABILITY_PREFLIGHT=true) to override at your own risk."
+  exit 78
+else
+  log "Capability preflight script not found at ${CAPABILITY_PREFLIGHT_SCRIPT} and no manifest present; skipping."
+fi
+
 if [[ ! -f ".squad/team.md" ]]; then
   log "No .squad/team.md found; initializing a default Squad in the ephemeral workspace."
   squad init --preset "${SQUAD_PRESET:-default}" --no-workflows
