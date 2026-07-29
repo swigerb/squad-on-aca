@@ -20,6 +20,13 @@
       4. .NET scaffold check- validates the optional aspire/ integration scaffold
                               structure (solution + AppHost project + README) and
                               optionally runs `dotnet build` with -RunDotnet.
+      5. Env key parity     - session-managed env keys must match between the
+                              PowerShell and worker dispatch paths.
+      6. Sync guard         - regression tests for the public-repo secret guard.
+      7. Logs fallback      - regression tests for `squad-aca logs` (issue #13):
+                              exit-code propagation, suppressed interactive
+                              extension install, and the Log Analytics fallback.
+                              Uses a fake `az` on PATH; no Azure access.
 
     Exit code is 0 when all checks pass, 1 otherwise. Use this before pushing
     and as the E2E "sprint gate" documented in docs/validation.md.
@@ -470,6 +477,301 @@ if (-not (Test-Path $syncSafetyFile)) {
             $env:SQUAD_ACA_ALLOW_UNSAFE_SYNC = $prevAllow
             Remove-Item -Recurse -Force $tmpRepo -ErrorAction SilentlyContinue
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 7. squad-aca logs: exit-code propagation, no interactive install, LA fallback
+# ---------------------------------------------------------------------------
+# Regression guard for GitHub issue #13. `squad-aca logs` used to call
+# `az containerapp job logs show` (a `containerapp` CLI *extension* command) as
+# the last statement of Invoke-Logs. On a host without the extension az printed
+# an argparse traceback, blocked on an interactive install prompt, and the
+# command still exited 0 -- a false green during incident response.
+#
+# The checks below are fully offline. A fake `az` is placed first on PATH (the
+# same technique worker/tests/test_ralph_dispatch.sh uses for az/gh) and each
+# scenario is driven through env vars, so no Azure call is ever made.
+Write-Section "squad-aca logs fallback + exit code"
+$acaLogsFile = Join-Path $RepoRoot "scripts\lib\aca-logs.ps1"
+$squadAcaFile = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+if (-not (Test-Path $acaLogsFile)) {
+    Add-Fail "scripts/lib/aca-logs.ps1 not found"
+} elseif (-not (Test-Path $squadAcaFile)) {
+    Add-Fail "scripts/squad-aca.ps1 not found"
+} else {
+    $squadAcaText = Get-Content -LiteralPath $squadAcaFile -Raw
+
+    # Source assertions: the bare, unchecked extension call must be gone and the
+    # doctor table must surface which log path `logs` will take.
+    if ($squadAcaText -match 'az containerapp job logs show') {
+        Add-Fail "Invoke-Logs still calls 'az containerapp job logs show' directly (exit code unchecked, extension required)"
+    } else {
+        Add-Pass "Invoke-Logs no longer calls 'az containerapp job logs show' directly"
+    }
+    if ($squadAcaText -match 'Get-AcaExecutionLog') {
+        Add-Pass "Invoke-Logs delegates to Get-AcaExecutionLog (exit-code checked, Log Analytics fallback)"
+    } else {
+        Add-Fail "Invoke-Logs does not delegate to Get-AcaExecutionLog"
+    }
+    if ($squadAcaText -match 'Check = "Logs path"') {
+        Add-Pass "squad-aca doctor reports the active logs path"
+    } else {
+        Add-Fail "squad-aca doctor has no 'Logs path' check (issue #13 asked for it)"
+    }
+
+    . $acaLogsFile
+
+    $stubRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("aca-logs-" + [guid]::NewGuid().ToString("N"))
+    $stubBin = Join-Path $stubRoot "bin"
+    New-Item -ItemType Directory -Force -Path $stubBin | Out-Null
+
+    # Fake `az`. Records one marker line per call. If dynamic extension install
+    # was NOT suppressed it records PROMPT-RISK, which stands in for the real
+    # CLI's interactive "install it now? (Y/n)" prompt that blocks on stdin.
+    # Every branch exits from a label, never from inside a parenthesized block:
+    # cmd.exe does not reliably propagate `exit /b <n>` out of nested blocks, and
+    # a stub that always returned 0 would silently make these checks meaningless.
+    $azStub = @'
+@echo off
+setlocal
+if not "%AZURE_EXTENSION_USE_DYNAMIC_INSTALL%"=="no" >>"%SQUAD_TEST_AZ_LOG%" echo PROMPT-RISK %1 %2 %3
+>>"%SQUAD_TEST_AZ_LOG%" echo CALL %1 %2 %3 %4
+
+if "%1"=="extension" goto :extension
+if "%1"=="containerapp" goto :containerapp
+if "%1"=="monitor" goto :monitor
+exit /b 0
+
+:extension
+if "%4"=="containerapp" goto :ext_containerapp
+if "%4"=="log-analytics" goto :ext_loganalytics
+exit /b 1
+
+:ext_containerapp
+if not "%SQUAD_TEST_AZ_EXT_CONTAINERAPP%"=="1" goto :ext_containerapp_missing
+exit /b 0
+:ext_containerapp_missing
+echo ERROR: Extension 'containerapp' is not installed.>&2
+exit /b 1
+
+:ext_loganalytics
+if not "%SQUAD_TEST_AZ_EXT_LOGANALYTICS%"=="1" goto :ext_loganalytics_missing
+exit /b 0
+:ext_loganalytics_missing
+echo ERROR: Extension 'log-analytics' is not installed.>&2
+exit /b 1
+
+:containerapp
+if not "%SQUAD_TEST_AZ_EXT_CONTAINERAPP%"=="1" goto :containerapp_noext
+if "%SQUAD_TEST_AZ_LOGS_FAIL%"=="1" goto :containerapp_fail
+echo native-log-line-1
+echo native-log-line-2
+exit /b 0
+:containerapp_noext
+echo ERROR: The command requires the extension containerapp.>&2
+exit /b 2
+:containerapp_fail
+echo ERROR: simulated containerapp logs failure>&2
+exit /b 1
+
+:monitor
+if not "%SQUAD_TEST_AZ_EXT_LOGANALYTICS%"=="1" goto :monitor_noext
+if "%3"=="workspace" goto :monitor_workspace
+if "%3"=="query" goto :monitor_query
+exit /b 1
+:monitor_noext
+echo ERROR: The command requires the extension log-analytics.>&2
+exit /b 2
+:monitor_workspace
+echo 00000000-0000-0000-0000-000000000000
+exit /b 0
+:monitor_query
+if "%SQUAD_TEST_AZ_QUERY_FAIL%"=="1" goto :monitor_query_fail
+echo [{"TimeGenerated":"2026-07-28T00:00:00Z","Log_s":"fallback-log-line-1"},{"TimeGenerated":"2026-07-28T00:00:01Z","Log_s":"fallback-log-line-2"}]
+exit /b 0
+:monitor_query_fail
+echo ERROR: simulated Log Analytics query failure>&2
+exit /b 1
+'@
+    Set-Content -LiteralPath (Join-Path $stubBin "az.cmd") -Value $azStub -Encoding ascii
+
+    $prevPath = $env:PATH
+    $prevDynamic = $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL
+    $hadDynamic = Test-Path Env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL
+    $env:PATH = "$stubBin;$prevPath"
+    $env:SQUAD_TEST_AZ_LOG = Join-Path $stubRoot "az-calls.log"
+
+    function Reset-AzStubState {
+        param([string]$Containerapp = "0", [string]$LogAnalytics = "0", [string]$LogsFail = "0", [string]$QueryFail = "0")
+        Set-Content -LiteralPath $env:SQUAD_TEST_AZ_LOG -Value "" -Encoding ascii
+        $env:SQUAD_TEST_AZ_EXT_CONTAINERAPP = $Containerapp
+        $env:SQUAD_TEST_AZ_EXT_LOGANALYTICS = $LogAnalytics
+        $env:SQUAD_TEST_AZ_LOGS_FAIL = $LogsFail
+        $env:SQUAD_TEST_AZ_QUERY_FAIL = $QueryFail
+    }
+    function Get-AzStubCalls {
+        if (-not (Test-Path $env:SQUAD_TEST_AZ_LOG)) { return @() }
+        return @(Get-Content -LiteralPath $env:SQUAD_TEST_AZ_LOG | Where-Object { $_ -and $_.Trim() })
+    }
+
+    try {
+        # Guard: the fake az must actually be the one being resolved. If PATH
+        # stubbing silently failed, every check below would hit the real CLI.
+        $resolvedAz = (Get-Command az -ErrorAction SilentlyContinue)
+        if (-not $resolvedAz -or $resolvedAz.Source -ne (Join-Path $stubBin "az.cmd")) {
+            Add-Fail "Could not stub 'az' on PATH for the logs regression test (resolved: $($resolvedAz.Source))"
+        } else {
+            Add-Pass "Fake 'az' is first on PATH; logs regression test runs fully offline"
+        }
+
+        # --- 1. Native path is preferred when the extension is present --------
+        Reset-AzStubState -Containerapp "1" -LogAnalytics "1"
+        $native = Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5
+        $nativeCalls = Get-AzStubCalls
+        if ($native.Source -eq "containerapp-extension" -and @($native.Lines) -contains "native-log-line-2" `
+                -and -not (@($nativeCalls) -match 'CALL monitor')) {
+            Add-Pass "Logs use the containerapp extension path when the extension is installed"
+        } else {
+            Add-Fail "Logs did not use the containerapp extension path when available (source=$($native.Source))"
+        }
+
+        # --- 2. Fallback when the extension is absent -------------------------
+        Reset-AzStubState -Containerapp "0" -LogAnalytics "1"
+        $fallback = Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5 -WorkspaceName "law-test"
+        $fallbackLines = @($fallback.Lines)
+        if ($fallback.Source -eq "log-analytics" -and $fallbackLines.Count -eq 2 `
+                -and $fallbackLines -contains "fallback-log-line-1" -and $fallbackLines -contains "fallback-log-line-2" `
+                -and $fallback.Workspace -eq "law-test") {
+            Add-Pass "Logs fall back to Log Analytics when the containerapp extension is absent"
+        } else {
+            Add-Fail "Logs did not fall back to Log Analytics correctly (source=$($fallback.Source), lines=$($fallbackLines.Count))"
+        }
+
+        # --- 2b. Same fallback under Windows PowerShell 5.1 -------------------
+        # squad-aca.ps1 runs under Windows PowerShell through the .cmd shim, and
+        # 5.1 does NOT unroll a JSON array the way pwsh 7 does. Validating only
+        # under the host that runs validate.ps1 would miss a row-flattening bug
+        # that silently turns real log lines into blanks.
+        $winPs = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        if (-not (Test-Path $winPs)) {
+            Write-Host "  [SKIP] Windows PowerShell 5.1 not present for cross-host log parsing check"
+        } else {
+            Reset-AzStubState -Containerapp "0" -LogAnalytics "1"
+            $winScript = ". '$acaLogsFile'; " +
+                "`$r = Get-AcaExecutionLog -ResourceGroup 'rg-test' -JobName 'caj-test' -ExecutionName 'caj-test-abc' -Tail 5 -WorkspaceName 'law-test'; " +
+                "foreach (`$l in @(`$r.Lines)) { Write-Output `"ROW:`$l`" }"
+            $winOut = @(& $winPs -NoProfile -NonInteractive -Command $winScript 2>&1 | ForEach-Object { [string]$_ })
+            $winRows = @($winOut | Where-Object { $_ -match '^ROW:' })
+            if ($winRows.Count -eq 2 -and ($winRows -contains "ROW:fallback-log-line-1") -and ($winRows -contains "ROW:fallback-log-line-2")) {
+                Add-Pass "Log Analytics rows survive intact under Windows PowerShell 5.1 (the host the squad-aca shim uses)"
+            } else {
+                Add-Fail "Log Analytics rows were mangled under Windows PowerShell 5.1 (got $($winRows.Count) row(s): $($winRows -join ' | '))"
+            }
+        }
+
+        # --- 3. Fallback when the extension exists but its call fails ---------
+        Reset-AzStubState -Containerapp "1" -LogAnalytics "1" -LogsFail "1"
+        $afterFail = Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5
+        $afterFailCalls = Get-AzStubCalls
+        $triedNative = @($afterFailCalls | Where-Object { $_ -match 'CALL containerapp job logs' }).Count -gt 0
+        $triedQuery = @($afterFailCalls | Where-Object { $_ -match 'CALL monitor log-analytics query' }).Count -gt 0
+        if ($afterFail.Source -eq "log-analytics" -and $triedNative -and $triedQuery) {
+            Add-Pass "A failing 'az containerapp job logs show' falls through to the Log Analytics query"
+        } else {
+            Add-Fail "A failing containerapp logs call did not fall through to Log Analytics (source=$($afterFail.Source), native=$triedNative, query=$triedQuery)"
+        }
+
+        # --- 4. Both paths unavailable => terminating, actionable error -------
+        Reset-AzStubState -Containerapp "0" -LogAnalytics "0"
+        $threw = $false
+        $message = ""
+        try {
+            Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5 -WorkspaceName "law-test" | Out-Null
+        } catch {
+            $threw = $true
+            $message = [string]$_.Exception.Message
+        }
+        if ($threw -and $message -match 'az extension add --name containerapp' -and $message -match 'az extension add --name log-analytics' -and $message -match 'law-test') {
+            Add-Pass "Both log paths unavailable produces a terminating, actionable error"
+        } else {
+            Add-Fail "Both log paths unavailable did not produce an actionable terminating error (threw=$threw)"
+        }
+
+        # --- 5. A failing Log Analytics query must also be fatal --------------
+        Reset-AzStubState -Containerapp "0" -LogAnalytics "1" -QueryFail "1"
+        $queryThrew = $false
+        try {
+            Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5 | Out-Null
+        } catch {
+            $queryThrew = $true
+        }
+        if ($queryThrew) {
+            Add-Pass "A failing Log Analytics query is fatal instead of silently returning nothing"
+        } else {
+            Add-Fail "A failing Log Analytics query was swallowed (false green)"
+        }
+
+        # --- 6. No az call may risk the interactive install prompt ------------
+        $promptRisks = @(Get-AzStubCalls | Where-Object { $_ -match '^PROMPT-RISK' })
+        Reset-AzStubState -Containerapp "0" -LogAnalytics "0"
+        try { Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5 | Out-Null } catch { }
+        $promptRisks += @(Get-AzStubCalls | Where-Object { $_ -match '^PROMPT-RISK' })
+        if ($promptRisks.Count -eq 0) {
+            Add-Pass "Every az invocation runs with AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no (no interactive install prompt can block)"
+        } else {
+            Add-Fail "$($promptRisks.Count) az invocation(s) could trigger the interactive extension-install prompt"
+        }
+
+        # --- 7. The suppression env var must be restored ----------------------
+        $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = "sentinel-value"
+        Reset-AzStubState -Containerapp "1" -LogAnalytics "1"
+        Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5 | Out-Null
+        $restoredSet = ($env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL -eq "sentinel-value")
+        Remove-Item Env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL -ErrorAction SilentlyContinue
+        Reset-AzStubState -Containerapp "1" -LogAnalytics "1"
+        Get-AcaExecutionLog -ResourceGroup "rg-test" -JobName "caj-test" -ExecutionName "caj-test-abc" -Tail 5 | Out-Null
+        $restoredUnset = -not (Test-Path Env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL)
+        if ($restoredSet -and $restoredUnset) {
+            Add-Pass "AZURE_EXTENSION_USE_DYNAMIC_INSTALL is restored after log retrieval (set and unset cases)"
+        } else {
+            Add-Fail "AZURE_EXTENSION_USE_DYNAMIC_INSTALL leaked after log retrieval (set restored=$restoredSet, unset restored=$restoredUnset)"
+        }
+
+        # --- 8. End-to-end exit code: a failed log fetch must not exit 0 ------
+        # The original bug was an exit code, not a message, so assert the real
+        # process exit code of a host that runs the same call path.
+        Reset-AzStubState -Containerapp "0" -LogAnalytics "0"
+        $psExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $childScript = ". '$acaLogsFile'; " +
+            "`$ErrorActionPreference = 'Stop'; " +
+            "Get-AcaExecutionLog -ResourceGroup 'rg-test' -JobName 'caj-test' -ExecutionName 'caj-test-abc' -Tail 5 -WorkspaceName 'law-test' | Out-Null"
+        & $psExe -NoProfile -NonInteractive -Command $childScript 2>&1 | Out-Null
+        $childExit = $LASTEXITCODE
+        if ($childExit -ne 0) {
+            Add-Pass "A failed log fetch exits non-zero (observed exit $childExit; issue #13 regression)"
+        } else {
+            Add-Fail "A failed log fetch still exits 0 (issue #13 regression: false green)"
+        }
+
+        # --- 9. --tail must reach the Log Analytics query ---------------------
+        $kql = Get-AcaLogAnalyticsQuery -ExecutionName "caj-test-abc" -Tail 42
+        if ($kql -match 'top 42 by TimeGenerated desc' -and $kql -match "startswith 'caj-test-abc'" -and $kql -match 'ContainerAppConsoleLogs_CL') {
+            Add-Pass "--tail and the execution name are honoured by the Log Analytics query"
+        } else {
+            Add-Fail "Log Analytics query ignores --tail or the execution name: $kql"
+        }
+    } finally {
+        $env:PATH = $prevPath
+        foreach ($name in @("SQUAD_TEST_AZ_LOG", "SQUAD_TEST_AZ_EXT_CONTAINERAPP", "SQUAD_TEST_AZ_EXT_LOGANALYTICS", "SQUAD_TEST_AZ_LOGS_FAIL", "SQUAD_TEST_AZ_QUERY_FAIL")) {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+        }
+        if ($hadDynamic) {
+            $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = $prevDynamic
+        } else {
+            Remove-Item Env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL -ErrorAction SilentlyContinue
+        }
+        Remove-Item -Recurse -Force $stubRoot -ErrorAction SilentlyContinue
     }
 }
 
