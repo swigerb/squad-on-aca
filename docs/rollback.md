@@ -46,7 +46,86 @@ required.
 
 The default ACA deployment keeps working regardless of the AppHost state.
 
-## 2. ACA worker image / session job
+## 2. ACA Sandboxes (feature-flagged, preview)
+
+Use this when a sandbox-routed session misbehaves, when a credential is
+suspected exposed, or when you simply want every dispatch back on ACA Jobs.
+**ACA Jobs are the unconditional default and the rollback path**; this section
+is a documented, tested procedure, not a hope.
+
+### The two independent fail-closed interlocks
+
+Both must be open for a dispatch to reach a sandbox. Either one alone returns
+every dispatch to ACA Jobs, so a rollback that touches only one is still safe:
+
+1. **The feature flag.** `SQUAD_ACA_ENABLE_SANDBOX` is unset or falsy by
+   default. With it off, `New-SessionExecutionProvider` returns the ACA Jobs
+   adapter *before* it reads the class catalog, resolves a route, or looks for
+   the `aca` binary.
+2. **The catalog's `provisional` marker.** `config/sandbox-classes.json` ships
+   with `"provisional": true`, which makes the sandbox route fail closed
+   (`reason: catalog-provisional`) **even with the flag on**. Only an
+   administrator setting `"provisional": false` — after reviewing each class's
+   image, egress template and `limits` — opens it.
+
+`scripts/validate.ps1` asserts both interlocks, and
+`scripts/tests/verify-cli-golden.ps1` plus
+`scripts/tests/compare-cli-baseline.ps1 -BaselineRef main` assert that with the
+flag off the control plane behaves byte-for-byte as it does with no sandbox code
+present.
+
+### Immediate rollback to ACA Jobs
+
+```powershell
+Remove-Item Env:SQUAD_ACA_ENABLE_SANDBOX      # or, as an explicit kill switch:
+$env:SQUAD_ACA_ENABLE_SANDBOX = "0"
+```
+
+`0`, `false`, `no` and `off` are an explicit kill switch: they win even over a
+deployment config that opted in. The flag is an environment variable, not a
+config key, so rolling back needs no file edit and nothing that syncs config can
+turn it back on.
+
+To roll back for **everyone**, not just your shell, set the catalog back to
+provisional — this is the interlock that survives someone else's environment:
+
+```powershell
+# config/sandbox-classes.json
+#   "provisional": true
+.\scripts\validate.ps1
+```
+
+### Then clean up what is already running
+
+Turning the flag off does **not** tear down sandboxes that are already running,
+and it does **not** revoke credentials.
+
+```powershell
+aca sandbox list -o json                            # squad-<session id> is ours
+aca sandbox delete -l name=squad-<session> --yes
+aca sandboxgroup credential delete --id <id> --yes  # credentials live on the GROUP
+```
+
+`squad-aca stop <session>` does both automatically for a session it still knows
+about, and reports loudly if a credential could not be revoked. For anything it
+could not reach, use the reaper and the credential delete above — see
+[runbook.md](runbook.md) (*Concurrency, cost and orphans*).
+
+### Verify the rollback
+
+- [ ] `squad-aca run "<prompt>"` dispatches to an ACA Job
+      (`squad-aca sessions` shows a job execution, not a sandbox).
+- [ ] `aca sandbox list -o json` contains no `squad-*` entries.
+- [ ] `aca sandboxgroup credential list` contains nothing belonging to a
+      finished session. **Do not capture this output** — it returns values.
+- [ ] `.\scripts\validate.ps1`, `verify-cli-golden.ps1` and
+      `compare-cli-baseline.ps1 -BaselineRef main` all pass.
+
+For credential exposure, identity, TLS-interception and orphan **incidents** —
+as opposed to a routine rollback — follow the incident runbook in
+[runbook.md](runbook.md).
+
+## 3. ACA worker image / session job
 
 Use this when a new worker image regresses sessions, Ralph, or the watcher.
 
@@ -84,7 +163,7 @@ Use this when a new worker image regresses sessions, Ralph, or the watcher.
   Session/Ralph jobs self-heal on redeploy because a changed login server changes
   the image string, forcing a delete + recreate with the current registry settings.
 
-## 3. Aspire token / secrets
+## 4. Aspire token / secrets
 
 Use this after a suspected token leak, a bad rotation, or a lost browser token.
 
@@ -106,7 +185,7 @@ Use this after a suspected token leak, a bad rotation, or a lost browser token.
 - Pick up the new browser token from the regenerated `deploy.outputs.json`. Never
   paste tokens into tracked files or share the dashboard URL publicly.
 
-## 4. Ralph / watch
+## 5. Ralph / watch
 
 Use this to stop unattended dispatch without touching the rest of the deployment.
 
@@ -133,7 +212,7 @@ Use this to stop unattended dispatch without touching the rest of the deployment
   squad-aca sessions --limit 20
   ```
 
-## 5. Full resource-group destroy / redeploy
+## 6. Full resource-group destroy / redeploy
 
 Last resort when the environment is unrecoverable or you want a clean rebuild.
 

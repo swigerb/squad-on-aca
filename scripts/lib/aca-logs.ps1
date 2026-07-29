@@ -114,6 +114,123 @@ function Invoke-CliSafe {
     }
 }
 
+function Invoke-CliSafeWithStdin {
+    <#
+    .SYNOPSIS
+        Run an external CLI, feeding a SECRET to it on standard input, and
+        capture stdout, stderr and the REAL exit code.
+
+    .DESCRIPTION
+        The companion to Invoke-CliSafe for the one thing Invoke-CliSafe cannot
+        do: hand a credential to a process without that credential ever being an
+        argument.
+
+        Why this exists at all. An argument vector is not private. On Linux it is
+        world-readable at /proc/<pid>/cmdline for the life of the process, it is
+        what `ps` prints, it is what a shell writes to its history, and it is what
+        every CLI wrapper in this repository renders into an error message. A
+        token passed as `--token <value>` is therefore disclosed to every other
+        process on the box, and redaction (Get-SandboxSafeArgv) only protects the
+        rendering, not the kernel-visible argv. Standard input has none of those
+        properties: it is a pipe between exactly two processes.
+
+        `aca sandboxgroup credential create` documents that the token may be
+        omitted from the command line and read from stdin, so this is the
+        platform's own supported path, not a workaround.
+
+        Implementation notes that are load-bearing:
+
+          * PowerShell's call operator cannot write to a child's stdin, so this
+            drops to System.Diagnostics.Process directly. UseShellExecute must be
+            false for redirection to be possible.
+          * stdout and stderr are drained CONCURRENTLY (ReadToEndAsync on both
+            before waiting). Reading one to the end before the other deadlocks as
+            soon as a child fills the pipe buffer it is not being drained on.
+          * The stdin writer uses a UTF8 encoding with NO byte-order mark. A BOM
+            would be prepended to the token and the service would reject it with
+            an error that looks like a bad credential.
+          * A trailing newline IS written: line-oriented readers (`read`,
+            `set /p`, most CLIs) block forever without it.
+          * The secret is never placed in $Arguments, never in an environment
+            variable, and is not returned in the result.
+          * A binary that cannot be started reports exit 127, matching
+            Invoke-CliSafe, so callers classify both the same way.
+
+    .PARAMETER StandardInput
+        The text written to the child's stdin. Treated as a secret: it is not
+        logged, not echoed, and not included in the returned object.
+
+    .OUTPUTS
+        The same shape Invoke-CliSafe returns: ExitCode, StdOut, StdErr.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [AllowEmptyString()][string]$StandardInput = "",
+        [System.Collections.IDictionary]$EnvironmentOverrides = @{},
+        [int]$TimeoutSeconds = 120
+    )
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $FilePath
+    foreach ($arg in @($Arguments)) { $psi.ArgumentList.Add([string]$arg) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    foreach ($name in @($EnvironmentOverrides.Keys)) {
+        $psi.Environment[[string]$name] = [string]$EnvironmentOverrides[$name]
+    }
+
+    $stdout = ""
+    $stderr = ""
+    $process = $null
+    try {
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $psi
+        if (-not $process.Start()) {
+            return [pscustomobject]@{ ExitCode = 127; StdOut = @(); StdErr = @("could not start '$FilePath'") }
+        }
+
+        # Start draining BOTH pipes before anything can block on them.
+        $outTask = $process.StandardOutput.ReadToEndAsync()
+        $errTask = $process.StandardError.ReadToEndAsync()
+
+        # No BOM, and a terminating newline so a line-oriented reader on the far
+        # side actually returns.
+        $writer = [System.IO.StreamWriter]::new($process.StandardInput.BaseStream, [System.Text.UTF8Encoding]::new($false))
+        try {
+            $writer.Write([string]$StandardInput)
+            $writer.Write("`n")
+            $writer.Flush()
+        } finally {
+            $writer.Dispose()
+        }
+
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill($true) } catch { }
+            return [pscustomobject]@{
+                ExitCode = 124
+                StdOut   = @()
+                StdErr   = @("timed out after ${TimeoutSeconds}s")
+            }
+        }
+        $stdout = $outTask.GetAwaiter().GetResult()
+        $stderr = $errTask.GetAwaiter().GetResult()
+
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut   = @(($stdout -split "`r?`n") | Where-Object { $_ -ne "" })
+            StdErr   = @(($stderr -split "`r?`n") | Where-Object { $_ -ne "" })
+        }
+    } catch {
+        return [pscustomobject]@{ ExitCode = 127; StdOut = @(); StdErr = @([string]$_.Exception.Message) }
+    } finally {
+        if ($process) { $process.Dispose() }
+    }
+}
+
 function Invoke-AzPromptSafe {
     <#
     .SYNOPSIS

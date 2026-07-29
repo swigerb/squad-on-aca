@@ -243,6 +243,39 @@ null
 ]
 '@
 
+    # Concurrency ceiling: two OTHER squad-owned sandboxes are already live, so a
+    # class with maxConcurrentSandboxes = 2 must refuse a third.
+    Set-Content -LiteralPath (Join-Path $fixtureDir "sandbox-list-busy.json") -Encoding ascii -Value @'
+[
+  { "labels": { "name": "squad-other-one" }, "status": "Running" },
+  { "labels": { "name": "squad-other-two" }, "status": "Running" },
+  { "labels": { "name": "not-ours-either" }, "status": "Running" },
+  { "labels": { "name": "not-ours-again" }, "status": "Running" }
+]
+'@
+
+    # Reaper fixture. The dates are absolute rather than relative on purpose:
+    # a fixture whose meaning depends on when the suite runs is the class of
+    # non-determinism that already broke this repository's goldens on CI once.
+    #   - squad-orphan-old   far past      -> a candidate
+    #   - squad-fresh-one    far future    -> never a candidate
+    #   - squad-unknown-age  no timestamp  -> undecidable, never deleted
+    #   - not-ours-orphan    far past      -> not ours, never touched
+    Set-Content -LiteralPath (Join-Path $fixtureDir "sandbox-list-reaper.json") -Encoding ascii -Value @'
+[
+  { "labels": { "name": "squad-orphan-old" }, "status": "Running", "createdAt": "2020-01-02T03:04:05" },
+  { "labels": { "name": "squad-fresh-one" }, "status": "Running", "createdAt": "2099-01-02T03:04:05" },
+  { "labels": { "name": "squad-unknown-age" }, "status": "Running" },
+  { "labels": { "name": "not-ours-orphan" }, "status": "Running", "createdAt": "2020-01-02T03:04:05" }
+]
+'@
+
+    # Brokered credential creation returns an OPAQUE id; the token itself is
+    # written to stdin and never appears in the response.
+    Set-Content -LiteralPath (Join-Path $fixtureDir "credential-create.json") -Encoding ascii -Value @'
+{ "id": "cred-stub-0001", "type": "github-copilot" }
+'@
+
     # --- Fake `az` ----------------------------------------------------------
     # Flat goto-based dispatch (no nested parenthesised blocks) so cmd.exe
     # parsing stays predictable for arguments containing [], {} and =.
@@ -361,6 +394,13 @@ exit /b 0
     # `-c` argument carries a whole shell command full of &, > and | and must
     # arrive intact. Delayed expansion is switched on only where the command
     # text has to be inspected.
+    #
+    # Sprint 7 added STDIN handling. `set /p` reads one line from standard
+    # input, which is exactly how the real `aca` accepts a token that must not
+    # appear on a command line. Recording what arrived on stdin to a file is
+    # what turns "the credential is delivered out of band" into a behavioural
+    # assertion: the test can prove BOTH that the token never appeared in the
+    # recorded argv AND that the full value still reached the process.
     Set-Content -LiteralPath (Join-Path $binDir "aca.cmd") -Encoding ascii -Value @'
 @echo off
 >>"%SQUAD_STUB_ACA_LOG%" echo %*
@@ -384,10 +424,28 @@ if "%A2%"=="list" goto acalist
 if "%A2%"=="delete" goto acadelete
 goto acaok
 :acasbg
+if "%A2%"=="credential" goto acacred
 if not "%A2%"=="disk" goto acaok
 if not "%A3%"=="list" goto acaok
 type "%SQUAD_STUB_FIXTURES%\disk-list.json"
 exit /b %SQUAD_STUB_ACA_RC%
+:acacred
+if "%A3%"=="delete" goto acacreddel
+if not "%A3%"=="create" goto acaok
+set "TOK="
+set /p TOK=
+if not "%SQUAD_STUB_ACA_CRED_STDIN%"=="" >"%SQUAD_STUB_ACA_CRED_STDIN%" echo %TOK%
+if not "%SQUAD_STUB_ACA_CRED_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_CRED_ERR%
+if not "%SQUAD_STUB_ACA_CRED_RC%"=="0" exit /b %SQUAD_STUB_ACA_CRED_RC%
+if "%SQUAD_STUB_ACA_CRED_ID%"=="" goto acacredfixture
+echo {"id": "%SQUAD_STUB_ACA_CRED_ID%"}
+exit /b 0
+:acacredfixture
+type "%SQUAD_STUB_FIXTURES%\credential-create.json"
+exit /b 0
+:acacreddel
+if not "%SQUAD_STUB_ACA_CREDDEL_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_CREDDEL_ERR%
+exit /b %SQUAD_STUB_ACA_CREDDEL_RC%
 :acacreate
 echo STUB-SANDBOX-CREATED
 if not "%SQUAD_STUB_ACA_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_ERR%
@@ -398,8 +456,14 @@ exit /b %SQUAD_STUB_ACA_EGRESS_RC%
 :acalifecycle
 exit /b %SQUAD_STUB_ACA_RC%
 :acalist
+if "%SQUAD_STUB_ACA_LIST_RC%"=="" set "SQUAD_STUB_ACA_LIST_RC=%SQUAD_STUB_ACA_RC%"
+if not "%SQUAD_STUB_ACA_LIST_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_LIST_ERR%
+if "%SQUAD_STUB_ACA_LIST_FIXTURE%"=="" goto acalistdefault
+type "%SQUAD_STUB_FIXTURES%\%SQUAD_STUB_ACA_LIST_FIXTURE%"
+exit /b %SQUAD_STUB_ACA_LIST_RC%
+:acalistdefault
 type "%SQUAD_STUB_FIXTURES%\sandbox-list.json"
-exit /b %SQUAD_STUB_ACA_RC%
+exit /b %SQUAD_STUB_ACA_LIST_RC%
 :acadelete
 if not "%SQUAD_STUB_ACA_DELETE_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_DELETE_ERR%
 exit /b %SQUAD_STUB_ACA_DELETE_RC%
@@ -411,12 +475,20 @@ if exist "%SQUAD_STUB_ACA_TIMEOUT_ONCE%" goto acaexec2
 exit /b 1
 :acaexec2
 setlocal enabledelayedexpansion
+if not "!CMD:squad-credentials-staged=!"=="!CMD!" goto acaseed
 if not "!CMD:squad-launched=!"=="!CMD!" goto acalaunch
 if not "!CMD:squad-cancelled=!"=="!CMD!" goto acacancel
 if not "!CMD:echo marker=!"=="!CMD!" goto acapoll
 if not "!CMD:tail -n=!"=="!CMD!" goto acalogs
 endlocal
 goto acaok
+:acaseed
+endlocal
+set "TOK="
+set /p TOK=
+if not "%SQUAD_STUB_ACA_SEED_STDIN%"=="" >"%SQUAD_STUB_ACA_SEED_STDIN%" echo %TOK%
+echo squad-credentials-staged
+exit /b %SQUAD_STUB_ACA_SEED_RC%
 :acalaunch
 endlocal
 echo squad-launched
