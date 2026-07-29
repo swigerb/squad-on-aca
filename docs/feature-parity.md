@@ -56,8 +56,27 @@ extra binaries, or open network egress. See
 manifest and preflight validation that surface unsupported repository
 requirements (extra SDKs, browsers, databases, private feeds, external
 services) as a fast, actionable failure instead of a mid-task surprise.
-That document also covers the deterministic routing decision the manifest now
-produces (ACA job, approved sandbox class, or fail-closed) — computed and
-reported, but not yet acted upon — and lists the deferred follow-up work:
-per-task Azure Container Apps Sandboxes selection, generated egress rules, and
-short-lived least-privilege credentials.
+That document also covers the deterministic routing decision the manifest
+produces: run on the default ACA job, run on an approved sandbox class, or fail
+closed.
+
+## ACA Sandboxes execution plane
+
+`squad-aca` can also dispatch a session to **Azure Container Apps Sandboxes**
+instead of an ACA Job. This has no `squad-on-aks` counterpart, so it is listed
+here rather than in the parity table. It is an **opt-in preview**, off by
+default behind `SQUAD_ACA_ENABLE_SANDBOX`, and gated a second time by the
+`"provisional": true` marker in `config/sandbox-classes.json`. ACA Jobs remain
+the unconditional default and the rollback path.
+
+The plane adds per-session isolation and default-deny, capability-scoped egress
+— neither of which the ACA Jobs plane provides. On ACA Jobs, `egress[]` entries
+in a manifest stay advisory, and GitHub and Azure access stay a long-lived token
+pair plus one shared user-assigned managed identity.
+
+Enabling the flag currently opens the route gate and nothing more: no
+`squad-aca` command yet passes the capability resolution to
+`New-SessionExecutionProvider`, so every dispatch still runs on ACA Jobs. See
+the [README](../README.md#aca-sandboxes-opt-in-preview),
+[runbook.md](runbook.md#aca-sandboxes-preview-feature-flagged-off), and
+[rollback.md](rollback.md#2-aca-sandboxes-feature-flagged-preview).
