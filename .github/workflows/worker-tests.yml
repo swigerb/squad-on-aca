@@ -86,13 +86,13 @@ jobs:
 
       # PR #9 was closed for an observable `squad-aca stop` output regression.
       # validate.ps1 now asserts stop stdout, but the only guard that compares
-      # the WHOLE observable surface -- exit code, every az/gh argv, stdout and
+      # the WHOLE observable surface -- exit code, every az/gh/squad argv, stdout and
       # stderr, across 22 CLI invocations -- is the golden gate. Its sibling,
       # compare-cli-baseline.ps1, needs a second git revision materialised and
       # fails permanently once a CLI change is intended, so it stays a manual
       # developer tool; the goldens are committed, so this runs on every push
       # and pull request. An intended CLI change is a reviewable diff produced
       # by `verify-cli-golden.ps1 -Update`, never a silent behaviour change.
-      # Offline: fake az/gh .cmd shims on PATH, synthetic config, no network.
+      # Offline: fake az/gh/squad .cmd shims on PATH, synthetic config, no network.
       - name: Verify squad-aca CLI goldens (scripts/tests/verify-cli-golden.ps1)
         run: ./scripts/tests/verify-cli-golden.ps1

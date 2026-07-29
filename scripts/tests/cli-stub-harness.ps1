@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Offline test harness that runs scripts/squad-aca.ps1 against stubbed `az`
-    and `gh` binaries on PATH.
+    Offline test harness that runs scripts/squad-aca.ps1 against stubbed `az`,
+    `gh` and `squad` binaries on PATH.
 
 .DESCRIPTION
     The CLI's observable behaviour is (a) what it prints, (b) the exit code it
@@ -13,12 +13,20 @@
         that is prepended to PATH. They append every invocation (one line per
         call, raw command line) to a log file and emit canned fixtures, so a
         test can assert exactly which Azure calls were made and in what order.
+      * `squad.cmd` is stubbed in the same bin directory. `squad-aca doctor`
+        reports whether the optional `squad` CLI is on PATH, so without a stub
+        its table reads "ok" on a machine that has Squad installed and
+        "optional" on one that does not -- and because `Format-Table -AutoSize`
+        sizes the Status column to its widest cell, that one word re-pads every
+        row of the table. Stubbing it makes the answer the same everywhere.
       * HOME / USERPROFILE are redirected to a throwaway directory holding a
         synthetic `~/.squad-on-aca/config.json`, so the developer's real
         deployment config can never influence a test run.
       * The CLI runs in a child process of the SAME PowerShell host, with
         stdout and stderr redirected to files, so the process exit code is
-        observed exactly as a user's shell would see it.
+        observed exactly as a user's shell would see it. That child is started
+        with DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 so dates and numbers render
+        under the invariant culture rather than the host's locale.
 
     This mirrors the fake-`az`/fake-`gh`-on-PATH pattern already used by
     worker/tests/test_ralph_dispatch.sh. Nothing here touches Azure, GitHub, or
@@ -70,8 +78,10 @@ function New-SquadCliStubEnvironment {
 
     $azLog = Join-Path $Root "az-calls.log"
     $ghLog = Join-Path $Root "gh-calls.log"
+    $squadLog = Join-Path $Root "squad-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $ghLog -Value "" -NoNewline -Encoding ascii
+    Set-Content -LiteralPath $squadLog -Value "" -NoNewline -Encoding ascii
 
     # --- Synthetic deployment config (never the developer's real one) --------
     $config = [ordered]@{
@@ -94,11 +104,20 @@ function New-SquadCliStubEnvironment {
 ]
 '@
 
+    # startTime deliberately carries NO UTC offset. ConvertFrom-Json turns an
+    # offset-bearing instant into a DateTime with Kind=Local, so `sessions`
+    # would render it in the host's time zone -- 03:04 on a UTC CI runner,
+    # 22:04 the previous day on a UTC-5 laptop -- and, because
+    # `Format-Table -AutoSize` sizes the Started column to its widest cell, the
+    # whole table would re-pad with it. An offset-free timestamp parses as
+    # Kind=Unspecified, so no conversion happens and every machine renders the
+    # identical wall clock. This pins the value instead of masking it: the
+    # Started column is still compared character for character.
     Set-Content -LiteralPath (Join-Path $fixtureDir "exec-show.json") -Encoding ascii -Value @'
 {
   "properties": {
     "status": "Running",
-    "startTime": "2026-01-02T03:04:05+00:00",
+    "startTime": "2026-01-02T03:04:05",
     "endTime": null,
     "template": {
       "containers": [
@@ -117,12 +136,13 @@ function New-SquadCliStubEnvironment {
 '@
 
     # Same execution, still coming up. Used to prove the ACA adapter's `wait`
-    # actually polls until the execution leaves Provisioning.
+    # actually polls until the execution leaves Provisioning. Same offset-free
+    # startTime, for the same time-zone reason as above.
     Set-Content -LiteralPath (Join-Path $fixtureDir "exec-show-provisioning.json") -Encoding ascii -Value @'
 {
   "properties": {
     "status": "Provisioning",
-    "startTime": "2026-01-02T03:04:05+00:00",
+    "startTime": "2026-01-02T03:04:05",
     "endTime": null,
     "template": {
       "containers": [
@@ -247,6 +267,21 @@ echo []
 exit /b 0
 '@
 
+    # --- Fake `squad` -------------------------------------------------------
+    # `squad` is OPTIONAL for squad-aca (only `init` uses it, with an npx
+    # fallback), so whether it is installed is a property of the developer's
+    # machine, not of the CLI. `doctor` reports that as ok / optional. Stubbing
+    # it makes the answer "installed" on every machine, which is what keeps the
+    # doctor golden portable. It logs like the other shims, so if any command
+    # ever starts shelling out to it that becomes a visible capture diff rather
+    # than a silent behaviour change.
+    Set-Content -LiteralPath (Join-Path $binDir "squad.cmd") -Encoding ascii -Value @'
+@echo off
+>>"%SQUAD_STUB_SQUAD_LOG%" echo %*
+echo STUB-SQUAD-ACK
+exit /b 0
+'@
+
     return [pscustomobject]@{
         Root       = $Root
         BinDir     = $binDir
@@ -255,6 +290,7 @@ exit /b 0
         WorkDir    = $workDir
         AzLog      = $azLog
         GhLog      = $ghLog
+        SquadLog   = $squadLog
     }
 }
 
@@ -298,24 +334,30 @@ function Initialize-SquadCliStubRepository {
 function Reset-SquadCliStubLog {
     <#
     .SYNOPSIS
-        Truncates the recorded az/gh invocation logs between cases.
+        Truncates the recorded az/gh/squad invocation logs between cases.
     #>
     param([Parameter(Mandatory = $true)][object]$Stub)
     Set-Content -LiteralPath $Stub.AzLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $Stub.GhLog -Value "" -NoNewline -Encoding ascii
+    if ($Stub.SquadLog) { Set-Content -LiteralPath $Stub.SquadLog -Value "" -NoNewline -Encoding ascii }
 }
 
 function Get-SquadCliStubCall {
     <#
     .SYNOPSIS
-        Returns the recorded command lines for the fake az (default) or gh.
+        Returns the recorded command lines for the fake az (default), gh or
+        squad.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
-        [ValidateSet("az", "gh")][string]$Tool = "az"
+        [ValidateSet("az", "gh", "squad")][string]$Tool = "az"
     )
-    $path = if ($Tool -eq "gh") { $Stub.GhLog } else { $Stub.AzLog }
-    if (-not (Test-Path $path)) { return @() }
+    $path = switch ($Tool) {
+        "gh"    { $Stub.GhLog }
+        "squad" { $Stub.SquadLog }
+        default { $Stub.AzLog }
+    }
+    if (-not $path -or -not (Test-Path $path)) { return @() }
     $raw = Get-Content -LiteralPath $path -Raw
     if (-not $raw) { return @() }
     return @(($raw -split "`r?`n") | Where-Object { $_ -ne "" } | ForEach-Object { $_.Trim() })
@@ -349,7 +391,9 @@ function Invoke-SquadCliCapture {
     $errFile = Join-Path $Stub.Root ("err-" + [guid]::NewGuid().ToString("N") + ".txt")
 
     $envNames = @("PATH", "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE",
-                  "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_FIXTURES",
+                  "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT",
+                  "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
+                  "SQUAD_STUB_FIXTURES",
                   "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC",
                   "SQUAD_STUB_STOP_ERR", "SQUAD_STUB_EXEC_SEQ", "SQUAD_STUB_EXEC_STUCK")
     $saved = @{}
@@ -369,7 +413,13 @@ function Invoke-SquadCliCapture {
         $env:HOMEPATH = $Stub.HomeDir.Substring($root.Length)
         $env:SQUAD_STUB_AZ_LOG = $Stub.AzLog
         $env:SQUAD_STUB_GH_LOG = $Stub.GhLog
+        $env:SQUAD_STUB_SQUAD_LOG = $Stub.SquadLog
         $env:SQUAD_STUB_FIXTURES = $Stub.FixtureDir
+        # Dates and numbers otherwise render under the host's locale, so a
+        # capture taken on an en-US box would not match one taken on a de-DE
+        # box. .NET honours this switch on every platform, including Windows,
+        # where there is no per-process time-zone or culture override.
+        $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $env:SQUAD_STUB_STOP_RC = "$StopExitCode"
         $env:SQUAD_STUB_START_RC = "$StartExitCode"
         # The adapter-level checks in validate.ps1 drive these; a CLI capture
@@ -396,11 +446,12 @@ function Invoke-SquadCliCapture {
     Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
     return [pscustomobject]@{
-        ExitCode = $exitCode
-        StdOut   = $stdout
-        StdErr   = $stderr
-        AzCalls  = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
-        GhCalls  = @(Get-SquadCliStubCall -Stub $Stub -Tool gh)
+        ExitCode   = $exitCode
+        StdOut     = $stdout
+        StdErr     = $stderr
+        AzCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
+        GhCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool gh)
+        SquadCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool squad)
     }
 }
 

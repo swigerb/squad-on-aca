@@ -8,6 +8,7 @@ containerapp job execution list --name caj-squad-aca-session --resource-group rg
 containerapp job execution list --name caj-squad-aca-ralph --resource-group rg-squad-stub --query [0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime} -o table
 containerapp show --name ca-squad-aca-aspire --resource-group rg-squad-stub --query properties.configuration.ingress.fqdn -o tsv
 ### GH CALLS
+### SQUAD CALLS
 ### STDOUT
 Container Apps:
 

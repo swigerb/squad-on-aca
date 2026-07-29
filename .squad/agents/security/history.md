@@ -80,3 +80,82 @@ feature flag — Sprint 5. `terminate` is still not wired to any CLI command, so
 `squad-aca stop` keeps its exact pass-through semantics. `worker/lib/*` and
 `worker/entrypoint.sh` untouched. `compare-cli-baseline.ps1` was left as a
 developer tool rather than promoted to CI, for the reason recorded above.
+
+## Golden gate CI failure: pinned the environment the goldens depend on
+
+**What happened.** I predicted this in the previous entry: *"Goldens verified
+only on this machine under pwsh 7; the first CI run is the real proof."* It was.
+The gate failed on `windows-latest` in 4 of 22 cases — and it failed correctly.
+It caught real non-determinism in its own fixtures, not a CLI regression.
+
+Two classes:
+
+1. **Time zone** (02, 03, 16). The stub `az` fixture returned
+   `"startTime": "2026-01-02T03:04:05+00:00"`. `ConvertFrom-Json` turns an
+   offset-bearing instant into `Kind=Local`, so `sessions` rendered
+   `1/1/2026 10:04:05 PM` on my UTC-4 box and `1/2/2026 3:04:05 AM` on the UTC
+   runner. Because `Format-Table -AutoSize` sizes every column to its widest
+   cell, that one value re-padded the header and separator rows too.
+2. **Optional tool availability** (11-doctor). `squad` is installed here and not
+   on the runner, so `doctor` printed `squad ok` vs `squad optional` — and again
+   the Status column width rippled through all 12 rows of the table.
+
+**Fix: pin, do not mask.** A mask deletes the value it hides; every masked byte
+is a byte the gate can no longer regress on. So each dependency is pinned at its
+source in `cli-stub-harness.ps1`:
+
+* *Time zone* — the `exec-show*.json` fixtures now carry an **offset-free**
+  `startTime`. That parses as `Kind=Unspecified`, so no local conversion
+  happens and every machine renders the identical wall clock. The `Started`
+  column is still compared character for character.
+* *Culture* — the CLI child process is started with
+  `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`. Windows .NET has no per-process
+  time-zone or culture override, but it does honour this switch, so dates and
+  numbers no longer render in the capture machine's locale. This was not one of
+  the two CI failures; it is the same class of hole, found while fixing them.
+* *Optional tools* — `squad.cmd` is now stubbed into the harness bin directory
+  alongside `az.cmd`/`gh.cmd`, so `doctor` reports it installed everywhere. It
+  logs its argv like the other shims, and captures gained a `### SQUAD CALLS`
+  section, so a command that starts shelling out to `squad` is a visible diff
+  rather than a silent change.
+
+Nothing was regenerated "on CI's values" and no assertion was weakened.
+
+**Documented honestly.** The reviewer previously (correctly) pinged an
+inaccurate claim that the normaliser "ignores one thing only". `docs/validation.md`
+now has a "What makes a golden portable" section listing the three pins and the
+**complete** ten-item list of masks (`<TS>`, `<SCRIPTS>`, `<STUB>`, `<LINE>`,
+`<TMP>`, `<HOME>`, `<SHA>`, ANSI SGR, the console-width-truncated error-record
+source echo, CRLF→LF), plus a copy-pasteable local CI simulation. The same list
+is mirrored in `Get-PortableCapture` and referenced from `verify-cli-golden.ps1`.
+
+**The pins are themselves guarded.** `validate.ps1` section 10 gained three
+checks (101 → 104): the stub fixtures carry no UTC offset, the capture child
+pins invariant globalization, and `squad` is stubbed onto PATH. Removing a pin
+is now a failing check here, not a red CI run days later.
+
+**Verification — under CI-like conditions, not just mine.** I changed the
+machine time zone with `tzutil` and stripped `squad` from PATH:
+
+* TZ **UTC**, no `squad`: goldens **22/22, exit 0**.
+* TZ **Tokyo Standard Time (UTC+9)**, no `squad`: goldens **22/22, exit 0** and
+  `validate.ps1` **104/0**. Time zone restored afterwards.
+* Normal environment: `validate.ps1` **104 passed / 0 failed**;
+  `verify-cli-golden.ps1` **22/22, exit 0**;
+  `compare-cli-baseline.ps1 -BaselineRef main` 19/22 byte-identical, **22/22
+  ignoring the error-line annotation, exit 0**.
+* Worker suite: **6 suites / 302 assertions (123/11/62/40/23/43), 0 failed,
+  0 skipped**.
+* Goldens confirmed byte-LF in the worktree, matching
+  `.gitattributes` (`scripts/tests/golden/cli/*.txt text eol=lf`).
+
+**Mutation-tested again — the one thing this gate exists to catch.** Re-applied
+`| Out-Null` to the ACA `cancel` az call: `verify-cli-golden.ps1` exits **1** on
+`07-stop-byexec`, `08-stop-latest`, `10-stop-azfail` (the lost `STUB-STOP-ACK`
+line), and `validate.ps1` exits **1** with both `stop` stdout failures. The
+normalisation does not mask the PR #9 regression class. Mutation reverted;
+`git status --short` clean for `scripts/lib/`.
+
+**Lesson recorded.** Local success proved nothing; the runner was the test. Any
+future change to the harness or goldens should be run through the documented
+local CI simulation before pushing.

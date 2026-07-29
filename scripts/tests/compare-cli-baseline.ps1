@@ -18,9 +18,9 @@
     scripts/tests/verify-cli-golden.ps1 (the committed-golden gate CI runs).
 
     Nothing here touches Azure or GitHub. `scripts/tests/cli-stub-harness.ps1`
-    puts fake `az.cmd`/`gh.cmd` on PATH, points HOME at a throwaway directory
-    with a synthetic config, and gives the `run`/`sync` cases a real git repo
-    whose "origin" is a local bare repo.
+    puts fake `az.cmd`/`gh.cmd`/`squad.cmd` on PATH, points HOME at a throwaway
+    directory with a synthetic config, and gives the `run`/`sync` cases a real
+    git repo whose "origin" is a local bare repo.
 
     KNOWN, UNAVOIDABLE DEVIATION
     PowerShell annotates an uncaught error with the *source line number* of the

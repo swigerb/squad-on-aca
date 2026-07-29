@@ -2,6 +2,7 @@
 ### EXITCODE: 1
 ### AZ CALLS
 ### GH CALLS
+### SQUAD CALLS
 ### STDOUT
 
 ### STDERR

@@ -7,12 +7,13 @@ containerapp job execution list --name caj-squad-aca-session --resource-group rg
 containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub01 -o json
 containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub02 -o json
 ### GH CALLS
+### SQUAD CALLS
 ### STDOUT
 
-Execution                    Status  Session      Mode   Repository Branch             Started              Ended
----------                    ------  -------      ----   ---------- ------             -------              -----
-caj-squad-aca-session-stub01 Running stub-session prompt octo/demo  squad/stub-session 1/1/2026 10:04:05 PM 
-caj-squad-aca-session-stub02 Running stub-session prompt octo/demo  squad/stub-session 1/1/2026 10:04:05 PM 
+Execution                    Status  Session      Mode   Repository Branch             Started             Ended
+---------                    ------  -------      ----   ---------- ------             -------             -----
+caj-squad-aca-session-stub01 Running stub-session prompt octo/demo  squad/stub-session 01/02/2026 03:04:05 
+caj-squad-aca-session-stub02 Running stub-session prompt octo/demo  squad/stub-session 01/02/2026 03:04:05 
 
 
 ### STDERR

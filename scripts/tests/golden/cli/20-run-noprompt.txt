@@ -5,6 +5,7 @@ account set --subscription 00000000-0000-0000-0000-000000000000
 containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
 ### GH CALLS
 repo view --json nameWithOwner --jq .nameWithOwner
+### SQUAD CALLS
 ### STDOUT
 
 ### STDERR

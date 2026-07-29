@@ -9,6 +9,7 @@ containerapp job start --name caj-squad-aca-session --resource-group rg-squad-st
 ### GH CALLS
 repo view --json nameWithOwner --jq .nameWithOwner
 repo view octo/demo --json defaultBranchRef --jq .defaultBranchRef.name
+### SQUAD CALLS
 ### STDOUT
 STUB-START-ACK
 

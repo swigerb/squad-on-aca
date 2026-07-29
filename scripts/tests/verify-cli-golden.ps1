@@ -15,19 +15,26 @@
 
     This script closes that gap with the pattern the worker suite already uses
     for routing decisions (docs/validation.md, "Golden decision fixtures"): the
-    same 22 CLI invocations are driven through the stubbed `az`/`gh`
-    environment, and each capture -- exit code, every `az`/`gh` argv, stdout and
-    stderr -- is compared against a file committed under
+    same 22 CLI invocations are driven through the stubbed `az`/`gh`/`squad`
+    environment, and each capture -- exit code, every `az`/`gh`/`squad` argv,
+    stdout and stderr -- is compared against a file committed under
     scripts/tests/golden/cli/.
 
     An intended CLI change is therefore a reviewable diff in the goldens rather
     than a silently-accepted behaviour change. Regenerate with -Update and
     review the diff before committing.
 
-    Captures are made machine-portable (temp roots, home directories, error
-    source-line annotations and ANSI colour sequences are folded out) so the
-    same goldens verify on a developer's box and on a CI runner. Everything
-    observable -- exit codes, az/gh argv, message text -- is compared as-is.
+    Captures are made machine-portable in two ways, both documented in full in
+    docs/validation.md ("What makes a golden portable") and in
+    Get-PortableCapture. Environment dependence is PINNED at the source where
+    possible -- the stub fixtures' timestamps carry no UTC offset (host time
+    zone), the CLI child runs with DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 (host
+    culture), and the optional `squad` CLI is stubbed onto PATH (host tool
+    availability). What cannot be pinned is masked: <TS>, <SCRIPTS>, <STUB>,
+    <LINE>, <TMP>, <HOME>, <SHA>, ANSI SGR sequences, PowerShell's
+    console-width-truncated error-record source echo, and CRLF. Nothing else:
+    exit codes, every az/gh/squad argv and all message text are compared byte
+    for byte.
 
     Requires Windows: the `az`/`gh` stubs are .cmd shims.
 

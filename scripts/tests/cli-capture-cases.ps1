@@ -15,10 +15,10 @@
         scripts/tests/golden/cli/. Needs no second revision, so it runs in CI on
         every push and pull request.
 
-    A capture records the exit code, every recorded `az`/`gh` argv, stdout and
-    stderr for one invocation. stdout is in there deliberately: PR #9 was closed
-    for an observable `stop` output regression, and a guard that only counts az
-    calls and checks the exit code cannot see one.
+    A capture records the exit code, every recorded `az`/`gh`/`squad` argv,
+    stdout and stderr for one invocation. stdout is in there deliberately: PR #9
+    was closed for an observable `stop` output regression, and a guard that only
+    counts az calls and checks the exit code cannot see one.
 
     Nothing here touches Azure, GitHub, or the network.
 #>
@@ -90,10 +90,49 @@ function Get-PortableCapture {
     .DESCRIPTION
         Get-NormalizedCapture only removes what differs between two runs on the
         same machine. A committed golden additionally has to survive a different
-        user name, temp directory, checkout path, PowerShell host banner width
-        and error colourisation -- so those are folded out here. Everything that
-        is actually observable behaviour (exit code, az/gh argv, message text)
-        is left untouched.
+        user name, temp directory, checkout path, PowerShell host width and
+        error colourisation.
+
+        Environment dependence is removed by PINNING at the source wherever that
+        is possible, because a pin keeps the value under comparison while a mask
+        throws it away:
+
+          * time zone   -- the stub `az` fixtures carry an offset-free
+                           startTime, so `sessions` renders the same wall clock
+                           in any host time zone (cli-stub-harness.ps1).
+          * culture     -- the CLI child process runs with
+                           DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+                           (cli-stub-harness.ps1).
+          * optional tools -- `squad` is stubbed onto PATH alongside `az`/`gh`,
+                           so `doctor` reports it installed everywhere
+                           (cli-stub-harness.ps1).
+
+        What is left genuinely cannot be pinned, so it is masked here and in
+        Get-NormalizedCapture. The COMPLETE list of masks is:
+
+          1. <TS>      timestamps of the form yyyyMMdd-HHmmss (generated
+                       session/branch names).
+          2. <SCRIPTS> the absolute path of the scripts/ tree under capture.
+          3. <STUB>    the GUID in the throwaway stub root directory name.
+          4. <LINE>    the line number in a "squad-aca.ps1:<n>" error header.
+          5. <TMP>     the temp root (GetTempPath, %TEMP%, %TMP%, and the 8.3
+                       form C:\Users\X~1\AppData\Local\Temp).
+          6. <HOME>    the user profile root (%USERPROFILE%, $HOME, and any
+                       C:\Users\<name> prefix).
+          7. <SHA>     40-hex git object ids from the stub repo's commits.
+          8. ANSI SGR colour sequences PowerShell 7 wraps error records in are
+             deleted.
+          9. PowerShell's error-record source-line decoration (the "Line |",
+             "<LINE> |" echo of the offending source line, and its "|  ~~~~"
+             caret underline) is dropped -- its content is truncated to the
+             host's console width, so it is not portable. The parts that ARE
+             observable -- the "Exception: <file>:<line>" header, the message
+             text, and the exit code -- are kept.
+         10. CRLF is folded to LF.
+
+        Nothing else is touched. Exit codes, every recorded az/gh/squad argv,
+        and all message text -- including the `az containerapp job stop` stdout
+        that PR #9 lost -- are compared byte for byte.
     #>
     param([AllowNull()][string]$Text)
     if ($null -eq $Text) { return "" }
@@ -174,6 +213,8 @@ function Invoke-CaptureSet {
             foreach ($line in $r.AzCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
             [void]$sb.AppendLine("### GH CALLS")
             foreach ($line in $r.GhCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
+            [void]$sb.AppendLine("### SQUAD CALLS")
+            foreach ($line in $r.SquadCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
             [void]$sb.AppendLine("### STDOUT")
             [void]$sb.AppendLine((Get-NormalizedCapture $r.StdOut $ScriptsRoot))
             [void]$sb.AppendLine("### STDERR")

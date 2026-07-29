@@ -43,8 +43,12 @@
                               az call sequences that the provider refactor must
                               not change.
      10. CLI golden gate    - the committed golden captures cover every capture
-                              case and CI actually runs
-                              scripts/tests/verify-cli-golden.ps1.
+                              case, CI actually runs
+                              scripts/tests/verify-cli-golden.ps1, and the
+                              harness still pins the environment (time zone,
+                              culture, optional-tool availability) that makes
+                              those goldens verify on a machine other than the
+                              one that produced them.
 
     Exit code is 0 when all checks pass, 1 otherwise. Use this before pushing
     and as the E2E "sprint gate" documented in docs/validation.md.
@@ -1357,6 +1361,36 @@ if (-not (Test-Path $goldenScript)) {
             Add-Pass "CI runs scripts/tests/verify-cli-golden.ps1, so a squad-aca stdout change fails a job (not just a manual tool)"
         } else {
             Add-Fail "No CI job runs scripts/tests/verify-cli-golden.ps1; the stdout regression guard would be developer-only again"
+        }
+    }
+
+    # The goldens are only a gate if they verify on a machine other than the one
+    # that produced them. The first CI run of this gate failed because they did
+    # not: timestamps rendered in the host time zone and `doctor` reported the
+    # optional `squad` CLI as installed only because the capture machine had it.
+    # Those are pinned in the harness now; assert the pins are still there, so
+    # removing one is a failing check rather than a red CI run days later.
+    if (-not (Test-Path $harness)) {
+        Add-Fail "scripts/tests/cli-stub-harness.ps1 is missing; the golden captures have no environment pins"
+    } else {
+        $harnessText = Get-Content -LiteralPath $harness -Raw
+
+        if ($harnessText -notmatch '"startTime"\s*:\s*"[^"]*(?:Z|[+\-]\d{2}:\d{2})"') {
+            Add-Pass "Stub execution fixtures use offset-free timestamps, so 'sessions' renders the same wall clock in every host time zone"
+        } else {
+            Add-Fail "A stub execution fixture carries a UTC offset in startTime; ConvertFrom-Json will render it in the host time zone and the sessions goldens stop being portable"
+        }
+
+        if ($harnessText -match 'DOTNET_SYSTEM_GLOBALIZATION_INVARIANT') {
+            Add-Pass "CLI captures run under the invariant culture, so dates and numbers do not render in the capture machine's locale"
+        } else {
+            Add-Fail "The CLI capture child process no longer pins DOTNET_SYSTEM_GLOBALIZATION_INVARIANT; goldens would encode the capture machine's locale"
+        }
+
+        if ($harnessText -match 'squad\.cmd') {
+            Add-Pass "The optional 'squad' CLI is stubbed onto PATH, so 'doctor' reports the same status on a machine that has it and one that does not"
+        } else {
+            Add-Fail "'squad' is no longer stubbed onto PATH; 'doctor' reports ok/optional depending on the host and re-pads every row of its table"
         }
     }
 }

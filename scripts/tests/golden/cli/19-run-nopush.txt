@@ -10,6 +10,7 @@ containerapp job start --name caj-squad-aca-session --resource-group rg-squad-st
 repo view --json nameWithOwner --jq .nameWithOwner
 auth status
 auth setup-git
+### SQUAD CALLS
 ### STDOUT
 STUB-START-ACK
 

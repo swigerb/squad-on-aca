@@ -44,11 +44,11 @@ behavior when the packaged preflight script is missing.
 ## Proving the CLI has not changed
 
 Two guards drive the same 22-invocation matrix (`scripts/tests/cli-capture-cases.ps1`)
-through the stubbed `az`/`gh` environment. A capture records the exit code,
-every recorded `az`/`gh` argv, **stdout**, and stderr — stdout deliberately,
-because PR #9 was closed for an observable `stop` output regression and a guard
-that only counts `az` calls cannot see one. Neither touches Azure, GitHub, or
-the network.
+through the stubbed `az`/`gh`/`squad` environment. A capture records the exit
+code, every recorded `az`/`gh`/`squad` argv, **stdout**, and stderr — stdout
+deliberately, because PR #9 was closed for an observable `stop` output
+regression and a guard that only counts `az` calls cannot see one. Neither
+touches Azure, GitHub, or the network.
 
 ### Golden gate (automated, runs in CI)
 
@@ -64,13 +64,61 @@ verify form on every push and pull request, so a change to what `squad-aca`
 prints fails a job instead of reaching review unnoticed. An **intended** CLI
 change is a reviewable diff: regenerate with `-Update`, read the diff, commit it.
 
-Goldens are made machine-portable — temp roots, home directories, PowerShell's
-error-record source-line annotation, its caret/source echo (which is truncated to
-the host console width), and ANSI SGR colour sequences are folded out — so the
-same files verify on a developer box and on a CI runner. Everything observable
-(exit codes, `az`/`gh` argv, message text) is compared as-is. Generate and verify
-them with **PowerShell 7** (`pwsh`), the host CI uses; Windows PowerShell 5.1
-renders error records differently.
+#### What makes a golden portable
+
+The first CI run of this gate failed on two environment dependencies that a
+single-machine capture cannot expose: rendered timestamps moved with the host
+time zone, and `doctor`'s `squad` row read `ok` on a machine with Squad
+installed and `optional` on the runner — and because `Format-Table -AutoSize`
+sizes each column to its widest cell, that one word re-padded every row of the
+table. Both are now **pinned at the source** rather than masked, because a mask
+throws away the value it hides:
+
+| Environment dependence | How it is pinned | Where |
+| --- | --- | --- |
+| Host time zone | The stub `az` execution fixtures carry an **offset-free** `startTime`. `ConvertFrom-Json` parses an offset-bearing instant as `Kind=Local` and `sessions` would then render it in the host's zone; offset-free parses as `Kind=Unspecified`, so no conversion happens and every machine renders the identical wall clock. The `Started` column is still compared character for character. | `cli-stub-harness.ps1` |
+| Host culture (date/number formats) | The CLI child process is started with `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`, so output renders under the invariant culture instead of the machine's locale. .NET honours this on Windows, where there is no per-process culture or time-zone override. | `cli-stub-harness.ps1` |
+| Optional tool availability | `squad` is stubbed onto PATH next to the `az`/`gh` shims, so `doctor` reports it installed on every machine. The stub logs its argv like the others, so if a command ever starts shelling out to `squad` that is a visible capture diff, not a silent change. | `cli-stub-harness.ps1` |
+
+What is left genuinely cannot be pinned, so it is masked. This is the
+**complete** list of masks applied to a golden (`Get-NormalizedCapture` and
+`Get-PortableCapture` in `cli-capture-cases.ps1`):
+
+1. `<TS>` — timestamps of the form `yyyyMMdd-HHmmss` (generated session/branch names).
+2. `<SCRIPTS>` — the absolute path of the `scripts/` tree under capture.
+3. `<STUB>` — the GUID in the throwaway stub root directory name.
+4. `<LINE>` — the line number in a `squad-aca.ps1:<n>` error header.
+5. `<TMP>` — the temp root (`GetTempPath()`, `%TEMP%`, `%TMP%`, and the 8.3 form `C:\Users\X~1\AppData\Local\Temp`).
+6. `<HOME>` — the user profile root (`%USERPROFILE%`, `$HOME`, and any `C:\Users\<name>` prefix).
+7. `<SHA>` — 40-hex git object ids from the stub repo's throwaway commits.
+8. ANSI SGR colour sequences (PowerShell 7 colourises error records) are deleted.
+9. PowerShell's error-record source decoration — the `Line |` header, the `<LINE> |` echo of the offending source line, and its `|  ~~~~` caret underline — is dropped. Its content is truncated to the host console width, so it is not portable. The `Exception: <file>:<line>` header, the message text, and the exit code are kept.
+10. CRLF is folded to LF.
+
+Nothing else is touched. Exit codes, every recorded `az`/`gh`/`squad` argv, and
+all message text — including the `az containerapp job stop` stdout that PR #9
+lost — are compared byte for byte.
+
+Generate and verify goldens with **PowerShell 7** (`pwsh`), the host CI uses;
+Windows PowerShell 5.1 renders error records differently. The goldens are
+LF-normalized via `.gitattributes` (`scripts/tests/golden/cli/*.txt text eol=lf`)
+so a Windows checkout does not diff on line endings.
+
+Before pushing a change to the harness or the goldens, reproduce the runner's
+environment locally — the whole point of this section is that passing on one
+machine proves nothing:
+
+```powershell
+# CI runs in UTC and has no `squad` installed.
+$orig = (tzutil /g)
+try {
+    tzutil /s "UTC"
+    pwsh -NoProfile -Command @'
+$env:PATH = (($env:PATH -split ';') | Where-Object { $_ -notlike '*npm*' }) -join ';'
+./scripts/tests/verify-cli-golden.ps1
+'@
+} finally { tzutil /s "$orig" }
+```
 
 ### Differential capture (manual, strongest claim)
 
@@ -85,7 +133,7 @@ It materialises the baseline revision's `scripts/` with `git archive`, drives
 both revisions through the same stub environment (`help`, `sessions`, `logs`,
 `stop`, `smoke`, `telemetry smoke`, `status`, `doctor`, `run`, `sync`, plus
 failure paths), and compares exit code, stdout, stderr, and every recorded
-`az`/`gh` argv. It exits non-zero if observable behaviour differs.
+`az`/`gh`/`squad` argv. It exits non-zero if observable behaviour differs.
 
 This one stays a developer tool rather than a CI gate: it needs a second
 revision materialised, and it fails permanently once a CLI change is *intended*.
