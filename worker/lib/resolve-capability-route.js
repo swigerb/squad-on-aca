@@ -245,6 +245,19 @@ function validateCatalog(catalog) {
     }
     if (!isPlainObject(cls.image) || typeof cls.image.reference !== 'string' || cls.image.reference.trim() === '') {
       errors.push(`${context}.image must be a mapping with a non-empty "reference"`);
+    } else if (catalog.provisional === false && cls.approved === true) {
+      // An approved class in a REVIEWED catalog can create a sandbox that runs
+      // repository code, so it must name an immutable image. A moving tag means
+      // re-tagging the registry silently changes what executes; a digest cannot
+      // be re-pointed. This is only enforced once provisional is cleared, so a
+      // provisional catalog may still carry placeholders (that is what
+      // provisional means).
+      if (cls.image.pinned !== true) {
+        errors.push(`${context}.image.pinned must be true for an approved class in a non-provisional catalog`);
+      }
+      if (typeof cls.image.digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(cls.image.digest)) {
+        errors.push(`${context}.image.digest must be a sha256 digest for an approved class in a non-provisional catalog`);
+      }
     }
     if (!isPlainObject(cls.resources)) {
       errors.push(`${context}.resources must be a mapping`);

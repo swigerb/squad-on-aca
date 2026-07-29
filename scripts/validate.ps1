@@ -1278,14 +1278,54 @@ if (-not (Test-Path $providerLib)) {
             Add-Fail "SQUAD_ACA_ENABLE_SANDBOX is not authoritative (kill switch honoured=$(-not $killed) explicit-on honoured=$onWithConfigOff)"
         }
 
-        # --- 5. Flag ON + shipped (provisional) catalog => fail closed --------
+        # --- 5. The shipped catalog is REVIEWED, and provisional still bites --
+        # Issue #25 cleared the provisional interlock on config/sandbox-classes.json
+        # (real digests, pinned). The interlock itself must still work, so it is
+        # exercised against a synthesized provisional copy of the SAME catalog --
+        # deleting the check along with the condition that triggered it would
+        # leave the next unreviewed catalog unguarded.
         $env:SQUAD_ACA_ENABLE_SANDBOX = "1"
-        $shippedRoute = Resolve-SquadExecutionRoute -Decision $sandboxDecision `
-            -CatalogPath (Join-Path $RepoRoot "config\sandbox-classes.json")
-        if ($shippedRoute.Route -eq "fail-closed" -and $shippedRoute.Reason -eq "catalog-provisional") {
-            Add-Pass "Flag ON + the shipped provisional catalog fails closed (provisional classes are report-only)"
+        $shippedCatalogPath = Join-Path $RepoRoot "config\sandbox-classes.json"
+        $shippedCatalogText = Get-Content $shippedCatalogPath -Raw
+        $shippedRoute = Resolve-SquadExecutionRoute -Decision $sandboxDecision -CatalogPath $shippedCatalogPath
+        if ($shippedRoute.Route -eq "sandbox" -and $shippedRoute.SandboxClass -and $shippedRoute.SandboxClass.id -eq "sandbox-node-lts") {
+            Add-Pass "Flag ON + the SHIPPED catalog reaches the sandbox plane (issue #25 cleared the provisional interlock)"
         } else {
-            Add-Fail "A provisional catalog did not fail closed (route=$($shippedRoute.Route) reason=$($shippedRoute.Reason))"
+            Add-Fail "The shipped catalog did not reach the sandbox plane (route=$($shippedRoute.Route) reason=$($shippedRoute.Reason))"
+        }
+
+        $provisionalCopy = $shippedCatalogText | ConvertFrom-Json
+        $provisionalCopy.provisional = $true
+        $provisionalRoute = Resolve-SquadExecutionRoute -Decision $sandboxDecision -Catalog $provisionalCopy
+        if ($provisionalRoute.Route -eq "fail-closed" -and $provisionalRoute.Reason -eq "catalog-provisional") {
+            Add-Pass "A provisional catalog still fails closed even when every class in it is approved and pinned (report-only means report-only)"
+        } else {
+            Add-Fail "A provisional catalog did not fail closed (route=$($provisionalRoute.Route) reason=$($provisionalRoute.Reason))"
+        }
+
+        # The shipped catalog's approved classes must be pinned by DIGEST. A
+        # moving tag means re-tagging the registry silently changes what executes
+        # repository code inside a sandbox, with nothing downstream to notice.
+        $shippedCatalog = $shippedCatalogText | ConvertFrom-Json
+        $shippedApproved = @($shippedCatalog.classes | Where-Object { $_.approved -eq $true })
+        $unpinned = @($shippedApproved | Where-Object { -not $_.image.pinned -or $_.image.digest -notmatch '^sha256:[0-9a-f]{64}$' })
+        $shippedUnapproved = @($shippedCatalog.classes | Where-Object { $_.approved -ne $true })
+        $placeholders = @($shippedCatalog.classes | Where-Object { [string]$_.image.reference -like "*REPLACE-ME*" })
+        if ($shippedApproved.Count -gt 0 -and $unpinned.Count -eq 0 -and $placeholders.Count -eq 0 -and $shippedUnapproved.Count -gt 0) {
+            Add-Pass "Every approved class in the shipped catalog is pinned to a sha256 digest with no placeholder reference, and an unapproved class is retained as the approved-only filter's negative fixture"
+        } else {
+            Add-Fail "Shipped catalog pinning is wrong (approved=$($shippedApproved.Count) unpinned=$($unpinned.Count) placeholders=$($placeholders.Count) unapproved=$($shippedUnapproved.Count))"
+        }
+
+        # The shipped catalog's own unapproved class must still be unreachable.
+        # Section 7 proves this against a synthetic catalog; this proves it
+        # against the file that actually ships.
+        $shippedUnapprovedRoute = Resolve-SquadExecutionRoute -CatalogPath $shippedCatalogPath `
+            -Decision ([pscustomobject]@{ route = "sandbox"; sandboxClass = "sandbox-container-build"; defaultImageSufficient = $false })
+        if ($shippedUnapprovedRoute.Route -eq "fail-closed" -and $shippedUnapprovedRoute.Reason -eq "class-not-approved") {
+            Add-Pass "The shipped catalog's unapproved class is still unreachable now that the catalog is reviewed"
+        } else {
+            Add-Fail "The shipped unapproved class was reachable (route=$($shippedUnapprovedRoute.Route) reason=$($shippedUnapprovedRoute.Reason))"
         }
 
         # --- 6. Flag ON + approved class => sandbox ---------------------------
@@ -3095,6 +3135,287 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
         Add-Fail "Dispatch ordering checks threw: $($_.Exception.Message)"
     } finally {
         if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Issue #25: the CLI actually REACHES the sandbox plane.
+#
+# Sprint 2 shipped the resolver and Sprint 5 shipped the ACA Sandboxes provider,
+# but nothing ever passed a capability resolution to New-SessionExecutionProvider
+# -- so every dispatch met the route gate with $null and resolved to `aca-job`.
+# The sandbox plane was unreachable from the CLI, which is why the last three
+# functional acceptance criteria of PRD #6 could not be demonstrated.
+#
+# These checks drive the REAL squad-aca through the stub environment and assert
+# which substrate each dispatch reached, by argv.
+# ---------------------------------------------------------------------------
+Write-Section "Capability resolution reaches the execution plane (issue #25)"
+if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
+    Write-Host "  [SKIP] issue #25 wiring checks require Windows + node" -ForegroundColor Yellow
+} else {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment -WithSandboxConfig
+        Initialize-SquadCliStubRepository -Stub $stub | Out-Null
+        $manifestPath = Join-Path $stub.WorkDir "squad-capabilities.yml"
+
+        # A manifest the DEFAULT worker image already satisfies. `node` and `git`
+        # are in the default profile, so the resolver routes this to aca-job even
+        # with the sandbox plane switched on.
+        $defaultManifest = @(
+            "version: 1"
+            "tools:"
+            "  - name: git"
+            "    required: true"
+            "  - name: node"
+            "    required: true"
+            "egress:"
+            "  - host: registry.npmjs.org"
+        ) -join "`n"
+
+        # A manifest requiring an APPROVED non-default class. python3/pip3 plus
+        # the Python index hosts match sandbox-python-3-12 in the shipped catalog.
+        $sandboxManifest = @(
+            "version: 1"
+            "tools:"
+            "  - name: git"
+            "    required: true"
+            "  - name: python3"
+            "    required: true"
+            "  - name: pip3"
+            "    required: true"
+            "egress:"
+            "  - host: pypi.org"
+            "  - host: files.pythonhosted.org"
+        ) -join "`n"
+
+        # A manifest naming an egress host NO approved class permits.
+        $unapprovedManifest = @(
+            "version: 1"
+            "tools:"
+            "  - name: python3"
+            "    required: true"
+            "egress:"
+            "  - host: exfil.example.net"
+        ) -join "`n"
+
+        function Set-StubManifest {
+            param([string]$Body)
+            [System.IO.File]::WriteAllText($manifestPath, $Body + "`n")
+        }
+        function Clear-StubManifest {
+            Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+        }
+
+        # --- 1. NO MANIFEST => ACA Jobs, and the sandbox binary is never run ---
+        # This is the guarantee the 22 goldens encode. It is asserted here too,
+        # with the flag ON, because "no manifest is unaffected" must hold in the
+        # configuration where the sandbox plane is reachable -- the goldens only
+        # ever prove it with the flag off.
+        Clear-StubManifest
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-nomanifest", "do the thing")
+        $jobStarts = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($r.ExitCode -eq 0 -and $jobStarts -eq 1 -and $r.AcaCalls.Count -eq 0) {
+            Add-Pass "No manifest + sandbox flag ON still dispatches to ACA Jobs and never invokes the sandbox binary"
+        } else {
+            Add-Fail "No-manifest dispatch changed (exit=$($r.ExitCode) jobStarts=$jobStarts acaCalls=$($r.AcaCalls.Count): $($r.AcaCalls -join ' | '))"
+        }
+
+        # --- 2. MANIFEST THE DEFAULT IMAGE SATISFIES => ACA Jobs --------------
+        # ACA Jobs stays the default and the rollback path. Reaching the sandbox
+        # plane must not have made the sandbox the new default.
+        Set-StubManifest -Body $defaultManifest
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-default", "do the thing")
+        $jobStarts = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($r.ExitCode -eq 0 -and $jobStarts -eq 1 -and $r.AcaCalls.Count -eq 0) {
+            Add-Pass "A manifest the default worker image satisfies still dispatches to ACA Jobs with the sandbox plane enabled"
+        } else {
+            Add-Fail "Default-satisfied manifest did not use ACA Jobs (exit=$($r.ExitCode) jobStarts=$jobStarts aca=$($r.AcaCalls -join ' | ') err=$($r.StdErr))"
+        }
+
+        # --- 3. APPROVED CLASS + FLAG ON => THE SANDBOX PLANE ----------------
+        # THE acceptance criterion issue #25 exists for.
+        Set-StubManifest -Body $sandboxManifest
+        Reset-SquadCliStubLog -Stub $stub
+        $sb = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-sandbox", "do the thing")
+        $jobStarts = @($sb.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $sbCreate = @($sb.AcaCalls | Where-Object { $_ -like "sandbox create*" }).Count
+        if ($sb.ExitCode -eq 0 -and $sbCreate -ge 1 -and $jobStarts -eq 0) {
+            Add-Pass "A repository requiring an approved non-default capability is routed to a matching SANDBOX, and no ACA Job execution is started"
+        } else {
+            Add-Fail "Sandbox routing did not reach the sandbox plane (exit=$($sb.ExitCode) sandboxCreate=$sbCreate jobStarts=$jobStarts aca=$($sb.AcaCalls -join ' | ') err=$($sb.StdErr))"
+        }
+
+        # EGRESS BEFORE ANY REPOSITORY CODE, asserted BY INDEX in the ordered
+        # `aca` log. Presence is not the property: a policy applied after the
+        # first exec protects nothing.
+        $egressIdx = [array]::FindIndex([string[]]$sb.AcaCalls, [Predicate[string]] { param($l) $l -like "sandbox egress set*" })
+        $execIdx = [array]::FindIndex([string[]]$sb.AcaCalls, [Predicate[string]] { param($l) $l -like "sandbox exec*" })
+        if ($egressIdx -ge 0 -and $execIdx -ge 0 -and $egressIdx -lt $execIdx) {
+            Add-Pass "Egress policy is applied at aca-call index $egressIdx, BEFORE the first in-sandbox exec at index $execIdx"
+        } else {
+            Add-Fail "Egress-before-execution ordering broken (egress index=$egressIdx exec index=$execIdx log=$($sb.AcaCalls -join ' | '))"
+        }
+
+        # Invariant 4: the sandbox group stays identity-free. A managed identity
+        # on the group would be reachable from inside a sandbox running arbitrary
+        # repository code, which is the whole reason ACR pulls use a scoped
+        # refresh token instead.
+        $identityCalls = @($sb.AcaCalls | Where-Object { $_ -like "*--identity*" })
+        if ($identityCalls.Count -eq 0) {
+            Add-Pass "The wired sandbox dispatch passes no --identity on any aca call (the group stays identity-free)"
+        } else {
+            Add-Fail "A wired sandbox dispatch passed --identity: $($identityCalls -join ' | ')"
+        }
+
+        # --- 4. SAME MANIFEST + FLAG OFF => FAIL CLOSED ----------------------
+        # NOT a silent downgrade. The default worker cannot meet these
+        # requirements; running there anyway is the "silently run unsafely"
+        # outcome PRD #6 forbids.
+        Reset-SquadCliStubLog -Stub $stub
+        $off = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-flagoff", "do the thing")
+        $jobStarts = @($off.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($off.ExitCode -ne 0 -and $jobStarts -eq 0 -and $off.AcaCalls.Count -eq 0 `
+                -and ($off.StdErr -match "sandbox-feature-disabled-and-default-insufficient")) {
+            Add-Pass "The same manifest with the sandbox flag OFF FAILS CLOSED naming the reason, and starts nothing on either plane (no silent downgrade to ACA Jobs)"
+        } else {
+            Add-Fail "Flag OFF silently downgraded or misreported (exit=$($off.ExitCode) jobStarts=$jobStarts aca=$($off.AcaCalls.Count) err=$($off.StdErr))"
+        }
+
+        # --- 5. UNAPPROVED CAPABILITY => FAIL CLOSED, flag ON or off ---------
+        Set-StubManifest -Body $unapprovedManifest
+        Reset-SquadCliStubLog -Stub $stub
+        $un = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-unapproved", "do the thing")
+        $jobStarts = @($un.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($un.ExitCode -ne 0 -and $jobStarts -eq 0 -and @($un.AcaCalls | Where-Object { $_ -like "sandbox create*" }).Count -eq 0) {
+            Add-Pass "A manifest no approved class satisfies fails closed with the flag ON, starting nothing on either plane"
+        } else {
+            Add-Fail "An unapproved capability was dispatched anyway (exit=$($un.ExitCode) jobStarts=$jobStarts aca=$($un.AcaCalls -join ' | '))"
+        }
+
+        # --- 6. MANIFEST UNREADABLE => REFUSE, never a guess -----------------
+        # A manifest that exists but cannot be parsed is the one case where
+        # guessing is most tempting and least safe: the file states requirements
+        # nobody can read. The shared resolver fails closed and the CLI refuses.
+        Set-StubManifest -Body "version: 1`ntools: [ this is not"
+        Reset-SquadCliStubLog -Stub $stub
+        $bad = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-badmanifest", "do the thing")
+        $jobStarts = @($bad.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($bad.ExitCode -ne 0 -and $jobStarts -eq 0 -and $bad.AcaCalls.Count -eq 0) {
+            Add-Pass "An unreadable squad-capabilities.yml refuses the dispatch outright rather than guessing a route, and starts nothing"
+        } else {
+            Add-Fail "An unreadable manifest was dispatched anyway (exit=$($bad.ExitCode) jobStarts=$jobStarts aca=$($bad.AcaCalls.Count))"
+        }
+
+        # --- 7. NO WORKING TREE => the documented ACA Jobs fall back, SAID ----
+        # `--repo other/repo` cannot be resolved from this working tree. That is
+        # the fall back the design documents, and it must be announced: an
+        # operator who believes a sandbox manifest is being honoured, while no
+        # manifest was ever opened, has no way to tell from silent output.
+        Set-StubManifest -Body $sandboxManifest
+        Reset-SquadCliStubLog -Stub $stub
+        $other = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CliArguments @("run", "--repo", "other/repo", "--name", "s25-otherrepo", "do the thing")
+        $jobStarts = @($other.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($jobStarts -eq 1 -and $other.AcaCalls.Count -eq 0 -and ($other.StdOut -match "read no manifest")) {
+            Add-Pass "A repository with no readable working tree falls back to ACA Jobs and SAYS SO, instead of silently pretending a manifest was consulted"
+        } else {
+            Add-Fail "The no-working-tree fall back is silent or wrong (jobStarts=$jobStarts aca=$($other.AcaCalls.Count) err=$($other.StdErr))"
+        }
+
+        # --- 8. LIFECYCLE FROM THE HANDLE, not from today's manifest ---------
+        # status / logs / stop must address the plane a session ACTUALLY runs on.
+        # Re-resolving would answer today's question about yesterday's session:
+        # edit squad-capabilities.yml after dispatch and `stop` would talk to the
+        # wrong substrate, reporting success while the real execution ran on.
+        Clear-StubManifest
+        Reset-SquadCliStubLog -Stub $stub
+        $ls = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" -CliArguments @("sessions")
+        if ($ls.ExitCode -eq 0 -and ($ls.AcaCalls | Where-Object { $_ -like "sandbox list*" }).Count -ge 1 -and $ls.StdOut -match "Route: sandbox") {
+            Add-Pass "squad-aca sessions lists BOTH planes with the flag on, so a sandbox-routed session is visible to logs and stop"
+        } else {
+            Add-Fail "sessions did not list the sandbox plane (exit=$($ls.ExitCode) aca=$($ls.AcaCalls -join ' | '))"
+        }
+
+        # The stub `aca sandbox list` fixture owns exactly one squad-labelled
+        # sandbox; that label is the session identifier a user would type.
+        $sandboxName = "squad-stub-session"
+        if ($ls.StdOut -notmatch [regex]::Escape($sandboxName)) {
+            Add-Fail "The sandbox '$sandboxName' is not visible in `sessions` output; lifecycle checks cannot run"
+        } else {
+            Reset-SquadCliStubLog -Stub $stub
+            $lg = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" -CliArguments @("logs", $sandboxName)
+            $lgJobLogs = @($lg.AzCalls | Where-Object { $_ -like "containerapp job logs*" }).Count
+            $lgSandbox = @($lg.AcaCalls | Where-Object { $_ -like "sandbox exec*" -or $_ -like "sandbox logs*" }).Count
+            if ($lg.ExitCode -eq 0 -and $lgSandbox -ge 1 -and $lgJobLogs -eq 0) {
+                Add-Pass "squad-aca logs against a SANDBOX handle reaches the Sandboxes provider and never the ACA Jobs adapter"
+            } else {
+                Add-Fail "logs on a sandbox handle used the wrong provider (exit=$($lg.ExitCode) sandboxCalls=$lgSandbox jobLogCalls=$lgJobLogs err=$($lg.StdErr))"
+            }
+
+            Reset-SquadCliStubLog -Stub $stub
+            $st = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" -CliArguments @("stop", $sandboxName)
+            $stJobStop = @($st.AzCalls | Where-Object { $_ -like "containerapp job stop*" }).Count
+            $stSandbox = @($st.AcaCalls | Where-Object { $_ -like "sandbox exec*" -or $_ -like "sandbox delete*" }).Count
+            if ($st.ExitCode -eq 0 -and $stSandbox -ge 1 -and $stJobStop -eq 0) {
+                Add-Pass "squad-aca stop against a SANDBOX handle cancels on the Sandboxes provider and never calls 'az containerapp job stop'"
+            } else {
+                Add-Fail "stop on a sandbox handle used the wrong provider (exit=$($st.ExitCode) sandboxCalls=$stSandbox jobStops=$stJobStop err=$($st.StdErr))"
+            }
+
+            # ...and the Jobs plane is still addressed by the Jobs adapter. One
+            # handle kind reaching the right provider proves nothing if the other
+            # kind now reaches it too.
+            Reset-SquadCliStubLog -Stub $stub
+            $stJob = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" -CliArguments @("stop", "caj-squad-aca-session-stub01")
+            $stJobStop = @($stJob.AzCalls | Where-Object { $_ -like "containerapp job stop*" }).Count
+            $stJobSandbox = @($stJob.AcaCalls | Where-Object { $_ -like "sandbox exec*" -or $_ -like "sandbox delete*" }).Count
+            if ($stJobStop -eq 1 -and $stJobSandbox -eq 0) {
+                Add-Pass "squad-aca stop against an ACA JOB handle still uses the Jobs adapter even with the sandbox plane enabled"
+            } else {
+                Add-Fail "stop on an aca-job handle used the wrong provider (jobStops=$stJobStop sandboxCalls=$stJobSandbox err=$($stJob.StdErr))"
+            }
+        }
+
+        # --- 9. A sandbox handle is INERT with the flag off ------------------
+        # The kill switch promises this control plane never touches `aca` while
+        # the flag is unset. Recovering a provider from a handle must not be a
+        # way around that.
+        Reset-SquadCliStubLog -Stub $stub
+        $offList = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "" -CliArguments @("sessions")
+        if ($offList.AcaCalls.Count -eq 0) {
+            Add-Pass "With the flag off, sessions makes no `aca` call at all -- the kill switch still means the sandbox binary is never invoked"
+        } else {
+            Add-Fail "The flag-off kill switch leaked aca calls: $($offList.AcaCalls -join ' | ')"
+        }
+    } catch {
+        Add-Fail "Issue #25 wiring checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
+# The golden capture matrix must NEVER enable the sandbox flag. -SandboxFlag
+# exists so the checks above can reach the sandbox plane; if a golden case ever
+# passed it, "flag off is byte-identical" would stop being what the 22 goldens
+# prove.
+$captureCases = Join-Path $RepoRoot "scripts\tests\cli-capture-cases.ps1"
+if (Test-Path $captureCases) {
+    $captureText = Get-Content $captureCases -Raw
+    if ($captureText -notmatch "SandboxFlag" -and $captureText -notmatch "SQUAD_ACA_ENABLE_SANDBOX") {
+        Add-Pass "The golden capture matrix never enables the sandbox feature flag, so all 22 goldens still pin the flag-off path"
+    } else {
+        Add-Fail "scripts/tests/cli-capture-cases.ps1 references the sandbox flag; the goldens no longer pin the flag-off path"
     }
 }
 

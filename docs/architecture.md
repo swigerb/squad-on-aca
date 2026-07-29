@@ -165,21 +165,68 @@ a session whose required capabilities cannot be met. Only administrator-approved
 classes from `config/sandbox-classes.json` are reachable; a repository's
 `image.hint` can at most *select among* them.
 
-`New-SessionExecutionProvider` in `scripts/squad-aca.ps1` checks the flag
-**first** and returns the ACA Jobs adapter immediately when it is off, without
-reading the catalog, resolving a route, or looking for `aca`. That is what makes
-"flag off" byte-identical to a build with no sandbox code in it, and it is what
-`scripts/tests/verify-cli-golden.ps1` and `scripts/tests/compare-cli-baseline.ps1`
-verify.
+`New-SessionExecutionProvider` in `scripts/squad-aca.ps1` always consults
+`Resolve-SquadExecutionRoute`; the flag is enforced *inside* the gate rather
+than by short-circuiting before it. With no capability resolution the gate
+returns `aca-job` without reading the catalog, resolving a class, or looking for
+`aca`, so "flag off, no manifest" is byte-identical to a build with no sandbox
+code in it — which is what `scripts/tests/verify-cli-golden.ps1` and
+`scripts/tests/compare-cli-baseline.ps1` verify.
 
-**The gate exists; it is not yet fed.** No `New-SessionExecutionProvider` call
-site in `scripts/squad-aca.ps1` passes `-CapabilityResolution`, so every CLI
-dispatch reaches the gate with *no* decision — the `(none)` row above — and the
-`sandbox` branch is unreachable from the CLI **even with the flag on**. That is
-the correct state for a default-off sprint: the routing table and the provider
-are testable in isolation before anything can select them. Handing the Sprint 2
-resolution to the gate is later work (PRD #6, Sprint 6+); until then, describing
-this as "the capability decision is now acted on" overstates what ships.
+Short-circuiting on the flag *before* the gate was the shape until issue #25.
+It was safe only while `-CapabilityResolution` was always `$null`; the moment a
+real decision flowed in, it became a silent downgrade — a repository whose
+required capabilities the default worker cannot meet would have run there
+anyway, unannounced. The gate distinguishes the two flag-off cases instead.
+
+**Where the decision is made, and when (issue #25).** The route is resolved
+**before any compute is requested**, by the same shared Node core Ralph and
+Watch use:
+
+```
+squad-aca run
+  -> Get-CapabilityManifestSource   (which working tree, if any, is this repo)
+  -> Get-SquadDispatchDecision -RepoDir <tree>      [scripts/lib/dispatch-contract.ps1]
+       -> node worker/lib/squad-dispatch.js decide --repo-dir <tree>
+            -> dispatch-decision.js -> resolve-capability-route.js
+  -> decision.routing.capability
+  -> New-SessionExecutionProvider -CapabilityResolution <capability>
+  -> Resolve-SquadExecutionRoute   (flag + approved-class gate)
+  -> aca-job adapter | Sandboxes provider | refuse
+```
+
+Nothing is re-implemented in PowerShell: `dispatch-contract.ps1` remains a thin
+shim that shells out and parses JSON, and `scripts/validate.ps1` asserts it
+contains no route literal. `decision.routing.capability` — not
+`decision.routing` — is what the gate is handed, because only the capability
+decision carries `defaultImageSufficient`, and that field is what separates "the
+default worker can serve this anyway" from "it cannot, so refuse".
+
+**The manifest source is the local working tree**, and only when that tree is
+provably the repository being dispatched. `squad-aca run` syncs the tree to the
+branch the worker will clone immediately beforehand and already warns about
+uncommitted drift; reading it adds no network call, so a dispatch cannot stall
+or be rate-limited by a routing lookup, and it adds no observable behaviour to
+the no-manifest path. Reading it can only produce a *hint*: the in-worker
+preflight re-checks against the real clone before any repository code runs and
+fails closed, so drift can cost a refused session but never grant one.
+
+The failure modes are explicit, never a guess:
+
+| Situation | Decision |
+| --- | --- |
+| No readable working tree for this repository (e.g. `--repo other/repo`) | Documented fall back to `aca-job`, **announced** with the reason; the in-worker preflight is the backstop |
+| Manifest absent from a readable tree | `aca-job` — today's path, unchanged |
+| Manifest present but unreadable, unparseable or invalid | `fail-closed`; `Get-SquadDispatchDecision` throws and nothing is dispatched |
+
+**Lifecycle operations never re-resolve.** `sessions`, `logs`, and `stop`
+recover the provider from the opaque execution handle
+(`New-SessionExecutionProviderForHandle`), which already carries its provider
+id. Re-resolving would answer *today's* routing question about *yesterday's*
+session: edit `squad-capabilities.yml` after a dispatch and `stop` would address
+the wrong substrate, reporting success while the real execution ran on. A
+sandbox handle still requires the feature flag, so the kill switch keeps its
+promise that this control plane never invokes `aca` while the flag is unset.
 
 ### Session execution model: detached + poll
 

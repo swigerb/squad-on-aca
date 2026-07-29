@@ -23,6 +23,6 @@
   "unsatisfiedCredentials": [],
   "unsatisfiedEgressHosts": [],
   "catalogSchemaVersion": 1,
-  "catalogProvisional": true,
+  "catalogProvisional": false,
   "detail": "Required capabilities exceed the default worker profile and an administrator-approved sandbox class provides all of them."
 }

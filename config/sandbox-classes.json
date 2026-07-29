@@ -1,6 +1,7 @@
 {
   "$comment": [
-    "PROVISIONAL — DO NOT USE IN PRODUCTION WITHOUT REVIEW.",
+    "REVIEWED AND PINNED. This catalog is acted upon: a class below can create a",
+    "real sandbox that runs repository code.",
     "",
     "Administrator-controlled sandbox class catalog for Squad on ACA.",
     "",
@@ -12,17 +13,23 @@
     "against imageHintAliases below purely to disambiguate between already-approved",
     "classes; it is NEVER executed or used as an image reference.",
     "",
-    "Every entry below is provisional placeholder data captured during Sprint 2 of",
-    "PRD #6 (routing decision only). The routing decision is computed and reported",
-    "but NOT acted upon: nothing in this catalog creates a sandbox today. Before",
-    "any code acts on it (Sprint 5), an administrator MUST review and replace:",
-    "  - image.reference / image.digest (nothing here is a real, pinned image),",
-    "  - resources and limits (cost/concurrency ceilings are guesses),",
-    "  - egress.hostRules (each pattern must be justified and security-reviewed),",
-    "  - allowedCredentials (each entry widens a class's blast radius),",
-    "  - approved (a class is only truthfully approved after that review),",
-    "and then set \"provisional\": false. Consumers must treat provisional: true as",
-    "'report only'.",
+    "\"provisional\": false means an administrator has reviewed image.digest,",
+    "resources, limits, egress.hostRules, allowedCredentials and approved for every",
+    "class. Every APPROVED class must carry image.pinned: true and a real",
+    "image.digest: a sandbox is created from an immutable digest, never from a",
+    "moving tag, so re-tagging a repository cannot change what runs. image.tag is",
+    "recorded for humans only and is not used to launch anything.",
+    "",
+    "BOTH APPROVED CLASSES CURRENTLY PIN THE SAME IMAGE: the squad-worker image",
+    "built from this repository's worker/Dockerfile. There is no separate",
+    "per-language image yet, so a class's `tools` list is the CONTRACT the class",
+    "offers to routing, not an inventory read out of the image. The enforcing gate",
+    "is worker/lib/squad-capability-preflight.sh, which runs INSIDE the sandbox",
+    "before any repository code and fails closed if a declared tool is absent. A",
+    "class that over-claims therefore costs a refused session, never an unsafe one.",
+    "What actually differentiates these classes from the default worker today is",
+    "allowedCredentials and egress, both of which are enforced by the control plane",
+    "before the sandbox starts.",
     "",
     "egress mirrors the real Azure Container Apps Sandboxes network policy shape",
     "(Microsoft.App/sandboxGroups, api-version 2026-02-01-preview): a defaultAction,",
@@ -49,7 +56,7 @@
     "a third party's data is put through a sandbox."
   ],
   "schemaVersion": 1,
-  "provisional": true,
+  "provisional": false,
   "defaultWorker": {
     "id": "aca-job-default",
     "description": "The fixed squad-worker image running as an ACA job. This is the current, unchanged execution path.",
@@ -83,12 +90,12 @@
     {
       "id": "sandbox-node-lts",
       "approved": true,
-      "description": "Node/JavaScript toolchain with private-registry auth. Provisional.",
+      "description": "Node/JavaScript toolchain with private-registry auth. Pinned to the squad-worker image by digest. Its distinguishing capability over the default worker is NODE_AUTH_TOKEN/NPM_TOKEN plus a default-deny egress policy.",
       "image": {
-        "reference": "REPLACE-ME.azurecr.io/squad-on-aca/sandbox-node",
-        "tag": "PROVISIONAL",
-        "digest": null,
-        "pinned": false
+        "reference": "acrsquadacah81u42kq.azurecr.io/squad-worker",
+        "tag": "2017201",
+        "digest": "sha256:e9a9c012cc23ab8eda20f02c4afee656a7029666863ed4c0795d6b5c878c07e0",
+        "pinned": true
       },
       "imageHintAliases": [
         "ghcr.io/example/squad-worker-node:latest"
@@ -134,12 +141,12 @@
     {
       "id": "sandbox-python-3-12",
       "approved": true,
-      "description": "Python 3.12 toolchain. Provisional.",
+      "description": "Python 3.12 toolchain. Pinned to the squad-worker image by digest. Its distinguishing capability over the default worker is a default-deny egress policy that permits the Python package indexes.",
       "image": {
-        "reference": "REPLACE-ME.azurecr.io/squad-on-aca/sandbox-python",
-        "tag": "PROVISIONAL",
-        "digest": null,
-        "pinned": false
+        "reference": "acrsquadacah81u42kq.azurecr.io/squad-worker",
+        "tag": "2017201",
+        "digest": "sha256:e9a9c012cc23ab8eda20f02c4afee656a7029666863ed4c0795d6b5c878c07e0",
+        "pinned": true
       },
       "imageHintAliases": [
         "ghcr.io/example/squad-worker-python:latest"
@@ -182,10 +189,10 @@
     {
       "id": "sandbox-container-build",
       "approved": false,
-      "description": "Container build tooling. NOT APPROVED: a usable Docker daemon inside a sandbox needs its own security review, so this class must never be selected. Present so the catalog documents the gap and the resolver's approved-only filter is exercised.",
+      "description": "Container build tooling. NOT APPROVED and NOT PINNED: a usable Docker daemon inside a sandbox needs its own security review, and no image has been built for it, so this class must never be selected. Present so the catalog documents the gap and the resolver's approved-only filter is exercised. Approving it requires building an image and pinning its digest here first.",
       "image": {
-        "reference": "REPLACE-ME.azurecr.io/squad-on-aca/sandbox-build",
-        "tag": "PROVISIONAL",
+        "reference": "not-provisioned.invalid/squad-on-aca/sandbox-build",
+        "tag": "NOT-PROVISIONED",
         "digest": null,
         "pinned": false
       },

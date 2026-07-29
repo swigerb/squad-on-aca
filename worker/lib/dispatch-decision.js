@@ -36,12 +36,18 @@
  * Route -> execution mode mapping:
  *
  *   capability aca-job      -> executionMode aca-job, dispatch
- *   capability sandbox      -> executionMode aca-job, dispatch, with
- *                              fallbackReason sandbox-provider-unavailable.
- *                              The Sandboxes provider is Sprint 5/7 work and is
- *                              not on this branch; ACA Jobs stays the default
- *                              and the in-worker preflight remains the final
- *                              gate, so behaviour is unchanged.
+ *   capability sandbox      -> executionMode sandbox, dispatch. The Sandboxes
+ *                              provider landed in Sprint 5
+ *                              (scripts/lib/providers/squad-sandbox-provider.ps1)
+ *                              and is wired into the CLI in issue #25, so the
+ *                              route is now reachable. Acting on it ALSO
+ *                              requires the control-plane feature flag
+ *                              SQUAD_ACA_ENABLE_SANDBOX and an approved,
+ *                              non-provisional catalog class; this file states
+ *                              what the manifest asked for, and
+ *                              Resolve-SquadExecutionRoute decides whether the
+ *                              deployment will honour it. The in-worker
+ *                              preflight remains the final gate either way.
  *   capability fail-closed  -> executionMode null, REFUSE. A repository whose
  *                              manifest cannot be resolved is not dispatched.
  *
@@ -71,14 +77,17 @@ const DISPATCH_SOURCES = ['local-cli', 'ralph', 'watch'];
 const ACTION_DISPATCH = 'dispatch';
 const ACTION_REFUSE = 'refuse';
 
-// Flipped on by the sprint that lands a Sandboxes provider. Kept as a named
-// constant rather than an inline `false` so the reason a sandbox route falls
-// back is greppable and testable.
-const SANDBOX_PROVIDER_AVAILABLE = false;
+// Whether a sandbox execution provider exists on this build. Kept as a named
+// constant rather than an inline literal so the reason a sandbox route falls
+// back stays greppable and testable. Flipped on by issue #25, which wired the
+// Sprint 5 Sandboxes provider into the CLI's dispatch path.
+const SANDBOX_PROVIDER_AVAILABLE = true;
 
 const ROUTING_DETAILS = {
   'aca-job':
     'Routed to the default ACA Jobs execution path.',
+  'sandbox':
+    'Routed to an administrator-approved ACA Sandboxes class. The dispatcher must also have the sandbox execution plane enabled and the class must be approved in a non-provisional catalog, or the dispatch fails closed rather than downgrading.',
   'sandbox-provider-unavailable':
     'The capability decision selected a sandbox class, but no sandbox execution provider is wired on this build, so the dispatch falls back to the default ACA Jobs path. The in-worker capability preflight remains the final gate.',
   'fail-closed':
@@ -138,7 +147,7 @@ function buildRouting(capability) {
     if (SANDBOX_PROVIDER_AVAILABLE) {
       executionMode = 'sandbox';
       action = ACTION_DISPATCH;
-      detail = ROUTING_DETAILS['aca-job'];
+      detail = ROUTING_DETAILS['sandbox'];
     } else {
       executionMode = 'aca-job';
       action = ACTION_DISPATCH;

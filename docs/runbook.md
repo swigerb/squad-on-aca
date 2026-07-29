@@ -415,13 +415,29 @@ reason to turn it on.** ACA Jobs are the default and the rollback path.
    `--name` on `disk create` becomes a **label**, not a resolvable name, and
    `--disk` accepts public images only — a private disk must be addressed by
    `--disk-id <GUID>`.
-4. **A reviewed class catalog.** `config/sandbox-classes.json` ships with
-   `"provisional": true` and placeholder images, egress rules and cost ceilings.
-   While it is provisional the sandbox route **fails closed even with the flag
-   on** (`reason: catalog-provisional`). An administrator must review the classes,
-   set `approved: true` on the ones that are genuinely approved, and set
-   `"provisional": false` on the catalog. Nothing else can grant a class: a
-   repository's `image.hint` may only select among approved classes.
+4. **A reviewed class catalog.** `config/sandbox-classes.json` is reviewed and
+   pinned: `"provisional": false`, and every `approved: true` class names an
+   immutable `sha256` digest. An approved class without a pinned digest is a
+   **catalog fault**, not a warning — `validateCatalog` rejects the whole
+   catalog, and every route fails closed until it is fixed. Setting
+   `"provisional": true` again fails every sandbox route closed even with the
+   flag on (`reason: catalog-provisional`), which is the supported way to
+   withdraw the plane without a code change. Nothing else can grant a class: a
+   repository's `image.hint` may only select among approved classes, and the
+   catalog deliberately retains one unapproved class so the approved-only filter
+   is exercised.
+5. **`sandboxGroup` and `sandboxDiskId` in `~/.squad-on-aca/config.json`.**
+   These travel from configuration to the Sandboxes provider by name. Without a
+   group the provider cannot complete its identity-free precondition and refuses
+   to create; without a disk id it refuses to dispatch (`--disk` accepts public
+   images only).
+
+   ```powershell
+   squad-aca configure --resource-group <rg> --session-job <job> --subscription <sub>
+   # then add, by hand, to ~/.squad-on-aca/config.json:
+   #   "sandboxGroup":  "sbg-squad-aca",
+   #   "sandboxDiskId": "<GUID from `aca sandboxgroup disk list -o json`>"
+   ```
 
 ### Enabling the flag
 
@@ -434,12 +450,28 @@ The flag is an environment variable rather than a config key on purpose: it is
 per-invocation, nothing that syncs config can turn it on, and rolling back needs
 no file edit.
 
-> **What the flag does today.** It opens the route gate — nothing more. No
-> `squad-aca` command yet hands the Sprint 2 capability resolution to
-> `New-SessionExecutionProvider`, so every dispatch reaches the gate with no
-> decision and still runs on ACA Jobs. Turning the flag on therefore changes
-> nothing observable yet; the sandbox path becomes reachable when the resolution
-> is wired through (PRD #6, Sprint 6+).
+> **What the flag does today (issue #25).** It makes the plane reachable.
+> `squad-aca run` reads `squad-capabilities.yml` from your working tree before
+> requesting any compute, resolves it through the shared Node routing core, and
+> dispatches to the plane the decision names. A repository an approved sandbox
+> class satisfies runs in a sandbox; `sessions`, `logs`, and `stop` then address
+> it there, recovered from the execution handle rather than re-resolved.
+>
+> A repository with **no manifest**, or one the **default worker image already
+> satisfies**, still runs on ACA Jobs — byte for byte. ACA Jobs remain the
+> default and the rollback path.
+>
+> With the flag **off**, a repository that genuinely requires a non-default
+> capability is **refused** (`sandbox-feature-disabled-and-default-insufficient`),
+> not quietly run on the default worker. Turning the flag off is a kill switch,
+> not a downgrade switch.
+>
+> **Diagnosing a route.** `squad-aca run` prints the sandbox name and the fact
+> that default-deny egress was applied. If a dispatch you expected to sandbox
+> went to ACA Jobs, look for a `Capability routing read no manifest for ...`
+> warning: it names exactly why no manifest was consulted (usually `--repo`
+> naming a repository other than the working tree you ran from). If a dispatch
+> is refused, the message names the route gate's reason verbatim.
 
 ### Credentials (four planes, kept separate)
 

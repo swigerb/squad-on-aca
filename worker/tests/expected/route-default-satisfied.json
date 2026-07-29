@@ -21,6 +21,6 @@
   "unsatisfiedCredentials": [],
   "unsatisfiedEgressHosts": [],
   "catalogSchemaVersion": 1,
-  "catalogProvisional": true,
+  "catalogProvisional": false,
   "detail": "Every required capability is already provided by the default worker profile, so the existing ACA job is used."
 }
