@@ -30,6 +30,7 @@ pre-push hook.
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
 | Execution provider contract | Exercises `scripts/lib/squad-aca-provider.ps1` offline against the filesystem-backed fake provider: create/wait/status/logs/cancel/terminate state transitions, idempotent `terminate` (repeat and after external deletion), double `cancel`, handle opacity, and rejection of unknown, malformed, and foreign-provider handles | Proves the provider seam behaves per PRD #6 with no Azure subscription, so a future Sandboxes provider can be developed and tested offline |
 | ACA Job adapter | Drives the **production** adapter (`scripts/lib/providers/squad-aca-job-provider.ps1`) against the fake `az` from `scripts/tests/cli-stub-harness.ps1`: `terminate` on a live execution, on an already-terminal/not-found one, under an auth failure, under RBAC/throttling/network/wrong-subscription/unrecognised failures, and with no `az` on `PATH`; plus `wait` polling `Provisioning -> Running` and timing out on an execution that never becomes ready | The fake provider proves the seam, not the adapter that ships. `terminate` used to return `Terminated = $true` for *every* non-zero `az` exit and label it `AlreadyTerminal`, so an auth failure read as a successful teardown; these checks fail if that returns |
+| ACA Sandboxes provider | Drives `scripts/lib/providers/squad-sandbox-provider.ps1` against a stub `aca`, and — the one assertion a stub cannot make — evaluates the **actually emitted** launch command in a real `bash` under WSL, timing when the caller's streams reach EOF against a still-running worker. Also covers `Protect-SandboxText` directly at realistic credential lengths, and `cancel`'s failure classification | A detach is a shell-grammar property, not a substring: `&` binds looser than `&&`, so a command containing every character of a detach can still hold the exec open until its ~120 s timeout. Only a real shell can tell the two apart |
 | CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, **stdout content**, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through output and exit code when `az` fails |
 | CLI golden gate wiring | Asserts every capture case in `scripts/tests/cli-capture-cases.ps1` has a committed golden, that the `stop` golden records `az` stdout, and that `.github/workflows/worker-tests.yml` actually runs `verify-cli-golden.ps1` | A guard that is not automated is not a guard; PR #9's regression class shipped once because the only stdout-comparing tool was a manual one |
 | Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, the capability routing decision, preflight contract, Ralph transactional dispatch, and the harness itself |
@@ -41,14 +42,41 @@ tool/credential allowlists, the advisory-only handling of `services`/`egress`
 administrator sandbox class catalog, and the entrypoint fail-closed
 behavior when the packaged preflight script is missing.
 
+### Skip semantics in `validate.ps1`
+
+Two checks depend on something `validate.ps1` cannot provide for itself: the
+`bash -n` worker syntax check needs `bash`, and the sandbox **detachment** check
+needs a real Linux shell (`wsl -d Ubuntu -e bash`). A check that could not
+execute is reported as `[SKIP]` and counted separately in the summary — never as
+a pass — mirroring `worker/tests/lib/deps.sh` (exit `77` → `run-tests.sh`
+reports a skip):
+
+```text
+  Passed: 149
+  Failed: 0
+  Skipped: 1
+
+Skipped (NOT passes -- the dependency was missing):
+  - Worker-launch detachment is UNVERIFIED: wsl.exe is not on PATH. ...
+```
+
+A skip that silently counted as a pass is a check that stops existing the moment
+its dependency goes missing. CI runs on a host where the dependency is present,
+so a skip there is a signal to investigate, not to ignore.
+
 ## Proving the CLI has not changed
 
 Two guards drive the same 22-invocation matrix (`scripts/tests/cli-capture-cases.ps1`)
-through the stubbed `az`/`gh`/`squad` environment. A capture records the exit
-code, every recorded `az`/`gh`/`squad` argv, **stdout**, and stderr — stdout
-deliberately, because PR #9 was closed for an observable `stop` output
+through the stubbed `az`/`gh`/`squad`/`aca` environment. A capture records the
+exit code, every recorded `az`/`gh`/`squad`/`aca` argv, **stdout**, and stderr —
+stdout deliberately, because PR #9 was closed for an observable `stop` output
 regression and a guard that only counts `az` calls cannot see one. Neither
 touches Azure, GitHub, or the network.
+
+The `### ACA CALLS` section is empty in all 22 goldens, and that emptiness *is*
+the flag-off guarantee written down rather than merely asserted: the `aca` shim
+is on `PATH` for every capture, so the first command that ever shells out to
+`aca` with `SQUAD_ACA_ENABLE_SANDBOX` unset shows up as a golden diff.
 
 ### Golden gate (automated, runs in CI)
 

@@ -21,47 +21,78 @@
 
 $script:AcaDefaultLogAnalyticsWorkspace = "law-squad-aca"
 
-function Invoke-AzPromptSafe {
+function Invoke-CliSafe {
     <#
     .SYNOPSIS
-        Run `az` with dynamic extension install disabled and capture its result.
+        Run an external CLI and capture stdout, stderr and the REAL exit code.
 
     .DESCRIPTION
-        Sets AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no for the duration of the call
-        so a missing extension fails fast instead of prompting on stdin (which
-        blocks forever in CI, Ralph, and Watch contexts). The previous value of
-        the variable is always restored, including when the call throws.
+        The single mechanism every provider uses to shell out. Two properties
+        matter and both are security properties, not conveniences:
 
-        Native stderr is captured rather than allowed to surface as a
-        PowerShell error record, so callers decide what a non-zero exit means.
+          * The exit code is the one this invocation produced. When the binary
+            cannot be run at all the result is exit 127, never a stale
+            $LASTEXITCODE left by an earlier command -- which is exactly how a
+            teardown that never ran once read as "successfully torn down".
+          * Native stderr is captured instead of surfacing as a PowerShell error
+            record, so the CALLER decides what a non-zero exit means.
+
+        Invoke-AzPromptSafe (for `az`) and the Sandboxes provider (for `aca`)
+        both delegate here. There is deliberately only one implementation: a
+        second one would drift, and the classification built on top of it
+        (Test-AcaJobExecutionGone) would then be reasoning about differently
+        shaped results.
+
+    .PARAMETER FilePath
+        The executable to run. May be a bare command name resolved from PATH or
+        an absolute path.
+
+    .PARAMETER Arguments
+        Argument vector, passed through unchanged.
+
+    .PARAMETER EnvironmentOverrides
+        Environment variables set for the duration of the call only. Every
+        previous value is restored afterwards, including when the call throws,
+        and a variable that did not exist before is removed again rather than
+        left behind as an empty string.
     #>
     param(
-        [Parameter(Mandatory = $true)][string[]]$AzArgs
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [System.Collections.IDictionary]$EnvironmentOverrides = @{}
     )
 
-    $hadVar = Test-Path Env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL
-    $previous = if ($hadVar) { $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL } else { $null }
+    $saved = @{}
+    $had = @{}
+    foreach ($name in @($EnvironmentOverrides.Keys)) {
+        $had[$name] = (Test-Path "Env:$name")
+        $saved[$name] = if ($had[$name]) { [Environment]::GetEnvironmentVariable($name, "Process") } else { $null }
+    }
     $previousEap = $ErrorActionPreference
 
     $merged = @()
     $exitCode = -1
     try {
-        $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = "no"
+        foreach ($name in @($EnvironmentOverrides.Keys)) {
+            [Environment]::SetEnvironmentVariable($name, [string]$EnvironmentOverrides[$name], "Process")
+        }
         # Native stderr merged into the pipeline would become a terminating
         # NativeCommandError under 'Stop'. Exit codes are inspected explicitly
-        # below, so relax the preference only around the invocation itself.
+        # by callers, so relax the preference only around the invocation itself.
         $ErrorActionPreference = "Continue"
-        $merged = & az @AzArgs 2>&1
+        $merged = & $FilePath @Arguments 2>&1
         $exitCode = $LASTEXITCODE
     } catch {
         $merged = @($_.Exception.Message)
         $exitCode = 127
     } finally {
         $ErrorActionPreference = $previousEap
-        if ($hadVar) {
-            $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = $previous
-        } else {
-            Remove-Item Env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL -ErrorAction SilentlyContinue
+        foreach ($name in @($EnvironmentOverrides.Keys)) {
+            if ($had[$name]) {
+                [Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")
+            } else {
+                Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+            }
         }
     }
 
@@ -80,6 +111,29 @@ function Invoke-AzPromptSafe {
         ExitCode = $exitCode
         StdOut   = $stdout
         StdErr   = $stderr
+    }
+}
+
+function Invoke-AzPromptSafe {
+    <#
+    .SYNOPSIS
+        Run `az` with dynamic extension install disabled and capture its result.
+
+    .DESCRIPTION
+        Sets AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no for the duration of the call
+        so a missing extension fails fast instead of prompting on stdin (which
+        blocks forever in CI, Ralph, and Watch contexts). The previous value of
+        the variable is always restored, including when the call throws.
+
+        Native stderr is captured rather than allowed to surface as a
+        PowerShell error record, so callers decide what a non-zero exit means.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string[]]$AzArgs
+    )
+
+    return Invoke-CliSafe -FilePath "az" -Arguments $AzArgs -EnvironmentOverrides @{
+        AZURE_EXTENSION_USE_DYNAMIC_INSTALL = "no"
     }
 }
 
