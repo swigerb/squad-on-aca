@@ -94,6 +94,29 @@ assert_contains "$out" '"route": "sandbox"' "narrowed egress: routes to a sandbo
 assert_contains "$out" '"sandboxClass": "sandbox-node-lts"' "narrowed egress: selects the node class that permits NPM_TOKEN"
 assert_contains "$out" '"imageHintPresent": false' "narrowed egress: records that no hint was declared"
 
+# The catalog's tool lists are now a VERIFIED INVENTORY of the pinned image
+# (config/image-evidence/), not a wish list. sandbox-node-lts used to claim
+# pnpm, jq and make that its image does not contain, so a repository requiring
+# any of them routed to a sandbox that would then refuse it at the preflight.
+# With the claim corrected, the same manifest fails closed HERE instead -- one
+# stage earlier, before a sandbox has been created and paid for.
+repo="$(make_repo)"
+printf 'version: 1\ntools:\n  - name: pnpm\n    required: true\ncredentials:\n  - name: NPM_TOKEN\n    required: true\negress:\n  - host: registry.npmjs.org\n' > "${repo}/squad-capabilities.yml"
+out="$(node "$RESOLVER" "$repo" --catalog "$CATALOG" --pretty 2>&1)"
+rm -rf "$repo"
+assert_contains "$out" '"route": "fail-closed"' "corrected claim: a tool no approved image actually has fails closed at routing"
+assert_contains "$out" '"reason": "no-approved-sandbox-class"' "corrected claim: reports that no approved class provides it"
+assert_contains "$out" 'pnpm' "corrected claim: names the unsatisfied tool"
+assert_not_contains "$out" '"sandboxClass": "sandbox-node-lts"' "corrected claim: no class is selected on a tool its image lacks"
+
+# The same, for the tools the python class used to over-claim on an image with
+# no Python. python3 IS provided now, by a genuinely different image, so this
+# asserts the positive half: the class that proves the routing premise still
+# routes.
+out="$(resolve_fixture "routing-sandbox-python.yml")"
+assert_contains "$out" '"sandboxClass": "sandbox-python-3-12"' "python routing: a Python repository still routes to the Python class"
+assert_contains "$out" '"route": "sandbox"' "python routing: reaches the sandbox plane"
+
 # A path-traversal-shaped hint must never select a class and must never appear
 # in the output. It can only ever match an administrator-approved alias.
 out="$(resolve_fixture "routing-sandbox-hint-unrecognized.yml")"

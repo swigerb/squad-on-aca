@@ -1,6 +1,6 @@
 version: 1
 tools:
-  - name: pnpm
+  - name: npm
     required: true
 credentials:
   - name: NPM_TOKEN

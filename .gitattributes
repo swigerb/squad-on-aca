@@ -11,6 +11,7 @@ worker/**/*.sh text eol=lf
 worker/tests/fixtures/*.yml text eol=lf
 worker/tests/expected/*.json text eol=lf
 config/*.json text eol=lf
+config/image-evidence/*.json text eol=lf
 .github/workflows/*.yml text eol=lf
 
 # squad-aca CLI golden captures are compared byte-for-byte by

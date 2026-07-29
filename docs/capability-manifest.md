@@ -341,7 +341,7 @@ Each class pins:
 | `image` | Pinned image reference (`reference`, `tag`, `digest`, `pinned`). Never emitted in a decision. |
 | `imageHintAliases[]` | Manifest `image.hint` values that may disambiguate *to this class*. Matching is exact. |
 | `resources` | CPU / memory / ephemeral storage limits. |
-| `tools[]` | Built-in tools the class provides. |
+| `tools[]` | Built-in tools the class provides. For an **approved** class in a reviewed catalog this is a *verified inventory*, not an aspiration — see [Image evidence](#image-evidence). |
 | `allowedCredentials[]` | Credential types that may be injected into the class. |
 | `egress` | The permitted-destination template (below). |
 | `limits` | Concurrency and cost ceilings (`maxConcurrentSandboxes`, `maxSessionMinutes`, `maxMonthlyCostUsd`). |
@@ -379,15 +379,18 @@ Matching semantics, as implemented and tested:
 job has unrestricted egress. That is an accurate description of today's posture,
 not an endorsement of it.
 
-### Provisional status
+### Review status
 
-Everything currently in the catalog is **placeholder data** captured during the
-routing sprint. Nothing reads it as authority. Before any code acts on it, an
-administrator must review and replace the image references and digests, the
-resource and cost limits, every egress rule, every `allowedCredentials` entry,
-and each `approved` flag — and then set `"provisional": false`. The file carries
-a `$comment` header saying exactly this, and the routing decision surfaces it as
-`catalogProvisional`.
+The catalog is **reviewed** (`"provisional": false`). Two classes are approved
+and pinned by digest; `sandbox-container-build` remains unapproved and is kept
+deliberately as the negative fixture that proves an unapproved class can never
+be selected.
+
+`provisional` still means what it always meant: `true` marks the catalog as
+report-only, and consumers must refuse to act on it. `validateCatalog` enforces
+the extra obligations that come with `false` — every approved class must pin an
+image by digest, and (see below) every approved class's tool claims must be
+backed by recorded evidence for *that* digest.
 
 The `defaultWorker.tools` list is deliberately **conservative**: it lists only
 tools guaranteed by `worker/Dockerfile`. Under-claiming routes a repository
@@ -398,6 +401,94 @@ Squad workers must run in a **dedicated, identity-free sandbox group**: managed
 identity on ACA Sandboxes is group-scoped, so an identity attached to the group
 would be reachable from inside the sandbox. With no identity on the group,
 in-sandbox token minting fails closed.
+
+### Image evidence
+
+A catalog that claims tools its image does not contain is a declaration nothing
+verifies — the exact defect class this programme keeps rejecting. It is not a
+theoretical risk: the first reviewed catalog pinned **both** approved classes to
+the same `squad-worker` image and, between them, claimed `python3`, `pip3`,
+`jq`, `make` and `pnpm` that image does not carry. A live end-to-end run routed
+a Python repository to `sandbox-python-3-12` exactly as designed, created the
+sandbox, applied default-deny egress, launched the worker — and only then did
+the in-worker preflight refuse the session for missing `python3`/`pip3`. The
+defence in depth worked. The claim should never have been made.
+
+The fix is to make the claim **falsifiable**. Every approved class in a reviewed
+catalog must have a committed evidence file recording what its pinned image was
+observed to provide:
+
+```
+config/image-evidence/<digest-with-':'-replaced-by-'-'>.json
+```
+
+The filename is derived from the image digest, and that is the whole mechanism:
+**re-pinning a class to a new digest changes the filename the offline check
+looks for**, so a re-pin without a fresh verification run fails immediately.
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "image": {
+    "reference": "acrsquadacah81u42kq.azurecr.io/squad-worker-python",
+    "digest": "sha256:748bcf32..."
+  },
+  "verifiedAt": "2025-06-05T00:00:00Z",
+  "method": "aca-sandbox-exec: command -v <tool> inside a sandbox booted from the pinned digest",
+  "tools": { "present": ["bash", "..."], "absent": ["pnpm"] },
+  "toolVersions": { "python3": "Python 3.12.13" }
+}
+```
+
+`worker/lib/verify-image-evidence.js` is the offline checker. For each approved
+class in a reviewed catalog it requires that:
+
+- an evidence file exists at the digest-derived path (**missing evidence is a
+  failure, never a skip**);
+- the document is well formed — schema version, strict `YYYY-MM-DDTHH:MM:SSZ`
+  timestamp, non-empty `method`, non-empty `tools.present`, no tool listed as
+  both present and absent, tool names matching `^[A-Za-z0-9._-]{1,64}$`;
+- the digest *inside* the document matches the digest the filename encodes, so
+  an evidence file cannot be copied to a new name to fake coverage;
+- the image `reference` matches the class's pinned reference, so evidence for a
+  different repository in the same registry does not satisfy a class;
+- **every tool the class declares appears in `tools.present`.** Declaring more
+  than the image provides is the failure this exists to catch.
+
+Run it directly, or as part of `scripts/validate.ps1`:
+
+```powershell
+node worker/lib/verify-image-evidence.js            # exit 0 = every claim backed
+node worker/lib/verify-image-evidence.js --json     # machine-readable findings
+```
+
+Evidence is required for approved classes only when `provisional` is `false`,
+mirroring the existing digest-pinning rule. A provisional catalog is already
+report-only — the route gate refuses to act on it — so requiring evidence there
+would block drafting without closing a hole. Unapproved classes need no
+evidence, but any evidence file they *do* carry must still be well formed.
+
+#### What CI proves, and what it does not
+
+Be plain about the boundary, because the failure this mechanism exists to
+prevent was itself an overstated claim:
+
+- **CI proves the bookkeeping.** GitHub Actions cannot pull a private ACR image.
+  The offline check therefore proves that evidence *exists for the digest pinned
+  today*, that it is well formed, that it belongs to the pinned image reference,
+  and that it covers every declared tool. It proves nothing about the bytes in
+  the registry.
+- **A live run proves the image.** `scripts/verify-image-tools.ps1` boots the
+  pinned digest as a real ACA sandbox, runs `command -v` for every declared tool
+  plus a control set, captures `--version` strings, and writes/refreshes the
+  evidence file. That is the only step that observes image contents, and it
+  requires an operator with Azure credentials. See `docs/runbook.md`.
+- **The preflight remains the final check.** Evidence is a pre-commit guard, not
+  a runtime one. `squad-capability-preflight.sh` still runs inside every worker
+  and still refuses a session whose required tools are absent. There is no
+  "catalog says so, skip the preflight" path and none will be added: the catalog
+  describes an image, the preflight observes the container actually running.
+
 
 ## Extending the worker image
 
@@ -415,10 +506,27 @@ RUN apt-get update \
 USER squad
 ```
 
+Always extend the published worker rather than starting from a language base
+image: a sandbox worker still needs `entrypoint.sh`, the capability preflight,
+and the dispatch core under `/usr/local/lib/squad-on-aca/`.
+
+`worker/images/python/Dockerfile` is the worked example that backs the
+`sandbox-python-3-12` class. It is not the naive `apt-get install python3` above,
+because Debian bookworm ships Python 3.11 and the class id promises 3.12; it
+multi-stage-copies CPython 3.12 from `python:3.12-slim-bookworm` (only
+`libpython3.12.so`, the stdlib, headers and entry points — never all of
+`/usr/local`, which would clobber the Node toolchain) and ends with a build-time
+smoke test that fails the build if Python, the Node toolchain, or any Squad
+library is missing.
+
 Build and push it with `az acr build`, then point the ACA session/Ralph/watch
 jobs at the new image tag (see `docs/runbook.md` for the job resource names).
 Reference the custom image in `image.hint` in the manifest so the gap is
 self-documenting even before automatic image selection exists (see below).
+
+If instead you are adding the image to the **sandbox class catalog**, the tool
+list you write there is a claim that must be backed by a live verification run —
+see [Image evidence](#image-evidence) and the runbook procedure.
 
 ## What's deliberately out of scope in this phase
 

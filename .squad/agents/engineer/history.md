@@ -762,3 +762,108 @@ Parse suite 62 -> 63; dispatch contract 76 -> 92.
 matched my own explanatory comment about the old assertion and failed the build.
 Anchor structural guards to `^\s*` so prose that quotes the banned pattern is
 still allowed — a rule you cannot document is a rule people will route around.
+
+## 2026-07-29 - Catalog image accuracy: the tools a class claims must be the tools its image has (`fix/catalog-image-accuracy`)
+
+**The defect.** PR #28 wired capability resolution and pinned
+`config/sandbox-classes.json` to a real digest, then marked the catalog reviewed
+(`provisional: false`) while pointing **both** approved classes at the same
+`squad-worker` image. Between them they claimed `python3`, `pip3`, `jq`, `make`
+and `pnpm` that image does not carry. A live end-to-end run routed a Python
+repository to `sandbox-python-3-12` exactly as designed - sandbox created,
+default-deny egress applied, worker launched detached, branch cloned - and then
+the in-worker preflight refused the session for missing `python3`/`pip3`. The
+defence in depth worked. The catalog should not have lied in the first place.
+
+**Per class, and why.**
+
+| Class | Decision | Now claims |
+| --- | --- | --- |
+| `sandbox-node-lts` | **Correct the claim.** Its distinguishing capability over the default worker is NODE_AUTH_TOKEN/NPM_TOKEN plus default-deny egress, not extra binaries. Building an image for `jq`/`make`/`pnpm` would have invented a need. | Re-pinned to `squad-worker:9972cf4` `sha256:266a8c31...`; tools reduced to bash, curl, git, node, npm, sh, yarn. |
+| `sandbox-python-3-12` | **Build a real image.** It is the class that proves the routing premise: a repository needing Python must get an image that has Python. | New `squad-worker-python:9972cf4-py312` `sha256:748bcf32...`; keeps python3, pip3, jq, make - all now genuinely present. |
+| `sandbox-container-build` | Unchanged, unapproved - the negative fixture. | n/a |
+
+**The image.** `worker/images/python/Dockerfile` extends the published worker so
+`entrypoint.sh`, the preflight and `/usr/local/lib/squad-on-aca/*` survive. It is
+not `apt-get install python3`: bookworm ships 3.11 and the class id promises
+3.12, so it multi-stage-copies CPython 3.12 from `python:3.12-slim-bookworm` -
+`libpython3.12.so.1.0`, the stdlib, headers and entry points only, never all of
+`/usr/local`, which would clobber the Node toolchain. A build-time smoke test
+fails the build if Python 3.12, Node, or any Squad library is missing. Built with
+`az acr build` (no local Docker). Live audit inside the pinned digest:
+`HAVE az bash curl gh git jq make node npm pip pip3 python python3 sh yarn`,
+`MISS pnpm`, `python3 -> Python 3.12.13`.
+
+**The important half: making the claim falsifiable.** A tool list nothing
+verifies is the declaration-without-evidence defect this programme keeps
+rejecting, so the fix is a check, not a promise.
+
+* `config/image-evidence/<digest-with-':'-as-'-'>.json` records what a digest was
+  observed to provide. **The filename is derived from the digest** - that is the
+  whole mechanism. Re-pinning changes the file the check looks for, so a re-pin
+  without re-verification fails offline.
+* `worker/lib/verify-image-evidence.js` (offline, runs in CI) requires, for every
+  approved class in a reviewed catalog: evidence exists (**missing is a failure,
+  never a skip**), is well formed, records the digest its filename encodes,
+  names the pinned image reference, and covers **every** declared tool.
+* `scripts/verify-image-tools.ps1` (live, operator-run) boots the pinned digest
+  as a real sandbox, probes `command -v` per tool, captures versions, writes the
+  evidence.
+* Scope: evidence is required only when `provisional` is `false`, mirroring the
+  existing digest-pinning rule. A provisional catalog is already report-only.
+  That boundary is asserted in the suite so it reads as decided, not overlooked.
+
+**The honest boundary, stated in the docs rather than implied.** CI cannot pull a
+private ACR image. CI proves the *bookkeeping* - evidence exists for the digest
+pinned today, is well formed, belongs to the pinned repository, covers every
+claim. Only a live run proves *image contents*. Neither replaces the in-worker
+preflight, which stays the final check; no "catalog says so, skip it" path was
+added and none will be.
+
+**Deliberate design split.** `validateCatalog` in `resolve-capability-route.js`
+stays pure and filesystem-free: it runs on the dispatch hot path and inside the
+worker image, where evidence files are not shipped. The evidence check is a
+separate filesystem-aware module that only gates run.
+
+**A routing test changed, and the change is the point.**
+`routing-narrowed-egress.yml` required `pnpm`, which the node image does not
+have; with the claim corrected it no longer matched any approved class. The
+fixture now requires `npm` (which the image genuinely has and which actually
+pairs with NPM_TOKEN), and a new assertion pins the corrected behaviour: a
+manifest requiring `pnpm` now **fails closed at routing** - one stage earlier,
+before a sandbox has been created and paid for - instead of routing to a sandbox
+that would refuse it at the preflight. The false claim cannot be restored: the
+evidence check rejects it.
+
+**A real leak, found by looking instead of trusting.** `aca sandbox delete`
+**prompts** without `--yes`, so the script's unattended cleanup silently left two
+probe sandboxes running. Found by listing the group rather than believing the
+script's own "deleted" message. Fixed by passing `--yes` and then **re-listing to
+confirm** - the script now warns `LEAKED probe sandbox(es) still present` rather
+than assuming an exit code means the resource is gone. Verified live on both
+classes afterwards; the group lists zero sandboxes.
+
+**Verification.** `validate.ps1` 274 passed / 0 failed / 0 skipped (was 265/0/0).
+`verify-cli-golden.ps1` 22/22, `### ACA CALLS` empty in all 22.
+`verify-launch-detachment.ps1` PASS. `compare-cli-baseline.ps1 -BaselineRef HEAD`
+22/22 byte-identical. Worker suite under WSL: 10 suites, 739 assertions, 0
+failed, 0 skipped (was 9 / 690) - new `test_image_evidence.sh` 43, routing
+128 -> 134.
+
+**Mutations** - all caught, all reverted, tree clean afterwards:
+
+| Mutation | Check that failed |
+| --- | --- |
+| over-claim guard removed (`unbacked = []`) | `over-claiming class: exits non-zero`, `... says how many claims are unbacked`, `... names exactly which claims are unbacked`, `... never reports OK`, plus both `--json` assertions (43 run, 6 failed) |
+| digest-match guard removed | `copied evidence: exits non-zero when the recorded digest disagrees with the pinned one`, `... reports the disagreement` (43 run, 2 failed) |
+| missing evidence treated as a silent skip | `re-pinned class:` x3, `no evidence:` x3, `absent evidence directory: still a failure, not a skip`, `clearing provisional on the same catalog turns it into a failure` (43 run, 8 failed) |
+| image-reference guard removed | `foreign repository: exits non-zero when evidence was recorded for another image repository`, `... names the mismatch` (43 run, 2 failed) |
+| catalog re-adds `jq` to `sandbox-node-lts` | `validate.ps1` "The shipped catalog claims tools its pinned images were not observed to provide" (273/1) and the offline check: `claims 1 tool(s) the pinned image was not observed to provide: jq` |
+| python class re-pinned to an unprobed digest | `no image evidence recorded for the pinned digest (expected .../sha256-0000...json)` |
+| evidence file deleted | same missing-evidence failure, naming the file and the command that produces it |
+| evidence document records a foreign digest | `records digest sha256:266a8c31..., but the class pins sha256:748bcf32...` |
+
+**Lesson recorded.** A cleanup routine that reports success from an exit code it
+never checked against reality is the same defect class as a catalog that claims
+tools nobody probed: a declaration with nothing behind it. Both were in this
+change; both are now verified rather than asserted.

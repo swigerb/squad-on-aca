@@ -116,7 +116,8 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\lib\git-checkout.sh"),
     (Join-Path $RepoRoot "worker\lib\squad-policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_agent_policy.sh"),
-    (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh")
+    (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
@@ -4037,6 +4038,162 @@ if (Test-Path $policyLib) {
         Add-Pass "The committed form of an append-only path is prefix-checked too, so a truncation cannot be committed and then hidden by restoring the working tree"
     } else {
         Add-Fail "The commit detector does not check the committed form of append-only paths; a history rewrite could be committed, hidden in the working tree, and pushed"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Image evidence: a class may only claim tools its PINNED IMAGE actually has
+# ---------------------------------------------------------------------------
+# PR #28 pinned both approved classes to the same squad-worker digest without
+# checking the tool claims. sandbox-node-lts claimed jq, make and pnpm;
+# sandbox-python-3-12 claimed python3, pip3, jq and make. The image had none of
+# them. A live session routed correctly to the Python class, created the
+# sandbox, applied egress and launched the worker -- and then the in-worker
+# preflight refused to run, because the tools were not there. Defence in depth
+# worked; the catalog should not have lied in the first place.
+#
+# The check below is the OFFLINE half. It cannot pull a private ACR image, so it
+# proves that evidence EXISTS for exactly the digest pinned today, was recorded
+# for the same image repository, and covers every declared tool. Producing the
+# evidence needs a live run (scripts/verify-image-tools.ps1). That boundary is
+# stated in docs/capability-manifest.md and is not papered over here: CI does
+# not claim to have seen inside the image.
+Write-Section "Image evidence backs every approved class's tool claims"
+$evidenceVerifier = Join-Path $RepoRoot "worker\lib\verify-image-evidence.js"
+$shippedCatalogFile = Join-Path $RepoRoot "config\sandbox-classes.json"
+$shippedEvidenceDir = Join-Path $RepoRoot "config\image-evidence"
+if (-not (Test-Path $evidenceVerifier)) {
+    Add-Fail "worker/lib/verify-image-evidence.js is missing: nothing compares a class's tool claims with its pinned image"
+} elseif (-not $nodeAvailable) {
+    Add-Skip "Image evidence checks require node on PATH"
+} else {
+    $evidenceTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("squad-evidence-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        New-Item -ItemType Directory -Path $evidenceTmp -Force | Out-Null
+
+        function Invoke-EvidenceVerifier {
+            param([string]$Catalog, [string]$EvidenceDir)
+            $previousEap = $ErrorActionPreference
+            $out = @()
+            $code = -1
+            try {
+                $ErrorActionPreference = "Continue"
+                $out = & node $evidenceVerifier --catalog $Catalog --evidence-dir $EvidenceDir 2>&1
+                $code = $LASTEXITCODE
+            } catch {
+                $out = @($_.Exception.Message)
+                $code = 127
+            } finally {
+                $ErrorActionPreference = $previousEap
+            }
+            return [pscustomobject]@{
+                ExitCode = $code
+                Output   = (@($out | ForEach-Object { [string]$_ }) -join "`n")
+            }
+        }
+
+        # --- 1. The file that SHIPS is backed -------------------------------
+        $shipped = Invoke-EvidenceVerifier -Catalog $shippedCatalogFile -EvidenceDir $shippedEvidenceDir
+        if ($shipped.ExitCode -eq 0) {
+            Add-Pass "Every approved class in the shipped catalog claims only tools its pinned image was observed to provide"
+        } else {
+            Add-Fail "The shipped catalog claims tools its pinned images were not observed to provide (exit $($shipped.ExitCode)): $($shipped.Output)"
+        }
+
+        $catalogObject = Get-Content $shippedCatalogFile -Raw | ConvertFrom-Json
+        $approvedClasses = @($catalogObject.classes | Where-Object { $_.approved -eq $true })
+
+        # --- 2. Over-claiming a single tool must FAIL -----------------------
+        # The mutation this check exists to catch is the original defect,
+        # applied to the real file.
+        $overClaim = Join-Path $evidenceTmp "over-claim.json"
+        $mutated = Get-Content $shippedCatalogFile -Raw | ConvertFrom-Json
+        $target = @($mutated.classes | Where-Object { $_.approved -eq $true })[0]
+        $target.tools = @($target.tools) + @("definitely-not-in-the-image")
+        ($mutated | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $overClaim -Encoding UTF8
+        $r = Invoke-EvidenceVerifier -Catalog $overClaim -EvidenceDir $shippedEvidenceDir
+        if ($r.ExitCode -ne 0 -and $r.Output -match "definitely-not-in-the-image") {
+            Add-Pass "A class that claims one tool its evidence does not record is refused, and the unbacked claim is named"
+        } else {
+            Add-Fail "An over-claiming class was accepted (exit $($r.ExitCode)): $($r.Output)"
+        }
+
+        # --- 3. Re-pinning without re-verifying must FAIL -------------------
+        # Evidence is keyed by DIGEST precisely so this cannot slide through.
+        $rePinned = Join-Path $evidenceTmp "re-pinned.json"
+        $mutated = Get-Content $shippedCatalogFile -Raw | ConvertFrom-Json
+        $target = @($mutated.classes | Where-Object { $_.approved -eq $true })[0]
+        $target.image.digest = "sha256:" + ("c" * 64)
+        ($mutated | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $rePinned -Encoding UTF8
+        $r = Invoke-EvidenceVerifier -Catalog $rePinned -EvidenceDir $shippedEvidenceDir
+        if ($r.ExitCode -ne 0 -and $r.Output -match "no image evidence recorded for the pinned digest") {
+            Add-Pass "Re-pinning an approved class to a digest nobody probed fails, because evidence is keyed by digest"
+        } else {
+            Add-Fail "A re-pinned class with no evidence for the new digest was accepted (exit $($r.ExitCode)): $($r.Output)"
+        }
+
+        # --- 4. Missing evidence is a FAILURE, never a skip -----------------
+        $emptyEvidence = Join-Path $evidenceTmp "no-evidence"
+        New-Item -ItemType Directory -Path $emptyEvidence -Force | Out-Null
+        $r = Invoke-EvidenceVerifier -Catalog $shippedCatalogFile -EvidenceDir $emptyEvidence
+        if ($r.ExitCode -ne 0) {
+            Add-Pass "An approved, pinned class with no evidence file at all is a failure, not a silent pass"
+        } else {
+            Add-Fail "The evidence check passed with an empty evidence directory -- a check that passes without its input is not a check"
+        }
+
+        # --- 5. The two approved classes pin DIFFERENT images ---------------
+        # One image behind both classes is what made the false claims possible:
+        # whatever the second class needed, the first class's image decided.
+        $digests = @($approvedClasses | ForEach-Object { [string]$_.image.digest })
+        $distinct = @($digests | Sort-Object -Unique)
+        if ($approvedClasses.Count -ge 2 -and $distinct.Count -eq $approvedClasses.Count) {
+            Add-Pass "Each approved class pins its own image digest, so a per-language class is a real image and not a relabelled one"
+        } else {
+            Add-Fail "Approved classes share an image digest (classes=$($approvedClasses.Count) distinct digests=$($distinct.Count)); a class's tools list would again be a label rather than an inventory"
+        }
+
+        # --- 6. The python class actually provides Python -------------------
+        # The acceptance criterion the live run failed on. Asserted against the
+        # committed evidence for the digest the class pins today.
+        $pyClass = @($catalogObject.classes | Where-Object { $_.id -eq "sandbox-python-3-12" })[0]
+        if (-not $pyClass) {
+            Add-Fail "sandbox-python-3-12 is missing from the shipped catalog"
+        } else {
+            $evidenceFile = Join-Path $shippedEvidenceDir ((([string]$pyClass.image.digest) -replace ':', '-') + ".json")
+            if (-not (Test-Path $evidenceFile)) {
+                Add-Fail "No evidence file for sandbox-python-3-12's pinned digest: $evidenceFile"
+            } else {
+                $pyEvidence = Get-Content $evidenceFile -Raw | ConvertFrom-Json
+                $present = @($pyEvidence.tools.present)
+                if ($present -contains "python3" -and $present -contains "pip3") {
+                    Add-Pass "sandbox-python-3-12's pinned image was observed to provide python3 and pip3 -- the two tools the live preflight refused a session over"
+                } else {
+                    Add-Fail "sandbox-python-3-12's evidence does not record python3 and pip3 as present: $($present -join ', ')"
+                }
+            }
+        }
+
+        # --- 7. The preflight is NOT weakened by any of this ----------------
+        # The evidence model stops the catalog making a claim the preflight has
+        # to refuse. It must never become a reason to skip the preflight.
+        $preflightPath = Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"
+        $entrypointPath = Join-Path $RepoRoot "worker\entrypoint.sh"
+        if ((Test-Path $preflightPath) -and (Test-Path $entrypointPath)) {
+            $entrypointText = Get-Content $entrypointPath -Raw
+            $bypassPattern = '(?im)^\s*(if|\[\[).*(catalog|evidence|sandboxClass).*(skip|bypass).*preflight'
+            if (($entrypointText -match 'squad-capability-preflight\.sh') -and ($entrypointText -notmatch $bypassPattern)) {
+                Add-Pass "The worker entrypoint still runs the capability preflight, with no 'the catalog says so, skip it' path"
+            } else {
+                Add-Fail "The in-worker capability preflight is no longer unconditionally invoked by the worker entrypoint"
+            }
+        } else {
+            Add-Fail "worker/entrypoint.sh or worker/lib/squad-capability-preflight.sh is missing"
+        }
+    } catch {
+        Add-Fail "Image evidence checks threw: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $evidenceTmp -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

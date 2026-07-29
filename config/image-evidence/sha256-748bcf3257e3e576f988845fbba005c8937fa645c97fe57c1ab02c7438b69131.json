@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "image": {
+    "reference": "acrsquadacah81u42kq.azurecr.io/squad-worker-python",
+    "digest": "sha256:748bcf3257e3e576f988845fbba005c8937fa645c97fe57c1ab02c7438b69131"
+  },
+  "verifiedAt": "2026-07-29T21:08:27Z",
+  "method": "aca sandbox exec: 'command -v <tool>' inside a sandbox created from this digest (scripts/verify-image-tools.ps1)",
+  "tools": {
+    "present": [
+      "az",
+      "bash",
+      "curl",
+      "gh",
+      "git",
+      "jq",
+      "make",
+      "node",
+      "npm",
+      "pip",
+      "pip3",
+      "python",
+      "python3",
+      "sh",
+      "yarn"
+    ],
+    "absent": [
+      "pnpm"
+    ]
+  },
+  "toolVersions": {
+    "az": "azure-cli                         2.88.0",
+    "bash": "GNU bash, version 5.2.15(1)-release (x86_64-pc-linux-gnu)",
+    "gh": "gh version 2.96.0 (2026-07-02)",
+    "git": "git version 2.39.5",
+    "jq": "jq-1.6",
+    "make": "GNU Make 4.3",
+    "node": "v24.18.0",
+    "npm": "11.16.0",
+    "pip": "pip 25.0.1 from /usr/local/lib/python3.12/site-packages/pip (python 3.12)",
+    "pip3": "pip 25.0.1 from /usr/local/lib/python3.12/site-packages/pip (python 3.12)",
+    "python": "Python 3.12.13",
+    "python3": "Python 3.12.13",
+    "yarn": "1.22.22"
+  }
+}

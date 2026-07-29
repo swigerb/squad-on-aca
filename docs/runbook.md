@@ -715,6 +715,97 @@ aca sandbox delete -l name=squad-<session> --yes
   `az acr login --expose-token` having switched your active subscription. Re-run
   `az account set --subscription <sub>`.
 
+### Adding or re-pinning a sandbox class image
+
+A class's `tools[]` list in `config/sandbox-classes.json` is a **claim about a
+specific image digest**, and `worker/lib/verify-image-evidence.js` refuses to let
+that claim ship unbacked. The full procedure, in order:
+
+**1. Build the image.** Extend the published worker — a sandbox worker still
+needs `entrypoint.sh`, the capability preflight and `/usr/local/lib/squad-on-aca/*`.
+Build server-side; no local Docker is required.
+
+```powershell
+az account set --subscription 3898b8ea-c676-4b43-95fc-d38425627d74
+az acr build --registry acrsquadacah81u42kq `
+  --image "squad-worker-python:<tag>" worker/images/python
+az acr repository show --name acrsquadacah81u42kq `
+  --image "squad-worker-python:<tag>" --query digest -o tsv
+```
+
+`worker/images/python/Dockerfile` is the worked example. Its build-time smoke
+test is the first gate: the build fails if Python 3.12, the Node toolchain, or
+any Squad library is missing.
+
+**2. Edit the catalog.** Set the class's `image.reference`, `image.tag`,
+`image.digest` and `image.pinned: true`, and write the `tools[]` you believe the
+image provides. Do not guess — the next step will contradict you if you do.
+
+**3. Verify live and record the evidence.** This is the only step that observes
+what is actually inside the image. It creates a real disk and sandbox, so it
+costs money and must clean up after itself (it does, by default).
+
+```powershell
+pwsh -NoProfile -File .\scripts\verify-image-tools.ps1 -ClassId sandbox-python-3-12
+```
+
+The script acquires an ACR pull token, creates a disk from the pinned digest,
+boots a probe sandbox, runs `command -v` for every declared tool plus a control
+set, captures `--version` strings, and writes
+`config/image-evidence/<digest-with-':'-replaced-by-'-'>.json`. It deletes the
+probe sandbox unconditionally and the probe disk unless `-KeepDisk` is passed.
+
+Useful switches:
+
+| Switch | Effect |
+| --- | --- |
+| `-ClassId <id>` | Which class to verify. Required. |
+| `-AdditionalTools a,b` | Probe extra tools beyond the declared list, so `absent` records a real MISS list, not just a pass. Use `-Command` form: `pwsh -NoProfile -Command "& .\scripts\verify-image-tools.ps1 -ClassId x -AdditionalTools jq,make"`. |
+| `-KeepDisk` | Leave the disk behind for reuse by real sessions. Record the disk id. |
+| `-DiskLabel <name>` | Reuse or create a disk under a specific label. |
+
+**If a declared tool comes back MISS, fix the claim or fix the image — never the
+evidence.** Editing an evidence file by hand to make a check pass reintroduces
+exactly the defect this mechanism exists to catch.
+
+**4. Confirm the offline check agrees**, and run the gates:
+
+```powershell
+node worker\lib\verify-image-evidence.js
+pwsh -NoProfile -File .\scripts\validate.ps1
+```
+
+**5. Commit the evidence file with the catalog change.** They are a pair. A
+catalog edit without its evidence file fails CI; an evidence file for a digest
+nothing pins is harmless but pointless.
+
+**What CI proves versus what this procedure proves.** GitHub Actions cannot pull
+a private ACR image, so CI proves only the bookkeeping: that evidence exists for
+the digest pinned *today*, is well formed, names the pinned image reference, and
+covers every declared tool. Because the evidence filename is derived from the
+digest, re-pinning without re-running step 3 fails offline — which is the point.
+Only step 3 observes image contents. And neither replaces the in-worker
+capability preflight, which still runs in every session and is the final check.
+
+**Cleanup obligation.** Probe sandboxes and disks cost money. The script cleans
+up its own; if it is interrupted, sweep by hand:
+
+```powershell
+$aca = "C:\Users\<you>\.aca\bin\aca.exe"
+$c = @("-s", "<sub>", "-g", "rg-squad-aca-dev-eastus2", "--sandbox-group", "sbg-squad-aca")
+& $aca @c sandbox list -o json                 # probe-<digest prefix> is ours
+& $aca @c sandbox delete --id <sandbox id> --yes
+& $aca @c sandboxgroup disk list -o json       # evidence-<digest prefix>
+& $aca @c sandboxgroup disk delete --id <disk id>
+```
+
+Two `aca` CLI details that bite here: global options such as `--sandbox-group`
+must come **before** the subcommand, and `sandbox delete` **prompts** unless
+`--yes` is passed — an unattended delete without it silently leaves the sandbox
+running. The script passes `--yes` and then re-lists to confirm nothing it
+created survived; a `LEAKED probe sandbox(es) still present` warning means sweep
+by hand with the commands above.
+
 ### Incident runbook
 
 Risk IDs are from [adr/0001-aca-sandboxes-feasibility.md](adr/0001-aca-sandboxes-feasibility.md).
