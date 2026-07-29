@@ -720,6 +720,7 @@ module.exports = {
   egressAllows,
   hostMatchesPattern,
   loadCatalog,
+  loadManifest,
   locateManifest,
   resolveCapabilityRoute,
   validateCatalog

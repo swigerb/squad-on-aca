@@ -424,3 +424,107 @@ rather than to build a bespoke mechanism and defend it. The second lesson is
 that a surviving mutation is information, not an embarrassment - M12 survives
 because it guards a state the code cannot reach, and saying so is worth more
 than a test engineered to kill it.
+
+## 2026-08-21: PR #20 reviewer rejection - two dispatchers both told "you own it", an unbounded ledger, and a fourth invisible recurrence of the deny-list defect (PRD #6 Sprint 6)
+
+**The author was locked out; I fixed all three blocking findings plus four
+non-blocking ones in `worker/lib/dispatch-lease.js` and its two shims.**
+
+**B1 - concurrent claims both won.** `decideExistingClaim` adopted any `claimed`
+lease unconditionally, on the assumption that a claim in flight is a crashed
+one. It is not. The claim-to-compute window in `ralph-dispatch.sh` spans
+`mktemp`, an env build that shells to `node` and `az`, and the job start -
+seconds - and Ralph's five-minute cron overlaps a manual `squad-aca ralph run`
+by design. Two dispatchers therefore got `created` and `repaired`, both of which
+mean "dispatch", for one issue.
+
+The fix is two TTLs, not one. A `claimed` lease and a `running` lease have
+nothing in common except a record: a claim only has to cover one env build
+(`SQUAD_LEASE_CLAIM_TTL_SECONDS`, 300s, clamped to never exceed the session
+TTL), while an execution has to cover a whole agent session (3600s, refreshed by
+the heartbeat). `STATE_CLAIMED` now takes the same staleness gate `ACTIVE_STATES`
+always had, against the clock that matches what a claim is allowed to be doing.
+Adoption also moved behind a single `adoptLease` helper that catches the CAS
+`409` and re-reads: if two claimers both decide a lease is abandoned, the store
+decides the winner and the loser is told `active`, not handed a second "you own
+it". A losing claimer gets the owner's record back so it can say who holds the
+work.
+
+The knock-on mattered more than the gate. Ralph labelled the issue on `active`.
+With `active` now also meaning "another dispatcher is mid-claim", labelling
+would retire an issue whose would-be owner may still fail and `release` -
+silently dropping the work. Ralph now reads the owner's state alongside the
+outcome and skips *without* labelling when the owner is still `claimed`. One
+extra evaluation next run beats losing the work.
+
+**B2 - the ledger only ever grew and the sweeper read every key.** There was no
+delete path at all; every `run`, `smoke`, `telemetry smoke` and Ralph issue
+minted a permanent blob, and Ralph swept 288 times a day at `1 + N` calls.
+The severity came from the error handling being *correct*: a 429 surfaces,
+`claimLease` throws, and Ralph skips every issue - a total outage with no
+operator-visible cause. Bounded on both axes: terminal leases past
+`SQUAD_LEASE_RETENTION_SECONDS` (7d) are deleted via the Contents API, and a
+sweep costs at most `1 + SQUAD_LEASE_SWEEP_MAX_READS` (50) calls regardless of
+ledger size. Coverage under the cap comes from a start offset derived from the
+clock rather than a persisted cursor - zero extra API calls, no blob of its own
+to corrupt or contend on. The 1000-entry listing cap is now reported as
+`truncated` and logged by both shims instead of silently short-changing the
+sweep.
+
+**B3 - the documented ordering was untestable, and this is the fourth
+recurrence.** Sprint 3 B1, Sprint 5 `cancel`, and now here. The implementation
+was correct; the tests could not tell. None of the four fail-mode texts carried
+a `GONE_PATTERNS` token, so the deny-list was never the deciding factor and the
+reviewer's swap of the two loops passed 163 checks and 361 assertions unchanged.
+
+The root cause is that `isGone` is not observable enough to guard an ordering:
+whenever a message matches only one list, both orderings produce the same
+boolean, so no assertion on the boolean can ever fail. `classifyGhFailure` now
+returns *which rule decided* (`real-failure`/`gone`/`unrecognised`/...), and the
+tests assert that. The fake `gh` gained four fail modes whose text carries BOTH
+signatures - `masked403`, `masked401`, `masked429`, `masked500`, modelled on the
+real shape, since GitHub masks a permission denial on a private resource as
+`HTTP 404: Not Found` - plus `unrecognised`, which matches neither. The
+previously-documented-but-never-used `FAKE_GH_FAIL_PATH` knob is now exercised,
+scoping a masked 403 to one blob so the directory listing still succeeds.
+
+I did not consolidate the JS and PowerShell classifiers. They are separate
+because they classify different tools (`gh` vs `az`) with different message
+shapes, and unifying them would mean shelling to node for every PowerShell
+classification. What I consolidated instead is the *decision*: one function in
+JS, and both languages now assert the deciding rule rather than the answer.
+
+**Non-blocking items 4-7, all genuine, all fixed.** The vacuous
+`write_idx <= last_idx` assertion (a `grep -n` line number compared against
+itself) was replaced with two falsifiable ones: GET-before-PUT, and the lease
+write being the last call of the claim. `Invoke-Leases` lost its bare
+`Format-Table -AutoSize`; the validate check I added for it also caught `doctor`
+carrying the same defect on a `Detail` column that holds an Aspire URL, so that
+was fixed too and its golden regenerated - one blank line, reviewed. The
+worker's heartbeat fired once and then not again, so any session outliving the
+one-hour TTL was swept as stale mid-flight and its lease became re-claimable
+while the execution was live; it is now a background ticker torn down by the
+EXIT trap before the terminal write. The `dispatched` writes in the CLI and
+Watch moved inside their own try: once compute is live, a transient 429 must
+neither throw to the user (whose retry would be told `repaired` and start a
+second execution) nor release (which would hand live work away). All three
+dispatchers now warn and let the heartbeat reconcile.
+
+**Verification.** `validate.ps1` 163 -> **173 passed / 0 failed / 0 skipped**;
+worker suite **7 suites / 361 -> 409 assertions (123/76/11/62/40/54/43), 0
+failed, 0 skipped**; `verify-cli-golden.ps1` **22/22** with `### ACA CALLS`
+empty in all 22; `verify-launch-detachment.ps1` **PASS**. Each fix was
+mutation-proven: removing the claim gate failed 6 contract + 4 Ralph assertions
+and 2 validate checks; restoring unbounded growth and cost failed 5 contract
+assertions and 2 validate checks; swapping the two classification loops - the
+mutation that was previously invisible to the entire suite - failed 15 contract
+assertions and 1 validate check.
+
+**Lesson recorded.** The recurring defect is not the ordering; it is asserting
+an *outcome* where the guarantee is a *precedence*. A precedence is only
+observable on an input that satisfies both branches, and no fixture in this
+programme had ever supplied one. Where code chooses between rules, the choice
+itself has to be part of the return value, or the choice cannot be tested. The
+same applies to B1: converging on one lease record was asserted, but "and
+exactly one of them is told to dispatch" never was, and the one test that
+should have covered it had a line inserted in the middle of the race.

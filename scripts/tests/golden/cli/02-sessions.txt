@@ -11,11 +11,10 @@ containerapp job execution show --name caj-squad-aca-session --resource-group rg
 ### ACA CALLS
 ### STDOUT
 
-Execution                    Status  Session      Mode   Repository Branch             Started             Ended
----------                    ------  -------      ----   ---------- ------             -------             -----
-caj-squad-aca-session-stub01 Running stub-session prompt octo/demo  squad/stub-session 01/02/2026 03:04:05 
-caj-squad-aca-session-stub02 Running stub-session prompt octo/demo  squad/stub-session 01/02/2026 03:04:05 
-
+Execution                    Status  Session      Mode   Repository Branch             Started             Ended Route   Source
+---------                    ------  -------      ----   ---------- ------             -------             ----- -----   ------
+caj-squad-aca-session-stub01 Running stub-session prompt octo/demo  squad/stub-session 01/02/2026 03:04:05       aca-job local-cli
+caj-squad-aca-session-stub02 Running stub-session prompt octo/demo  squad/stub-session 01/02/2026 03:04:05       aca-job local-cli
 
 ### STDERR
 

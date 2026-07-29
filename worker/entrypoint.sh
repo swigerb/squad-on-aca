@@ -122,6 +122,63 @@ else
 fi
 log "Copilot flags: ${COPILOT_FLAGS}"
 
+# --- Lease heartbeat (Sprint 6, PRD #6) --------------------------------------
+# A session started by any dispatcher carries SQUAD_LEASE_KEY. Report liveness
+# PERIODICALLY and record a terminal state on exit, so the sweeper can tell a
+# live execution from an orphaned claim. Every call is best-effort: a lease that
+# cannot be updated must never take down a session that is doing real work, and
+# the sweeper reclaims it on heartbeat expiry anyway.
+#
+# The heartbeat must be periodic, not one-shot. A single heartbeat at start means
+# a session that outlives SQUAD_LEASE_TTL_SECONDS (default 3600) is swept as
+# stale WHILE IT IS STILL RUNNING, and its lease becomes re-claimable by another
+# dispatcher -- the exact double-dispatch the lease exists to prevent. Squad
+# sessions routinely run 10-60+ minutes.
+SQUAD_DISPATCH_CLI="${SQUAD_DISPATCH_CLI:-/usr/local/lib/squad-on-aca/squad-dispatch.js}"
+SQUAD_LEASE_HEARTBEAT_SECONDS="${SQUAD_LEASE_HEARTBEAT_SECONDS:-300}"
+SQUAD_LEASE_HEARTBEAT_PID=""
+
+squad_lease_report() {
+  local op="$1"
+  shift
+  [[ -n "${SQUAD_LEASE_KEY:-}" && -n "${GITHUB_REPOSITORY:-}" ]] || return 0
+  [[ -f "$SQUAD_DISPATCH_CLI" ]] || return 0
+  node "$SQUAD_DISPATCH_CLI" "$op" \
+    --repository "$GITHUB_REPOSITORY" \
+    --lease-key "$SQUAD_LEASE_KEY" "$@" >/dev/null 2>&1 || true
+}
+
+squad_lease_heartbeat_loop() {
+  while true; do
+    sleep "$SQUAD_LEASE_HEARTBEAT_SECONDS"
+    squad_lease_report heartbeat
+  done
+}
+
+squad_lease_finish() {
+  local code=$?
+  # Stop the ticker first, so it cannot resurrect the lease to `running` after
+  # the terminal state has been written.
+  if [[ -n "$SQUAD_LEASE_HEARTBEAT_PID" ]]; then
+    kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    wait "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    SQUAD_LEASE_HEARTBEAT_PID=""
+  fi
+  if [[ "$code" -eq 0 ]]; then
+    squad_lease_report complete --state succeeded
+  else
+    squad_lease_report complete --state failed --reason "exit-${code}"
+  fi
+  return "$code"
+}
+
+if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
+  squad_lease_report heartbeat
+  squad_lease_heartbeat_loop &
+  SQUAD_LEASE_HEARTBEAT_PID=$!
+  trap squad_lease_finish EXIT
+fi
+
 commit_and_push_if_needed() {
   if [[ "${PUSH_CHANGES:-false}" != "true" ]]; then
     return 0

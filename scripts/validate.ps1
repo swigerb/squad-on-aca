@@ -2561,6 +2561,388 @@ if (-not (Test-Path $harness)) {
 }
 
 # ---------------------------------------------------------------------------
+# 9b. Unified dispatch contract + durable leases (Sprint 6, PRD #6)
+# ---------------------------------------------------------------------------
+# Two things are proven here that no other check can prove:
+#   1. The PowerShell CLI does not carry its own copy of the routing rule. It is
+#      compared byte-for-byte against the shared dispatch core's own output for
+#      every dispatch source, so any PowerShell-side "adjustment" of the route
+#      shows up as a failure rather than as drift.
+#   2. The lease is written BEFORE compute is requested. Asserted by INDEX in a
+#      shared, ordered call log that both the fake `az` and the lease store
+#      append to -- a presence check would pass even if the order were inverted.
+Write-Section "Unified dispatch contract and leases"
+$dispatchCli = Join-Path $RepoRoot "worker\lib\squad-dispatch.js"
+$contractLib = Join-Path $RepoRoot "scripts\lib\dispatch-contract.ps1"
+$fakeGh = Join-Path $RepoRoot "worker\tests\lib\fake-gh.js"
+$nodeAvailable = [bool](Get-Command node -ErrorAction SilentlyContinue)
+
+if (-not (Test-Path $dispatchCli)) {
+    Add-Fail "worker/lib/squad-dispatch.js is missing (the shared dispatch core)"
+} elseif (-not (Test-Path $contractLib)) {
+    Add-Fail "scripts/lib/dispatch-contract.ps1 is missing (the PowerShell face of the contract)"
+} elseif (-not $nodeAvailable) {
+    Add-Fail "node is required for the shared dispatch contract but is not on PATH"
+} else {
+    # The contract must be one implementation, not two that happen to agree.
+    # Assert the PowerShell side never re-derives a route locally: strip comments
+    # and look for a hard-coded route literal in executable code.
+    $contractCode = (Get-Content -LiteralPath $contractLib) |
+        Where-Object { $_.TrimStart() -notlike "#*" } |
+        ForEach-Object { $_ -replace '\s+#.*$', '' }
+    $localRoute = @($contractCode | Where-Object { $_ -match "['`"](aca-job|sandbox|fail-closed)['`"]" })
+    $delegates = @($contractCode | Where-Object { $_ -match "squad-dispatch\.js" }).Count -ge 1
+    if ($localRoute.Count -eq 0 -and $delegates) {
+        Add-Pass "dispatch-contract.ps1 contains no PowerShell-local routing rule (it only calls the shared core)"
+    } else {
+        Add-Fail "dispatch-contract.ps1 appears to re-implement routing in PowerShell (delegates=$delegates, literals=$($localRoute -join ' | ')); the decision must come from worker/lib/dispatch-decision.js only"
+    }
+
+    . $contractLib
+    $leaseRoot = Join-Path $RepoRoot ".validate-leases"
+    $savedGhBin = $env:SQUAD_GH_BIN
+    $savedState = $env:FAKE_GH_STATE
+    $savedNow = $env:SQUAD_LEASE_NOW
+    $savedFail = $env:FAKE_GH_FAIL_MODE
+    try {
+        Remove-Item -Recurse -Force $leaseRoot -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $leaseRoot | Out-Null
+        $env:SQUAD_GH_BIN = $fakeGh
+        $env:FAKE_GH_STATE = $leaseRoot
+        $env:SQUAD_LEASE_NOW = "2024-05-01T00:00:00.000Z"
+        $env:FAKE_GH_FAIL_MODE = ""
+
+        # --- 1. One decision, three dispatchers, compared byte-for-byte ------
+        $routings = @{}
+        foreach ($source in @("local-cli", "ralph", "watch")) {
+            $psDecision = Get-SquadDispatchDecision -SessionId "s-1" -DispatchSource $source -Repository "octo/demo" -IssueNumber "7"
+            $routings[$source] = ($psDecision.routing | ConvertTo-Json -Depth 20 -Compress)
+        }
+        if ($routings["local-cli"] -eq $routings["ralph"] -and $routings["local-cli"] -eq $routings["watch"]) {
+            Add-Pass "The routing decision is identical for local-cli, ralph and watch (byte-for-byte)"
+        } else {
+            Add-Fail "The routing decision differs by dispatcher: $($routings.Values -join ' || ')"
+        }
+
+        # The PowerShell shim must return the core's answer unmodified. Compare
+        # against the core invoked directly, not against a hand-written expectation.
+        $rawJson = & node $dispatchCli decide --session-id "s-1" --dispatch-source "ralph" --repository "octo/demo" --issue 7
+        $rawRouting = (($rawJson | ConvertFrom-Json).routing | ConvertTo-Json -Depth 20 -Compress)
+        if ($rawRouting -eq $routings["ralph"]) {
+            Add-Pass "Get-SquadDispatchDecision returns the shared core's decision unmodified"
+        } else {
+            Add-Fail "The PowerShell shim altered the routing decision (core=$rawRouting shim=$($routings['ralph']))"
+        }
+
+        # --- 2. Lease lifecycle from PowerShell ------------------------------
+        $decision = Get-SquadDispatchDecision -SessionId "issue-7-a" -DispatchSource "local-cli" -Repository "octo/demo" -IssueNumber "7"
+        $claim1 = New-SquadDispatchLease -Decision $decision -Repository "octo/demo"
+        Set-SquadDispatchLeaseState -Operation "dispatched" -Repository "octo/demo" -LeaseKey $decision.leaseKey | Out-Null
+        $claim2 = New-SquadDispatchLease -Decision $decision -Repository "octo/demo"
+        if ($claim1.outcome -eq "created" -and $claim2.outcome -eq "active") {
+            Add-Pass "A duplicate claim from PowerShell is refused while the lease is live (no double-dispatch)"
+        } else {
+            Add-Fail "Duplicate claim handling changed (first=$($claim1.outcome) second=$($claim2.outcome))"
+        }
+
+        # --- 3. Cleanup under auth failure THROWS ----------------------------
+        $env:FAKE_GH_FAIL_MODE = "auth"
+        $threw = $false
+        try {
+            Invoke-SquadLeaseSweep -Repository "octo/demo" | Out-Null
+        } catch {
+            $threw = $true
+        }
+        if ($threw) {
+            Add-Pass "Sweeping under an auth failure throws instead of reporting a clean sweep"
+        } else {
+            Add-Fail "Sweeping under an auth failure reported success; a 401 must never be read as 'already clean'"
+        }
+        $threw = $false
+        try {
+            Set-SquadDispatchLeaseState -Operation "complete" -Repository "octo/demo" -LeaseKey $decision.leaseKey -State "succeeded" | Out-Null
+        } catch {
+            $threw = $true
+        }
+        if ($threw) {
+            Add-Pass "Completing a lease under an auth failure throws instead of reporting success"
+        } else {
+            Add-Fail "Completing a lease under an auth failure reported success"
+        }
+        $env:FAKE_GH_FAIL_MODE = ""
+
+        # --- 4. Externally-deleted lease is an idempotent SUCCESS ------------
+        $gone = Set-SquadDispatchLeaseState -Operation "complete" -Repository "octo/demo" -LeaseKey "issue-99999" -State "succeeded"
+        if ($gone.outcome -eq "gone") {
+            Add-Pass "Completing a lease that no longer exists succeeds (idempotent cleanup)"
+        } else {
+            Add-Fail "Completing a missing lease returned '$($gone.outcome)', expected 'gone'"
+        }
+
+        # --- 5. The sweeper reclaims a stale lease and is idempotent ---------
+        $env:SQUAD_LEASE_NOW = "2024-05-01T05:00:00.000Z"
+        $sweep1 = Invoke-SquadLeaseSweep -Repository "octo/demo"
+        $sweep2 = Invoke-SquadLeaseSweep -Repository "octo/demo"
+        if (@($sweep1.reclaimed).Count -ge 1 -and @($sweep2.reclaimed).Count -eq 0) {
+            Add-Pass "The sweeper reclaims a stale lease and reclaims nothing on a second run (idempotent)"
+        } else {
+            Add-Fail "Sweeper behaviour changed (first=$(@($sweep1.reclaimed).Count) second=$(@($sweep2.reclaimed).Count))"
+        }
+
+        # --- 6. CONCURRENT CLAIMS: a live claim is not a crashed one ---------
+        # The check above proves a DISPATCHED lease refuses a second claim. That
+        # is not the dangerous case. The dangerous case is back-to-back: two
+        # dispatchers claim before either reaches compute, because the window
+        # between claim and `az containerapp job start` spans an env build that
+        # shells out to node and az -- seconds, not milliseconds. Ralph's cron
+        # and a manual `squad-aca ralph run` overlap by design, so this is
+        # reachable through supported operation.
+        #
+        # Both `created` and `repaired` mean "you own it, dispatch". A second
+        # claimer must therefore see NEITHER.
+        $env:SQUAD_LEASE_NOW = "2024-05-01T06:00:00.000Z"
+        $decA = Get-SquadDispatchDecision -SessionId "issue-71-a" -DispatchSource "ralph" -Repository "octo/demo" -IssueNumber "71"
+        $decB = Get-SquadDispatchDecision -SessionId "issue-71-b" -DispatchSource "local-cli" -Repository "octo/demo" -IssueNumber "71"
+        $raceA = New-SquadDispatchLease -Decision $decA -Repository "octo/demo"
+        $raceB = New-SquadDispatchLease -Decision $decB -Repository "octo/demo"
+        if ($raceA.outcome -eq "created" -and $raceB.outcome -eq "active") {
+            Add-Pass "Two dispatchers claiming back-to-back BEFORE compute: exactly one is told to dispatch (winner=created, loser=active)"
+        } else {
+            Add-Fail "Concurrent claim exclusion broken: first='$($raceA.outcome)' second='$($raceB.outcome)'; both 'created' and 'repaired' authorise a dispatch, so anything but 'active' for the loser double-dispatches"
+        }
+        if ($raceB.lease -and $raceB.lease.sessionId -eq "issue-71-a") {
+            Add-Pass "The losing claimer is handed the CURRENT OWNER's lease record, so it can report who holds the work"
+        } else {
+            Add-Fail "The losing claimer did not receive the owner's lease record (sessionId='$($raceB.lease.sessionId)', expected 'issue-71-a')"
+        }
+        # ...and a claim that never reached compute is still self-healing once
+        # its window elapses, or a crash would wedge the issue forever.
+        $env:SQUAD_LEASE_NOW = "2024-05-01T06:30:00.000Z"
+        $raceC = New-SquadDispatchLease -Decision $decB -Repository "octo/demo"
+        if ($raceC.outcome -eq "repaired") {
+            Add-Pass "An abandoned claim is adopted once its window elapses ('repaired'), so a crash between claim and compute still self-heals"
+        } else {
+            Add-Fail "An abandoned claim was not adoptable after its window ('$($raceC.outcome)'); a crashed dispatcher would wedge the issue permanently"
+        }
+
+        # --- 7. The ledger is BOUNDED: terminal leases are pruned ------------
+        # Every run, smoke, telemetry smoke and Ralph issue mints a lease. With
+        # no delete path the ledger only ever grows, the Contents API directory
+        # listing silently caps at 1000 entries, and the sweeper's per-key read
+        # eventually exhausts the REST budget -- at which point a 429 makes
+        # claimLease throw and dispatch stops for EVERY issue.
+        $env:SQUAD_LEASE_NOW = "2024-05-01T07:00:00.000Z"
+        foreach ($n in 81..86) {
+            $d = Get-SquadDispatchDecision -SessionId "prune-$n" -DispatchSource "ralph" -Repository "octo/demo" -IssueNumber "$n"
+            New-SquadDispatchLease -Decision $d -Repository "octo/demo" | Out-Null
+            Set-SquadDispatchLeaseState -Operation "complete" -Repository "octo/demo" -LeaseKey $d.leaseKey -State "succeeded" | Out-Null
+        }
+        $beforePrune = @(Get-SquadDispatchLease -Repository "octo/demo").Count
+        $env:SQUAD_LEASE_NOW = "2024-05-01T08:00:00.000Z"
+        $sweepInside = Invoke-SquadLeaseSweep -Repository "octo/demo"
+        $insidePruned = @($sweepInside.pruned).Count
+        $env:SQUAD_LEASE_NOW = "2024-06-01T00:00:00.000Z"
+        $sweepAfter = Invoke-SquadLeaseSweep -Repository "octo/demo"
+        $afterPrune = @(Get-SquadDispatchLease -Repository "octo/demo").Count
+        if ($insidePruned -eq 0 -and @($sweepAfter.pruned).Count -ge 6 -and $afterPrune -lt $beforePrune) {
+            Add-Pass "The lease ledger SHRINKS: terminal leases survive the retention window and are pruned past it ($beforePrune -> $afterPrune)"
+        } else {
+            Add-Fail "Ledger growth is unbounded (inside-window pruned=$insidePruned past-window pruned=$(@($sweepAfter.pruned).Count) before=$beforePrune after=$afterPrune); a ledger that only grows ends in a 429 that stops all dispatch"
+        }
+
+        # --- 8. Sweep cost does not scale with ledger size -------------------
+        # A per-key read on a five-minute cron is 288 x N calls/day. Cap it, and
+        # make the cap observable so a partial pass is never mistaken for a
+        # complete one.
+        $env:SQUAD_LEASE_NOW = "2024-06-01T00:00:00.000Z"
+        foreach ($n in 91..98) {
+            $d = Get-SquadDispatchDecision -SessionId "cost-$n" -DispatchSource "ralph" -Repository "octo/demo" -IssueNumber "$n"
+            New-SquadDispatchLease -Decision $d -Repository "octo/demo" | Out-Null
+        }
+        $savedBudget = $env:SQUAD_LEASE_SWEEP_MAX_READS
+        $env:SQUAD_LEASE_SWEEP_MAX_READS = "3"
+        $bounded = Invoke-SquadLeaseSweep -Repository "octo/demo"
+        $env:SQUAD_LEASE_SWEEP_MAX_READS = $savedBudget
+        if ($bounded.examined -le 3 -and $bounded.total -ge 8 -and $bounded.budget -eq 3) {
+            Add-Pass "One sweep reads at most SQUAD_LEASE_SWEEP_MAX_READS records (examined=$($bounded.examined) of total=$($bounded.total)), so per-run API cost is O(1) in ledger size"
+        } else {
+            Add-Fail "Sweep cost is unbounded (examined=$($bounded.examined) total=$($bounded.total) budget=$($bounded.budget)); 288 runs/day x N reads exhausts the 5000/hr REST budget and stops dispatch"
+        }
+        if ($null -ne $bounded.truncated) {
+            Add-Pass "The sweep reports whether the ledger listing was truncated at the Contents API 1000-entry cap (never silently short)"
+        } else {
+            Add-Fail "The sweep no longer reports listing truncation; past 1000 entries the ledger would stop enumerating with no operator-visible cause"
+        }
+    } catch {
+        Add-Fail "Dispatch contract checks threw: $($_.Exception.Message)"
+    } finally {
+        $env:SQUAD_GH_BIN = $savedGhBin
+        $env:FAKE_GH_STATE = $savedState
+        $env:SQUAD_LEASE_NOW = $savedNow
+        $env:FAKE_GH_FAIL_MODE = $savedFail
+        Remove-Item -Recurse -Force $leaseRoot -ErrorAction SilentlyContinue
+    }
+
+    # --- 9. Deny-list-first classification, asserted on the DECIDING rule ----
+    # This defect class has now recurred three times (Sprint 3 B1, Sprint 5
+    # `cancel`, Sprint 6 B1). Asserting only the boolean cannot catch it:
+    # whenever a message matches just one list, both loop orders agree. So the
+    # classifier reports WHICH list decided, and that is what is asserted here.
+    # Swapping the two loops flips 'real-failure' to 'gone' and fails this check
+    # even though every boolean would still look right.
+    #
+    # These four texts are the realistic shapes: GitHub masks a permission
+    # denial on a private resource as a 404, so "403 ... (Not Found)" and
+    # "Bad credentials (HTTP 401) - Not Found" are the MOST likely real inputs.
+    $leaseModule = ((Join-Path $RepoRoot "worker\lib\dispatch-lease.js") -replace '\\', '/')
+    if (-not $nodeAvailable) {
+        Add-Fail "node is required to verify the gh failure classification but is not on PATH"
+    } else {
+        $probe = @"
+const lease = require('$leaseModule');
+const cases = [
+  ['gh: HTTP 403: Resource not accessible by integration (Not Found)', false, 'real-failure'],
+  ['gh: Bad credentials (HTTP 401) - Not Found', false, 'real-failure'],
+  ['gh: HTTP 429: API rate limit exceeded; the resource does not exist', false, 'real-failure'],
+  ['gh: HTTP 502: Bad gateway - Not Found', false, 'real-failure'],
+  ['gh: HTTP 404: Not Found', true, 'gone'],
+  ['gh: the mainframe declined politely', false, 'unrecognised']
+];
+const bad = [];
+for (const [text, isGone, decidedBy] of cases) {
+  const c = lease.classifyGhFailure({ ok: false, exitCode: 1, stderr: text, stdout: '' });
+  if (c.isGone !== isGone || c.decidedBy !== decidedBy) {
+    bad.push(text + ' => isGone=' + c.isGone + ' decidedBy=' + c.decidedBy);
+  }
+}
+process.stdout.write(bad.length ? 'BAD: ' + bad.join(' | ') : 'OK');
+"@
+        $classifyOut = (& node -e $probe 2>&1) -join " "
+        if ($LASTEXITCODE -eq 0 -and $classifyOut -eq "OK") {
+            Add-Pass "gh failure classification is DENY-LIST FIRST and reports the deciding rule: a 403/401/429/5xx that also says 'Not Found' is a failure, an unrecognised failure is a failure, and only a clean 404 is 'gone'"
+        } else {
+            Add-Fail "gh failure classification changed: $classifyOut"
+        }
+    }
+}
+
+# The end-to-end ordering proof needs the CLI stub (a real `squad-aca` dispatch).
+if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment
+        Initialize-SquadCliStubRepository -Stub $stub | Out-Null
+
+        # ORDERING BY INDEX: the lease blob must be written before the compute
+        # request. Both events land in one ordered log, so this compares
+        # positions -- not merely that both happened.
+        Reset-SquadCliStubLog -Stub $stub
+        Set-Content -LiteralPath $stub.CallLog -Value "" -NoNewline -Encoding ascii
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("smoke", "--repo", "octo/demo")
+        $calls = @(Get-Content -LiteralPath $stub.CallLog -ErrorAction SilentlyContinue)
+        $leaseIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -like "gh lease-write*" })
+        $startIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -eq "az job-start" })
+        if ($leaseIdx -ge 0 -and $startIdx -ge 0 -and $leaseIdx -lt $startIdx) {
+            Add-Pass "squad-aca dispatch writes the lease at index $leaseIdx, BEFORE the compute request at index $startIdx"
+        } else {
+            Add-Fail "Claim-before-compute ordering broken (lease index=$leaseIdx, compute index=$startIdx, log=$($calls -join ' | '))"
+        }
+
+        # Route and dispatcher source must reach the execution env, or `sessions`
+        # has nothing to show.
+        $startCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($startCall.Count -eq 1 -and $startCall[0] -like "*SQUAD_DISPATCH_ROUTE=aca-job*" -and $startCall[0] -like "*SQUAD_DISPATCH_SOURCE=local-cli*" -and $startCall[0] -like "*SQUAD_LEASE_KEY=*") {
+            Add-Pass "Dispatch stamps SQUAD_DISPATCH_ROUTE, SQUAD_DISPATCH_SOURCE and SQUAD_LEASE_KEY into the execution"
+        } else {
+            Add-Fail "Dispatch no longer stamps the route/source/lease env: $($startCall -join ' | ')"
+        }
+
+        # sessions surfaces both, in full (no width-dependent truncation).
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("sessions")
+        if ($r.StdOut -match "Route" -and $r.StdOut -match "Source" -and $r.StdOut -match "aca-job" -and $r.StdOut -match "local-cli") {
+            Add-Pass "squad-aca sessions shows the resolved Route and the dispatcher Source"
+        } else {
+            Add-Fail "squad-aca sessions no longer surfaces Route/Source"
+        }
+
+        # A repeat dispatch of the SAME work must not start a second execution.
+        Reset-SquadCliStubLog -Stub $stub
+        $first = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "dupe-session", "do the thing")
+        $firstStarts = @($first.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        Reset-SquadCliStubLog -Stub $stub
+        $second = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "dupe-session", "do the thing")
+        $secondStarts = @($second.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($firstStarts -eq 1 -and $secondStarts -eq 0) {
+            Add-Pass "A repeated dispatch of the same session does not start a second execution (idempotent)"
+        } else {
+            Add-Fail "Duplicate dispatch started $secondStarts execution(s) on the second run (first run started $firstStarts)"
+        }
+    } catch {
+        Add-Fail "Dispatch ordering checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
+# --- Operational invariants around the lease that only source can prove -----
+# These three are cheap to state and expensive to lose. Each is a defect the
+# reviewer found by reading, and each would otherwise be re-introducible with a
+# one-line edit and no failing test.
+$entrypointSh = Join-Path $RepoRoot "worker\entrypoint.sh"
+if (Test-Path $entrypointSh) {
+    $entryText = Get-Content -LiteralPath $entrypointSh -Raw
+    # A heartbeat that fires ONCE is not a heartbeat. With a one-hour TTL, a
+    # session running longer than that is swept as stale mid-flight and its
+    # lease becomes re-claimable while the execution is still live.
+    if ($entryText -match "squad_lease_heartbeat_loop" -and $entryText -match "SQUAD_LEASE_HEARTBEAT_SECONDS" -and $entryText -match "while\s+(true|:)") {
+        Add-Pass "The worker heartbeat is PERIODIC (a background ticker), so a session outliving the lease TTL is not swept as stale mid-flight"
+    } else {
+        Add-Fail "worker/entrypoint.sh no longer runs a periodic heartbeat; a single beat plus a terminal write lets a long-running session's lease be reclaimed while it is still executing"
+    }
+}
+$cliSource = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+if (Test-Path $cliSource) {
+    $cliText = Get-Content -LiteralPath $cliSource -Raw
+    # `Format-Table -AutoSize` sizes to the terminal, so the rightmost columns
+    # vanish on a narrow window. The leases table has seven columns and the
+    # runbook tells operators to read the last two.
+    $bareAutoSize = @(
+        Select-String -LiteralPath $cliSource -Pattern 'Format-Table\s+-AutoSize\s*$' -AllMatches
+    )
+    if ($bareAutoSize.Count -eq 0) {
+        Add-Pass "No table in squad-aca.ps1 ends at 'Format-Table -AutoSize'; every one is piped through Out-String -Width so columns cannot silently vanish on a narrow terminal"
+    } else {
+        Add-Fail "squad-aca.ps1 has $($bareAutoSize.Count) bare 'Format-Table -AutoSize' table(s) at line(s) $(($bareAutoSize.LineNumber) -join ', '); trailing columns disappear on a narrow terminal"
+    }
+    # The `dispatched` write must not be able to throw AFTER compute has been
+    # requested: a transient 429 would leave the lease `claimed`, and the user's
+    # retry would then be told `repaired` and start a SECOND execution. Assert
+    # the STRUCTURE rather than a marker comment: each write must sit inside its
+    # own try, and that try must not release the lease (releasing would hand
+    # live work to another dispatcher).
+    $cliLines = @(Get-Content -LiteralPath $cliSource)
+    $markLines = @(
+        Select-String -LiteralPath $cliSource -Pattern 'Operation\s+"dispatched"' -AllMatches |
+            ForEach-Object { $_.LineNumber }
+    )
+    $unguarded = @()
+    foreach ($ln in $markLines) {
+        $before = $cliLines[[Math]::Max(0, $ln - 3)..($ln - 2)] -join "`n"
+        $after = $cliLines[$ln..[Math]::Min($cliLines.Count - 1, $ln + 3)] -join "`n"
+        if ($before -notmatch 'try\s*\{' -or $after -notmatch '\}\s*catch' -or $after -match 'Operation\s+"release"') {
+            $unguarded += $ln
+        }
+    }
+    if ($markLines.Count -ge 2 -and $unguarded.Count -eq 0) {
+        Add-Pass "All $($markLines.Count) 'dispatched' lease writes in squad-aca.ps1 sit inside a try that warns rather than throwing or releasing, so a fault after compute started cannot strand the lease as 'claimed'"
+    } else {
+        Add-Fail "Unguarded 'dispatched' lease write(s) in squad-aca.ps1 at line(s) $($unguarded -join ', ') (found $($markLines.Count) write(s)); a 429 there throws to the user after compute started, and the retry is told 'repaired' and starts a second execution"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 10. CLI golden gate is present AND automated
 # ---------------------------------------------------------------------------
 # scripts/tests/verify-cli-golden.ps1 is the only guard that compares the whole

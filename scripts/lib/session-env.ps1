@@ -58,7 +58,10 @@ $script:SessionManagedEnvKeys = @(
     "PR_BODY",
     "COMMIT_MESSAGE",
     "RALPH_LABELS",
-    "RALPH_MAX_ISSUES"
+    "RALPH_MAX_ISSUES",
+    "SQUAD_DISPATCH_ROUTE",
+    "SQUAD_DISPATCH_SOURCE",
+    "SQUAD_LEASE_KEY"
 )
 
 function Get-JobTemplateEnvVars {
