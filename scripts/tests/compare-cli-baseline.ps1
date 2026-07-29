@@ -8,10 +8,13 @@
     The execution provider seam (docs/architecture.md, "Execution provider
     boundary") is only safe if it is observably invisible. `validate.ps1`
     section 8 asserts specific properties; this script proves the stronger
-    claim by *differential capture*: it materialises another revision's
-    `scripts/` tree, drives both revisions through the same stubbed `az`/`gh`
+    claim by *differential capture*: it materialises another revision's whole
+    tree, drives both revisions through the same stubbed `az`/`gh`
     environment, and compares the recorded exit code, stdout, stderr, and every
     `az`/`gh` argv byte for byte.
+
+    SELF-CHECK: `-BaselineRef HEAD` compares the working tree against itself and
+    MUST report 22/22. If it does not, this tool is broken, not the CLI.
 
     The capture matrix and capture format live in
     scripts/tests/cli-capture-cases.ps1, shared with
@@ -65,19 +68,42 @@ if (-not $WorkDir) {
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
 try {
-    # Materialise the baseline revision's scripts/ without disturbing the worktree.
+    # Materialise the baseline revision's WHOLE tree without disturbing the
+    # worktree. Not just `scripts`: squad-aca.ps1 resolves siblings of that
+    # directory -- scripts/lib/dispatch-contract.ps1 shells out to
+    # worker/lib/squad-dispatch.js, resolved as <repoRoot>/worker/lib -- so a
+    # scripts-only archive gives the baseline a tree where those siblings do not
+    # exist. Every case that dispatches then dies with `Cannot find module` and
+    # is reported as "OBSERVABLE BEHAVIOUR CHANGED", which is the tool accusing
+    # the working tree of a change the baseline could not make.
+    #
+    # That is not hypothetical: it shipped. Sprint 6 added the worker/lib
+    # dependency without widening this scope, and the tool then reported 16/22
+    # for two IDENTICAL trees (-BaselineRef HEAD). A tool that cannot report
+    # "unchanged" for identical trees proves nothing about a real change.
+    #
+    # Archiving the entire ref -- rather than adding `worker` to the pathspec --
+    # is the fix that cannot recur: the next cross-directory dependency needs no
+    # edit here. 296 tracked files; the cost is milliseconds.
     $baselineRoot = Join-Path $WorkDir "baseline"
     New-Item -ItemType Directory -Force -Path $baselineRoot | Out-Null
     Push-Location $RepoRoot
     try {
-        $archive = Join-Path $WorkDir "baseline-scripts.tar"
-        git archive --format=tar --output=$archive $BaselineRef scripts
+        $archive = Join-Path $WorkDir "baseline-tree.tar"
+        git archive --format=tar --output=$archive $BaselineRef
         if ($LASTEXITCODE -ne 0) { throw "git archive $BaselineRef failed" }
     } finally {
         Pop-Location
     }
-    tar -xf (Join-Path $WorkDir "baseline-scripts.tar") -C $baselineRoot
+    tar -xf (Join-Path $WorkDir "baseline-tree.tar") -C $baselineRoot
     if ($LASTEXITCODE -ne 0) { throw "extracting the baseline archive failed" }
+    # Fail loudly rather than silently comparing against a tree that cannot run
+    # the thing under test.
+    foreach ($required in @("scripts\squad-aca.ps1", "worker\lib\squad-dispatch.js")) {
+        if (-not (Test-Path (Join-Path $baselineRoot $required))) {
+            throw "the materialised baseline ($BaselineRef) has no $required -- the archive scope is wrong, and every capture that needs it would be reported as a behaviour change."
+        }
+    }
 
     Write-Host "Capturing baseline ($BaselineRef)..." -ForegroundColor Cyan
     Invoke-CaptureSet -ScriptsRoot (Join-Path $baselineRoot "scripts") -OutDir (Join-Path $WorkDir "out-baseline")

@@ -281,6 +281,21 @@ null
 ]
 '@
 
+    # A listing whose labels are HOSTILE. The service is not a trusted source of
+    # identifiers: these are shapes New-SandboxLabelName can never produce, and
+    # each one reaches an argv (`sandbox delete -l name=<label>`) or a log line.
+    #   - path traversal, to address a sibling resource
+    #   - an embedded newline, to forge an audit record
+    Set-Content -LiteralPath (Join-Path $fixtureDir "sandbox-list-hostile-label.json") -Encoding ascii -Value @'
+[
+  { "labels": { "name": "squad-../../other-tenant" }, "status": "Running", "createdAt": "2020-01-02T03:04:05" }
+]
+'@
+    Set-Content -LiteralPath (Join-Path $fixtureDir "sandbox-list-hostile-label-2.json") -Encoding ascii -Value @'
+[
+  { "labels": { "name": "squad-ok\nDELETED everything" }, "status": "Running", "createdAt": "2020-01-02T03:04:05" }
+]
+'@
     # Brokered credential creation returns an OPAQUE id; the token itself is
     # written to stdin and never appears in the response.
     Set-Content -LiteralPath (Join-Path $fixtureDir "credential-create.json") -Encoding ascii -Value @'

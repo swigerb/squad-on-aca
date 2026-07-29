@@ -2146,6 +2146,55 @@ if (-not (Test-Path $providerLib)) {
             Add-Fail "A default-allow class template was accepted: $sbOpenErr"
         }
 
+        # The suffix matcher itself, DIRECTLY. It decides whether a requested
+        # host is already covered by a template pattern, so it is the function
+        # that says "no new rule is needed" -- and a matcher that is too generous
+        # silently widens the sandbox's reach. Only the narrowing PATH was
+        # covered before, and mutating the matcher to
+        # `$Host_.EndsWith($Pattern.Substring(2))` -- which makes
+        # `evilgithub.com` "covered" by `*.github.com` -- left the whole suite
+        # green. These are direct assertions over the value classes that matter.
+        $sbHostCases = @(
+            # exact
+            @{ Host_ = "registry.npmjs.org"; Pattern = "registry.npmjs.org"; Want = $true },
+            @{ Host_ = "REGISTRY.NPMJS.ORG"; Pattern = "registry.npmjs.org"; Want = $true },
+            @{ Host_ = "registry.npmjs.org."; Pattern = "registry.npmjs.org"; Want = $false },
+            # leading wildcard: a proper subdomain, and ONLY a proper subdomain
+            @{ Host_ = "api.github.com";      Pattern = "*.github.com"; Want = $true },
+            @{ Host_ = "a.b.github.com";      Pattern = "*.github.com"; Want = $true },
+            @{ Host_ = "API.GITHUB.COM";      Pattern = "*.github.com"; Want = $true },
+            @{ Host_ = "github.com";          Pattern = "*.github.com"; Want = $false },  # the bare apex
+            @{ Host_ = ".github.com";         Pattern = "*.github.com"; Want = $false },  # empty label
+            # the boundary attacks: the label separator must be part of the match
+            @{ Host_ = "evilgithub.com";      Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "xgithub.com";         Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "notgithub.com";       Pattern = "*.github.com"; Want = $false },
+            # the suffix attacks: the pattern must be a SUFFIX, not a substring
+            @{ Host_ = "github.com.evil.net"; Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.github.com.evil.net"; Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.github.company.com";  Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.github.com.";     Pattern = "*.github.com"; Want = $false },  # trailing dot
+            # homograph / punycode: neither is github.com and neither may pass
+            @{ Host_ = "g" + [char]0x0131 + "thub.com"; Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.xn--gthub-jua.com";        Pattern = "*.github.com"; Want = $false },
+            # degenerate patterns must never become "match anything"
+            @{ Host_ = "evil.example.com"; Pattern = "*";   Want = $false },
+            @{ Host_ = "evil.example.com"; Pattern = "*.";  Want = $false },
+            @{ Host_ = "evil.example.com"; Pattern = "**";  Want = $false },
+            @{ Host_ = "evil.example.com"; Pattern = "";    Want = $false },
+            @{ Host_ = "";                 Pattern = "*.github.com"; Want = $false }
+        )
+        $sbHostBad = @()
+        foreach ($case in $sbHostCases) {
+            $got = Test-SandboxHostCoveredByPattern -Host_ $case.Host_ -Pattern $case.Pattern
+            if ($got -ne $case.Want) { $sbHostBad += "'$($case.Host_)' vs '$($case.Pattern)' -> $got (wanted $($case.Want))" }
+        }
+        if ($sbHostBad.Count -eq 0) {
+            Add-Pass "The egress suffix matcher covers only a proper subdomain of a wildcard pattern: not the bare apex, not 'evilgithub.com', not 'github.com.evil.net', not a homograph or punycode lookalike, and no degenerate pattern ('*', '*.', '**', '') matches anything"
+        } else {
+            Add-Fail "The egress host matcher is wrong: $($sbHostBad -join '; ')"
+        }
+
         # --- 15. hostile identifiers are refused BEFORE API construction -----
         # Fuzz over the value classes that turn an identifier into something
         # other than data: path traversal, control characters, and a leading
@@ -2338,13 +2387,62 @@ if (-not (Test-Path $providerLib)) {
         }
         $env:SQUAD_STUB_ACA_LIST_FIXTURE = ""
 
+        # A label is service-supplied input, not a value this process minted, and
+        # it reaches an argv (`sandbox delete -l name=<label>`) and a log line.
+        # The disk id resolved from this same service is already validated
+        # "whether it came from config or from the service's own listing"; a
+        # label that skipped that check was the one inconsistency left.
+        $sbHostileLabels = @(
+            @{ Fixture = "sandbox-list-hostile-label.json";   What = "path traversal" },
+            @{ Fixture = "sandbox-list-hostile-label-2.json"; What = "an embedded newline" }
+        )
+        $sbLabelBad = @()
+        foreach ($case in $sbHostileLabels) {
+            $env:SQUAD_STUB_ACA_LIST_FIXTURE = $case.Fixture
+            Reset-SquadCliStubLog -Stub $sbStub
+            $sbLabelErr = ""
+            try { Invoke-SquadSandboxReaper -Context $sbCredProvider.Context -MaxAgeMinutes 60 -Delete 6>$null | Out-Null } catch { $sbLabelErr = [string]$_.Exception.Message }
+            $sbLabelDeletes = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca | Where-Object { $_ -like "sandbox delete *" })
+            if ($sbLabelErr -notmatch "squad-sandbox:capability") { $sbLabelBad += "$($case.What) was not refused (err=$sbLabelErr)" }
+            if ($sbLabelDeletes.Count -ne 0) { $sbLabelBad += "$($case.What) still produced $($sbLabelDeletes.Count) delete call(s)" }
+            if ($sbLabelErr -match "other-tenant" -or $sbLabelErr -match "DELETED everything") { $sbLabelBad += "$($case.What) was echoed back into the error message" }
+        }
+        $env:SQUAD_STUB_ACA_LIST_FIXTURE = ""
+        if ($sbLabelBad.Count -eq 0) {
+            Add-Pass "A sandbox label supplied by the SERVICE's own listing is validated exactly like the disk id resolved from it: a traversal or control-character label is refused before any 'sandbox delete' is built, and is never echoed"
+        } else {
+            Add-Fail "Service-supplied labels bypass identifier validation: $($sbLabelBad -join '; ')"
+        }
+
         # --- 19. failure kinds are separately identifiable -------------------
         # PRD #6 requires quota exhaustion, auth failure, capability refusal,
-        # readiness and execution failure to be distinguishable. The order
-        # matters: quota is classified BEFORE auth because a throttling response
-        # is a 429 and several services return 403 for a quota refusal --
-        # reading "you have hit your ceiling" as "your credentials are bad"
-        # sends an operator to rotate a perfectly good token.
+        # readiness and execution failure to be distinguishable, and the ORDER of
+        # the rules is load-bearing: a throttling response is a 429 and several
+        # services return 403 for a quota refusal, so reading "you have hit your
+        # ceiling" as "your credentials are bad" sends an operator to rotate a
+        # perfectly good token -- while the inverse, reading a rotated-out
+        # credential as "a ceiling was hit, retry later", makes an unattended
+        # dispatcher retry a credential fault forever.
+        #
+        # WHY THIS BLOCK LOOKS THE WAY IT DOES. The previous version asserted
+        # only the kind, over fixtures that each matched exactly ONE rule list.
+        # For such an input every ordering agrees, so swapping the quota and auth
+        # blocks left the suite at 200/0/0 -- the label "quota is not misread as
+        # auth" was a claim, not an observation. That is the fifth recurrence of
+        # this defect class in this programme. Two devices stop it recurring:
+        #
+        #   1. AMBIGUOUS fixtures. Each `Also` fixture matches more than one rule
+        #      list, and the ambiguity is PROVEN from the shipping pattern lists
+        #      rather than asserted by a comment. Only such an input can tell two
+        #      orderings apart.
+        #   2. An ADJACENCY audit. Every neighbouring pair of rules in
+        #      $script:SandboxFailureRules must have at least one ambiguous
+        #      fixture spanning it. Adding a rule, or deleting a fixture, without
+        #      a discriminating input is itself a failing check.
+        #
+        # `DecidedBy` (Get-SandboxFailureClassification) is what makes a
+        # precedence assertable at all -- the same treatment classifyGhFailure
+        # in worker/lib/dispatch-lease.js received after Sprint 6's B3.
         $sbKinds = @(
             @{ Err = "ERROR: QuotaExceeded: the subscription has exceeded the limit for sandboxes"; Want = "quota" },
             @{ Err = "ERROR: 429 TooManyRequests"; Want = "quota" },
@@ -2352,18 +2450,132 @@ if (-not (Test-Path $providerLib)) {
             @{ Err = "ERROR: (AuthorizationFailed) does not have permission"; Want = "auth" },
             @{ Err = "ERROR: sandbox is still provisioning"; Want = "readiness" },
             @{ Err = "Error: Network issue - retry policy expired"; Want = "transport" },
-            @{ Err = "ERROR: the command exited with status 2"; Want = "execution" }
+            @{ Err = "ERROR: the command exited with status 2"; Want = "execution" },
+
+            # --- ambiguous: quota vs auth (the reorder mutation) -------------
+            # The discriminating input class the taxonomy exists for, and which
+            # no previous fixture covered: a 403 that is really a quota refusal.
+            @{ Err = "ERROR: 403 Forbidden (QuotaExceeded): the subscription has no remaining sandbox capacity"
+               Want = "quota"; Also = @("auth") },
+
+            # --- ambiguous: auth vs quota by GUID (the substring mutation) ---
+            # Azure decorates every auth failure with GUIDs. With "429" matched
+            # as a bare substring these classified as `quota`, so a rotated-out
+            # credential looked like a ceiling and got retried forever.
+            @{ Err = "ERROR: (AuthorizationFailed) The client does not have authorization to perform action. Correlation ID: 1b8f429c-8f2d-4c1e-9a42-9b7f0e429a11"
+               Want = "auth" },
+            @{ Err = "ERROR: AADSTS700016 unauthorized_client. Trace ID: 5c429abc-1d2e-4f3a-8b6c-0d1e2f3a4b5c"
+               Want = "auth" },
+            @{ Err = "ERROR: 401 Unauthorized (request id 0000429f-aaaa-bbbb-cccc-ddddeeeeffff)"
+               Want = "auth" },
+            @{ Err = "ERROR: sandbox is still provisioning. Request ID: 4291aaaa-bbbb-cccc-dddd-eeeeffff0000"
+               Want = "readiness" },
+
+            # --- ambiguous: auth vs readiness -------------------------------
+            @{ Err = "ERROR: (AuthorizationFailed) the sandbox is still provisioning and the caller is not authorized to wait for it"
+               Want = "auth"; Also = @("readiness") },
+
+            # --- ambiguous: transport vs quota ------------------------------
+            # Transport wins: a reset connection tells us nothing about a ceiling.
+            @{ Err = "ERROR: 429 TooManyRequests (connection reset by peer)"
+               Want = "transport"; Also = @("quota") }
         )
-        $sbKindBad = @()
-        foreach ($case in $sbKinds) {
-            $got = Get-SandboxFailureKind -Result ([pscustomobject]@{ ExitCode = 1; StdOut = @(); StdErr = @($case.Err) })
-            if ($got -ne $case.Want) { $sbKindBad += "'$($case.Err.Substring(0, [math]::Min(28, $case.Err.Length)))' -> $got (wanted $($case.Want))" }
+
+        # Which rule lists does this text match at all? Computed from the SHIPPING
+        # lists, so "this fixture is ambiguous" is an observation, not a label.
+        function Get-SbMatchingRules {
+            param([string]$Text)
+            $hit = @()
+            foreach ($rule in $script:SandboxFailureRules) {
+                foreach ($pattern in $rule.Patterns) {
+                    if ($Text -match $pattern) { $hit += $rule.Kind; break }
+                }
+            }
+            return $hit
         }
-        if ((Get-SandboxFailureKind -Result ([pscustomobject]@{ ExitCode = 0; StdOut = @(); StdErr = @() })) -ne "") { $sbKindBad += "success classified as a failure" }
+
+        $sbKindBad = @()
+        $sbAmbiguousPairs = @{}
+        foreach ($case in $sbKinds) {
+            $short = $case.Err.Substring(0, [math]::Min(34, $case.Err.Length))
+            $cls = Get-SandboxFailureClassification -Result ([pscustomobject]@{ ExitCode = 1; StdOut = @(); StdErr = @($case.Err) })
+            if ($cls.Kind -ne $case.Want) { $sbKindBad += "'$short' -> $($cls.Kind) (wanted $($case.Want))" }
+            # The rule that decided must be the rule that was supposed to.
+            $wantDecider = $(if ($case.Want -eq "execution") { "fallthrough" } else { $case.Want })
+            if ($cls.DecidedBy -ne $wantDecider) { $sbKindBad += "'$short' was decided by '$($cls.DecidedBy)', wanted '$wantDecider'" }
+            if ($case.Want -ne "execution" -and -not $cls.Pattern) { $sbKindBad += "'$short' reported no deciding pattern" }
+
+            $matching = @(Get-SbMatchingRules -Text $case.Err)
+            $also = @()
+            if ($case.ContainsKey("Also")) { $also = @($case.Also | Where-Object { $_ }) }
+            if ($also.Count -gt 0) {
+                # PROVE the ambiguity from the shipping lists. If a pattern edit
+                # makes this fixture match only one list, it stops discriminating
+                # between the two orderings and this check says so.
+                foreach ($other in $also) {
+                    if ($matching -notcontains $other) {
+                        $sbKindBad += "'$short' was declared ambiguous with '$other' but the shipping '$other' patterns do not match it -- it no longer discriminates between the two orderings"
+                    }
+                }
+                if ($matching -notcontains $case.Want) {
+                    $sbKindBad += "'$short' does not match the '$($case.Want)' list at all"
+                }
+                foreach ($other in $also) {
+                    $sbAmbiguousPairs["$($case.Want)|$other"] = $true
+                    $sbAmbiguousPairs["$other|$($case.Want)"] = $true
+                }
+            }
+        }
+        $sbSuccessCls = Get-SandboxFailureClassification -Result ([pscustomobject]@{ ExitCode = 0; StdOut = @(); StdErr = @() })
+        if ($sbSuccessCls.Kind -ne "" -or $sbSuccessCls.DecidedBy -ne "success") { $sbKindBad += "success classified as a failure" }
+        # Our own client give-up is transport whatever it says, because it is not
+        # a service verdict (Invoke-CliSafeWithStdin reports exit 124).
+        $sbTimeoutCls = Get-SandboxFailureClassification -Result ([pscustomobject]@{ ExitCode = 124; StdOut = @(); StdErr = @("timed out after 120s") })
+        if ($sbTimeoutCls.Kind -ne "transport") { $sbKindBad += "a client timeout (exit 124, 'timed out after 120s') classified as '$($sbTimeoutCls.Kind)', not transport" }
+        # ...and by TEXT alone too, so a caller that lost the exit code still gets it right.
+        if ((Get-SandboxFailureKind -Result ([pscustomobject]@{ ExitCode = 1; StdOut = @(); StdErr = @("aca: timed out after 120s") })) -ne "transport") {
+            $sbKindBad += "'timed out after 120s' is not matched as a transport failure by text"
+        }
         if ($sbKindBad.Count -eq 0) {
-            Add-Pass "Quota, auth, readiness, transport and execution failures are separately identifiable, and quota is not misread as auth"
+            Add-Pass "Quota, auth, readiness, transport and execution failures are separately identifiable, each names the rule that decided it, and a 403-that-is-really-a-quota-refusal is classified quota while a GUID-bearing auth failure is NOT"
         } else {
             Add-Fail "Failure classification is wrong: $($sbKindBad -join '; ')"
+        }
+
+        # The anti-recurrence device: no adjacent pair of rules may be ordered
+        # without a fixture that can tell the two orderings apart.
+        $sbRuleKinds = @($script:SandboxFailureRules | ForEach-Object { $_.Kind })
+        $sbUncovered = @()
+        for ($i = 0; $i -lt ($sbRuleKinds.Count - 1); $i++) {
+            $key = "$($sbRuleKinds[$i])|$($sbRuleKinds[$i + 1])"
+            if (-not $sbAmbiguousPairs.ContainsKey($key)) { $sbUncovered += $key.Replace("|", " before ") }
+        }
+        if ($sbUncovered.Count -eq 0 -and $sbRuleKinds.Count -ge 4) {
+            Add-Pass "Every adjacent pair of classification rules ($($sbRuleKinds -join ' > ')) has a fixture that matches BOTH lists, so swapping any two neighbouring rules is a visible, failing change"
+        } else {
+            Add-Fail "These rule orderings are unobservable -- no fixture matches both lists, so reordering them is silent: $($sbUncovered -join ', ')"
+        }
+
+        # And the ordering itself, stated once: transport, then quota, then auth.
+        if ($sbRuleKinds[0] -eq "transport" -and $sbRuleKinds.IndexOf("quota") -lt $sbRuleKinds.IndexOf("auth")) {
+            Add-Pass "Classification order is transport-first and quota-before-auth (docs/runbook.md: a quota refusal phrased as a 403 must not send an operator to rotate a good token)"
+        } else {
+            Add-Fail "Classification rule order is wrong: $($sbRuleKinds -join ' > ') -- quota must precede auth and transport must be first"
+        }
+
+        # No numeric HTTP code may be matched as a bare substring. This is the
+        # discipline Test-AcaJobExecutionGone has always kept, and dropping it is
+        # what let a GUID decide a credential fault was a quota ceiling.
+        $sbBareCodes = @()
+        foreach ($rule in $script:SandboxFailureRules) {
+            foreach ($pattern in $rule.Patterns) {
+                if ($pattern -match "^\d{3}$") { $sbBareCodes += "$($rule.Kind): '$pattern'" }
+            }
+        }
+        if ($sbBareCodes.Count -eq 0) {
+            Add-Pass "No classification rule matches a bare HTTP status code, so a correlation GUID can never decide a failure kind"
+        } else {
+            Add-Fail "Bare HTTP status codes are matched as substrings and will fire on GUIDs: $($sbBareCodes -join ', ')"
         }
         # The tag has to actually reach the caller, not just exist as a function.
         $env:SQUAD_STUB_ACA_RC = "1"

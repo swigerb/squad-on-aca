@@ -118,8 +118,88 @@ $script:SandboxInconclusivePatterns = @(
     "connection aborted",
     "read timed out",
     "operation timed out",
+    # Invoke-CliSafeWithStdin (scripts/lib/aca-logs.ps1) reports its OWN client
+    # timeout as exit 124 with "timed out after <n>s". That is this process
+    # giving up on a wait, not the service reaching a verdict, so it is
+    # inconclusive for exactly the same reason as the `aca` client's ~120s
+    # give-up. Without this, a timeout on the credential broker or the seed exec
+    # classified as `execution` -- a definite statement nothing observed.
+    "timed out after",
     "temporary failure in name resolution",
     "EOF occurred in violation of protocol"
+)
+
+# ---------------------------------------------------------------------------
+# Failure classification rules -- ORDERED, and exposed for exactly that reason
+# ---------------------------------------------------------------------------
+#
+# The order of these blocks is load-bearing, so it lives in DATA a test can walk
+# rather than in the control flow of a function a test can only call. Two
+# properties depend on it:
+#
+#   * transport first  -- a failure that says nothing about the sandbox must not
+#                         be read as a verdict about it;
+#   * quota before auth -- several services phrase a quota rejection as a 403,
+#                         and reading "you have hit your ceiling" as "your
+#                         credentials are bad" sends an operator to rotate a
+#                         perfectly good token.
+#
+# NUMERIC HTTP CODES ARE NEVER MATCHED AS BARE SUBSTRINGS. Test-AcaJobExecutionGone
+# (squad-aca-job-provider.ps1) has always used only NAMED codes -- "TooManyRequests",
+# "throttl", "Retry-After" -- and never "429", precisely because Azure decorates
+# every auth failure with object-, subscription- and correlation-GUIDs. A bare
+# "429" matched the hex of `Correlation ID: 1b8f429c-...` and, being first in an
+# ordered classifier, turned every GUID-bearing AuthorizationFailed / AADSTS
+# message into `quota` -- i.e. "a ceiling was hit, retry later" -- so an
+# unattended dispatcher would retry a rotated-out credential forever. The
+# taxonomy exists to prevent that, and a bare substring inverted it.
+#
+# Where a numeric code is still useful it is written with a hardened boundary:
+#
+#     (?<![0-9A-Za-z-])429(?![0-9A-Za-z-])
+#
+# The code must be delimited by something that is neither alphanumeric NOR a
+# hyphen. Every GUID/trace-id occurrence is bounded by a hex digit or a hyphen
+# on at least one side (`1b8f429c`, `0000429f`, `-429c-`, `4291aaaa`), so none of
+# them can match; a real code -- `HTTP 429`, `(403)`, `status=401,` -- always is
+# not. A plain `\b` is NOT enough: `\b` treats `-` as a boundary, so
+# `Correlation ID: 1b8f-429c` would still match.
+$script:SandboxFailureRules = @(
+    [pscustomobject]@{
+        Kind     = "transport"
+        Patterns = $script:SandboxInconclusivePatterns
+    },
+    [pscustomobject]@{
+        Kind     = "quota"
+        # "quota" is case-insensitive here and therefore already covers
+        # "QuotaExceeded"; the named throttling codes mirror Test-AcaJobExecutionGone.
+        Patterns = @(
+            "quota",
+            "exceeded the limit", "limit exceeded",
+            "insufficient capacity", "no capacity", "out of capacity",
+            "TooManyRequests", "SubscriptionRequestsThrottled",
+            "throttl", "rate limit", "Retry-After",
+            "(?<![0-9A-Za-z-])429(?![0-9A-Za-z-])"
+        )
+    },
+    [pscustomobject]@{
+        Kind     = "auth"
+        # "unauthorized" covers "Unauthorized" and "unauthorized_client".
+        Patterns = @(
+            "AADSTS", "unauthorized", "invalid_client", "Forbidden",
+            "CheckAccess", "AuthorizationFailed", "AuthorizationPermissionMismatch",
+            "does not have authorization", "aca login", "az login",
+            "refresh token has expired", "ExpiredAuthenticationToken",
+            "InvalidAuthenticationToken", "authentication failed",
+            "(?<![0-9A-Za-z-])401(?![0-9A-Za-z-])",
+            "(?<![0-9A-Za-z-])403(?![0-9A-Za-z-])"
+        )
+    },
+    [pscustomobject]@{
+        Kind     = "readiness"
+        Patterns = @("not ready", "NotReady", "still provisioning", "Provisioning",
+                     "is starting", "suspended", "Suspended")
+    }
 )
 
 # Flags whose VALUE must never reach a log, an error message, or a test capture:
@@ -368,46 +448,73 @@ function New-SandboxFailure {
     return "[squad-sandbox:$Kind] $Message"
 }
 
+function Get-SandboxFailureClassification {
+    <#
+    .SYNOPSIS
+        Classify a raw CLI failure, and report WHICH RULE DECIDED.
+
+    .DESCRIPTION
+        Returns `Kind` (the failure kind), `DecidedBy` (the rule that produced
+        it) and `Pattern` (the literal pattern that matched).
+
+        `DecidedBy`/`Pattern` are not decoration. A precedence between two rule
+        blocks is UNOBSERVABLE through the kind alone: for every input where
+        only one list matches, both orderings return the same kind, so a test
+        built from unambiguous fixtures passes under either. Only an input that
+        matches BOTH lists distinguishes them, and only the reported rule says
+        which one won. This mirrors classifyGhFailure in
+        worker/lib/dispatch-lease.js, which was given the same treatment after
+        Sprint 6's B3 -- the same defect class, now for the fifth time in this
+        programme (PR #9's runner, Sprint 3 B1, Sprint 5 `cancel`, Sprint 6 B3,
+        and this classifier).
+
+        Ordering, and the deny-list-first discipline, live in
+        $script:SandboxFailureRules; this function only walks them. Rule order
+        and the presence of a genuinely ambiguous fixture for every ADJACENT
+        pair of rules are both asserted in scripts/validate.ps1, so removing the
+        discriminating fixtures is itself a failing change.
+
+        DecidedBy values:
+          success      exit 0; nothing to classify.
+          transport    the failure said nothing about the sandbox.
+          quota/auth/readiness   that rule's pattern list matched first.
+          fallthrough  no rule matched -> `execution`, the last resort.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Result)
+
+    if ($Result.ExitCode -eq 0) {
+        return [pscustomobject]@{ Kind = ""; DecidedBy = "success"; Pattern = "" }
+    }
+    # Same rule as Test-SandboxTransportInconclusive: exit 124 is our own
+    # give-up, decided without any message text.
+    if ($Result.ExitCode -eq 124) {
+        return [pscustomobject]@{ Kind = "transport"; DecidedBy = "transport"; Pattern = "exit 124" }
+    }
+    $text = ((@($Result.StdErr) + @($Result.StdOut) | Where-Object { $_ }) -join " ")
+
+    foreach ($rule in $script:SandboxFailureRules) {
+        foreach ($pattern in $rule.Patterns) {
+            if ($text -match $pattern) {
+                return [pscustomobject]@{ Kind = $rule.Kind; DecidedBy = $rule.Kind; Pattern = $pattern }
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Kind = "execution"; DecidedBy = "fallthrough"; Pattern = "" }
+}
+
 function Get-SandboxFailureKind {
     <#
     .SYNOPSIS
         Classify a raw CLI failure into one of the failure kinds.
 
     .DESCRIPTION
-        Deny-list first, most specific first, and `execution` only as the last
-        resort -- the same fail-loud ordering Test-AcaJobExecutionGone uses.
-        Quota is checked BEFORE auth because several services phrase a quota
-        rejection as a 403, and reading "you have hit your ceiling" as "your
-        credentials are bad" sends an operator to rotate a perfectly good token.
+        The kind only. Use Get-SandboxFailureClassification when the rule that
+        decided matters -- which is any time a precedence is being asserted.
     #>
     param([Parameter(Mandatory = $true)][object]$Result)
 
-    if ($Result.ExitCode -eq 0) { return "" }
-    $text = ((@($Result.StdErr) + @($Result.StdOut) | Where-Object { $_ }) -join " ")
-
-    if (Test-SandboxTransportInconclusive -Result $Result) { return "transport" }
-
-    $quota = @("quota", "QuotaExceeded", "exceeded the limit", "limit exceeded",
-               "insufficient capacity", "no capacity", "out of capacity",
-               "429", "TooManyRequests", "SubscriptionRequestsThrottled")
-    foreach ($pattern in $quota) {
-        if ($text -match [regex]::Escape($pattern)) { return "quota" }
-    }
-
-    $auth = @("AADSTS", "unauthorized", "Unauthorized", "401", "403", "Forbidden",
-              "CheckAccess", "AuthorizationFailed", "aca login", "az login",
-              "refresh token has expired", "invalid_client", "unauthorized_client")
-    foreach ($pattern in $auth) {
-        if ($text -match [regex]::Escape($pattern)) { return "auth" }
-    }
-
-    $readiness = @("not ready", "NotReady", "still provisioning", "Provisioning",
-                   "is starting", "suspended", "Suspended")
-    foreach ($pattern in $readiness) {
-        if ($text -match [regex]::Escape($pattern)) { return "readiness" }
-    }
-
-    return "execution"
+    return (Get-SandboxFailureClassification -Result $Result).Kind
 }
 
 function Assert-SandboxIdentifier {
@@ -606,10 +713,16 @@ function Test-SandboxTransportInconclusive {
         on running. Reading that as a session failure would report a healthy
         60-minute run as failed at the two-minute mark. It is INCONCLUSIVE:
         status re-polls, and terminate refuses to claim a teardown happened.
+
+        Exit 124 is Invoke-CliSafeWithStdin's own give-up marker (aca-logs.ps1).
+        It is THIS process deciding to stop waiting, never a service verdict, so
+        it is inconclusive by construction and does not depend on the wording of
+        the message that accompanies it.
     #>
     param([Parameter(Mandatory = $true)][object]$Result)
 
     if ($Result.ExitCode -eq 0) { return $false }
+    if ($Result.ExitCode -eq 124) { return $true }
     $text = (@($Result.StdErr) + @($Result.StdOut) | Where-Object { $_ }) -join " "
     foreach ($pattern in $script:SandboxInconclusivePatterns) {
         if ($text -match [regex]::Escape($pattern)) { return $true }
@@ -1288,6 +1401,16 @@ function Get-SquadSandboxInventory {
             $label = [string]$entry.name
         }
         if ($label -notlike "squad-*") { continue }
+        # The label reaches an argv: `sandbox delete -l name=<label>`. Whether it
+        # came from config or from the service's own listing, an identifier this
+        # process did not mint is untrusted input -- exactly the reasoning
+        # already applied to the disk id resolved from this same service. A label
+        # carrying a control character forges a log line; one carrying `/` or
+        # `..` addresses a sibling resource. New-SandboxLabelName can never
+        # produce either, so a malformed `squad-` label is a squatter or an
+        # attack. Refusing loudly beats skipping it: skipping under-counts the
+        # concurrency ceiling, and that spends money.
+        Assert-SandboxIdentifier -Value $label -Name "a sandbox label returned by 'aca sandbox list'" -Kind "label" -MaxLength 63 | Out-Null
         $status = "Unknown"
         if ($entry.PSObject.Properties.Name -contains "status") { $status = [string]$entry.status }
         $created = $null
@@ -1983,8 +2106,12 @@ function New-SandboxExecutionProvider {
                     $label = [string]$entry.name
                 }
                 # Only sandboxes this control plane owns. The squad- prefix plus
-                # the session id is what a reaper matches on.
+                # the session id is what a reaper matches on. The label is
+                # service-supplied and lands in a handle and in later argv, so it
+                # is validated here for the same reason as in
+                # Get-SquadSandboxInventory.
                 if ($label -notlike "squad-*") { continue }
+                Assert-SandboxIdentifier -Value $label -Name "a sandbox label returned by 'aca sandbox list'" -Kind "label" -MaxLength 63 | Out-Null
                 $state = [pscustomobject]@{
                     Status   = $(if ($entry.PSObject.Properties.Name -contains "status") { [string]$entry.status } else { "Unknown" })
                     Phase    = ""

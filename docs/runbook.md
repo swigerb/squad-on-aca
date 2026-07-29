@@ -523,6 +523,17 @@ Failures are tagged so they can be told apart:
 and reading "you have hit your ceiling" as "your credentials are bad" sends an
 operator to rotate a perfectly good token.
 
+The inverse mistake is worse, so numeric status codes are **never** matched as
+bare substrings. Azure decorates auth failures with correlation, object and
+trace GUIDs, and a GUID such as `1b8f429c-…` contains `429`; matching that would
+tag a rotated-out credential `[squad-sandbox:quota]` — "a ceiling was hit, retry
+later" — and an unattended dispatcher would then retry a credential fault
+indefinitely. A code only counts when it is delimited by something that is
+neither alphanumeric nor a hyphen (`HTTP 429`, `(403)`, `status=401,`), which no
+GUID occurrence ever is. `[squad-sandbox:transport]` wins over everything: our
+own client give-up (exit `124`, "timed out after 120s") is not a verdict about
+the sandbox.
+
 ### Rollback to ACA Jobs
 
 ```powershell
