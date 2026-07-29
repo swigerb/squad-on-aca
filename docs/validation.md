@@ -27,6 +27,8 @@ pre-push hook.
 | Session-managed env parity | Compares the session-managed env key lists in `scripts/lib/session-env.ps1` and `worker/lib/ralph-dispatch.sh` | Fails on drift so both dispatch paths strip the same keys and session isolation cannot regress |
 | Sync guard enumeration | Asserts `Test-SyncSafety` (`scripts/lib/sync-safety.ps1`) uses repository-rooted, byte-safe NUL-delimited `git diff`/`git ls-files` enumeration with ordinal path de-duplication, then runs the real guard against a throwaway repo with nested, ignored, non-ASCII, and newline-parser regression cases | Proves every file `git add -A` would stage is scanned before `--sync-all`, including nested untracked files and quoted/escaped paths, while git-ignored files stay excluded |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
+| Execution provider contract | Exercises `scripts/lib/squad-aca-provider.ps1` offline against the filesystem-backed fake provider: create/wait/status/logs/cancel/terminate state transitions, idempotent `terminate` (repeat and after external deletion), double `cancel`, handle opacity, and rejection of unknown, malformed, and foreign-provider handles | Proves the provider seam behaves per PRD #6 with no Azure subscription, so a future Sandboxes provider can be developed and tested offline |
+| CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, rendered output, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through behaviour when `az` fails |
 | Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, preflight contract, Ralph transactional dispatch, and the harness itself |
 
 The capability manifest contract itself is documented in
@@ -34,6 +36,29 @@ The capability manifest contract itself is documented in
 tool/credential allowlists, the advisory-only handling of `services`/`egress`
 (required services are rejected at validation), and the entrypoint fail-closed
 behavior when the packaged preflight script is missing.
+
+## Proving the CLI has not changed
+
+`validate.ps1` section 8 asserts specific properties of `squad-aca` output. When
+a change touches the control plane — particularly the execution provider seam —
+prove the stronger claim with a differential capture against another revision:
+
+```powershell
+pwsh -NoProfile -File .\scripts\tests\compare-cli-baseline.ps1 -BaselineRef main
+```
+
+It materialises the baseline revision's `scripts/` with `git archive`, drives
+both revisions through the same stubbed `az`/`gh` environment across 22 CLI
+invocations (`help`, `sessions`, `logs`, `stop`, `smoke`, `telemetry smoke`,
+`status`, `doctor`, `run`, `sync`, plus failure paths), and compares exit code,
+stdout, stderr, and every recorded `az`/`gh` argv. It exits non-zero if
+observable behaviour differs. No Azure, no GitHub, no network.
+
+It reports two counts. The raw count is byte-for-byte. The second ignores one
+thing only: PowerShell annotates an uncaught error with the **source line
+number** of the `throw`, so any change to a file's length shifts that annotation
+for cases that end in an error. The exception text, exit code, and call
+sequences are still compared unnormalised.
 
 ## Worker test harness guarantees
 
@@ -146,6 +171,13 @@ Run these in order. Static checks first (fast, no Azure), then E2E.
 ### 1. Static (no Azure required)
 
 - [ ] `.\scripts\validate.ps1` passes.
+- [ ] The **Execution provider contract** and **CLI behaviour regression**
+      sections of `validate.ps1` report 0 failures. Any change to
+      `scripts/squad-aca.ps1` must keep the CLI regression section green — it is
+      the guard against a behaviour change slipping in behind the provider seam.
+- [ ] If the sprint touched the control plane,
+      `.\scripts\tests\compare-cli-baseline.ps1 -BaselineRef main` exits 0 (see
+      [Proving the CLI has not changed](#proving-the-cli-has-not-changed)).
 - [ ] `bash -n worker/entrypoint.sh` passes (also covered by validate.ps1).
 - [ ] `node --check worker/lib/parse-capabilities.js` passes.
 - [ ] `bash worker/tests/run-tests.sh` passes on Linux/WSL (capability parser,
