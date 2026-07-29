@@ -159,3 +159,130 @@ normalisation does not mask the PR #9 regression class. Mutation reverted;
 **Lesson recorded.** Local success proved nothing; the runner was the test. Any
 future change to the harness or goldens should be run through the documented
 local CI simulation before pushing.
+
+
+## 2026-08-14: PR #19 reviewer rejection - a launch that does not detach and a redactor that never redacts (PRD #6 Sprint 5)
+
+Assigned as the fixer because the author is locked out of this revision and I
+had already fixed the equivalent class of defect on Sprint 3 (PR #18): a
+swallowed-error teardown plus tests that could not detect their own defect. Same
+class again, different file.
+
+**B1 - the launch command did not detach.** `New-SandboxLaunchCommand` emitted
+`prelude && setsid nohup bash -c '...' </dev/null >/dev/null 2>&1 & printf ... ; echo squad-launched`.
+In POSIX/bash grammar `&` is a list terminator with *lower* precedence than
+`&&`, so it backgrounds the entire AND-list, and the three redirections bind
+only to the final simple command. The async subshell therefore inherited the
+exec's fd 0/1/2 for the whole worker run. I reproduced the precedence directly:
+
+```
+bash -c "true && sleep 4 >/dev/null 2>&1 & echo returned" | cat   -> 4s
+bash -c "true;   sleep 4 >/dev/null 2>&1 & echo returned" | cat   -> 0s
+```
+
+Against live Azure that means `aca sandbox exec` holds open to its ~120s client
+timeout, `create` throws, and its own `catch` calls `terminate` - destroying a
+healthy 10-60 minute session two minutes in. Two secondary consequences of the
+same mis-scoping: `printf %s running > $StateDir/phase` ran in the foreground
+racing a backgrounded `mkdir -p` (on a fresh sandbox the state dir does not
+exist yet), and `rm -f done exit-code` became asynchronous relative to the
+poller.
+
+Fixed by brace-grouping the launch so the `&` terminates a list containing only
+the redirected `setsid`:
+
+```
+prelude && { setsid nohup bash -c '...' </dev/null >/dev/null 2>&1 & } \
+  && printf %s running > S/phase && echo squad-launched
+```
+
+The brace group is a compound command that returns 0 immediately, so the whole
+line stays one `&&` chain. The prelude now runs synchronously and *gates* the
+launch (a failed `mkdir` means no worker and no `squad-launched`, which the
+caller greps for), `phase=running` cannot race an async `mkdir`, and the `rm -f`
+is ordered before any poll.
+
+**Why nothing caught it.** `validate.ps1:1476/1481` were pure substring
+assertions (`-like "*setsid nohup bash -c *"`, `-like "*</dev/null >/dev/null 2>&1 &*"`).
+Both substrings are present in a command whose shell semantics do not detach - I
+confirmed both still return `True` against the broken shape. The stub `aca.cmd`
+never evaluates the `-c` payload in a shell; it only greps it for
+`squad-launched`. No check in the suite could distinguish "detaches" from
+"contains the characters of a detach."
+
+**The behavioural test.** New `scripts/tests/verify-launch-detachment.ps1`
+generates the command from the *shipping* generator and evaluates it in a real
+POSIX shell (native `bash` on Linux, `wsl.exe -d <Distro>` on Windows; Git Bash
+is deliberately excluded because it has no `setsid` and would produce a false
+FAIL rather than an honest skip). The oracle matters: PowerShell's
+native-command pipeline is *not* reliable here - every shape returned ~0.1s. The
+reliable oracle is `out=$( <command> )` **inside bash**, because command
+substitution reads the pipe until every writer closes it, which is exactly the
+condition that holds `aca sandbox exec` open. It asserts the caller returns
+inside a 1500ms budget against a 3s worker, that `squad-launched` was printed,
+that `phase` is `running` at return and `done` afterwards, and that the exit
+code and completion marker land. Exit 0 pass / 1 fail / **77 skip**, mirroring
+`worker/tests/lib/deps.sh`. `validate.ps1` gained `Add-Skip`, prints
+`Skipped: N` under a heading that says skips are NOT passes, and a byte-for-byte
+identity check that the probed command is the shipped one.
+
+**The CI gap I nearly shipped.** `powershell-validation` runs on
+`windows-latest`, which has no WSL - so the new check could only ever SKIP
+there, reproducing the exact "test that cannot detect its own defect" failure I
+was sent to fix. The probe is therefore also wired into the `ubuntu-latest`
+`worker-tests` job with exit 77 forced to a job failure, and `validate.ps1`
+asserts that wiring exists (both the script reference and the 77-is-a-failure
+handling) so it cannot be quietly removed.
+
+**B2 - `Protect-SandboxText` was a no-op for realistic credential lengths.**
+`if ([string]$secret.Length -lt 8)` parses as `[string]($secret.Length)` because
+member access binds tighter than a cast. PowerShell then coerces the right
+operand to the left's type, making it the *lexical* comparison `"40" -lt "8"`,
+which is `$true`. Only lengths 8, 9 and 80-99 were ever scrubbed; a 40-char
+classic PAT, a 36-char GUID and a 1200-char JWT all passed through verbatim.
+`Get-SandboxSafeArgv` still redacted on the argv side so nothing leaked today,
+but the documented defence-in-depth against a CLI echoing a secret back in its
+own error text was absent - and it backs every thrown error in the file. Fixed
+by dropping the cast. The reviewer had replaced the whole function body with
+`return [string]$Text` and the suite still reported 140/0, because the function
+appeared only at its definition and three call sites and never in a test.
+
+**Mutation results - four mutations, four kills.**
+
+| Mutation | Result |
+| --- | --- |
+| Restore the mis-scoped `&` | 149/1 - `ELAPSED_MS=3013` against a 3s worker, `phase` not `running` at return |
+| `Protect-SandboxText` body -> `return [string]$Text` | 147/3 - leaked at 27, 36, 40, 64, 93, 1200 |
+| Reinstate only the `[string]` cast | 147/3 - leaked at 27, 36, 40, 64, 1200 but **not 93**, pinning the 80-99 lexical window exactly |
+| `cancel` back to the `Write-Host` swallow | 146/3 |
+
+**Skip honesty proved, not assumed.** Pointing the probe at a nonexistent distro
+gave 146 passed / 0 failed / **1 skipped**, exit 0, with the skip listed under
+"Skipped (NOT passes -- the dependency was missing)". Three checks dropped out
+rather than silently passing.
+
+**Non-blocking items, all genuine, all fixed.** `cancel` classified failures the
+way `terminate` was hardened on Sprint 3 - same `Test-SandboxGone` /
+`Test-SandboxTransportInconclusive` mechanism, no second invention - instead of
+`Write-Host`-ing a non-zero exit and returning success. `validate.ps1` no longer
+prints the raw token-bearing launch argv on failure. `cli-capture-cases.ps1`
+gained an `### ACA CALLS` section so the harness comment about the `aca` shim is
+true; goldens were regenerated deliberately and the diff is exactly one added
+line per file with nothing under it - the emptiness *is* the flag-off guarantee.
+The overstated commit claim that the route gate "acts on the Sprint 2 capability
+decision" was corrected in docs only: all six `New-SessionExecutionProvider`
+call sites still omit `-CapabilityResolution`, so the sandbox branch is
+unreachable from the CLI even with the flag on. Wiring it is Sprint 6+; I did
+not wire it.
+
+**Verification.** `validate.ps1` 140 -> **150 passed / 0 failed / 0 skipped**;
+`verify-cli-golden.ps1` **22/22, exit 0**; `compare-cli-baseline.ps1
+-BaselineRef main` 19/22 byte-identical, **22/22 ignoring error line numbers,
+exit 0**; worker suite **6 suites / 302 assertions (123/11/62/40/23/43), 0
+failed, 0 skipped**; the probe's native-`bash` branch - the path CI takes -
+executed end to end and passed, not just the Windows/WSL branch.
+
+**Lesson recorded.** Both defects were assertions that matched the *shape* of a
+guarantee rather than the guarantee. A substring of a detach is not a detach,
+and a redactor with no test is a comment. Where a check needs a dependency, it
+must run where the dependency exists and skip loudly where it does not.

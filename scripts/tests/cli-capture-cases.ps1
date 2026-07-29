@@ -215,6 +215,14 @@ function Invoke-CaptureSet {
             foreach ($line in $r.GhCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
             [void]$sb.AppendLine("### SQUAD CALLS")
             foreach ($line in $r.SquadCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
+            # The `aca` shim is on PATH for every capture so that any command
+            # which ever starts shelling out to it shows up as a capture diff --
+            # a claim the harness makes and that only holds if the captures
+            # actually RECORD the aca calls. Empty in every golden today, which
+            # is the flag-off guarantee written down: the first command that
+            # invokes `aca` with the flag off fails this gate.
+            [void]$sb.AppendLine("### ACA CALLS")
+            foreach ($line in $r.AcaCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
             [void]$sb.AppendLine("### STDOUT")
             [void]$sb.AppendLine((Get-NormalizedCapture $r.StdOut $ScriptsRoot))
             [void]$sb.AppendLine("### STDERR")

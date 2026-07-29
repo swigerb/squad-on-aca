@@ -60,6 +60,30 @@ jobs:
           fi
           rm -f run-tests.out
 
+      # The worker launch must DETACH. `aca sandbox exec` has a hard ~120s
+      # client timeout, so a launch that holds the exec open times out and
+      # `create` then tears a healthy 10-60 minute session down two minutes in.
+      # Detachment is a shell-grammar property (`&` binds looser than `&&`), so
+      # a command containing every character of a detach need not detach, and no
+      # substring assertion or stubbed `aca` can tell the two apart. This runs
+      # the actually-emitted command in the runner's real bash. It lives here,
+      # not in the windows-latest job, because GitHub's Windows runners have no
+      # WSL and Git Bash has no `setsid` -- there, the check can only skip.
+      #
+      # Exit 77 means the probe did not run (worker/tests/lib/deps.sh
+      # convention). On a runner with bash that is an environment regression,
+      # and a skip is not a pass, so the job fails on it.
+      - name: Verify the worker launch actually detaches
+        shell: bash
+        run: |
+          rc=0
+          pwsh -NoProfile -File ./scripts/tests/verify-launch-detachment.ps1 || rc=$?
+          if [[ "$rc" -eq 77 ]]; then
+            echo "::error::The launch-detachment probe was SKIPPED on CI. A skip is not a pass."
+            exit 1
+          fi
+          exit "$rc"
+
   powershell-validation:
     # scripts/validate.ps1 is the repo's static gate: PowerShell parse, worker
     # bash -n, secret scan, session-managed env parity, and the sync-guard

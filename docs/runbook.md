@@ -434,6 +434,13 @@ The flag is an environment variable rather than a config key on purpose: it is
 per-invocation, nothing that syncs config can turn it on, and rolling back needs
 no file edit.
 
+> **What the flag does today.** It opens the route gate — nothing more. No
+> `squad-aca` command yet hands the Sprint 2 capability resolution to
+> `New-SessionExecutionProvider`, so every dispatch reaches the gate with no
+> decision and still runs on ACA Jobs. Turning the flag on therefore changes
+> nothing observable yet; the sandbox path becomes reachable when the resolution
+> is wired through (PRD #6, Sprint 6+).
+
 ### Rollback to ACA Jobs
 
 ```powershell

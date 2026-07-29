@@ -172,6 +172,15 @@ reading the catalog, resolving a route, or looking for `aca`. That is what makes
 `scripts/tests/verify-cli-golden.ps1` and `scripts/tests/compare-cli-baseline.ps1`
 verify.
 
+**The gate exists; it is not yet fed.** No `New-SessionExecutionProvider` call
+site in `scripts/squad-aca.ps1` passes `-CapabilityResolution`, so every CLI
+dispatch reaches the gate with *no* decision — the `(none)` row above — and the
+`sandbox` branch is unreachable from the CLI **even with the flag on**. That is
+the correct state for a default-off sprint: the routing table and the provider
+are testable in isolation before anything can select them. Handing the Sprint 2
+resolution to the gate is later work (PRD #6, Sprint 6+); until then, describing
+this as "the capability decision is now acted on" overstates what ships.
+
 ### Session execution model: detached + poll
 
 `aca sandbox exec` has a hard **~120 s client transport timeout**, constant
@@ -192,8 +201,24 @@ style choice:
 4. `aca sandbox lifecycle set … --auto-suspend enable --idle-timeout-seconds …`
    (auto-suspend otherwise defaults to enabled at 600 s and would suspend a live
    session);
-5. `aca sandbox exec -l name=… -c "… setsid nohup bash -c '…' </dev/null >/dev/null 2>&1 & …"`
+5. `aca sandbox exec -l name=… -c "prelude && { setsid nohup bash -c '…' </dev/null >/dev/null 2>&1 & } && …"`
    — the **detached** worker launch, and the first repository code to run.
+
+The brace group in step 5 is load-bearing. In POSIX/bash grammar `&` is a list
+terminator that binds *looser* than `&&`, so writing
+
+```text
+prelude && setsid nohup bash -c '…' </dev/null >/dev/null 2>&1 &
+```
+
+backgrounds the **entire** `&&`-list and binds the three redirections to the last
+simple command only — the async subshell keeps the exec's own fd 0/1/2 open for
+the whole worker run, the launching exec blocks to its ~120 s timeout, and
+`create`'s teardown then destroys a perfectly healthy session two minutes in.
+`{ … & }` scopes the `&` to the redirected `setsid` alone, so the prelude runs
+synchronously (and gates the launch), `phase=running` cannot race an asynchronous
+`mkdir`, and the exec returns immediately. `validate.ps1` proves this by running
+the emitted command in a real shell rather than by matching its text.
 
 Any failure between steps 3 and 5 tears the sandbox down and rethrows the
 original error, so repository code can never run in a sandbox whose egress policy

@@ -201,6 +201,14 @@ function Protect-SandboxText {
         Defence in depth behind Get-SandboxSafeArgv: a CLI can echo a value back
         in its own error text. Every non-trivial secret the provider was given is
         replaced wherever it appears.
+
+        The length floor must NOT be written `[string]$secret.Length -lt 8`.
+        Member access binds tighter than the cast, so that is
+        `[string]($secret.Length)` and PowerShell then coerces the right operand
+        to the left operand's type -- a LEXICAL comparison. `"40" -lt "8"` is
+        $true, so a 40-character PAT, a 36-character GUID and a 1200-character
+        JWT were all skipped and passed through verbatim; only lengths 8, 9 and
+        80-99 were ever scrubbed.
     #>
     param(
         [AllowEmptyString()][string]$Text = "",
@@ -210,7 +218,7 @@ function Protect-SandboxText {
     $result = [string]$Text
     foreach ($secret in @($Secrets)) {
         if (-not $secret) { continue }
-        if ([string]$secret.Length -lt 8) { continue }
+        if ($secret.Length -lt 8) { continue }
         $result = $result.Replace([string]$secret, "<redacted>")
     }
     return $result
@@ -634,6 +642,29 @@ function New-SandboxLaunchCommand {
         lets `aca sandbox exec` return immediately instead of holding the
         connection open until its ~120s client timeout kills it.
 
+        WHERE THE `&` GOES IS THE WHOLE POINT. In POSIX/bash grammar `&` is a
+        list terminator with LOWER precedence than `&&`, so
+
+            prelude && setsid nohup bash -c '...' </dev/null >/dev/null 2>&1 &
+
+        backgrounds the ENTIRE and-list, and the three redirections bind only to
+        the last simple command in it. The async subshell keeps the exec's own
+        fd 0/1/2 open for the whole worker run, so the launching exec blocks,
+        hits the ~120s timeout, and `create` tears a healthy session down two
+        minutes in -- the exact failure this design exists to prevent. Proven:
+
+            bash -c "true && sleep 5 >/dev/null 2>&1 & echo x"   -> blocks 5s
+            bash -c "true;   sleep 5 >/dev/null 2>&1 & echo x"   -> returns
+
+        The launch is therefore wrapped in a brace group, `{ ... & }`, so the
+        `&` terminates a list containing only the redirected `setsid` command.
+        The group is a compound command with exit status 0, which keeps the
+        whole line a single `&&` chain: the prelude runs SYNCHRONOUSLY and gates
+        the launch (a sandbox whose state directory could not be created never
+        starts a worker and never prints `squad-launched`), `phase=running` is
+        written after the fork rather than racing an async `mkdir`, and the
+        `rm -f` of the previous run's terminal files is ordered before any poll.
+
         The wrapper records terminal state so a poll never has to infer it:
 
           worker runs (its own run includes the git push)
@@ -667,9 +698,12 @@ function New-SandboxLaunchCommand {
              "touch $StateDir/done"
 
     $prelude = "mkdir -p $StateDir && rm -f $StateDir/done $StateDir/exit-code && printf %s starting > $StateDir/phase"
-    $detach = "setsid nohup bash -c $(ConvertTo-SandboxShellSingleQuoted $inner) </dev/null >/dev/null 2>&1 &"
+    # `{ ... & }`: the `&` terminates a list containing only the redirected
+    # `setsid`, so exactly that command is backgrounded with its fds on
+    # /dev/null. The group returns 0 immediately, keeping the `&&` chain intact.
+    $detach = "{ setsid nohup bash -c $(ConvertTo-SandboxShellSingleQuoted $inner) </dev/null >/dev/null 2>&1 & }"
 
-    return "$prelude && $detach printf %s running > $StateDir/phase; echo squad-launched"
+    return "$prelude && $detach && printf %s running > $StateDir/phase && echo squad-launched"
 }
 
 function New-SandboxPollCommand {
@@ -1089,6 +1123,15 @@ function New-SandboxExecutionProvider {
     # Stop the running session, reporting the substrate's own result. The
     # sandbox itself is left in place -- teardown is terminate's job -- so logs
     # stay readable after a cancel.
+    #
+    # Failure classification is the SAME mechanism terminate uses (Test-SandboxGone
+    # over Test-AcaJobExecutionGone, plus the transport-inconclusive narrowing),
+    # not a second one. Writing a non-zero exit to the host and returning success
+    # is the softer sibling of the defect terminate was hardened against on
+    # Sprint 3: an auth failure, an RBAC denial, throttling or a transport
+    # timeout says nothing about whether the worker actually stopped, and a
+    # caller told "cancelled" stops looking at a session that is still running
+    # and still billing. Only "the sandbox is gone" is success without a cancel.
     $operations["cancel"] = {
         param($Context, $Arguments)
 
@@ -1103,9 +1146,20 @@ function New-SandboxExecutionProvider {
         foreach ($line in @($result.StdOut)) {
             Write-Host (Protect-SandboxText -Text ([string]$line) -Secrets $Context.Secrets)
         }
-        if ($result.ExitCode -ne 0) {
-            Write-Host "[squad-aca] cancel of sandbox '$($payload.name)' returned exit $($result.ExitCode): $(Get-SandboxErrorText -Result $result -Secrets $Context.Secrets)"
+        if ($result.ExitCode -eq 0) {
+            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $false }
         }
+        if (Test-SandboxGone -Result $result) {
+            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $true }
+        }
+
+        $inconclusive = Test-SandboxTransportInconclusive -Result $result
+        $why = if ($inconclusive) {
+            "the failure is a transport timeout, which says nothing about whether the worker stopped"
+        } else {
+            "the failure is not 'already deleted or gone'"
+        }
+        throw "Could not cancel the session in sandbox '$($payload.name)': '$($result.SafeArgv)' failed with exit $($result.ExitCode), and $why. $(Get-SandboxErrorText -Result $result -Secrets $Context.Secrets)"
     }
 
     # -- terminate -----------------------------------------------------------

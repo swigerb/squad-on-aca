@@ -72,6 +72,7 @@ $RepoRoot = Split-Path -Parent $ScriptDir
 
 $script:Failures = @()
 $script:Passes = @()
+$script:Skips = @()
 
 # $IsWindows only exists in PowerShell 6+; this file also has to run under 5.1.
 $IsWindowsHost = if ($null -ne $PSVersionTable.Platform) { $PSVersionTable.Platform -eq "Win32NT" } else { $true }
@@ -79,6 +80,12 @@ $IsWindowsHost = if ($null -ne $PSVersionTable.Platform) { $PSVersionTable.Platf
 function Write-Section($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 function Add-Pass($text) { $script:Passes += $text; Write-Host "  [PASS] $text" -ForegroundColor Green }
 function Add-Fail($text) { $script:Failures += $text; Write-Host "  [FAIL] $text" -ForegroundColor Red }
+# A check that could not execute is NEITHER a pass nor a failure. The worker
+# suite established this (worker/tests/lib/deps.sh exits 77 and run-tests.sh
+# reports it as SKIP, never as a pass); a validate.ps1 check with an external
+# dependency has to be equally honest, because a skip that silently counted as
+# a pass is a check that stops existing the moment the dependency goes missing.
+function Add-Skip($text) { $script:Skips += $text; Write-Host "  [SKIP] $text" -ForegroundColor Yellow }
 
 # ---------------------------------------------------------------------------
 # 1. PowerShell parse
@@ -1348,6 +1355,7 @@ if (-not (Test-Path $providerLib)) {
         "SQUAD_STUB_ACA_RC", "SQUAD_STUB_ACA_ERR", "SQUAD_STUB_ACA_EXEC_RC",
         "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
         "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
+        "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
         "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE")
     try {
         $sbStub = New-SquadCliStubEnvironment
@@ -1364,6 +1372,8 @@ if (-not (Test-Path $providerLib)) {
         $env:SQUAD_STUB_ACA_EGRESS_ERR = ""
         $env:SQUAD_STUB_ACA_DELETE_RC = "0"
         $env:SQUAD_STUB_ACA_DELETE_ERR = ""
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
         $env:SQUAD_STUB_ACA_POLL_DIR = ""
         $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
 
@@ -1467,21 +1477,69 @@ if (-not (Test-Path $providerLib)) {
             Add-Fail "Auto-suspend was not pinned: $(if ($iLife -ge 0) { $sbCalls[$iLife] } else { '<missing>' })"
         }
 
-        # --- 2. the launch is DETACHED ---------------------------------------
+        # --- 2. the launch is DETACHED (proven by running it in a real shell) -
         # `aca sandbox exec` returns after ~120s no matter what the command is
-        # doing, so a session held open by one exec dies at two minutes. The
-        # shape below (stdin closed AND both output streams redirected, plus
-        # setsid/nohup and a trailing &) is what was proven to survive.
+        # doing, so a session held open by one exec dies at two minutes -- and
+        # `create`'s catch tears the healthy sandbox down with it.
+        #
+        # This CANNOT be asserted by substring. In POSIX/bash grammar `&` is a
+        # list terminator that binds LOOSER than `&&`, so
+        #
+        #   prelude && setsid nohup bash -c '...' </dev/null >/dev/null 2>&1 &
+        #
+        # contains every character of a detach while backgrounding the entire
+        # and-list and binding the three redirections to the last simple command
+        # only -- the async subshell keeps the exec's fd 0/1/2 open for the whole
+        # worker run. A substring assertion passes on both shapes; the stub `aca`
+        # never evaluates the `-c` payload in a shell, so nothing else in this
+        # suite can tell them apart either. The only assertion that can is to
+        # execute the emitted command in a real shell and time when the parent's
+        # streams reach EOF.
         $launchLine = if ($iLaunch -ge 0) { $sbCalls[$iLaunch] } else { "" }
-        if ($launchLine -like "*setsid nohup bash -c *" -and $launchLine -like "*</dev/null >/dev/null 2>&1 &*") {
-            Add-Pass "The worker is launched detached (setsid + nohup, stdin closed, both output streams redirected)"
+        # The launch argv is the ONE call that legitimately carries the worker
+        # token, so it must be scrubbed before it can reach a failure message
+        # (and from there a CI log).
+        $safeLaunchLine = Protect-SandboxText -Text $launchLine -Secrets @($sbSecret)
+
+        # (a) the command evaluated below is byte-for-byte the command that ships.
+        $sbShipEnv = New-SandboxWorkerEnvironment -Request $sbRequest -Context $sbProvider.Context
+        $sbShipLaunch = New-SandboxLaunchCommand -Environment $sbShipEnv -StateDir $sbProvider.Context.StateDir
+        if ($launchLine.Contains($sbShipLaunch)) {
+            Add-Pass "The command the detach test evaluates is byte-for-byte the command 'aca sandbox exec -c' was given"
         } else {
-            Add-Fail "The worker launch is not detached -- a session run as a synchronous exec dies at the ~120s client timeout: $launchLine"
+            Add-Fail "New-SandboxLaunchCommand no longer produces the argv that was actually issued, so the detach test would be testing a different string: $safeLaunchLine"
         }
+
+        # (b) the behavioural test, delegated to scripts/tests/verify-launch-detachment.ps1
+        #     so the same probe is a standalone CI gate on a real Linux runner
+        #     rather than a check that only ever runs on a developer's WSL box.
+        #     A correct implementation releases the caller while the worker is
+        #     still running; the mis-scoped one blocks for the worker's full
+        #     duration. Exit 77 means the probe DID NOT RUN (deps.sh convention).
+        $sbDetachScript = Join-Path $RepoRoot "scripts\tests\verify-launch-detachment.ps1"
+        if (-not (Test-Path $sbDetachScript)) {
+            Add-Fail "scripts/tests/verify-launch-detachment.ps1 is missing -- nothing else in this suite can tell a detach from a command containing the characters of one"
+        } else {
+            $sbDetachOut = (& (Get-Process -Id $PID).Path -NoProfile -File $sbDetachScript 2>&1 | Out-String)
+            $sbDetachRc = $LASTEXITCODE
+            $sbDetachFlat = ($sbDetachOut -replace "`r?`n", " | ").Trim()
+            if ($sbDetachRc -eq 0) {
+                Add-Pass "The emitted launch command really detaches in a real shell (verify-launch-detachment.ps1): $sbDetachFlat"
+            } elseif ($sbDetachRc -eq 77) {
+                # A dependency we cannot satisfy is a SKIP, never a pass: the
+                # worker suite's convention (worker/tests/lib/deps.sh -> exit 77
+                # -> run-tests.sh reports SKIP) exists so a check cannot quietly
+                # stop existing when its dependency goes missing.
+                Add-Skip "Worker-launch detachment is UNVERIFIED: $sbDetachFlat"
+            } else {
+                Add-Fail "The emitted launch command does NOT detach (verify-launch-detachment.ps1 exit $sbDetachRc): $sbDetachFlat"
+            }
+        }
+
         if ($launchLine -like "*/usr/local/bin/squad-on-aca*" -and $launchLine -like "*exit-code*" -and $launchLine -like "*touch /tmp/squad-session/done*") {
             Add-Pass "The detached wrapper records an exit code and touches the completion marker last"
         } else {
-            Add-Fail "The detached wrapper does not record terminal state: $launchLine"
+            Add-Fail "The detached wrapper does not record terminal state: $safeLaunchLine"
         }
 
         # --- 3. secrets never reach anything the provider EMITS ---------------
@@ -1513,6 +1571,64 @@ if (-not (Test-Path $providerLib)) {
             Add-Pass "A failed worker launch reports the failure without echoing the token-bearing command"
         } else {
             Add-Fail "A failed worker launch leaked the token or the egress policy: $sbLaunchMsg"
+        }
+
+        # Protect-SandboxText, DIRECTLY. It is the only control on captured CLI
+        # OUTPUT (Get-SandboxErrorText feeds every thrown error in the provider,
+        # plus `logs` line output and `cancel` host output), and until now it had
+        # no test of its own: the checks above pass on Get-SandboxSafeArgv's
+        # argv-side redaction alone, so the whole function body could be replaced
+        # with `return $Text` and the suite still reported all green.
+        #
+        # The lengths are the ones that occur in practice. They also happen to be
+        # exactly the lengths the defect hid behind: `[string]$secret.Length -lt 8`
+        # is `[string]($secret.Length)`, so PowerShell coerced the right operand
+        # to string and compared LEXICALLY -- "40" -lt "8" is $true -- and only
+        # lengths 8, 9 and 80-99 were ever scrubbed.
+        $sbRedactLengths = @(
+            @{ Len = 27;   What = "the suite's own fixture token" },
+            @{ Len = 36;   What = "a GUID" },
+            @{ Len = 40;   What = "a classic GitHub PAT" },
+            @{ Len = 64;   What = "a hex API key" },
+            @{ Len = 93;   What = "a fine-grained PAT" },
+            @{ Len = 1200; What = "an ACR refresh token / JWT" }
+        )
+        $sbRedactBad = @()
+        foreach ($case in $sbRedactLengths) {
+            $secret = "s" + ("K" * ([int]$case.Len - 1))
+            $out = Protect-SandboxText -Text "aca: request failed, token=$secret was rejected" -Secrets @($secret)
+            if ($out.Contains($secret) -or $out -notlike "*token=<redacted>*") {
+                $sbRedactBad += "$($case.Len) ($($case.What))"
+            }
+        }
+        if ($sbRedactBad.Count -eq 0) {
+            Add-Pass "Protect-SandboxText redacts a secret at every realistic credential length (27/36/40/64/93/1200)"
+        } else {
+            Add-Fail "Protect-SandboxText passed a secret through verbatim at length(s): $($sbRedactBad -join ', ')"
+        }
+
+        # Multiple secrets, repeated occurrences, and the sub-8 floor (too short
+        # to be a credential and too likely to shred ordinary words).
+        $sbLongA = "A" * 40
+        $sbLongB = "B" * 36
+        $sbMulti = Protect-SandboxText -Text "first=$sbLongA second=$sbLongB again=$sbLongA short=abc" -Secrets @($sbLongA, $sbLongB, "abc")
+        if ($sbMulti -eq "first=<redacted> second=<redacted> again=<redacted> short=abc") {
+            Add-Pass "Protect-SandboxText replaces every occurrence of every secret and leaves sub-8 values alone"
+        } else {
+            Add-Fail "Protect-SandboxText mishandled multiple/repeated secrets or the length floor: $sbMulti"
+        }
+
+        # And the path that matters: a CLI echoing the secret back in its OWN
+        # error text must not survive Get-SandboxErrorText into a thrown message.
+        $sbEchoResult = [pscustomobject]@{
+            StdErr = @("ERROR: authentication failed for token $sbSecret (40 chars)")
+            StdOut = @()
+        }
+        $sbEchoText = Get-SandboxErrorText -Result $sbEchoResult -Secrets @($sbSecret)
+        if ($sbEchoText -notmatch [regex]::Escape($sbSecret) -and $sbEchoText -like "*<redacted>*") {
+            Add-Pass "A CLI that echoes the secret back in its own error text is scrubbed before the text reaches an exception"
+        } else {
+            Add-Fail "Get-SandboxErrorText passed a CLI-echoed secret through: $sbEchoText"
         }
 
         # --- 4. a long session is driven by POLLING, not by one exec ---------
@@ -1669,6 +1785,58 @@ if (-not (Test-Path $providerLib)) {
             Add-Pass "Sandbox terminate THROWS on auth, RBAC, throttling and transport failures (never reported as torn down)"
         } else {
             Add-Fail "Sandbox terminate swallowed a real failure ($($sbFailDetail -join '; '))"
+        }
+
+        # --- 6b. cancel classifies failures the same way terminate does -------
+        # cancel is the softer sibling of the same defect: writing a non-zero
+        # exit to the host and returning success tells the caller the session was
+        # stopped when an auth failure, an RBAC denial, throttling or a transport
+        # timeout says nothing about whether the worker is still running -- and
+        # still billing. Same classifier as terminate, not a second mechanism.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        $sbCancelOk = Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null
+        $sbCancelCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca | Where-Object { $_ -like "*squad-cancelled*" })
+        if ($sbCancelOk.Cancelled -and -not $sbCancelOk.AlreadyTerminal -and $sbCancelCalls.Count -eq 1) {
+            Add-Pass "Sandbox cancel stops the worker with one labelled 'aca sandbox exec' and reports success"
+        } else {
+            Add-Fail "Sandbox cancel did not cancel correctly (cancelled=$($sbCancelOk.Cancelled) calls=$($sbCancelCalls.Count))"
+        }
+
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "1"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = "Error: sandbox with label name=squad-stub-session was not found"
+        $sbCancelGone = $null
+        $sbCancelGoneThrew = $false
+        try { $sbCancelGone = Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null } catch { $sbCancelGoneThrew = $true }
+        if (-not $sbCancelGoneThrew -and $sbCancelGone.Cancelled -and $sbCancelGone.AlreadyTerminal) {
+            Add-Pass "Sandbox cancel is idempotent: an already-gone sandbox is success (AlreadyTerminal), not an error"
+        } else {
+            Add-Fail "Sandbox cancel mishandled an already-gone sandbox (threw=$sbCancelGoneThrew cancelled=$($sbCancelGone.Cancelled) already=$($sbCancelGone.AlreadyTerminal))"
+        }
+
+        $sbCancelFailOk = $true
+        $sbCancelFailDetail = @()
+        foreach ($case in $sbFailCases) {
+            $env:SQUAD_STUB_ACA_CANCEL_RC = "1"
+            $env:SQUAD_STUB_ACA_CANCEL_ERR = $case.Err
+            $threw = $false
+            $msg = ""
+            try { Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null | Out-Null } catch { $threw = $true; $msg = [string]$_.Exception.Message }
+            if (-not $threw) {
+                $sbCancelFailOk = $false
+                $sbCancelFailDetail += "$($case.Label): did not throw"
+            } elseif ($msg -match [regex]::Escape($sbSecret)) {
+                $sbCancelFailOk = $false
+                $sbCancelFailDetail += "$($case.Label): leaked the token"
+            }
+        }
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        if ($sbCancelFailOk) {
+            Add-Pass "Sandbox cancel THROWS on auth, RBAC, throttling and transport failures (never reported as cancelled)"
+        } else {
+            Add-Fail "Sandbox cancel swallowed a real failure ($($sbCancelFailDetail -join '; '))"
         }
 
         # --- 7. refusal when the sandbox group carries a managed identity ----
@@ -1941,6 +2109,22 @@ if (-not (Test-Path $goldenScript)) {
         } else {
             Add-Fail "No CI job runs scripts/tests/verify-cli-golden.ps1; the stdout regression guard would be developer-only again"
         }
+
+        # Same principle for the one invariant that needs a real Linux shell.
+        # The windows-latest job can only ever SKIP it (no WSL on GitHub's
+        # Windows runners, and Git Bash has no setsid), so it has to run in the
+        # ubuntu-latest job -- and that job must treat exit 77 as a failure,
+        # because a skip is not a pass.
+        if ($workflowText -match 'verify-launch-detachment\.ps1') {
+            Add-Pass "CI runs scripts/tests/verify-launch-detachment.ps1, so a launch that stops detaching fails a job on a real Linux shell"
+        } else {
+            Add-Fail "No CI job runs scripts/tests/verify-launch-detachment.ps1; worker-launch detachment would be verified only on a developer's WSL box"
+        }
+        if ($workflowText -match '(?s)verify-launch-detachment\.ps1.{0,400}\brc\b.{0,200}\b77\b') {
+            Add-Pass "The CI detachment step treats exit 77 (probe did not run) as a failure, not as a pass"
+        } else {
+            Add-Fail "The CI detachment step does not fail on exit 77; a runner that lost bash would report green while proving nothing"
+        }
     }
 
     # The goldens are only a gate if they verify on a machine other than the one
@@ -1980,6 +2164,11 @@ if (-not (Test-Path $goldenScript)) {
 Write-Section "Summary"
 Write-Host ("  Passed: {0}" -f $script:Passes.Count) -ForegroundColor Green
 Write-Host ("  Failed: {0}" -f $script:Failures.Count) -ForegroundColor ($(if ($script:Failures.Count -gt 0) { 'Red' } else { 'Green' }))
+Write-Host ("  Skipped: {0}" -f $script:Skips.Count) -ForegroundColor ($(if ($script:Skips.Count -gt 0) { 'Yellow' } else { 'Green' }))
+if ($script:Skips.Count -gt 0) {
+    Write-Host "`nSkipped (NOT passes -- the dependency was missing):" -ForegroundColor Yellow
+    $script:Skips | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+}
 if ($script:Failures.Count -gt 0) {
     Write-Host "`nFailures:" -ForegroundColor Red
     $script:Failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }

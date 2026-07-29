@@ -417,6 +417,14 @@ function New-SessionExecutionProvider {
         `sandbox` only for an administrator-approved class in a non-provisional
         catalog, and returns `fail-closed` rather than quietly downgrading a
         session whose required capabilities the default worker cannot satisfy.
+
+        NOTHING PASSES -CapabilityResolution YET. Every call site in this file
+        omits it, so the gate is always reached with no decision and the
+        `sandbox` branch is unreachable from the CLI even with the flag on. That
+        is deliberate for a default-off sprint -- the gate and the provider are
+        proven in isolation first -- and wiring the resolution through is later
+        work (PRD #6, Sprint 6+). Do not describe this as the capability
+        decision being acted on end to end; it is not, yet.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Config,

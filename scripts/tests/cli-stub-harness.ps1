@@ -59,6 +59,13 @@
       SQUAD_STUB_ACA_EGRESS_RC exit code for `sandbox egress set` only
       SQUAD_STUB_ACA_DELETE_RC exit code for `sandbox delete` only
       SQUAD_STUB_ACA_DELETE_ERR stderr for `sandbox delete` only
+      SQUAD_STUB_ACA_CANCEL_RC exit code for a cancel `sandbox exec` only
+      SQUAD_STUB_ACA_CANCEL_ERR stderr for a cancel `sandbox exec` only. Cancel
+                               needs its own pair because its failure
+                               classification (auth / RBAC / throttling /
+                               transport vs "already gone") is the same
+                               classification terminate makes, and it has to be
+                               driven independently of the launch exec's rc.
       SQUAD_STUB_ACA_POLL_DIR  directory holding the simulated sandbox state.
                                A poll (`sandbox exec` whose command reads the
                                state dir) reports phase/exit/marker from
@@ -417,7 +424,8 @@ exit /b %SQUAD_STUB_ACA_EXEC_RC%
 :acacancel
 endlocal
 echo squad-cancelled
-exit /b %SQUAD_STUB_ACA_EXEC_RC%
+if not "%SQUAD_STUB_ACA_CANCEL_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_CANCEL_ERR%
+exit /b %SQUAD_STUB_ACA_CANCEL_RC%
 :acalogs
 endlocal
 if exist "%SQUAD_STUB_ACA_POLL_DIR%\session-log.txt" type "%SQUAD_STUB_ACA_POLL_DIR%\session-log.txt"
@@ -566,6 +574,7 @@ function Invoke-SquadCliCapture {
                   "SQUAD_STUB_ACA_RC", "SQUAD_STUB_ACA_ERR",
                   "SQUAD_STUB_ACA_EXEC_RC", "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
                   "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
+                  "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
                   "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
                   "SQUAD_ACA_ENABLE_SANDBOX", "SQUAD_ACA_SANDBOX_CLI")
     $saved = @{}
@@ -602,8 +611,10 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_SBG_IDENTITY = ""
         $env:SQUAD_STUB_SBG_RC = "0"
         # The `aca` shim is on PATH for every capture so that any command which
-        # ever starts shelling out to it shows up as a capture diff. It must be
-        # quiet and default-configured, exactly like the `az` shim.
+        # ever starts shelling out to it shows up as a capture diff -- and the
+        # captures RECORD its calls in an `### ACA CALLS` section, which is what
+        # makes that claim true rather than aspirational. It must be quiet and
+        # default-configured, exactly like the `az` shim.
         $env:SQUAD_STUB_ACA_LOG = $Stub.AcaLog
         $env:SQUAD_STUB_ACA_RC = "0"
         $env:SQUAD_STUB_ACA_ERR = ""
@@ -612,6 +623,8 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_ACA_EGRESS_ERR = ""
         $env:SQUAD_STUB_ACA_DELETE_RC = "0"
         $env:SQUAD_STUB_ACA_DELETE_ERR = ""
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
         $env:SQUAD_STUB_ACA_POLL_DIR = ""
         $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
         # THE golden-portability pin for Sprint 5. A CLI capture must always be
