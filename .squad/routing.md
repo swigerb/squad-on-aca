@@ -46,8 +46,11 @@ How to decide who handles what.
 
 | Work | Agent | Required model |
 |------|-------|----------------|
-| Lead planning, sequencing, coordination | lead | `gpt-5.6-luna` |
-| Code writing, tests, refactoring, scripts, Dockerfiles | engineer | `claude-opus-4.8` |
+| All work, all roles | every member | `claude-opus-5` |
+
+All Squad members run `claude-opus-5` only. `.squad/config.json` sets both
+`defaultModel` and an explicit `agentModelOverrides` entry per member, because
+Layer 0 per-agent overrides take precedence over `defaultModel`.
 
 If any agent other than `engineer` needs to write implementation code, spawn or hand off that work to `engineer` so code-writing work uses Opus 4.8.
 
