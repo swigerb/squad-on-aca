@@ -56,7 +56,8 @@ extra binaries, or open network egress. See
 manifest and preflight validation that surface unsupported repository
 requirements (extra SDKs, browsers, databases, private feeds, external
 services) as a fast, actionable failure instead of a mid-task surprise.
-That document also lists deferred follow-up work — per-task ACA
-SandboxGroup/image selection, generated egress rules, and short-lived
-least-privilege credentials — that the manifest is designed to feed but
-that this repo does not implement yet.
+That document also covers the deterministic routing decision the manifest now
+produces (ACA job, approved sandbox class, or fail-closed) — computed and
+reported, but not yet acted upon — and lists the deferred follow-up work:
+per-task Azure Container Apps Sandboxes selection, generated egress rules, and
+short-lived least-privilege credentials.
