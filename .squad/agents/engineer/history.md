@@ -253,3 +253,97 @@ Re-verified after the merge:
   Sprint 3's own sections, 86 once #16's 15 logs checks merged in).
 - Worker suite: **6 suites / 302 assertions (123/11/62/40/23/43), 0 failed, 0
   skipped** - unchanged from `main`; this sprint added no bash tests.
+
+## Sprint 5 - ACA Sandboxes provider behind a feature flag (PRD #6)
+
+Branch `squad/6-s5-sandbox-provider`, worktree `wt-sfive`. Sprint 3 gave the
+provider seam; Sprint 2 computed a route (`aca-job` | `sandbox` | `fail-closed`)
+that nothing acted on. This sprint added the third provider and the gate that
+finally acts on that decision - with the sandbox plane unreachable unless a flag
+is explicitly turned on.
+
+**What shipped**
+
+- `scripts/lib/providers/squad-sandbox-provider.ps1` - all six contract
+  operations over ACA Sandboxes, driven by the standalone `aca` binary (resolved
+  through an overridable path so tests can stub it). Every preview-specific
+  detail is inside this one file.
+- `scripts/lib/squad-aca-provider.ps1` - `Test-SquadSandboxEnabled`,
+  `Get-SquadSandboxCatalog`, `Get-SquadSandboxClass`,
+  `Resolve-SquadExecutionRoute`, a `sandbox` branch in the factory, and an
+  additive `-UntilTerminal` on `Wait-SquadExecution`.
+- `scripts/lib/aca-logs.ps1` - extracted the shared `Invoke-CliSafe` that both
+  `Invoke-AzPromptSafe` and the sandbox provider use, rather than inventing a
+  second capture mechanism.
+- `scripts/squad-aca.ps1` - `New-SessionExecutionProvider` checks the flag first
+  and returns the ACA Jobs adapter immediately when it is off.
+- `scripts/tests/cli-stub-harness.ps1` - an `aca.cmd` shim with its own ordered
+  call log, an `az resource show` branch for the group identity check, and the
+  `SQUAD_STUB_ACA_*` drivers. Extended, not duplicated.
+- `scripts/validate.ps1` - two new sections (route gate; provider against the
+  stubbed `aca`), 36 new checks.
+- `docs/architecture.md`, `docs/runbook.md` updated.
+
+**Decisions worth remembering**
+
+- The flag is an environment variable (`SQUAD_ACA_ENABLE_SANDBOX`), not a config
+  key. Adding a key to `Get-AcaConfig`'s fixed list would change what
+  `configure` writes and put the goldens at risk for no benefit. An explicit
+  `0`/`false` is a kill switch that beats an opted-in config.
+- Flag OFF plus a `sandbox` decision fails **closed**, not back to `aca-job`. A
+  `sandbox` route means the resolver already found the default image
+  insufficient, so falling back would be exactly the "silently run unsafely"
+  outcome PRD #6 forbids.
+- The shipped catalog is still `provisional: true`, so the sandbox route fails
+  closed even with the flag on until an administrator reviews it. That is a
+  documented second prerequisite in the runbook, and the ON-path tests have to
+  supply their own non-provisional catalog - which is itself the proof the gate
+  bites.
+- Session execution is **detached + poll**, never a synchronous exec.
+  `aca sandbox exec` has a hard ~120s client timeout regardless of command
+  duration; a 10-60 minute session held open by one exec dies at two minutes.
+  Terminal state comes from the completion marker plus a recorded exit code -
+  a marker with no exit code is `Unknown`, not `Succeeded`.
+- `Network issue - retry policy expired` is **inconclusive**, never a failure.
+  Reading it as a failure would kill healthy hour-long sessions at the two-minute
+  mark.
+- Ordering in `create` is a security control: identity assertion -> create ->
+  egress -> lifecycle -> detached launch. A failure between egress and launch
+  tears the sandbox down and rethrows the original error, so repository code can
+  never run without policy and a policy-less sandbox is never left billing. The
+  test asserts call **indexes**, not just presence.
+- `terminate` reuses `Test-AcaJobExecutionGone` rather than inventing a second
+  classifier, with two narrowings: transport-inconclusive is never "gone", and
+  the Azure-CLI exit-3 convention is neutralised because `aca` documents no such
+  rule.
+
+**Verification**
+
+- `scripts/validate.ps1`: **140 passed / 0 failed** (baseline 104/0; +36).
+- `scripts/tests/verify-cli-golden.ps1`: **22 cases, 22 matching goldens**, exit 0.
+- `scripts/tests/compare-cli-baseline.ps1 -BaselineRef main`: 19/22 byte-identical,
+  **22/22 identical ignoring PowerShell's error-record line annotation**, exit 0.
+- Worker suite (WSL): **6 suites / 302 assertions (123/11/62/40/23/43), 0 failed,
+  0 skipped** - unchanged; this sprint added no bash tests.
+- **12 mutations, 12 killed.** Egress moved after the launch, a synchronous
+  (non-detached) launch, inconclusive-as-failure, terminate succeeding on every
+  non-zero exit, the identity assertion removed, redaction removed, the flag
+  defaulting ON, flag-OFF downgrading instead of failing closed, unapproved
+  classes accepted, terminal state from the marker alone, no teardown after a
+  policy failure, and auto-suspend left at its 600s default - each failed at
+  least one check, and each failed a check that names the actual defect.
+
+**Deliberately not done**
+
+- Ralph/Watch wiring (Sprint 6) and credential brokerage (Sprint 7). Worker
+  credentials are still environment assignments inside the launch command, so
+  they appear in that one `aca` process argv on the client; the provider never
+  repeats them into a response, an error, or a rendered argv. Recorded as a
+  known limitation in `docs/architecture.md`.
+- Repeated `--rule` on `aca sandbox egress set` is an **assumption**: only a
+  single `--rule` was verified live, but the ADR's policy shape needs several.
+  Worth confirming against a live sandbox before the first real run.
+- The CLI cannot yet produce a `sandbox` decision end-to-end, because the Sprint
+  2 resolver runs inside the worker. `New-SessionExecutionProvider` accepts a
+  `-CapabilityResolution` so the wiring is a one-line change when a control-plane
+  resolution exists.
