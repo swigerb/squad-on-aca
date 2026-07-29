@@ -528,3 +528,75 @@ itself has to be part of the return value, or the choice cannot be tested. The
 same applies to B1: converging on one lease record was asserted, but "and
 exactly one of them is told to dispatch" never was, and the one test that
 should have covered it had a line inserted in the middle of the race.
+
+## Issue #26: tool approval parity - `--yolo` removed from both planes, and the honest boundary around what a flag can enforce
+
+**The defect.** `worker/entrypoint.sh` ran every session with `--yolo` on an
+image that also set `COPILOT_ALLOW_ALL=true`, and `deploy.ps1` injected the same
+flag string through the job template. `--yolo` is `--allow-all-tools
+--allow-all-paths --allow-all-urls`, so a remote session could write anywhere on
+the filesystem while the same agent on a developer's machine was confined to its
+working directory. Remote execution applied *weaker* policy than local - the
+escalation PRD #6 explicitly forbids - and none of the eight sprints had touched
+it. It affected both planes, so "the sandbox is isolated" was never an answer.
+
+**The investigation came before the design, and changed it.** The pinned
+`@github/copilot@1.0.69-2` was installed into a scratch tree and interrogated
+directly rather than trusted: `--deny-tool` accepts two-word subcommand patterns
+and denials outrank `--allow-all-tools`; a real probe confirmed `shell(git
+config)` is refused with *"Permission to run this tool was denied due to the
+following rules"*; a write outside the working directory is refused once
+`--allow-all-paths` is gone; `--allow-all-urls` turned out to gate neither the
+shell tool nor web-fetch, so it is simply not passed. The finding that mattered
+was negative: there is **no `--deny-path`**, and `write` is all-or-nothing. A
+control paper had assumed "restrict writes to `.squad/policies` via flags" would
+be possible. It is not expressible at all, so governance had to move to the
+filesystem or be decoration.
+
+The second constraint was found the same way: `@bradygaster/squad-cli@0.11.0`
+splits `--copilot-flags` with `.trim().split(/\s+/)` in nine `dist/` modules, so
+a multi-word deny pattern cannot survive `squad watch` / `squad loop`. Rather
+than quietly emit a weaker set on that path, the resolver publishes two surfaces
+and the session log names every rule the handoff cannot carry. That gap belongs
+to the Squad runtime and is written down as such.
+
+**What was built.** One pure resolver (`worker/lib/agent-policy.js`) decides a
+tier from `SQUAD_MODE` + `SQUAD_DISPATCH_SOURCE`; one bash layer
+(`worker/lib/squad-policy.sh`) applies it. Both planes reach both through the
+single entrypoint, so parity is structural rather than asserted. Unattended runs
+lose the irreversible infrastructure verbs outright rather than being
+approval-gated, because Ralph is a five-minute cron and there is nobody to
+approve anything. Governance paths are made read-only *and* fingerprinted into a
+0700 directory outside the checkout, re-verified before the push and at the end
+of every agent-running mode; every failure path exits 78 and nothing is pushed.
+
+**Two things I had to correct in my own work.** The resolver originally treated
+an absent `SQUAD_DISPATCH_SOURCE` as attended - fail-open, and exactly the shape
+this change exists to remove; it is now autonomous, which in turn exposed that
+`New-SandboxWorkerEnvironment` never carried the dispatch source at all, so a
+Ralph-dispatched sandbox session would have resolved to the *attended* tier while
+the identical ACA Jobs session resolved to *autonomous*. That is escalation by
+choosing a substrate, sitting in the repository the whole time, and the parity
+check that found it drives the real env builders rather than hand-written maps.
+
+**The mutation that failed to be detected, kept in the report.** Removing the
+manifest's `absent` markers changed nothing: the baseline-vs-current diff already
+detects a path appearing or disappearing. My own comment had claimed otherwise.
+The claim was wrong, so the comment was corrected and the markers reclassified as
+manifest completeness rather than a control - an undetectable "control" is a
+liability, and the honest move was to stop calling it one instead of inventing an
+assertion to protect it.
+
+**Verification.** `validate.ps1` 213 -> **240 passed / 0 failed / 0 skipped**;
+worker suite **7 -> 9 suites, 426 -> 623 assertions, 0 failed / 0 skipped**;
+`verify-cli-golden.ps1` 22/22 and `compare-cli-baseline.ps1` byte-identical
+22/22 - **no golden changed**; `verify-launch-detachment.ps1` PASS. Sixteen
+mutations were run; fifteen produced a specific named failure and the sixteenth
+is reported above as undetected with the reason.
+
+**Lesson recorded.** Investigate the enforcement point before designing the
+control. Two of the three shapes the issue proposed were unimplementable as
+written, and only reading the pinned binary's own help - and then running it -
+revealed which. The related habit: when a mutation you expected to be caught
+isn't, the first hypothesis should be that the control does less than its comment
+claims, not that the test is weak.

@@ -490,6 +490,116 @@ every execution (both are stamped into the execution environment as
 ledger itself. `scripts/show-status.ps1` is unchanged: it renders raw Azure
 projections and has no access to the lease ledger.
 
+## Agent tool policy (issue #26, PRD #6)
+
+> Isolation is not authorization.
+
+Until this change, every session on both planes ran Copilot with `--yolo` on an
+image that also set `COPILOT_ALLOW_ALL=true`. `--yolo` expands to
+`--allow-all-tools --allow-all-paths --allow-all-urls`, so a *remote* session
+could write anywhere on the filesystem while the same agent on a developer's
+machine was confined to its working directory. Remote execution applied **weaker**
+policy than local — privilege escalation by choosing a substrate, which PRD #6
+forbids. This predates the sandbox programme and affected both planes.
+
+### What the Copilot CLI actually gives us
+
+Verified against the pinned `@github/copilot@1.0.69-2` (`copilot help permissions`),
+not assumed:
+
+| Capability | Flag | Available? |
+| --- | --- | --- |
+| Deny a tool or shell subcommand | `--deny-tool 'shell(git config)'` | yes — and *"denial rules always take precedence over allow rules, even `--allow-all-tools`"* |
+| Allow a tool | `--allow-tool` | yes |
+| Hide tools from the model | `--available-tools` / `--excluded-tools` | yes |
+| Confine file tools to the working directory | default; `--allow-all-paths` disables it | yes |
+| Never block on an approval prompt | `--no-ask-user` | yes |
+| **Deny a specific path while allowing the rest of the repo** | — | **no. There is no `--deny-path`, and `write` is all-or-nothing.** |
+
+That last row is the finding that shapes everything else: *"may write the
+repository but not `.squad/policies`"* is **not expressible as a Copilot flag**.
+Enforcing governance through flags would be decoration, so it is enforced at the
+filesystem instead.
+
+Two behaviours were also confirmed empirically against the pinned binary:
+a `--deny-tool 'shell(git config)'` rule really does block the call
+(*"Permission to run this tool was denied due to the following rules"*), and
+without `--allow-all-paths` a write outside the working directory is refused
+(*"Permission denied and could not request permission from user"*) while a write
+inside it succeeds. `--allow-all-urls` turned out to be unnecessary: both the
+shell tool and web-fetch worked without it, so it is not passed.
+
+### The tier model
+
+An approval gate assumes a human. Ralph is a five-minute cron and Watch is a
+polling loop, so "remove `--yolo` and prompt" would hang every unattended run
+until timeout. Instead the *available* tool set narrows when nobody is watching.
+
+`worker/lib/agent-policy.js` is a pure function of `SQUAD_MODE`,
+`SQUAD_DISPATCH_SOURCE`, `ENABLE_GITHUB_REMOTE` and `SQUAD_COPILOT_FLAGS`:
+
+- **attended** — an attended mode (`prompt`, `new-project`, `shell`, `smoke`,
+  `telemetry-smoke`) dispatched from `local-cli`.
+- **autonomous** — everything else, including every unrecognised value and an
+  *absent* dispatch source. This is the default, and it is the fail-closed
+  direction: treating "nobody said" as attended would make the strict tier
+  opt-out by omitting a variable.
+
+The autonomous tier is a strict superset of the attended denials, adding the
+irreversible infrastructure verbs (`az`, `kubectl`, `terraform`, `docker`,
+`gh api`, `gh repo delete`, `gh release delete`) and `--no-ask-user`. Destructive
+operations are **unavailable** to an unattended run rather than approval-gated,
+because there is nobody to approve them. See
+[runbook.md#agent-tool-policy](runbook.md#agent-tool-policy) for the full table.
+
+### Why parity is structural, not asserted
+
+Both planes launch through the *same* `worker/entrypoint.sh`, which reaches the
+*same* resolver. Nothing composes flags anywhere else; `scripts/deploy.ps1` now
+explicitly clears `SQUAD_COPILOT_FLAGS` rather than injecting a flag string, and
+`New-SandboxWorkerEnvironment` carries `SQUAD_DISPATCH_SOURCE` so a
+Ralph-dispatched sandbox session cannot resolve to the attended tier while the
+same session on ACA Jobs resolves to the autonomous one.
+
+There is **no deliberate local/remote asymmetry**. The only asymmetry is between
+*attended* and *unattended*, and it is available on both substrates.
+
+### Governance-path enforcement
+
+Two layers, applied after `squad init` / SubSquad activation (bootstrap
+legitimately creates these files) and before any agent runs:
+
+1. **Preventive** — every governance path is stripped of write bits, and
+   `chmod`, `chown`, `chattr`, `setfacl` are denied at the CLI in *both* tiers so
+   they cannot be put back with a tool call.
+2. **Detective** — a SHA-256 manifest of every governance file plus the session's
+   base commit is recorded in a `0700` directory **outside the checkout** (which
+   the agent's file tools can no longer reach, because `--allow-all-paths` is
+   gone) and re-verified before the push and at the end of every agent-running
+   mode. Any difference — content, added file, deleted file, or a change that was
+   *committed* rather than left in the working tree — exits 78 and nothing is
+   pushed.
+
+### What this does NOT enforce, and who owns it
+
+An honest boundary is worth more than a half-enforced control:
+
+| Not enforced here | Why | Owner |
+| --- | --- | --- |
+| A determined agent editing a governance file anyway | It runs as the uid that owns the checkout, and the shell tool is not path-confined. `chmod u+w` defeats the mode bits. The detective layer means it cannot go *unnoticed* or be *published*, which is the property that actually matters. A tamper-proof preventive control needs a uid or mount boundary that does not exist in a single-user container. | Container/runtime layer (a non-owning uid, or a read-only mount) |
+| Deleting `.squad/config.json` or `.squad/routing.md` | Unlinking a file needs write on its *parent*, and `.squad/` itself must stay writable for run state. Caught by the manifest, not by mode bits — asserted as a documented gap in `worker/tests/test_governance_guard.sh`. | Detective layer (accepted) |
+| Multi-word deny patterns on `squad watch` / `squad loop` | `@bradygaster/squad-cli@0.11.0` consumes `--copilot-flags` as one string and splits it with `.trim().split(/\s+/)` in nine `dist/` modules, so `shell(git config)` cannot survive the handoff. Single-word patterns do. The dropped rules are logged by name at session start rather than silently downgraded. | Squad runtime (`--copilot-flags` needs to accept an array, or `squad` needs its own policy input) |
+| Per-path *write* permission inside Copilot | The CLI has no `--deny-path`; `write` is all-or-nothing. | Copilot CLI |
+| An interactive approval gate with an aborting timeout | Viable for a human-attended `squad-aca run`; useless for a cron-triggered Ralph, and there is no TTY in either container. Not implemented rather than implemented decoratively. | Copilot CLI / Squad runtime |
+| Network egress and credential brokerage | Untouched by this change. | Sprint 7 egress layer, credential broker |
+
+### Failure mode
+
+Every failure path exits **78** (`EX_CONFIG`). There is no branch that logs a
+warning and continues and no fallback to a permissive flag set: "the policy could
+not be applied" and "the session runs with blanket allow" must never be the same
+outcome. That equivalence *was* `--yolo`.
+
 ## Optional .NET/Aspire integration path
 
 The `aspire/` directory adds an **opt-in** path. It does not replace the ACA

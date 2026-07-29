@@ -104,13 +104,83 @@ The Contributor assignment lets Ralph start ACA session job executions. Scope it
 
 ## GitHub remote sessions
 
-Copilot CLI runs with:
+Copilot CLI flags are **not** a fixed string any more. They are composed per session by `worker/lib/agent-policy.js` from `SQUAD_MODE` and `SQUAD_DISPATCH_SOURCE` — see [Agent tool policy](#agent-tool-policy) below. An attended session gets:
 
 ```text
---yolo --agent squad --remote --no-auto-update
+--allow-all-tools --agent squad --remote --no-auto-update --deny-tool <pattern> ...
 ```
 
+and an unattended one additionally gets `--no-ask-user` and a longer deny list.
+
+`--yolo` is no longer used anywhere. It expanded to `--allow-all-tools --allow-all-paths --allow-all-urls`, which meant a remote session could write outside its checkout while the same agent on a developer's machine could not — remote execution applying *weaker* policy than local. `COPILOT_ALLOW_ALL=true` has likewise been removed from `worker/Dockerfile`.
+
 `--remote` enables GitHub web/mobile remote access for running sessions. Use a `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` that is valid for Copilot CLI headless auth. Fine-grained PATs with the GitHub "Copilot Requests" permission are preferred; GitHub CLI OAuth tokens are also supported by Copilot CLI.
+
+## Agent tool policy
+
+Every session resolves a **tier** before any agent starts. The tier decides which tools the agent may use; a separate filesystem guard decides which paths it may write.
+
+### Which tier a session gets
+
+| Signal | Value | Tier |
+| --- | --- | --- |
+| `SQUAD_MODE` ∈ `prompt`, `new-project`, `shell`, `smoke`, `telemetry-smoke` **and** `SQUAD_DISPATCH_SOURCE` = `local-cli` | a person just typed a command | `attended` |
+| anything else — `ralph`, `watch`, `triage`, `loop`, any `api` dispatch, any unrecognised value, **or an absent `SQUAD_DISPATCH_SOURCE`** | nobody is watching | `autonomous` |
+
+The default is `autonomous`. "Nobody said who started this" is not evidence that a human did.
+
+### What each tier permits
+
+Both tiers get `--allow-all-tools` (the CLI documents it as required for non-interactive mode) and both are confined to the checkout, because `--allow-all-paths` is no longer passed. Denial rules take precedence over `--allow-all-tools` in the Copilot CLI, so the deny list is what actually bounds the session.
+
+| | attended | autonomous |
+| --- | --- | --- |
+| `shell(sudo)`, `shell(su)` | denied | denied |
+| `shell(chmod)`, `shell(chown)`, `shell(chattr)`, `shell(setfacl)` | denied | denied |
+| `shell(git config)`, `shell(gh auth)`, `shell(gh secret)`, `shell(gh variable)` | denied | denied |
+| `shell(az)`, `shell(kubectl)`, `shell(terraform)`, `shell(docker)` | allowed | **denied** |
+| `shell(gh api)`, `shell(gh repo delete)`, `shell(gh release delete)` | allowed | **denied** |
+| `--no-ask-user` (cannot block on a prompt) | no | **yes** |
+| writes outside the checkout | denied | denied |
+| writes to a governance path | denied | denied |
+
+Destructive infrastructure verbs are **unavailable** to an unattended run rather than approval-gated, because there is no one to approve them. On an attended run they remain available and are gated by the human who started it.
+
+### Governance paths
+
+These are made read-only before the agent starts and their SHA-256 hashes are recorded outside the checkout:
+
+`.squad/policies`, `.squad/agents`, `.squad/identity`, `.squad/config.json`, `.squad/routing.md`, `.squad/casting-policy.json`, `.squad/casting/policy.json`, `.squad/memory/config.json`, `.squad/memory/audit.jsonl`, `.squad/fact-checker/policy.md`, `.squad/fact-checker/audit-trail.md`, `.squad/rai/policy.md`, `.squad/rai/audit-trail.md`
+
+The set is identical for both tiers. **An autonomous session can no longer append to `.squad/agents/<name>/history.md`** — that is a deliberate behaviour change, not an oversight. Agent history is governance state, and a run that can rewrite the record of what it did is not auditable. Record session outcomes in the issue, the PR, or `.squad/decisions.md` instead.
+
+### Operator extras
+
+`SQUAD_COPILOT_FLAGS` still works for genuine extras such as `--model` or `--log-level`. A permission-widening flag in it (`--yolo`, `--allow-all`, `--allow-all-paths`, `--add-dir`) **aborts the session with exit 78** rather than being silently ignored — a silently dropped escalation attempt looks identical to a working one from the caller's side.
+
+### Diagnosing a run blocked by policy
+
+All policy output is prefixed `[squad-policy]` in the session log (`.\scripts\logs.ps1` or `az containerapp job logs`).
+
+**Exit code 78** always means "policy could not be applied, or was violated". The session did not push.
+
+| Log line | Cause | Fix |
+| --- | --- | --- |
+| `Agent policy library not found at …` | the image predates this change, or the Dockerfile `COPY` lost `lib/squad-policy.sh` | rebuild and redeploy the worker image |
+| `SQUAD_COPILOT_FLAGS contains permission-widening flag(s): …` | an old job template still injects `--yolo` | redeploy with `scripts/deploy.ps1`, which explicitly clears the variable; `az containerapp job update --set-env-vars` merges, so the old value survives until something sets it empty |
+| `node is not available` / `sha256sum is not available` | the image is missing a base tool | rebuild from `worker/Dockerfile` |
+| `Could not create a private policy state directory outside the checkout` | `$HOME` is unset or unwritable in the container | check the job's user and `HOME`; the baseline must not live inside the repository |
+| `GOVERNANCE VIOLATION: a protected path changed during this session` | the agent modified a governance file | the following `+`/`-` lines name the exact files; nothing was pushed. Make the change yourself in a reviewed PR |
+| `GOVERNANCE VIOLATION: protected path(s) changed in commits made during this session` | the change was committed rather than left in the working tree | same — the commit is still local to the dead container |
+| `Permission denied` writing under `.squad/` in agent output | the agent tried to edit governance state | expected; the agent should route the change through a PR |
+| `NOT enforced on this path: shell(git config) …` | informational, on `squad watch` / `squad loop` only | see the limitation note below; governance enforcement is unaffected |
+
+To see the tier a session chose without running it:
+
+```powershell
+$env:SQUAD_MODE = "ralph"; $env:SQUAD_DISPATCH_SOURCE = "ralph"
+node .\worker\lib\agent-policy.js json
+```
 
 ## Deploy
 
