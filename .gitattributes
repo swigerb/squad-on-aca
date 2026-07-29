@@ -9,4 +9,6 @@
 # Worker tests run under bash; keep shell/test inputs LF-normalized on Windows.
 worker/**/*.sh text eol=lf
 worker/tests/fixtures/*.yml text eol=lf
+worker/tests/expected/*.json text eol=lf
+config/*.json text eol=lf
 .github/workflows/*.yml text eol=lf

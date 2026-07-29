@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "route": "aca-job",
+  "reason": "default-profile-satisfies-manifest",
+  "requiredTools": [
+    "git",
+    "node"
+  ],
+  "requiredCredentials": [],
+  "egressHosts": [
+    "registry.npmjs.org"
+  ],
+  "imageHint": null,
+  "defaultImageSufficient": true,
+  "sandboxClass": null,
+  "manifestPresent": true,
+  "manifestVersion": 1,
+  "imageHintPresent": false,
+  "imageHintRecognized": false,
+  "unsatisfiedTools": [],
+  "unsatisfiedCredentials": [],
+  "unsatisfiedEgressHosts": [],
+  "catalogSchemaVersion": 1,
+  "catalogProvisional": true,
+  "detail": "Every required capability is already provided by the default worker profile, so the existing ACA job is used."
+}

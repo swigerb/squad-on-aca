@@ -1,0 +1,13 @@
+version: 1
+tools:
+  - name: git
+    required: true
+  - name: node
+    required: true
+  - name: pnpm
+    required: false
+    reason: Optional; falls back to npm
+egress:
+  - host: registry.npmjs.org
+    reason: Package installs
+notes: Default worker profile already covers everything required here.

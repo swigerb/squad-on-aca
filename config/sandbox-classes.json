@@ -1,0 +1,214 @@
+{
+  "$comment": [
+    "PROVISIONAL — DO NOT USE IN PRODUCTION WITHOUT REVIEW.",
+    "",
+    "Administrator-controlled sandbox class catalog for Squad on ACA.",
+    "",
+    "This file is owned by the Squad on ACA control plane (this repository), NOT",
+    "by the repositories Squad works on. A worked-on repository's",
+    "squad-capabilities.yml can only *request* capabilities; it can never add a",
+    "class, add an egress destination, widen a credential list, name a shell",
+    "command, or select an arbitrary image. image.hint from a manifest is matched",
+    "against imageHintAliases below purely to disambiguate between already-approved",
+    "classes; it is NEVER executed or used as an image reference.",
+    "",
+    "Every entry below is provisional placeholder data captured during Sprint 2 of",
+    "PRD #6 (routing decision only). The routing decision is computed and reported",
+    "but NOT acted upon: nothing in this catalog creates a sandbox today. Before",
+    "any code acts on it (Sprint 5), an administrator MUST review and replace:",
+    "  - image.reference / image.digest (nothing here is a real, pinned image),",
+    "  - resources and limits (cost/concurrency ceilings are guesses),",
+    "  - egress.hostRules (each pattern must be justified and security-reviewed),",
+    "  - allowedCredentials (each entry widens a class's blast radius),",
+    "  - approved (a class is only truthfully approved after that review),",
+    "and then set \"provisional\": false. Consumers must treat provisional: true as",
+    "'report only'.",
+    "",
+    "egress mirrors the real Azure Container Apps Sandboxes network policy shape",
+    "(Microsoft.App/sandboxGroups, api-version 2026-02-01-preview): a defaultAction,",
+    "an ordered hostRules[] of {pattern, action}, and trafficInspection. Patterns are",
+    "either an exact host or a leading-wildcard suffix (\"*.github.com\" matches any",
+    "host ending in \".github.com\", and does not match the bare apex). Rules are",
+    "evaluated in order; the first match wins; defaultAction applies when none match.",
+    "Squad workers must run in an identity-free sandbox group (managed identity on",
+    "ACA Sandboxes is group-scoped, so an identity on the group would be reachable",
+    "from inside the sandbox)."
+  ],
+  "schemaVersion": 1,
+  "provisional": true,
+  "defaultWorker": {
+    "id": "aca-job-default",
+    "description": "The fixed squad-worker image running as an ACA job. This is the current, unchanged execution path.",
+    "tools": [
+      "az",
+      "bash",
+      "curl",
+      "gh",
+      "git",
+      "node",
+      "npm",
+      "sh"
+    ],
+    "credentials": [
+      "ACA_SESSION_JOB_NAME",
+      "AZURE_CLIENT_ID",
+      "AZURE_RESOURCE_GROUP",
+      "AZURE_SUBSCRIPTION_ID",
+      "AZURE_TENANT_ID",
+      "COPILOT_GITHUB_TOKEN",
+      "GH_TOKEN",
+      "GITHUB_TOKEN"
+    ],
+    "egress": {
+      "defaultAction": "Allow",
+      "trafficInspection": "None",
+      "hostRules": []
+    }
+  },
+  "classes": [
+    {
+      "id": "sandbox-node-lts",
+      "approved": true,
+      "description": "Node/JavaScript toolchain with private-registry auth. Provisional.",
+      "image": {
+        "reference": "REPLACE-ME.azurecr.io/squad-on-aca/sandbox-node",
+        "tag": "PROVISIONAL",
+        "digest": null,
+        "pinned": false
+      },
+      "imageHintAliases": [
+        "ghcr.io/example/squad-worker-node:latest"
+      ],
+      "resources": {
+        "cpu": 1,
+        "memoryGi": 2,
+        "ephemeralStorageGi": 4
+      },
+      "tools": [
+        "bash",
+        "curl",
+        "git",
+        "jq",
+        "make",
+        "node",
+        "npm",
+        "pnpm",
+        "sh",
+        "yarn"
+      ],
+      "allowedCredentials": [
+        "NODE_AUTH_TOKEN",
+        "NPM_TOKEN"
+      ],
+      "egress": {
+        "defaultAction": "Deny",
+        "trafficInspection": "Full",
+        "hostRules": [
+          { "pattern": "*.github.com", "action": "Allow" },
+          { "pattern": "github.com", "action": "Allow" },
+          { "pattern": "registry.npmjs.org", "action": "Allow" },
+          { "pattern": "*.npmjs.org", "action": "Allow" },
+          { "pattern": "*.nodejs.org", "action": "Allow" }
+        ]
+      },
+      "limits": {
+        "maxConcurrentSandboxes": 2,
+        "maxSessionMinutes": 60,
+        "maxMonthlyCostUsd": 50
+      }
+    },
+    {
+      "id": "sandbox-python-3-12",
+      "approved": true,
+      "description": "Python 3.12 toolchain. Provisional.",
+      "image": {
+        "reference": "REPLACE-ME.azurecr.io/squad-on-aca/sandbox-python",
+        "tag": "PROVISIONAL",
+        "digest": null,
+        "pinned": false
+      },
+      "imageHintAliases": [
+        "ghcr.io/example/squad-worker-python:latest"
+      ],
+      "resources": {
+        "cpu": 1,
+        "memoryGi": 2,
+        "ephemeralStorageGi": 4
+      },
+      "tools": [
+        "bash",
+        "curl",
+        "git",
+        "jq",
+        "make",
+        "pip",
+        "pip3",
+        "python",
+        "python3",
+        "sh"
+      ],
+      "allowedCredentials": [],
+      "egress": {
+        "defaultAction": "Deny",
+        "trafficInspection": "Full",
+        "hostRules": [
+          { "pattern": "*.github.com", "action": "Allow" },
+          { "pattern": "github.com", "action": "Allow" },
+          { "pattern": "pypi.org", "action": "Allow" },
+          { "pattern": "*.pypi.org", "action": "Allow" },
+          { "pattern": "files.pythonhosted.org", "action": "Allow" }
+        ]
+      },
+      "limits": {
+        "maxConcurrentSandboxes": 2,
+        "maxSessionMinutes": 60,
+        "maxMonthlyCostUsd": 50
+      }
+    },
+    {
+      "id": "sandbox-container-build",
+      "approved": false,
+      "description": "Container build tooling. NOT APPROVED: a usable Docker daemon inside a sandbox needs its own security review, so this class must never be selected. Present so the catalog documents the gap and the resolver's approved-only filter is exercised.",
+      "image": {
+        "reference": "REPLACE-ME.azurecr.io/squad-on-aca/sandbox-build",
+        "tag": "PROVISIONAL",
+        "digest": null,
+        "pinned": false
+      },
+      "imageHintAliases": [],
+      "resources": {
+        "cpu": 2,
+        "memoryGi": 4,
+        "ephemeralStorageGi": 8
+      },
+      "tools": [
+        "bash",
+        "curl",
+        "docker",
+        "git",
+        "jq",
+        "make",
+        "sh"
+      ],
+      "allowedCredentials": [
+        "ACR_PASSWORD",
+        "ACR_USERNAME",
+        "DOCKER_PASSWORD",
+        "DOCKER_USERNAME"
+      ],
+      "egress": {
+        "defaultAction": "Deny",
+        "trafficInspection": "Full",
+        "hostRules": [
+          { "pattern": "*.github.com", "action": "Allow" },
+          { "pattern": "github.com", "action": "Allow" }
+        ]
+      },
+      "limits": {
+        "maxConcurrentSandboxes": 1,
+        "maxSessionMinutes": 45,
+        "maxMonthlyCostUsd": 25
+      }
+    }
+  ]
+}
