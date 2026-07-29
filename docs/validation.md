@@ -27,13 +27,117 @@ pre-push hook.
 | Session-managed env parity | Compares the session-managed env key lists in `scripts/lib/session-env.ps1` and `worker/lib/ralph-dispatch.sh` | Fails on drift so both dispatch paths strip the same keys and session isolation cannot regress |
 | Sync guard enumeration | Asserts `Test-SyncSafety` (`scripts/lib/sync-safety.ps1`) uses repository-rooted, byte-safe NUL-delimited `git diff`/`git ls-files` enumeration with ordinal path de-duplication, then runs the real guard against a throwaway repo with nested, ignored, non-ASCII, and newline-parser regression cases | Proves every file `git add -A` would stage is scanned before `--sync-all`, including nested untracked files and quoted/escaped paths, while git-ignored files stay excluded |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
-| Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, preflight contract, and Ralph transactional dispatch |
+| Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, preflight contract, Ralph transactional dispatch, and the harness itself |
 
 The capability manifest contract itself is documented in
 [capability-manifest.md](capability-manifest.md): manifest schema, built-in
 tool/credential allowlists, the advisory-only handling of `services`/`egress`
 (required services are rejected at validation), and the entrypoint fail-closed
 behavior when the packaged preflight script is missing.
+
+## Worker test harness guarantees
+
+The worker suite is the only executable test coverage in this repository, so the
+harness itself is treated as production code and is tested. Run it with:
+
+```bash
+bash worker/tests/run-tests.sh
+```
+
+### The harness self-test
+
+`worker/tests/test_run_tests.sh` tests `run-tests.sh`. This exists because a
+prior runner could not report failure: it captured the suite status inside
+`if ! bash "$test_script"`, where `$?` is the *negated* status and is therefore
+always `0`. A failing suite left the status at `0`, so the runner printed
+"All worker capability tests passed." and exited `0` — a permanently green gate.
+
+The self-test runs the **real** runner against a throwaway directory of
+synthetic suites (via the `SQUAD_ACA_TEST_DIR` override, which exists only for
+this purpose — with it unset the runner behaves exactly as before and runs the
+suites beside itself). It asserts the exit code, banner, and suite counts for
+every outcome: failing suite, non-`1` failure code, all passing, mixed
+pass/fail, a failure in the middle, skip, skip + failure, all-skipped, an empty
+test directory, and default suite discovery. Fixtures live under a self-cleaning
+temp root and never appear in a normal run.
+
+The runner also refuses to print the success banner when **no suite actually
+executed** — an empty test directory or a run where every suite skipped exits
+non-zero, because a run that proved nothing must never read as green.
+
+### Declared dependencies and skip semantics
+
+Each suite declares what it needs up front via `worker/tests/lib/deps.sh`:
+
+```bash
+source "${TEST_DIR}/lib/deps.sh"
+require_deps node git
+```
+
+| Suite | Declared dependencies |
+| --- | --- |
+| `test_git_checkout.sh` | `git` |
+| `test_parse_capabilities.sh` | `node` |
+| `test_preflight.sh` | `node` |
+| `test_ralph_dispatch.sh` | `node`, `mktemp`, `date` |
+| `test_run_tests.sh` | `env`, `find` |
+
+When every dependency is present, `require_deps` is a silent no-op. When one is
+genuinely absent the suite prints a visible line and exits `77`:
+
+```text
+SKIP: test_parse_capabilities.sh — missing node
+```
+
+`run-tests.sh` counts exit `77` as a **skip**, never a pass, and ends the run
+with an explicit accounting:
+
+```text
+Suites: 2 passed, 0 failed, 3 skipped.
+Skipped suites (NOT counted as passes):
+  - test_parse_capabilities.sh
+```
+
+Nothing is ever downloaded or installed during a test run: a missing runtime is
+reported, not silently provisioned. A run that quietly bootstrapped `node` would
+no longer be testing the environment it claims to test.
+
+On CI every declared dependency is present, so the `worker-tests` job in
+[`.github/workflows/worker-tests.yml`](../.github/workflows/worker-tests.yml)
+**fails when any suite reports a skip** — a partial green is treated as a
+regression.
+
+### Linux-only constraint (no Git Bash / Cygwin)
+
+The suite must be run on Linux — WSL on a Windows workstation, or the
+`ubuntu-latest` runner in CI:
+
+```powershell
+wsl -d Ubuntu -e bash -c 'cd /path/to/repo && bash worker/tests/run-tests.sh'
+```
+
+It cannot run under Git Bash or Cygwin. `worker/lib/squad-capability-preflight.sh`
+hardens its temporary directory handling and refuses to proceed when the temp
+path is predictable, which is exactly what the Git Bash/Cygwin `TMPDIR` emulation
+produces. That refusal is correct behaviour — the preflight is doing its job —
+so the fix is to run the suite on a real Linux environment rather than to weaken
+the guard. This is also why `validate.ps1` only runs `bash -n` on the worker
+scripts (a syntax check, which Git Bash handles fine) and leaves the behavioural
+suite to WSL/CI.
+
+### PowerShell validation in CI
+
+The `powershell-validation` job runs `scripts/validate.ps1` on `windows-latest`.
+Every check in that script is offline — none of it touches Azure — so nothing is
+gated on credentials. The runner ships pwsh 7 and Git Bash pre-installed, so no
+PowerShell runtime is downloaded at test time and the `bash -n` section executes
+instead of skipping.
+
+It runs on `windows-latest` rather than `ubuntu-latest` (which also ships pwsh)
+because `validate.ps1` resolves repo paths with Windows separators today, so it
+cannot execute unmodified under Linux pwsh. Making `validate.ps1` fully
+cross-platform is a worthwhile follow-up; it is deliberately out of scope for a
+guardrails-only sprint that touches tests, CI, and docs.
 
 ## Sprint validation checklist
 
@@ -44,7 +148,9 @@ Run these in order. Static checks first (fast, no Azure), then E2E.
 - [ ] `.\scripts\validate.ps1` passes.
 - [ ] `bash -n worker/entrypoint.sh` passes (also covered by validate.ps1).
 - [ ] `node --check worker/lib/parse-capabilities.js` passes.
-- [ ] `bash worker/tests/run-tests.sh` passes (capability parser + preflight suite).
+- [ ] `bash worker/tests/run-tests.sh` passes on Linux/WSL (capability parser,
+      preflight, Ralph dispatch, and the harness self-test) with **0 failed and
+      0 skipped** — see [Worker test harness guarantees](#worker-test-harness-guarantees).
 - [ ] `git grep` finds no personal subscription IDs, tenant IDs, tokens, or user
       handles in tracked files (see [Secret scans](#secret-scans)).
 - [ ] Optional: `.\scripts\validate.ps1 -RunDotnet` builds `aspire/Squad.Aca.sln`.
@@ -243,6 +349,11 @@ rollback ends with a post-rollback verification checklist that re-runs
   credentials; they cannot run in a pure static/offline gate.
 - `bash -n` requires a `bash` on PATH (Git Bash or WSL on Windows). validate.ps1
   skips it gracefully when bash is absent.
+- The behavioural worker suite (`worker/tests/run-tests.sh`) needs a real Linux
+  environment; Git Bash and Cygwin cannot run it. See
+  [Linux-only constraint](#linux-only-constraint-no-git-bash--cygwin).
+- `scripts/validate.ps1` is Windows-only today (it resolves repo paths with
+  Windows separators), so the CI PowerShell job runs on `windows-latest`.
 - The secret scans are pattern-based and catch common token shapes, not every
   possible secret. They complement, not replace, a dedicated secret-scanning
   tool in CI.

@@ -10,6 +10,9 @@ TEST_TMP_ROOT="${TEST_DIR}/.tmp-preflight"
 
 # shellcheck source=lib/assert.sh
 source "${TEST_DIR}/lib/assert.sh"
+# shellcheck source=lib/deps.sh
+source "${TEST_DIR}/lib/deps.sh"
+require_deps node
 
 echo "== squad-capability-preflight.sh =="
 rm -rf "$TEST_TMP_ROOT"

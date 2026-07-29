@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'worker/**'
+      - 'scripts/**'
+      - 'config/**'
       - 'docs/capability-manifest.md'
       - 'docs/examples/squad-capabilities.example.yml'
       - '.github/workflows/worker-tests.yml'
@@ -11,6 +13,8 @@ on:
     branches: [main]
     paths:
       - 'worker/**'
+      - 'scripts/**'
+      - 'config/**'
       - 'docs/capability-manifest.md'
       - 'docs/examples/squad-capabilities.example.yml'
       - '.github/workflows/worker-tests.yml'
@@ -26,10 +30,54 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Run worker capability tests
+      - name: Syntax-check worker sources
         run: |
           node --check worker/lib/parse-capabilities.js
           bash -n worker/lib/squad-capability-preflight.sh
           bash -n worker/lib/ralph-dispatch.sh
           bash -n worker/entrypoint.sh
-          bash worker/tests/run-tests.sh
+
+      # run-tests.sh reports SKIP for any suite whose declared dependencies are
+      # missing (worker/tests/lib/deps.sh) and never counts a skip as a pass. On
+      # a CI runner every declared dependency is present, so a skip means the
+      # environment regressed and the run proved less than it claims. Fail the
+      # job rather than accept a partial green.
+      - name: Run worker capability tests
+        shell: bash
+        run: |
+          set -o pipefail
+          rc=0
+          bash worker/tests/run-tests.sh 2>&1 | tee run-tests.out || rc=$?
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::Worker capability tests failed (exit ${rc})."
+            exit "$rc"
+          fi
+          if ! grep -qE 'Suites: [0-9]+ passed, 0 failed, 0 skipped\.' run-tests.out; then
+            echo "::error::A worker test suite was SKIPPED on CI. Every declared dependency must be present on the runner; a skip is not a pass."
+            exit 1
+          fi
+          rm -f run-tests.out
+
+  powershell-validation:
+    # scripts/validate.ps1 is the repo's static gate: PowerShell parse, worker
+    # bash -n, secret scan, session-managed env parity, and the sync-guard
+    # regression tests. Every check is offline - none of it touches Azure - so
+    # nothing here needs to be gated on credentials.
+    #
+    # It runs on windows-latest because validate.ps1 resolves repo paths with
+    # Windows separators today, so the ubuntu-latest pwsh cannot execute it
+    # unmodified. windows-latest ships pwsh 7 AND Git Bash pre-installed, so
+    # PowerShell is never downloaded at test time and the `bash -n` section
+    # actually runs instead of skipping. See docs/validation.md.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show PowerShell version (pre-installed, not downloaded)
+        run: $PSVersionTable.PSVersion.ToString()
+
+      - name: Run static validation (scripts/validate.ps1)
+        run: ./scripts/validate.ps1
