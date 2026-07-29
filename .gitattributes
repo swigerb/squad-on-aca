@@ -12,3 +12,7 @@ worker/tests/fixtures/*.yml text eol=lf
 worker/tests/expected/*.json text eol=lf
 config/*.json text eol=lf
 .github/workflows/*.yml text eol=lf
+
+# squad-aca CLI golden captures are compared byte-for-byte by
+# scripts/tests/verify-cli-golden.ps1; keep them LF on every checkout.
+scripts/tests/golden/cli/*.txt text eol=lf

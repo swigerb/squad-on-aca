@@ -13,6 +13,10 @@
     environment, and compares the recorded exit code, stdout, stderr, and every
     `az`/`gh` argv byte for byte.
 
+    The capture matrix and capture format live in
+    scripts/tests/cli-capture-cases.ps1, shared with
+    scripts/tests/verify-cli-golden.ps1 (the committed-golden gate CI runs).
+
     Nothing here touches Azure or GitHub. `scripts/tests/cli-stub-harness.ps1`
     puts fake `az.cmd`/`gh.cmd` on PATH, points HOME at a throwaway directory
     with a synthetic config, and gives the `run`/`sync` cases a real git repo
@@ -23,9 +27,9 @@
     `throw`. Adding lines to squad-aca.ps1 shifts those numbers, so cases that
     end in a thrown error can never be byte-identical across revisions. The
     comparison therefore reports two numbers: a raw byte-for-byte count, and a
-    count after normalising only that annotation. The exception message text,
-    the exit code, and the az/gh call sequence are compared unnormalised in
-    both.
+    count after normalising that annotation (and the ANSI colour sequences
+    PowerShell 7 wraps error records in). The exception message text, the exit
+    code, and the az/gh call sequence are compared unnormalised in both.
 
 .PARAMETER BaselineRef
     Git ref to compare against. Defaults to `main`.
@@ -53,110 +57,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
 
 . (Join-Path $ScriptDir "cli-stub-harness.ps1")
-
-# Every case is a full squad-aca invocation. NeedsRepo cases mutate git state,
-# so they each get a pristine stub environment.
-$Cases = @(
-    @{ Id = "01-help";            Args = @("help") }
-    @{ Id = "02-sessions";        Args = @("sessions") }
-    @{ Id = "03-sessions-limit";  Args = @("sessions", "--limit", "3") }
-    @{ Id = "04-logs-latest";     Args = @("logs") }
-    @{ Id = "05-logs-byname";     Args = @("logs", "stub-session", "--tail", "5") }
-    @{ Id = "06-logs-byexec";     Args = @("logs", "caj-squad-aca-session-stub02") }
-    @{ Id = "07-stop-byexec";     Args = @("stop", "caj-squad-aca-session-stub01") }
-    @{ Id = "08-stop-latest";     Args = @("stop") }
-    @{ Id = "09-stop-missing";    Args = @("stop", "no-such-session") }
-    @{ Id = "10-stop-azfail";     Args = @("stop", "caj-squad-aca-session-stub01"); StopRc = 3 }
-    @{ Id = "11-doctor";          Args = @("doctor") }
-    @{ Id = "12-smoke";           Args = @("smoke", "--repo", "octo/demo") }
-    @{ Id = "13-smoke-azfail";    Args = @("smoke", "--repo", "octo/demo"); StartRc = 5 }
-    @{ Id = "14-telemetry";       Args = @("telemetry", "smoke", "--repo", "octo/demo") }
-    @{ Id = "15-status";          Args = @("status") }
-    @{ Id = "16-sessions-limit1"; Args = @("sessions", "--limit", "1") }
-    @{ Id = "17-badcmdusage";     Args = @("secrets") }
-    @{ Id = "18-run";             Args = @("run", "Build the thing and open a PR", "--name", "fixedsession"); NeedsRepo = $true }
-    @{ Id = "19-run-nopush";      Args = @("run", "Do the thing", "--name", "fixedtwo", "--no-push", "--sub-squad", "alpha"); NeedsRepo = $true }
-    @{ Id = "20-run-noprompt";    Args = @("run", "--name", "fixedthree"); NeedsRepo = $true }
-    @{ Id = "21-run-implicit";    Args = @("Implicit prompt form", "--name", "fixedfour"); NeedsRepo = $true }
-    @{ Id = "22-sync-dryrun";     Args = @("sync", "--dry-run"); NeedsRepo = $true }
-)
-
-function Get-NormalizedCapture {
-    <#
-    .SYNOPSIS
-        Removes values that legitimately differ between two runs of the SAME
-        revision (timestamps, the scripts root, the stub directory GUID).
-    #>
-    param([AllowNull()][string]$Text, [string]$ScriptsRoot)
-    if ($null -eq $Text) { return "" }
-    $t = [regex]::Replace($Text, '\d{8}-\d{6}', '<TS>')
-    $t = [regex]::Replace($t, [regex]::Escape($ScriptsRoot), '<SCRIPTS>')
-    $t = [regex]::Replace($t, 'squad-cli-stub-[0-9a-f]{32}', '<STUB>')
-    return ($t -replace "`r`n", "`n")
-}
-
-function Get-CaptureWithoutErrorLineNumbers {
-    <#
-    .SYNOPSIS
-        Strips ONLY PowerShell's error-record source-line annotation, which
-        cannot survive a refactor that changes a file's length.
-    #>
-    param([string]$Text)
-    $t = $Text -replace "$([char]27)\[[0-9;]*m", ''       # PS7 colourises error records
-    $t = $t -replace 'squad-aca\.ps1:\d+', 'squad-aca.ps1:<LINE>'
-    return ($t -replace '(?m)^\s*\d+\s\|', '<LINE> |')
-}
-
-function Invoke-CaptureSet {
-    param([string]$ScriptsRoot, [string]$OutDir)
-
-    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-    Get-ChildItem -Path $OutDir -File | Remove-Item -Force
-    $cli = Join-Path $ScriptsRoot "squad-aca.ps1"
-    if (-not (Test-Path $cli)) { throw "squad-aca.ps1 not found under $ScriptsRoot" }
-
-    $shared = New-SquadCliStubEnvironment
-    try {
-        foreach ($case in $Cases) {
-            $stub = $shared
-            $fresh = $null
-            if ($case.ContainsKey("NeedsRepo") -and $case.NeedsRepo) {
-                $fresh = New-SquadCliStubEnvironment
-                Initialize-SquadCliStubRepository -Stub $fresh | Out-Null
-                $stub = $fresh
-            }
-            Reset-SquadCliStubLog -Stub $stub
-
-            $stopRc = 0
-            if ($case.ContainsKey("StopRc")) { $stopRc = $case.StopRc }
-            $startRc = 0
-            if ($case.ContainsKey("StartRc")) { $startRc = $case.StartRc }
-
-            $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cli -CliArguments $case.Args `
-                -StopExitCode $stopRc -StartExitCode $startRc
-
-            $sb = New-Object System.Text.StringBuilder
-            [void]$sb.AppendLine("### CASE $($case.Id): squad-aca $($case.Args -join ' ')")
-            [void]$sb.AppendLine("### EXITCODE: $($r.ExitCode)")
-            [void]$sb.AppendLine("### AZ CALLS")
-            foreach ($line in $r.AzCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
-            [void]$sb.AppendLine("### GH CALLS")
-            foreach ($line in $r.GhCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
-            [void]$sb.AppendLine("### STDOUT")
-            [void]$sb.AppendLine((Get-NormalizedCapture $r.StdOut $ScriptsRoot))
-            [void]$sb.AppendLine("### STDERR")
-            [void]$sb.AppendLine((Get-NormalizedCapture $r.StdErr $ScriptsRoot))
-
-            [System.IO.File]::WriteAllText(
-                (Join-Path $OutDir "$($case.Id).txt"),
-                ($sb.ToString() -replace "`r`n", "`n"))
-            Write-Host ("  captured {0} (exit {1}, {2} az calls)" -f $case.Id, $r.ExitCode, $r.AzCalls.Count)
-            if ($fresh) { Remove-SquadCliStubEnvironment -Stub $fresh }
-        }
-    } finally {
-        Remove-SquadCliStubEnvironment -Stub $shared
-    }
-}
+. (Join-Path $ScriptDir "cli-capture-cases.ps1")
 
 if (-not $WorkDir) {
     $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("squad-cli-baseline-" + [guid]::NewGuid().ToString("N"))

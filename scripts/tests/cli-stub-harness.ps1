@@ -24,7 +24,22 @@
     worker/tests/test_ralph_dispatch.sh. Nothing here touches Azure, GitHub, or
     the network.
 
-    Used by scripts/validate.ps1 ("squad-aca CLI regression" section).
+    The fake `az` reads these environment variables, so a caller can drive the
+    failure modes a live subscription would produce. Invoke-SquadCliCapture
+    always resets them, so a CLI capture only ever sees default behaviour; the
+    ACA-adapter checks in validate.ps1 set them directly:
+
+      SQUAD_STUB_STOP_RC     exit code for `containerapp job stop`
+      SQUAD_STUB_STOP_ERR    stderr line `containerapp job stop` emits (auth
+                             failure, RBAC denial, throttling, not-found, ...)
+      SQUAD_STUB_START_RC    exit code for `containerapp job start`
+      SQUAD_STUB_EXEC_SEQ    marker file path; the FIRST
+                             `containerapp job execution show` reports
+                             Provisioning, later calls report Running
+      SQUAD_STUB_EXEC_STUCK  "1" => every `execution show` reports Provisioning
+
+    Used by scripts/validate.ps1 ("ACA Job adapter" and "CLI behaviour
+    regression" sections).
 #>
 
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here. This file
@@ -101,6 +116,30 @@ function New-SquadCliStubEnvironment {
 }
 '@
 
+    # Same execution, still coming up. Used to prove the ACA adapter's `wait`
+    # actually polls until the execution leaves Provisioning.
+    Set-Content -LiteralPath (Join-Path $fixtureDir "exec-show-provisioning.json") -Encoding ascii -Value @'
+{
+  "properties": {
+    "status": "Provisioning",
+    "startTime": "2026-01-02T03:04:05+00:00",
+    "endTime": null,
+    "template": {
+      "containers": [
+        {
+          "env": [
+            { "name": "SESSION_NAME", "value": "stub-session" },
+            { "name": "SQUAD_MODE", "value": "prompt" },
+            { "name": "GITHUB_REPOSITORY", "value": "octo/demo" },
+            { "name": "GITHUB_REF", "value": "squad/stub-session" }
+          ]
+        }
+      ]
+    }
+  }
+}
+'@
+
     Set-Content -LiteralPath (Join-Path $fixtureDir "template-env.json") -Encoding ascii -Value @'
 [
   { "name": "ASPIRE_OTLP_GRPC_ENDPOINT", "value": "http://ca-squad-aca-aspire:18889" },
@@ -148,7 +187,19 @@ if "%A3%"=="start" goto sqjobstart
 goto sqok
 :sqexec
 if "%A4%"=="list" type "%SQUAD_STUB_FIXTURES%\exec-list.json"
-if "%A4%"=="show" type "%SQUAD_STUB_FIXTURES%\exec-show.json"
+if "%A4%"=="show" goto sqexecshow
+goto sqok
+:sqexecshow
+if "%SQUAD_STUB_EXEC_STUCK%"=="1" goto sqexecprov
+if "%SQUAD_STUB_EXEC_SEQ%"=="" goto sqexecready
+if exist "%SQUAD_STUB_EXEC_SEQ%" goto sqexecready
+>"%SQUAD_STUB_EXEC_SEQ%" echo seen
+goto sqexecprov
+:sqexecprov
+type "%SQUAD_STUB_FIXTURES%\exec-show-provisioning.json"
+goto sqok
+:sqexecready
+type "%SQUAD_STUB_FIXTURES%\exec-show.json"
 goto sqok
 :sqjobshow
 if "%Q%"=="properties.template.containers[0].env" goto sqtplenv
@@ -167,6 +218,7 @@ echo STUB-LOG-LINE-2
 goto sqok
 :sqjobstop
 echo STUB-STOP-ACK
+if not "%SQUAD_STUB_STOP_ERR%"=="" >&2 echo %SQUAD_STUB_STOP_ERR%
 exit /b %SQUAD_STUB_STOP_RC%
 :sqjobstart
 echo STUB-START-ACK
@@ -298,7 +350,8 @@ function Invoke-SquadCliCapture {
 
     $envNames = @("PATH", "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE",
                   "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_FIXTURES",
-                  "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC")
+                  "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC",
+                  "SQUAD_STUB_STOP_ERR", "SQUAD_STUB_EXEC_SEQ", "SQUAD_STUB_EXEC_STUCK")
     $saved = @{}
     foreach ($name in $envNames) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
@@ -319,6 +372,11 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_FIXTURES = $Stub.FixtureDir
         $env:SQUAD_STUB_STOP_RC = "$StopExitCode"
         $env:SQUAD_STUB_START_RC = "$StartExitCode"
+        # The adapter-level checks in validate.ps1 drive these; a CLI capture
+        # must always see the default (quiet, sequence-free) stub behaviour.
+        $env:SQUAD_STUB_STOP_ERR = ""
+        $env:SQUAD_STUB_EXEC_SEQ = ""
+        $env:SQUAD_STUB_EXEC_STUCK = ""
 
         $argList = @("-NoProfile", "-NonInteractive", "-File", $ScriptPath) + $CliArguments
         $proc = Start-Process -FilePath $hostExe -ArgumentList $argList `

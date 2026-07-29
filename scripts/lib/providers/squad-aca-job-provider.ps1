@@ -205,19 +205,49 @@ function New-AcaJobExecutionProvider {
     # never fails when there is nothing left to stop: an already-terminated or
     # externally-deleted execution is a success. Not wired to any CLI command in
     # this sprint, so `squad-aca stop` keeps its current strict semantics.
+    #
+    # Idempotency is NOT "ignore every failure". A non-zero `az` exit is only
+    # success when the error says the execution is gone or already terminal.
+    # Auth failures, RBAC denials, throttling, network errors, a wrong
+    # subscription, and a missing `az` all surface as terminating errors --
+    # reporting "terminated" for those would tell a Sprint 5 cleanup path that
+    # an execution it never touched is safely torn down.
     $operations["terminate"] = {
         param($Context, $Arguments)
 
         $decoded = ConvertFrom-SquadExecutionHandle -Handle $Arguments["Handle"] -ExpectedProviderId "aca-job"
         $payload = $decoded.Payload
 
-        az containerapp job stop --name $payload.job --resource-group $payload.rg --job-execution-name $payload.execution 1>$null 2>$null
-        $alreadyTerminal = ($LASTEXITCODE -ne 0)
+        # Invoke-AzPromptSafe (scripts/lib/aca-logs.ps1) captures stdout, stderr
+        # and the real exit code, and reports 127 when `az` is not on PATH at all
+        # -- so a stale $LASTEXITCODE from an earlier command can never be read
+        # as "the stop succeeded".
+        $result = Invoke-AzPromptSafe -AzArgs @(
+            "containerapp", "job", "stop",
+            "--name", [string]$payload.job,
+            "--resource-group", [string]$payload.rg,
+            "--job-execution-name", [string]$payload.execution
+        )
 
-        return [pscustomobject]@{
-            Terminated      = $true
-            AlreadyTerminal = $alreadyTerminal
+        if ($result.ExitCode -eq 0) {
+            return [pscustomobject]@{
+                Terminated      = $true
+                AlreadyTerminal = $false
+            }
         }
+
+        if (Test-AcaJobExecutionGone -Result $result) {
+            return [pscustomobject]@{
+                Terminated      = $true
+                AlreadyTerminal = $true
+            }
+        }
+
+        $message = "Could not terminate execution '$($payload.execution)' in job '$($payload.job)' " +
+            "(resource group '$($payload.rg)'): 'az containerapp job stop' failed with exit " +
+            "$($result.ExitCode), and the failure is not 'already terminated or gone'. " +
+            "$(Get-AzErrorText $result)"
+        throw $message
     }
 
     $provider = [pscustomobject]@{
@@ -230,6 +260,84 @@ function New-AcaJobExecutionProvider {
     # the provider in a closure.
     $context | Add-Member -MemberType NoteProperty -Name Self -Value $provider
     return $provider
+}
+
+function Test-AcaJobExecutionGone {
+    <#
+    .SYNOPSIS
+        Decide whether a failed `az containerapp job stop` means "there was
+        nothing left to stop".
+
+    .DESCRIPTION
+        PROVIDER-INTERNAL, and the whole of terminate's idempotency rule.
+
+        PRD #6 requires terminate to be idempotent: an execution that is already
+        terminal, already terminated, or was deleted out from under us is a
+        SUCCESS. It does not require -- and must not be read as -- "treat every
+        `az` failure as success". An auth failure, an RBAC denial, throttling, a
+        network timeout, a wrong subscription, or a missing `az` binary tells us
+        nothing about the execution's state, so reporting it as terminated is a
+        false teardown that a cleanup path would act on.
+
+        Classification is FAIL-CLOSED and deny-list first:
+
+          1. A failure whose text matches a known real-failure signature is a
+             real failure even if it also mentions "not found" (an RBAC denial
+             can read as "... or the scope is invalid").
+          2. Only then is a known not-found / already-terminal signature -- or
+             the Azure CLI's ResourceNotFoundError exit code 3 -- treated as
+             gone.
+          3. Anything unrecognised is a real failure.
+
+    .OUTPUTS
+        [bool] $true when the execution is provably gone or already terminal.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Result
+    )
+
+    # 127 is Invoke-AzPromptSafe's marker for "az could not be run at all"
+    # (CommandNotFoundException); -1 means the exit code was never observed.
+    # Neither says anything about the execution.
+    if ($Result.ExitCode -eq 127 -or $Result.ExitCode -eq -1) { return $false }
+
+    $text = (@($Result.StdErr) + @($Result.StdOut) | Where-Object { $_ }) -join " "
+
+    $realFailurePatterns = @(
+        # Authentication
+        "az login", "AADSTS", "ExpiredAuthenticationToken", "InvalidAuthenticationToken",
+        "authentication failed", "Unauthorized", "credentials have expired", "re-authenticate",
+        # Authorization / RBAC
+        "AuthorizationFailed", "does not have authorization", "Forbidden", "AuthorizationPermissionMismatch",
+        # Wrong subscription / tenant
+        "SubscriptionNotFound", "subscription .* not found", "not registered", "set the subscription",
+        # Throttling
+        "TooManyRequests", "throttl", "rate limit", "Retry-After",
+        # Network / service availability
+        "Max retries exceeded", "Connection aborted", "ConnectionError", "ConnectTimeout",
+        "timed out", "timeout", "Temporary failure in name resolution", "getaddrinfo",
+        "ServiceUnavailable", "InternalServerError", "Bad Gateway",
+        # az itself could not run
+        "is not recognized as", "CommandNotFound", "command not found",
+        "requires the extension"
+    )
+    foreach ($pattern in $realFailurePatterns) {
+        if ($text -match $pattern) { return $false }
+    }
+
+    # Azure CLI reserves exit code 3 for ResourceNotFoundError.
+    if ($Result.ExitCode -eq 3) { return $true }
+
+    $gonePatterns = @(
+        "ResourceNotFound", "NotFound", "not found", "does not exist", "no longer exists",
+        "already stopped", "already terminated", "already completed", "already in a terminal",
+        "is not running", "terminal state", "has already finished"
+    )
+    foreach ($pattern in $gonePatterns) {
+        if ($text -match $pattern) { return $true }
+    }
+
+    return $false
 }
 
 function New-AcaJobExecutionHandle {

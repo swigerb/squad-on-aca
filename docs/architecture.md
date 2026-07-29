@@ -65,7 +65,7 @@ scripts/lib/squad-aca-provider.ps1        the contract
 | `status` | List recent executions, or describe the one behind a handle. |
 | `logs` | Return an execution's logs as `Lines` plus an optional `Notice` the caller prints verbatim. Which of a substrate's log paths produced them is the provider's business. |
 | `cancel` | Ask the substrate to stop a running execution, reporting the substrate's own result. |
-| `terminate` | **Idempotent** teardown. Already-terminated, already-terminal, or externally-deleted is a success. |
+| `terminate` | **Idempotent** teardown. Already-terminated, already-terminal, or externally-deleted is a success. Idempotent is not "ignore every failure": a substrate error that says nothing about the execution's state (auth, RBAC, throttling, network, wrong subscription, a missing CLI binary) must surface as an error. |
 
 `cancel` and `terminate` are deliberately different operations. `squad-aca stop`
 maps to `cancel`, because its observable contract today is "run the substrate's
@@ -73,15 +73,26 @@ stop and show me what happened" — including failures. `terminate` is the
 idempotent teardown PRD #6 requires for cleanup paths, and is not wired to a CLI
 command yet.
 
+The ACA Job adapter classifies a failed `az containerapp job stop`
+**fail-closed**: a known real-failure signature wins over a "not found" reading,
+Azure CLI's `ResourceNotFoundError` (exit 3) and the not-found/already-terminal
+messages report `AlreadyTerminal`, and anything unrecognised is an error. It runs
+`az` through `Invoke-AzPromptSafe` (`scripts/lib/aca-logs.ps1`), which captures
+stderr and reports a distinct exit code when `az` cannot be run at all — so a
+stale `$LASTEXITCODE` from an earlier command can never be read as a successful
+stop. `scripts/validate.ps1` exercises all of this against a stubbed `az`.
+
 ### Opaque handles
 
 Every operation after `create` takes an **opaque execution handle** — a `sqx1.`
 prefixed token that encodes the owning provider plus a provider-private payload.
-Callers must pass it back verbatim; they cannot assume it is an ACA Job execution
-name, and decoding it for a different provider is an error. Records returned by
-`status` keep the handle separate from a `Display` object, so the CLI renders
-substrate-shaped columns without any call site being able to round-trip an
-identifier out of them.
+Opacity here is a *convention*, not a security boundary: the payload is base64
+and anyone who wants to decode it can. What the convention buys is that no call
+site can accidentally depend on "the handle is an ACA Job execution name".
+Callers must pass it back verbatim, and decoding a handle for a different
+provider is an error. Records returned by `status` keep the handle separate from
+a `Display` object, so the CLI renders substrate-shaped columns without any call
+site being able to round-trip an identifier out of them.
 
 ### Request and response
 
@@ -102,6 +113,9 @@ The ACA Job adapter's `logs` operation delegates to `Get-AcaExecutionLog`
 falls back to Log Analytics, and throws when both fail (issue #13). The seam
 does not change that behaviour; it only moves the decision of *how* to fetch
 logs behind the provider, leaving `Invoke-Logs` responsible for presentation.
+`scripts/lib/squad-aca-provider.ps1` dot-sources `aca-logs.ps1` itself, so the
+adapter's `logs` and `terminate` operations do not depend on the caller having
+loaded it first.
 
 ### What is deliberately *not* behind the seam
 

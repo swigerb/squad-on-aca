@@ -1,0 +1,12 @@
+### CASE 22-sync-dryrun: squad-aca sync --dry-run
+### EXITCODE: 0
+### AZ CALLS
+### GH CALLS
+### STDOUT
+Files that would be considered for Squad state sync:
+  .squad
+
+Current git status:
+
+### STDERR
+

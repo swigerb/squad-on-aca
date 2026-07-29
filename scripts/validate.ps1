@@ -31,10 +31,20 @@
                               against the filesystem-backed fake provider
                               (state transitions, idempotent terminate, handle
                               opacity, unknown/foreign handle rejection).
+     8b. ACA Job adapter   - the PRODUCTION adapter is exercised against a
+                              stubbed `az`: terminate on a live, gone, and
+                              already-terminal execution, terminate under auth /
+                              RBAC / throttling / network / missing-`az`
+                              failures (all of which must surface as errors),
+                              and wait's polling and timeout.
       9. CLI regression     - `squad-aca` is driven end to end with stub `az`
                               and `gh` binaries on PATH, asserting the observable
-                              output, exit codes, and az call sequences that the
-                              provider refactor must not change.
+                              output (including `stop` stdout), exit codes, and
+                              az call sequences that the provider refactor must
+                              not change.
+     10. CLI golden gate    - the committed golden captures cover every capture
+                              case and CI actually runs
+                              scripts/tests/verify-cli-golden.ps1.
 
     Exit code is 0 when all checks pass, 1 otherwise. Use this before pushing
     and as the E2E "sprint gate" documented in docs/validation.md.
@@ -868,12 +878,16 @@ if (-not (Test-Path $providerLib)) {
         }
 
         # -- handle opacity --------------------------------------------------
+        # Convention-level opacity, and the message says exactly that: a handle
+        # is base64 and trivially decodable by anyone who wants to. What this
+        # asserts is that a caller cannot *accidentally* depend on the execution
+        # id by string-matching a handle it was handed.
         $status = Get-SquadExecutionStatus -Provider $fake -Handle $handle
         $execId = $status.Display.Execution
         if ($handle -ne $execId -and $handle -notlike "*$execId*") {
-            Add-Pass "Execution handles are opaque (the execution id is not recoverable by string inspection)"
+            Add-Pass "Execution handles do not embed the execution id verbatim (no call site can string-match one out by accident)"
         } else {
-            Add-Fail "Execution handle leaks the underlying execution id '$execId'"
+            Add-Fail "Execution handle contains the underlying execution id '$execId' verbatim; a call site could string-match it out"
         }
 
         # -- state transitions -----------------------------------------------
@@ -971,6 +985,202 @@ if (-not (Test-Path $providerLib)) {
 }
 
 # ---------------------------------------------------------------------------
+# 8b. ACA Job adapter against a stubbed `az` (the PRODUCTION adapter)
+# ---------------------------------------------------------------------------
+# Section 8 exercises the contract against the fake provider. That proves the
+# seam, not the adapter that actually ships: replacing the ACA adapter's
+# terminate az call with a no-op, or its `wait` body with a throw, left section
+# 8 fully green. These checks close that hole by driving
+# New-AcaJobExecutionProvider itself against the fake `az` from
+# scripts/tests/cli-stub-harness.ps1.
+#
+# The defect they exist for: terminate used to return Terminated=$true for EVERY
+# non-zero `az` exit and label it AlreadyTerminal, so an auth failure, an RBAC
+# denial, throttling, or a missing `az` all read as "successfully torn down".
+Write-Section "ACA Job adapter (stubbed az)"
+$adapterHarness = Join-Path $RepoRoot "scripts\tests\cli-stub-harness.ps1"
+if (-not (Test-Path $providerLib)) {
+    Add-Fail "scripts/lib/squad-aca-provider.ps1 is missing (ACA Job adapter checks)"
+} elseif (-not (Test-Path $adapterHarness)) {
+    Add-Fail "scripts/tests/cli-stub-harness.ps1 is missing (ACA Job adapter checks)"
+} elseif (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] ACA Job adapter checks require Windows (.cmd stubs)" -ForegroundColor Yellow
+} else {
+    . $adapterHarness
+    $adapterStub = $null
+    $adapterPrevPath = $env:PATH
+    $adapterEnvNames = @("SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_FIXTURES",
+        "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC", "SQUAD_STUB_STOP_ERR",
+        "SQUAD_STUB_EXEC_SEQ", "SQUAD_STUB_EXEC_STUCK")
+    try {
+        $adapterStub = New-SquadCliStubEnvironment
+        $env:PATH = "$($adapterStub.BinDir);$adapterPrevPath"
+        $env:SQUAD_STUB_AZ_LOG = $adapterStub.AzLog
+        $env:SQUAD_STUB_GH_LOG = $adapterStub.GhLog
+        $env:SQUAD_STUB_FIXTURES = $adapterStub.FixtureDir
+        $env:SQUAD_STUB_STOP_RC = "0"
+        $env:SQUAD_STUB_START_RC = "0"
+        $env:SQUAD_STUB_STOP_ERR = ""
+        $env:SQUAD_STUB_EXEC_SEQ = ""
+        $env:SQUAD_STUB_EXEC_STUCK = ""
+
+        $resolvedAz = (Get-Command az -ErrorAction SilentlyContinue)
+        if (-not $resolvedAz -or $resolvedAz.Source -ne (Join-Path $adapterStub.BinDir "az.cmd")) {
+            Add-Fail "Could not stub 'az' on PATH for the ACA Job adapter checks (resolved: $($resolvedAz.Source))"
+        } else {
+            Add-Pass "Fake 'az' is first on PATH; ACA Job adapter checks run fully offline"
+        }
+
+        $adapterConfig = [pscustomobject]@{
+            resourceGroup        = "rg-squad-stub"
+            sessionJob           = "caj-squad-aca-session"
+            subscriptionId       = "00000000-0000-0000-0000-000000000000"
+            logAnalyticsWorkspace = "law-stub"
+        }
+        $acaAdapter = New-SquadExecutionProvider -Kind "aca-job" -Options @{
+            Config    = $adapterConfig
+            ScriptDir = (Join-Path $RepoRoot "scripts")
+        }
+        $acaHandle = New-AcaJobExecutionHandle -Config $adapterConfig -Name "caj-squad-aca-session-stub01"
+
+        function Invoke-AdapterTerminate {
+            param([string]$StopRc = "0", [string]$StopErr = "", [string]$Handle)
+            Reset-SquadCliStubLog -Stub $adapterStub
+            $env:SQUAD_STUB_STOP_RC = $StopRc
+            $env:SQUAD_STUB_STOP_ERR = $StopErr
+            $outcome = [pscustomobject]@{ Threw = $false; Message = ""; Result = $null }
+            try {
+                $outcome.Result = Remove-SquadExecution -Provider $acaAdapter -Handle $Handle
+            } catch {
+                $outcome.Threw = $true
+                $outcome.Message = [string]$_.Exception.Message
+            }
+            return $outcome
+        }
+
+        # --- 1. Normal terminate ---------------------------------------------
+        $t = Invoke-AdapterTerminate -StopRc "0" -Handle $acaHandle
+        $stopCalls = @(Get-SquadCliStubCall -Stub $adapterStub -Tool az | Where-Object { $_ -like "containerapp job stop*" })
+        if (-not $t.Threw -and $t.Result.Terminated -and -not $t.Result.AlreadyTerminal `
+                -and $stopCalls.Count -eq 1 `
+                -and $stopCalls[0] -like "*--name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub01*") {
+            Add-Pass "ACA adapter terminate stops a live execution with one 'az containerapp job stop' (Terminated, not AlreadyTerminal)"
+        } else {
+            Add-Fail "ACA adapter terminate did not stop a live execution correctly (threw=$($t.Threw) terminated=$($t.Result.Terminated) alreadyTerminal=$($t.Result.AlreadyTerminal) calls=$($stopCalls.Count) msg=$($t.Message))"
+        }
+
+        # --- 2. Already terminal / deleted out from under us => SUCCESS -------
+        # Azure CLI reserves exit 3 for ResourceNotFoundError.
+        $goneCases = @(
+            @{ Rc = "3"; Err = "ERROR: (JobExecutionNotFound) The job execution 'caj-squad-aca-session-stub01' was not found."; Label = "not found (exit 3)" },
+            @{ Rc = "1"; Err = "ERROR: (ResourceNotFound) The Resource 'Microsoft.App/jobs/caj-squad-aca-session/executions/stub01' under resource group 'rg-squad-stub' was not found."; Label = "ResourceNotFound" },
+            @{ Rc = "1"; Err = "ERROR: The job execution is already stopped."; Label = "already stopped" }
+        )
+        $goneFailures = @()
+        foreach ($case in $goneCases) {
+            $g = Invoke-AdapterTerminate -StopRc $case.Rc -StopErr $case.Err -Handle $acaHandle
+            if ($g.Threw -or -not $g.Result.Terminated -or -not $g.Result.AlreadyTerminal) {
+                $goneFailures += "$($case.Label) (threw=$($g.Threw))"
+            }
+        }
+        if ($goneFailures.Count -eq 0) {
+            Add-Pass "ACA adapter terminate is idempotent: an already-terminal or externally-deleted execution reports Terminated + AlreadyTerminal"
+        } else {
+            Add-Fail "ACA adapter terminate failed for a genuinely-gone execution: $($goneFailures -join '; ') (PRD #6 requires success)"
+        }
+
+        # --- 3. Auth failure MUST surface, not become AlreadyTerminal ---------
+        $auth = Invoke-AdapterTerminate -StopRc "1" -StopErr "ERROR: Please run 'az login' to setup account." -Handle $acaHandle
+        if ($auth.Threw -and $auth.Message -match "az login") {
+            Add-Pass "ACA adapter terminate surfaces an 'az login' auth failure as an error (never AlreadyTerminal)"
+        } else {
+            Add-Fail "ACA adapter terminate swallowed an auth failure (threw=$($auth.Threw) terminated=$($auth.Result.Terminated) alreadyTerminal=$($auth.Result.AlreadyTerminal)); an unauthenticated CLI proves nothing about the execution"
+        }
+
+        # --- 4. Other real failures must surface too --------------------------
+        $realFailureCases = @(
+            @{ Rc = "1"; Err = "ERROR: (AuthorizationFailed) The client does not have authorization to perform action 'Microsoft.App/jobs/stop/action'."; Label = "RBAC denial" },
+            @{ Rc = "1"; Err = "ERROR: (TooManyRequests) The request is being throttled. Retry-After: 30"; Label = "throttling" },
+            @{ Rc = "1"; Err = "ERROR: HTTPSConnectionPool: Max retries exceeded (connection timed out)"; Label = "network timeout" },
+            @{ Rc = "1"; Err = "ERROR: (SubscriptionNotFound) The subscription could not be found."; Label = "wrong subscription" },
+            @{ Rc = "1"; Err = "ERROR: something the CLI has never printed before"; Label = "unrecognised failure (fail closed)" }
+        )
+        $swallowed = @()
+        foreach ($case in $realFailureCases) {
+            $f = Invoke-AdapterTerminate -StopRc $case.Rc -StopErr $case.Err -Handle $acaHandle
+            if (-not $f.Threw) { $swallowed += $case.Label }
+        }
+        if ($swallowed.Count -eq 0) {
+            Add-Pass "ACA adapter terminate surfaces RBAC, throttling, network, wrong-subscription and unrecognised failures as errors (fail closed)"
+        } else {
+            Add-Fail "ACA adapter terminate reported success for real failure(s): $($swallowed -join ', ')"
+        }
+
+        # --- 5. `az` missing entirely must fail, not read a stale exit code ---
+        # The pre-fix adapter read $LASTEXITCODE after a call that never ran, so
+        # a preceding success made a missing `az` look like a completed stop.
+        cmd /c "exit 0" | Out-Null   # force $LASTEXITCODE to 0 ("success")
+        $env:PATH = "$($adapterStub.WorkDir)"
+        $missingAz = [pscustomobject]@{ Threw = $false; Result = $null; Message = "" }
+        try {
+            $missingAz.Result = Remove-SquadExecution -Provider $acaAdapter -Handle $acaHandle
+        } catch {
+            $missingAz.Threw = $true
+            $missingAz.Message = [string]$_.Exception.Message
+        } finally {
+            $env:PATH = "$($adapterStub.BinDir);$adapterPrevPath"
+        }
+        if ($missingAz.Threw) {
+            Add-Pass "ACA adapter terminate fails when 'az' is not on PATH (a stale `$LASTEXITCODE cannot be read as a successful stop)"
+        } else {
+            Add-Fail "ACA adapter terminate reported Terminated=$($missingAz.Result.Terminated) with no 'az' on PATH; nothing ran, so nothing was terminated"
+        }
+
+        # --- 6. wait advances Provisioning -> Running -------------------------
+        Reset-SquadCliStubLog -Stub $adapterStub
+        $env:SQUAD_STUB_EXEC_SEQ = Join-Path $adapterStub.Root "exec-seq.marker"
+        Remove-Item -LiteralPath $env:SQUAD_STUB_EXEC_SEQ -Force -ErrorAction SilentlyContinue
+        $waitResult = $null
+        $waitThrew = ""
+        try {
+            $waitResult = Wait-SquadExecution -Provider $acaAdapter -Handle $acaHandle -TimeoutSeconds 30 -PollSeconds 1
+        } catch {
+            $waitThrew = [string]$_.Exception.Message
+        }
+        $env:SQUAD_STUB_EXEC_SEQ = ""
+        $showCalls = @(Get-SquadCliStubCall -Stub $adapterStub -Tool az | Where-Object { $_ -like "containerapp job execution show*" })
+        if (-not $waitThrew -and $waitResult -and $waitResult.Status -eq "Running" -and $showCalls.Count -ge 2) {
+            Add-Pass "ACA adapter wait polls 'az containerapp job execution show' until the execution leaves Provisioning ($($showCalls.Count) polls)"
+        } else {
+            Add-Fail "ACA adapter wait did not advance Provisioning -> Running (status=$($waitResult.Status) polls=$($showCalls.Count) error=$waitThrew)"
+        }
+
+        # --- 7. wait must not report a still-provisioning execution as ready --
+        Reset-SquadCliStubLog -Stub $adapterStub
+        $env:SQUAD_STUB_EXEC_STUCK = "1"
+        $stuckThrew = $false
+        $stuckStatus = ""
+        try {
+            $stuckStatus = (Wait-SquadExecution -Provider $acaAdapter -Handle $acaHandle -TimeoutSeconds 1 -PollSeconds 1).Status
+        } catch {
+            $stuckThrew = $true
+        }
+        $env:SQUAD_STUB_EXEC_STUCK = ""
+        if ($stuckThrew) {
+            Add-Pass "ACA adapter wait times out instead of returning a still-Provisioning execution as ready"
+        } else {
+            Add-Fail "ACA adapter wait returned status '$stuckStatus' for an execution that never left Provisioning"
+        }
+    } catch {
+        Add-Fail "ACA Job adapter checks threw: $($_.Exception.Message)"
+    } finally {
+        $env:PATH = $adapterPrevPath
+        foreach ($name in $adapterEnvNames) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        if ($adapterStub) { Remove-SquadCliStubEnvironment -Stub $adapterStub }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 9. CLI behaviour regression (offline, stubbed az/gh)
 # ---------------------------------------------------------------------------
 Write-Section "CLI behaviour regression"
@@ -1029,6 +1239,11 @@ if (-not (Test-Path $harness)) {
         }
 
         # stop: must map to az job stop (cancel), NOT to idempotent terminate.
+        # The stdout assertion is the point: PR #9 was closed for a `stop`
+        # output regression, and call-count + exit-code alone cannot see one.
+        # The stub's `az containerapp job stop` prints STUB-STOP-ACK; appending
+        # `| Out-Null` to the adapter's cancel call keeps the call count and the
+        # exit code identical while the user loses every byte az printed.
         Reset-SquadCliStubLog -Stub $stub
         $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("stop")
         $stopCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job stop*" })
@@ -1037,9 +1252,14 @@ if (-not (Test-Path $harness)) {
         } else {
             Add-Fail "squad-aca stop az call sequence changed: $($r.AzCalls -join ' | ')"
         }
+        if ($r.StdOut -match "STUB-STOP-ACK") {
+            Add-Pass "squad-aca stop passes 'az containerapp job stop' stdout through to the user (PR #9 regression class)"
+        } else {
+            Add-Fail "squad-aca stop swallowed az stdout; the user no longer sees what 'az containerapp job stop' printed (PR #9 regression class). stdout=$($r.StdOut)"
+        }
 
         # Anti-regression for PR #9: a failing az stop must still surface exactly
-        # one stop call and must not be swallowed into a success path of our own.
+        # one stop call, its output, and today's exit code -- no swallowing.
         Reset-SquadCliStubLog -Stub $stub
         $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("stop") -StopExitCode 3
         $stopCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job stop*" })
@@ -1047,6 +1267,11 @@ if (-not (Test-Path $harness)) {
             Add-Pass "squad-aca stop preserves today's pass-through behaviour when az stop fails (no swallowing, no retry)"
         } else {
             Add-Fail "squad-aca stop changed behaviour on az failure (calls=$($stopCall.Count), exit=$($r.ExitCode))"
+        }
+        if ($r.StdOut -match "STUB-STOP-ACK") {
+            Add-Pass "squad-aca stop still shows az output when az stop fails (the failure text is the user's only diagnostic)"
+        } else {
+            Add-Fail "squad-aca stop swallowed az output on failure; the user gets no diagnostic at all. stdout=$($r.StdOut)"
         }
 
         # Unresolvable session: message text and exit code are observable.
@@ -1080,6 +1305,56 @@ if (-not (Test-Path $harness)) {
         Add-Fail "CLI behaviour regression checks threw: $($_.Exception.Message)"
     } finally {
         if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 10. CLI golden gate is present AND automated
+# ---------------------------------------------------------------------------
+# scripts/tests/verify-cli-golden.ps1 is the only guard that compares the whole
+# observable surface of `squad-aca` -- including stdout -- against a committed
+# baseline. That is the exact regression class PR #9 was closed for. It is only
+# a guard if CI runs it, so assert both halves: the goldens exist and cover
+# every case, and the workflow actually invokes the script.
+Write-Section "CLI golden gate"
+$goldenScript = Join-Path $RepoRoot "scripts\tests\verify-cli-golden.ps1"
+$caseFile = Join-Path $RepoRoot "scripts\tests\cli-capture-cases.ps1"
+$goldenDir = Join-Path $RepoRoot "scripts\tests\golden\cli"
+$workflowFile = Join-Path $RepoRoot ".github\workflows\worker-tests.yml"
+
+if (-not (Test-Path $goldenScript)) {
+    Add-Fail "scripts/tests/verify-cli-golden.ps1 is missing (no automated stdout regression gate)"
+} elseif (-not (Test-Path $caseFile)) {
+    Add-Fail "scripts/tests/cli-capture-cases.ps1 is missing (shared CLI capture matrix)"
+} else {
+    . $caseFile
+    $goldenFiles = @()
+    if (Test-Path $goldenDir) { $goldenFiles = @(Get-ChildItem -Path $goldenDir -Filter *.txt -File) }
+    $caseIds = @($Cases | ForEach-Object { $_.Id })
+    $missingGolden = @($caseIds | Where-Object { $goldenFiles.Name -notcontains "$_.txt" })
+    if ($caseIds.Count -gt 0 -and $missingGolden.Count -eq 0 -and $goldenFiles.Count -eq $caseIds.Count) {
+        Add-Pass "Every one of the $($caseIds.Count) CLI capture cases has a committed golden under scripts/tests/golden/cli"
+    } else {
+        Add-Fail "CLI goldens are out of sync with the capture matrix (cases=$($caseIds.Count), goldens=$($goldenFiles.Count), missing=$($missingGolden -join ', ')); regenerate with verify-cli-golden.ps1 -Update"
+    }
+
+    # A golden that records no stdout could never catch the PR #9 regression.
+    $stopGolden = Join-Path $goldenDir "07-stop-byexec.txt"
+    if ((Test-Path $stopGolden) -and ((Get-Content -LiteralPath $stopGolden -Raw) -match "### STDOUT\s*\r?\nSTUB-STOP-ACK")) {
+        Add-Pass "The 'stop' golden records az stdout, so losing that output is a diff (PR #9 regression class)"
+    } else {
+        Add-Fail "The 'stop' golden does not record 'az containerapp job stop' stdout; the PR #9 regression class would pass unnoticed"
+    }
+
+    if (-not (Test-Path $workflowFile)) {
+        Add-Fail ".github/workflows/worker-tests.yml is missing; the CLI golden gate has no automated runner"
+    } else {
+        $workflowText = Get-Content -LiteralPath $workflowFile -Raw
+        if ($workflowText -match 'verify-cli-golden\.ps1') {
+            Add-Pass "CI runs scripts/tests/verify-cli-golden.ps1, so a squad-aca stdout change fails a job (not just a manual tool)"
+        } else {
+            Add-Fail "No CI job runs scripts/tests/verify-cli-golden.ps1; the stdout regression guard would be developer-only again"
+        }
     }
 }
 

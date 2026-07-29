@@ -548,6 +548,14 @@ function Remove-SquadExecution {
     return Invoke-SquadProviderOperation -Provider $Provider -Operation "terminate" -Arguments @{ Handle = $Handle }
 }
 
+# The ACA Job adapter's `logs` operation calls Get-AcaExecutionLog and its
+# `terminate` operation calls Invoke-AzPromptSafe / Get-AzErrorText, all from
+# scripts/lib/aca-logs.ps1. Load it here rather than relying on the caller
+# having dot-sourced it first: scripts/squad-aca.ps1 happens to load aca-logs
+# one line earlier today, and reordering those two lines would otherwise break
+# `logs` and `terminate` at runtime with no test catching it.
+. (Join-Path $PSScriptRoot "aca-logs.ps1")
+
 # Adapters. Dot-sourced at load so the factory can construct them without
 # scoping surprises (dot-sourcing inside a function would scope the adapter's
 # functions to that function).

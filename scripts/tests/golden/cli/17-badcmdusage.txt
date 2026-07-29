@@ -1,0 +1,10 @@
+### CASE 17-badcmdusage: squad-aca secrets
+### EXITCODE: 1
+### AZ CALLS
+### GH CALLS
+### STDOUT
+
+### STDERR
+Exception: <SCRIPTS>\squad-aca.ps1:<LINE>
+     | Usage: squad-aca secrets rotate [--github-token <token>] [--copilot-token <token>]
+

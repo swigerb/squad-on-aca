@@ -1,0 +1,19 @@
+### CASE 02-sessions: squad-aca sessions
+### EXITCODE: 0
+### AZ CALLS
+account set --subscription 00000000-0000-0000-0000-000000000000
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
+containerapp job execution list --name caj-squad-aca-session --resource-group rg-squad-stub --query [0:10].name -o json
+containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub01 -o json
+containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub02 -o json
+### GH CALLS
+### STDOUT
+
+Execution                    Status  Session      Mode   Repository Branch             Started              Ended
+---------                    ------  -------      ----   ---------- ------             -------              -----
+caj-squad-aca-session-stub01 Running stub-session prompt octo/demo  squad/stub-session 1/1/2026 10:04:05 PM 
+caj-squad-aca-session-stub02 Running stub-session prompt octo/demo  squad/stub-session 1/1/2026 10:04:05 PM 
+
+
+### STDERR
+

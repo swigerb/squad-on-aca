@@ -29,7 +29,9 @@ pre-push hook.
 | Logs fallback + exit code | Drives `Get-AcaExecutionLog` (`scripts/lib/aca-logs.ps1`) against a fake `az` placed first on `PATH`: extension present, extension absent, extension call failing, Log Analytics query failing, both paths unavailable, and a child-process exit-code assertion. Also re-runs the Log Analytics path under Windows PowerShell 5.1, the host the `squad-aca` shim uses | Regression guard for issue #13: `logs` must never exit 0 after a failed fetch, must never trigger the interactive extension-install prompt, and must fall back to Log Analytics when the `containerapp` extension is unavailable |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
 | Execution provider contract | Exercises `scripts/lib/squad-aca-provider.ps1` offline against the filesystem-backed fake provider: create/wait/status/logs/cancel/terminate state transitions, idempotent `terminate` (repeat and after external deletion), double `cancel`, handle opacity, and rejection of unknown, malformed, and foreign-provider handles | Proves the provider seam behaves per PRD #6 with no Azure subscription, so a future Sandboxes provider can be developed and tested offline |
-| CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, rendered output, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through behaviour when `az` fails |
+| ACA Job adapter | Drives the **production** adapter (`scripts/lib/providers/squad-aca-job-provider.ps1`) against the fake `az` from `scripts/tests/cli-stub-harness.ps1`: `terminate` on a live execution, on an already-terminal/not-found one, under an auth failure, under RBAC/throttling/network/wrong-subscription/unrecognised failures, and with no `az` on `PATH`; plus `wait` polling `Provisioning -> Running` and timing out on an execution that never becomes ready | The fake provider proves the seam, not the adapter that ships. `terminate` used to return `Terminated = $true` for *every* non-zero `az` exit and label it `AlreadyTerminal`, so an auth failure read as a successful teardown; these checks fail if that returns |
+| CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, **stdout content**, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through output and exit code when `az` fails |
+| CLI golden gate wiring | Asserts every capture case in `scripts/tests/cli-capture-cases.ps1` has a committed golden, that the `stop` golden records `az` stdout, and that `.github/workflows/worker-tests.yml` actually runs `verify-cli-golden.ps1` | A guard that is not automated is not a guard; PR #9's regression class shipped once because the only stdout-comparing tool was a manual one |
 | Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, the capability routing decision, preflight contract, Ralph transactional dispatch, and the harness itself |
 
 The capability manifest contract itself is documented in
@@ -41,26 +43,59 @@ behavior when the packaged preflight script is missing.
 
 ## Proving the CLI has not changed
 
-`validate.ps1` section 9 asserts specific properties of `squad-aca` output. When
-a change touches the control plane — particularly the execution provider seam —
-prove the stronger claim with a differential capture against another revision:
+Two guards drive the same 22-invocation matrix (`scripts/tests/cli-capture-cases.ps1`)
+through the stubbed `az`/`gh` environment. A capture records the exit code,
+every recorded `az`/`gh` argv, **stdout**, and stderr — stdout deliberately,
+because PR #9 was closed for an observable `stop` output regression and a guard
+that only counts `az` calls cannot see one. Neither touches Azure, GitHub, or
+the network.
+
+### Golden gate (automated, runs in CI)
+
+```powershell
+pwsh -NoProfile -File .\scripts\tests\verify-cli-golden.ps1           # verify
+pwsh -NoProfile -File .\scripts\tests\verify-cli-golden.ps1 -Update   # regenerate
+```
+
+Captures are compared against files committed under `scripts/tests/golden/cli/`,
+the same pattern the worker suite uses for routing decisions. The
+`powershell-validation` job in `.github/workflows/worker-tests.yml` runs the
+verify form on every push and pull request, so a change to what `squad-aca`
+prints fails a job instead of reaching review unnoticed. An **intended** CLI
+change is a reviewable diff: regenerate with `-Update`, read the diff, commit it.
+
+Goldens are made machine-portable — temp roots, home directories, PowerShell's
+error-record source-line annotation, its caret/source echo (which is truncated to
+the host console width), and ANSI SGR colour sequences are folded out — so the
+same files verify on a developer box and on a CI runner. Everything observable
+(exit codes, `az`/`gh` argv, message text) is compared as-is. Generate and verify
+them with **PowerShell 7** (`pwsh`), the host CI uses; Windows PowerShell 5.1
+renders error records differently.
+
+### Differential capture (manual, strongest claim)
+
+When a change touches the control plane — particularly the execution provider
+seam — also prove the stronger claim against another revision:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\tests\compare-cli-baseline.ps1 -BaselineRef main
 ```
 
 It materialises the baseline revision's `scripts/` with `git archive`, drives
-both revisions through the same stubbed `az`/`gh` environment across 22 CLI
-invocations (`help`, `sessions`, `logs`, `stop`, `smoke`, `telemetry smoke`,
-`status`, `doctor`, `run`, `sync`, plus failure paths), and compares exit code,
-stdout, stderr, and every recorded `az`/`gh` argv. It exits non-zero if
-observable behaviour differs. No Azure, no GitHub, no network.
+both revisions through the same stub environment (`help`, `sessions`, `logs`,
+`stop`, `smoke`, `telemetry smoke`, `status`, `doctor`, `run`, `sync`, plus
+failure paths), and compares exit code, stdout, stderr, and every recorded
+`az`/`gh` argv. It exits non-zero if observable behaviour differs.
 
-It reports two counts. The raw count is byte-for-byte. The second ignores one
-thing only: PowerShell annotates an uncaught error with the **source line
-number** of the `throw`, so any change to a file's length shifts that annotation
-for cases that end in an error. The exception text, exit code, and call
-sequences are still compared unnormalised.
+This one stays a developer tool rather than a CI gate: it needs a second
+revision materialised, and it fails permanently once a CLI change is *intended*.
+
+It reports two counts. The raw count is byte-for-byte. The second ignores the
+two things that cannot survive a refactor: PowerShell annotates an uncaught
+error with the **source line number** of the `throw`, so any change to a file's
+length shifts that annotation, and PowerShell 7 wraps error records in **ANSI
+SGR colour sequences**. The exception text, exit code, and call sequences are
+still compared unnormalised.
 
 ## Worker test harness guarantees
 
