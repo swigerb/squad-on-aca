@@ -14,7 +14,8 @@
 #     produced no logs can never be reported as success.
 #
 # When the extension path is unavailable, logs are read from the Log Analytics
-# workspace the deployment already provisions (`law-squad-aca`), which needs no
+# workspace the deployment already provisions (`law-squad-aca`). That fallback
+# does require the `log-analytics` az extension; what it does not require is the
 # `containerapp` extension. If neither path works the caller gets a terminating
 # error with actionable guidance.
 
@@ -132,7 +133,8 @@ function Get-AcaExecutionLog {
           1. `az containerapp job logs show` (nicer, but needs the containerapp
              extension).
           2. Log Analytics (`ContainerAppConsoleLogs_CL`) against the workspace
-             the deployment provisions - no containerapp extension required.
+             the deployment provisions - requires the log-analytics extension,
+             but not the containerapp extension.
 
         Every `az` exit code is inspected. If both paths fail the function
         throws, so the caller exits non-zero instead of reporting a silent

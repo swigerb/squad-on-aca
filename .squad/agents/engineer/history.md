@@ -47,6 +47,7 @@ separators), so the PowerShell CI job runs on `windows-latest` rather than
 `ubuntu-latest`. Making it cross-platform is a control-plane change, out of
 scope for a tests/CI/docs-only sprint; recorded as a follow-up in
 `docs/validation.md`.
+
 ## 2026-07-28: `squad-aca logs` exit-code + Log Analytics fallback (issue #13)
 
 Branch `squad/13-logs-fallback`. Two independent defects, both fixed.

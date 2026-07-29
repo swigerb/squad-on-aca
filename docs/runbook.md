@@ -164,7 +164,8 @@ squad-aca stop <session-or-execution>
 squad-aca open <session-or-execution>
 squad-aca sync --dry-run
 squad-aca sync --sync-all
-squad-aca watch start --repo "<github-owner>/<repo>"squad-aca watch stop
+squad-aca watch start --repo "<github-owner>/<repo>"
+squad-aca watch stop
 squad-aca ralph status
 squad-aca ralph run --repo "<github-owner>/<repo>"
 squad-aca ralph pause
@@ -244,9 +245,9 @@ squad-aca logs <session-or-execution> --tail 200
 `logs` resolves the execution the same way `sessions`, `stop`, and `open` do, then reads console output through the first path that is available:
 
 1. **`az containerapp job logs show`** — used when the `containerapp` Azure CLI extension is installed. This is the nicer path when it exists.
-2. **Log Analytics fallback** — used otherwise. The deployment already provisions the `law-squad-aca` workspace (`deploy.ps1` writes its name to `deploy.outputs.json` as `logAnalyticsWorkspace`), and querying it needs no `containerapp` extension. When this path is used, `logs` prints a one-line note naming the workspace it read.
+2. **Log Analytics fallback** — used otherwise. The deployment already provisions the `law-squad-aca` workspace (`deploy.ps1` writes its name to `deploy.outputs.json` as `logAnalyticsWorkspace`). Querying it does require the `log-analytics` az extension; what it avoids is the `containerapp` extension. When this path is used, `logs` prints a one-line note naming the workspace it read.
 
-`az containerapp job logs show` is the **only** command the control plane uses that lives in a CLI extension; `run`, `status`, `sessions`, `stop`, and `doctor` are all core `az`. On hosts where the extension cannot be installed (for example an Azure CLI whose bundled Python lacks `_ctypes`, which breaks the `kubernetes` → `python-dateutil` build chain), only `logs` was affected — and it used to fail silently with exit 0. It now always propagates a non-zero exit code, and it never triggers the interactive "install the extension now?" prompt, which would otherwise block on stdin in CI, Ralph, and Watch contexts.
+`az containerapp job logs show` is the **only** command the control plane uses that lives in the `containerapp` CLI extension; `run`, `status`, `sessions`, `stop`, and `doctor` are all core `az`. On hosts where the extension cannot be installed (for example an Azure CLI whose bundled Python lacks `_ctypes`, which breaks the `kubernetes` → `python-dateutil` build chain), only `logs` was affected — and it used to fail silently with exit 0. It now always propagates a non-zero exit code, and it never triggers the interactive "install the extension now?" prompt, which would otherwise block on stdin in CI, Ralph, and Watch contexts.
 
 Check which path is active:
 
