@@ -130,6 +130,136 @@ through an execution provider would add risk without helping a future substrate.
 Sandboxes provider plugs in there without touching CLI plumbing. Sandboxes are
 **not** implemented yet.
 
+## Unified dispatch contract and durable leases
+
+Three things dispatch work: the local CLI (`squad-aca run`), Ralph (a cron-driven
+ACA Job running `worker/lib/ralph-dispatch.sh`), and Watch (a hosted container
+app). PRD #6 requires that all three *share one routing decision* and that
+*claim and session state are written before compute is requested*.
+
+### One implementation, two thin callers
+
+The routing decision and the lease lifecycle live in **Node**, under
+`worker/lib/`:
+
+| File | Responsibility |
+| --- | --- |
+| `worker/lib/dispatch-decision.js` | The one routing decision. Wraps the Sprint 2 capability resolver and produces `{sessionId, dispatchSource, leaseKey, routing{…}}`. |
+| `worker/lib/dispatch-lease.js` | The durable lease store, lifecycle, gone-classification and sweeper. |
+| `worker/lib/squad-dispatch.js` | The CLI seam: `decide \| claim \| dispatched \| heartbeat \| complete \| release \| sweep \| list`. |
+
+Bash and PowerShell do **not** re-implement any of it. `ralph-dispatch.sh` and
+`scripts/lib/dispatch-contract.ps1` are shims that shell out to
+`node worker/lib/squad-dispatch.js` and parse its JSON. Node was chosen because
+the capability resolver it wraps is already Node, Ralph already shells to `node`,
+and the worker image already ships it — so the shared core needed no new runtime
+anywhere.
+
+The `routing` object deliberately carries **no dispatcher identity**. Dispatcher
+identity lives one level up, in `dispatchSource`. That means the same input
+produces a byte-identical `routing` object from all three paths, and the test
+suites compare it byte-for-byte rather than field-by-field.
+
+If `node` is missing, dispatch **fails closed**. It never falls back to a
+locally-guessed route: a second, divergent routing rule is exactly the failure
+mode this contract exists to prevent.
+
+### Where lease state lives, and why
+
+Leases are stored **in GitHub**, on a dedicated orphan ref (`squad-aca-leases`)
+in the same repository, one JSON blob per lease at `leases/<lease-key>.json`,
+written through the Contents API.
+
+- GitHub is already the durable system of record for this project (issues,
+  labels, branches, PRs) and Ralph already claims work by labelling an issue.
+  Extending that model adds **no new infrastructure** — no table, no queue, no
+  blob account, no extra RBAC surface.
+- All three dispatchers can already reach it. Ralph runs in ACA with a token,
+  Watch runs in ACA with a token, the local CLI has `gh` — no dispatcher needs a
+  new credential.
+- It survives a laptop reboot. A local file would not, which the PRD rules out.
+- The Contents API gives the two primitives a lease needs without a lock service:
+  **create-once** (`PUT` without a `sha` returns `422` if the blob exists) is the
+  atomic claim, and **compare-and-swap** (`PUT` with the `sha` you read, `409` on
+  stale) is the atomic update.
+- It is off the default branch, so lease churn never pollutes `main`'s history,
+  never triggers CI, and never appears in a PR diff.
+
+Cost: dispatch now requires `contents: write` on the repository. That is a real
+new dependency and is called out in the runbook.
+
+### Lease key = idempotency key
+
+The lease key is `issue-<n>` when the work is tied to a GitHub issue, and
+`session-<sanitized session id>` otherwise. Two dispatchers that pick different
+session names for the same issue therefore converge on **one** lease, which is
+what makes "Ralph ran twice" and "Ralph and the CLI both fired" the same,
+already-handled case.
+
+### Lifecycle
+
+```
+claimed ──► dispatched ──► running ──► succeeded | failed | cancelled
+   │                          ▲
+   │                          │ heartbeat
+   └──► released (retryable)  └──► reclaimed (by the sweeper)
+```
+
+`claimLease` returns one of four outcomes, and only two of them permit compute:
+
+| Outcome | Meaning | Dispatch? |
+| --- | --- | --- |
+| `created` | No prior lease; this dispatcher owns it. | yes |
+| `repaired` | A `claimed`/`released`/`reclaimed` lease was adopted — this is the crash-between-claim-and-compute repair path. | yes |
+| `active` | Someone else holds a live lease. | **no** |
+| `completed` | The work already reached a terminal state. | **no** |
+
+`reclaimed` is terminal for the *sweeper* (it is never swept twice) but is
+explicitly **repairable** for a *claimer*. A sweeper that permanently retired the
+work it reclaimed would turn every transient stall into lost work, which is the
+opposite of reclaiming it.
+
+### Claim before compute
+
+Every path writes the lease before it requests compute:
+
+1. resolve the decision (`decide`),
+2. write the lease (`claim`) — a durable record now exists,
+3. request compute (`az containerapp job start` / `az containerapp update`),
+4. mark `dispatched`; on any failure in step 3, `release` so the next run retries.
+
+The worker heartbeats on start and writes the terminal state from an `EXIT` trap
+(`worker/entrypoint.sh`), so a lease reflects the execution that owns it.
+
+The tests assert this ordering **by index** in a single ordered call log that
+both the fake `az` and the fake `gh` append to. A presence check would still pass
+if the order were inverted.
+
+### Sweeper
+
+`squad-aca leases sweep` (and Ralph, at the top of every run) reclaims:
+
+- **orphaned claims** — a lease stuck in `claimed` past its TTL, i.e. a
+  dispatcher that died between claim and compute;
+- **expired heartbeats** — a `dispatched`/`running` lease whose worker stopped
+  heartbeating.
+
+Cleanup follows the same fail-closed rule as
+`scripts/lib/providers/squad-aca-job-provider.ps1`: **already-cleaned,
+already-terminal and externally-deleted are all SUCCESS**, but auth, RBAC,
+throttling and network failures **surface**. Classification uses the same
+deny-list-first shape as `Test-AcaJobExecutionGone` — a message that mentions
+both `401` and `not found` is a failure, not a "gone", and an unrecognised
+failure is a failure.
+
+### Observability
+
+`squad-aca sessions` shows the resolved `Route` and the dispatcher `Source` for
+every execution (both are stamped into the execution environment as
+`SQUAD_DISPATCH_ROUTE` / `SQUAD_DISPATCH_SOURCE`). `squad-aca leases` lists the
+ledger itself. `scripts/show-status.ps1` is unchanged: it renders raw Azure
+projections and has no access to the lease ledger.
+
 ## Optional .NET/Aspire integration path
 
 The `aspire/` directory adds an **opt-in** path. It does not replace the ACA

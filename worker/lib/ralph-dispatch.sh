@@ -7,13 +7,24 @@
 # testable with fake `az`/`gh` on PATH.
 #
 # Design goals (see docs/runbook.md "Ralph job runner"):
-#   * Transactional per issue: build+validate the env, START the ACA session job,
-#     and only THEN add the dispatch label. A failed start must leave the issue
-#     UNLABELED so it is retried next run instead of being permanently skipped.
+#   * ONE routing decision. Ralph does NOT decide its own route. It calls
+#     worker/lib/squad-dispatch.js -- the same file the PowerShell CLI and the
+#     watcher call -- so all three dispatchers produce the same decision for the
+#     same input. See worker/lib/dispatch-decision.js.
+#   * Durable claim BEFORE compute. A lease record is written to the GitHub lease
+#     ledger before `az containerapp job start` is invoked (PRD #6: "claim and
+#     session state are written before compute is requested"). A crash between
+#     the two is repaired on the next run, not duplicated, because the lease is
+#     keyed on the ISSUE rather than on the timestamped session name.
+#   * Transactional per issue: build+validate the env, claim the lease, START the
+#     ACA session job, and only THEN add the dispatch label. A failed start
+#     releases the lease and leaves the issue UNLABELED so it is retried next run
+#     instead of being permanently skipped.
 #   * Failure isolation: one bad issue is logged and skipped; the batch keeps
 #     going. No single failure aborts the remaining dispatches.
 #   * No secret/prompt leakage: env building and `az`/`gh` output are suppressed;
-#     only generic, issue-scoped status is logged.
+#     only generic, issue-scoped status is logged. The lease record carries
+#     identifiers, a route, and timestamps -- never a prompt or a secret ref.
 
 # Authoritative list of session-managed env keys. These are stripped from the
 # session job template snapshot before fresh per-execution values are overlaid,
@@ -44,7 +55,76 @@ RALPH_MANAGED_ENV_KEYS=(
   COMMIT_MESSAGE
   RALPH_LABELS
   RALPH_MAX_ISSUES
+  SQUAD_DISPATCH_ROUTE
+  SQUAD_DISPATCH_SOURCE
+  SQUAD_LEASE_KEY
 )
+
+# Absolute path to the shared dispatch CLI (worker/lib/squad-dispatch.js). The
+# worker image installs it next to this file; tests point at the repository copy.
+squad_dispatch_cli() {
+  if [[ -n "${SQUAD_DISPATCH_CLI:-}" ]]; then
+    printf '%s' "$SQUAD_DISPATCH_CLI"
+    return 0
+  fi
+  printf '%s' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/squad-dispatch.js"
+}
+
+squad_dispatch_decide() {
+  # Resolves THE routing decision for one unit of work and writes it to stdout as
+  # JSON. Ralph never interprets the decision beyond `routing.action`; the
+  # decision document itself is handed straight to `claim`, so a claim can never
+  # be made against a route computed some other way.
+  local session_id="$1" repository="$2" issue_number="${3:-}"
+  local -a args=(
+    "$(squad_dispatch_cli)" decide
+    --session-id "$session_id"
+    --dispatch-source ralph
+    --repository "$repository"
+  )
+  if [[ -n "$issue_number" ]]; then
+    args+=(--issue "$issue_number")
+  fi
+  node "${args[@]}"
+}
+
+squad_lease_claim() {
+  # Writes the lease BEFORE compute is requested. Reads the decision on stdin.
+  # Prints the claim outcome (created | repaired | active | completed) on stdout.
+  local repository="$1" claim_json
+  claim_json="$(node "$(squad_dispatch_cli)" claim --repository "$repository")" || return 1
+  printf '%s' "$claim_json" | squad_json_field outcome
+}
+
+squad_lease_op() {
+  # dispatched | heartbeat | complete | release | sweep, with output suppressed.
+  local op="$1" repository="$2"
+  shift 2
+  node "$(squad_dispatch_cli)" "$op" --repository "$repository" "$@"
+}
+
+squad_json_field() {
+  # Reads JSON on stdin and prints one dotted field. Empty string when absent.
+  local field="$1"
+  SQUAD_JSON_FIELD="$field" node -e '
+const chunks = [];
+process.stdin.on("data", (d) => chunks.push(d));
+process.stdin.on("end", () => {
+  let value;
+  try {
+    value = JSON.parse(chunks.join(""));
+  } catch (err) {
+    process.stdout.write("");
+    return;
+  }
+  for (const part of String(process.env.SQUAD_JSON_FIELD).split(".")) {
+    if (value === null || typeof value !== "object") { value = undefined; break; }
+    value = value[part];
+  }
+  process.stdout.write(value === undefined || value === null ? "" : String(value));
+});
+'
+}
 
 # Provide a minimal logger when sourced outside entrypoint.sh (for example in
 # tests). entrypoint.sh defines its own richer log() first, so this never
@@ -125,7 +205,7 @@ ralph_dispatch_issue() {
   #   RALPH_DISPATCH_LABEL, RALPH_SESSION_JOB_ENV_JSON, RALPH_SESSION_JOB_IMAGE,
   #   RALPH_SESSION_JOB_CPU, RALPH_SESSION_JOB_MEMORY, RALPH_SESSION_JOB_CONTAINER
   local issue_number="$1" issue_title="$2" issue_url="$3"
-  local session_name prompt env_file
+  local session_name prompt env_file decision claim_outcome route lease_key
   local -a start_env
 
   session_name="issue-${issue_number}-$(date +%Y%m%d%H%M%S)"
@@ -135,7 +215,44 @@ Issue URL: ${issue_url}
 
 Use Squad to inspect the repository, work the issue if it is actionable, create a branch, commit changes, and open a pull request. If blocked, comment on the issue with the blocker and stop."
 
+  # ONE routing decision, resolved by the shared dispatch core rather than by
+  # any Ralph-local rule. A refused route (exit 65) is fail-closed: no lease, no
+  # compute, no label.
+  if ! decision="$(squad_dispatch_decide "$session_name" "$GITHUB_REPOSITORY" "$issue_number" 2>/dev/null)"; then
+    log "Ralph: routing refused or unavailable for issue #${issue_number}; skipping without labeling."
+    return 1
+  fi
+  route="$(printf '%s' "$decision" | squad_json_field routing.route)"
+  lease_key="$(printf '%s' "$decision" | squad_json_field leaseKey)"
+  if [[ -z "$route" || -z "$lease_key" ]]; then
+    log "Ralph: routing decision for issue #${issue_number} was incomplete; skipping without labeling."
+    return 1
+  fi
+
+  # CLAIM BEFORE COMPUTE. The lease is durable and keyed on the issue, so a
+  # crash anywhere below repairs on the next run instead of double-dispatching.
+  if ! claim_outcome="$(printf '%s' "$decision" | squad_lease_claim "$GITHUB_REPOSITORY" 2>/dev/null)"; then
+    log "Ralph: could not claim a lease for issue #${issue_number}; skipping without labeling."
+    return 1
+  fi
+  case "$claim_outcome" in
+    active|completed)
+      # Another dispatcher already owns (or finished) this work. Do NOT start a
+      # second execution; just reconcile the label so the issue stops appearing
+      # as a candidate. This is the crash-between-claim-and-label repair path.
+      gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$RALPH_DISPATCH_LABEL" >/dev/null 2>&1 || true
+      log "Ralph: issue #${issue_number} already has a live lease (${claim_outcome}); not dispatching again."
+      return 0
+      ;;
+    created|repaired) ;;
+    *)
+      log "Ralph: unexpected lease outcome for issue #${issue_number}; skipping without labeling."
+      return 1
+      ;;
+  esac
+
   env_file="$(mktemp 2>/dev/null)" || {
+    squad_lease_op release "$GITHUB_REPOSITORY" --lease-key "$lease_key" >/dev/null 2>&1 || true
     log "Ralph: could not allocate a temp file for issue #${issue_number}; skipping without labeling."
     return 1
   }
@@ -159,9 +276,13 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
        OV_PUSH_CHANGES="true" \
        OV_OUTPUT_BRANCH="squad/issue-${issue_number}" \
        OV_PR_TITLE="Squad: issue #${issue_number}" \
+       OV_SQUAD_DISPATCH_ROUTE="$route" \
+       OV_SQUAD_DISPATCH_SOURCE="ralph" \
+       OV_SQUAD_LEASE_KEY="$lease_key" \
        ralph_build_session_env > "$env_file" 2>/dev/null
   then
     rm -f "$env_file"
+    squad_lease_op release "$GITHUB_REPOSITORY" --lease-key "$lease_key" >/dev/null 2>&1 || true
     log "Ralph: could not build a valid env for issue #${issue_number}; skipping without labeling."
     return 1
   fi
@@ -170,13 +291,14 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
   rm -f "$env_file"
 
   if [[ "${#start_env[@]}" -eq 0 ]]; then
+    squad_lease_op release "$GITHUB_REPOSITORY" --lease-key "$lease_key" >/dev/null 2>&1 || true
     log "Ralph: env build for issue #${issue_number} produced no variables; skipping without labeling."
     return 1
   fi
 
   # Start the ACA session job BEFORE labeling. Output is suppressed so prompts
-  # and secret references are never written to logs. A failed start leaves the
-  # issue unlabeled so the next scheduled run retries it.
+  # and secret references are never written to logs. A failed start releases the
+  # lease and leaves the issue unlabeled so the next scheduled run retries it.
   if ! az containerapp job start \
         --name "$ACA_SESSION_JOB_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -186,9 +308,14 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
         --container-name "$RALPH_SESSION_JOB_CONTAINER" \
         --env-vars "${start_env[@]}" >/dev/null 2>&1
   then
+    squad_lease_op release "$GITHUB_REPOSITORY" --lease-key "$lease_key" >/dev/null 2>&1 || true
     log "Ralph: failed to start ACA session job for issue #${issue_number}; leaving it undispatched for retry."
     return 1
   fi
+
+  # Compute is live: move the lease out of `claimed` so a concurrent dispatcher
+  # sees an active owner rather than a repairable claim.
+  squad_lease_op dispatched "$GITHUB_REPOSITORY" --lease-key "$lease_key" >/dev/null 2>&1 || true
 
   # Label ONLY after a confirmed start. A labeling failure here is non-fatal:
   # the job is already running, so we log it and let the (idempotent) next run
@@ -209,6 +336,13 @@ run_ralph_dispatch() {
   # logged; the loop always continues to the next issue.
   local row issue_number issue_title issue_url
   local dispatched=0 failed=0
+
+  # Reclaim leases whose heartbeat has aged out before dispatching. Sweeping is
+  # idempotent and never fatal: a sweep failure must not block new work.
+  if ! squad_lease_op sweep "${GITHUB_REPOSITORY:-}" >/dev/null 2>&1; then
+    log "Ralph: stale-lease sweep did not complete; continuing with dispatch."
+  fi
+
   for row in "${issue_rows[@]}"; do
     IFS=$'\t' read -r issue_number issue_title issue_url <<< "$row"
     if ralph_dispatch_issue "$issue_number" "$issue_title" "$issue_url"; then

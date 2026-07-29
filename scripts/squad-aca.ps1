@@ -12,6 +12,7 @@ $RepoRoot = Split-Path -Parent $ScriptDir
 . (Join-Path $ScriptDir "lib\sync-safety.ps1")
 . (Join-Path $ScriptDir "lib\aca-logs.ps1")
 . (Join-Path $ScriptDir "lib\squad-aca-provider.ps1")
+. (Join-Path $ScriptDir "lib\dispatch-contract.ps1")
 $UserConfigDir = Join-Path $HOME ".squad-on-aca"
 $UserConfigPath = Join-Path $UserConfigDir "config.json"
 
@@ -28,6 +29,7 @@ Usage:
   squad-aca status
   squad-aca doctor
   squad-aca sessions [--limit 10]
+  squad-aca leases [list|sweep] [--repo owner/repo]
   squad-aca logs <session-or-execution> [--tail 100]
   squad-aca stop <session-or-execution>
   squad-aca open [session-or-execution]
@@ -440,7 +442,102 @@ function Invoke-Run {
         -SubSquad $subSquad `
         -PushChanges (-not (Has-Option $Items @("--no-push"))) `
         -OutputBranch $branch
-    Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Request $request
+    Start-LeasedExecution -Config $config -Request $request
+}
+
+function Start-LeasedExecution {
+    <#
+    .SYNOPSIS
+        The local CLI's single dispatch path: one shared routing decision, a
+        durable lease written BEFORE compute, then execution.
+
+    .DESCRIPTION
+        Implements the PRD #6 lifecycle invariant "claim and session state are
+        written before compute is requested" for the local CLI, using exactly
+        the same decision and lease code Ralph and Watch use (see
+        scripts/lib/dispatch-contract.ps1).
+
+        Ordering is the point of this function:
+            1. decide   -- the shared routing decision (fail-closed routes throw)
+            2. claim    -- the durable lease record is written
+            3. create   -- compute is requested
+            4. dispatched / release
+
+        A claim that comes back `active` or `completed` means another dispatcher
+        already owns this work, so nothing is started -- that is what stops a
+        duplicate run from double-dispatching. If step 3 throws, the lease is
+        released so the work retries instead of being pinned by a dead claim.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][object]$Request,
+        [string]$IssueNumber = ""
+    )
+
+    $repo = [string]$Request.repository.fullName
+    $decision = Get-SquadDispatchDecision `
+        -SessionId ([string]$Request.sessionId) `
+        -DispatchSource ([string]$Request.dispatchSource) `
+        -Repository $repo `
+        -IssueNumber $IssueNumber
+
+    $claim = New-SquadDispatchLease -Decision $decision -Repository $repo
+    if ($claim.outcome -eq "active" -or $claim.outcome -eq "completed") {
+        Write-Warning ("Not dispatching '$($Request.sessionId)': lease '$($decision.leaseKey)' is already " +
+            "$($claim.lease.state) (claimed by $($claim.lease.dispatchSource) at $($claim.lease.startedAt)). " +
+            "Run 'squad-aca leases' to inspect it.")
+        return
+    }
+
+    $Request.capabilityResolution = $decision
+
+    try {
+        Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $Config) -Request $Request
+    } catch {
+        Set-SquadDispatchLeaseState -Operation "release" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -Reason "dispatch-failed" | Out-Null
+        throw
+    }
+
+    Set-SquadDispatchLeaseState -Operation "dispatched" -Repository $repo -LeaseKey ([string]$decision.leaseKey) | Out-Null
+}
+
+function Invoke-Leases {
+    <#
+    .SYNOPSIS
+        Inspect or sweep the durable dispatch leases.
+    #>
+    param([string[]]$Items)
+    $config = Assert-AcaConfigured
+    $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
+    if (-not $repo) { throw "No GitHub repo detected. Run 'squad-aca init' first or pass --repo <owner/repo>." }
+
+    $sub = if ($Items.Count -gt 0 -and -not $Items[0].StartsWith("-")) { $Items[0].ToLowerInvariant() } else { "list" }
+    switch ($sub) {
+        "list" {
+            $leases = Get-SquadDispatchLease -Repository $repo
+            if (-not $leases -or @($leases).Count -eq 0) {
+                Write-Output "No dispatch leases for $repo."
+                return
+            }
+            @($leases) | ForEach-Object {
+                [pscustomobject]@{
+                    Lease   = $_.leaseKey
+                    State   = $_.state
+                    Route   = $_.route
+                    Source  = $_.dispatchSource
+                    Session = $_.sessionId
+                    Started = $_.startedAt
+                    Heartbeat = $_.lastHeartbeatAt
+                }
+            } | Format-Table -AutoSize
+        }
+        "sweep" {
+            $result = Invoke-SquadLeaseSweep -Repository $repo
+            Write-Output "Examined $($result.examined) lease(s); reclaimed $(@($result.reclaimed).Count)."
+            foreach ($item in @($result.reclaimed)) { Write-Output "  reclaimed $($item.key) ($($item.reason))" }
+        }
+        default { throw "Usage: squad-aca leases [list|sweep] [--repo <owner/repo>]" }
+    }
 }
 
 function Test-Command {
@@ -551,7 +648,19 @@ function Invoke-Sessions {
     $config = Assert-AcaConfigured
     $limitText = Get-OptionValue $Items @("--limit", "-Limit") "10"
     $limit = [int]$limitText
-    Get-SessionExecutions -Config $config -Limit $limit | ForEach-Object { $_.Display } | Format-Table -AutoSize
+    # Out-String -Width pins the render width instead of inheriting the host's
+    # console width. Sprint 6 appends Route and Source, which pushes the table
+    # past the default 120 columns -- and Format-Table silently DROPS trailing
+    # columns that do not fit, so the two values this sprint exists to surface
+    # would vanish on a narrow terminal. Pinning the width also removes the last
+    # implicit host dependency from this golden (docs/validation.md, "What makes
+    # a golden portable").
+    Get-SessionExecutions -Config $config -Limit $limit |
+        ForEach-Object { $_.Display } |
+        Format-Table -AutoSize |
+        Out-String -Width 200 |
+        ForEach-Object { $_.TrimEnd() } |
+        Write-Output
 }
 
 function Invoke-Logs {
@@ -644,12 +753,37 @@ function Invoke-Watch {
             if (-not $repo) { throw "No GitHub repo detected. Pass --repo <owner/repo>." }
             $ref = Get-OptionValue $Items @("--ref", "-Ref") (Get-CurrentBranch)
             $subSquad = Get-OptionValue $Items @("--sub-squad", "-SubSquad")
-            & (Join-Path $ScriptDir "start-watch.ps1") -ResourceGroupName $config.resourceGroup -WatchAppName $config.watchApp -Repository $repo -Ref $ref -SubSquad $subSquad
+
+            # Watch is a long-lived dispatcher, so its lease covers the watcher
+            # itself: the same decision code the CLI and Ralph use resolves the
+            # route, and the lease is written BEFORE `az containerapp app update`
+            # requests compute. A watcher that is already running holds an active
+            # lease, which is what makes a second `watch start` a no-op instead of
+            # a second dispatcher racing the first.
+            $session = "watch"
+            $decision = Get-SquadDispatchDecision -SessionId $session -DispatchSource "watch" -Repository $repo
+            $claim = New-SquadDispatchLease -Decision $decision -Repository $repo
+            if ($claim.outcome -eq "active") {
+                Write-Warning ("Watch already holds lease '$($decision.leaseKey)' (started $($claim.lease.startedAt)). " +
+                    "Run 'squad-aca leases' to inspect it, or 'squad-aca watch stop' first.")
+                return
+            }
+            try {
+                & (Join-Path $ScriptDir "start-watch.ps1") -ResourceGroupName $config.resourceGroup -WatchAppName $config.watchApp -Repository $repo -Ref $ref -SubSquad $subSquad -DispatchRoute ([string]$decision.routing.route) -LeaseKey ([string]$decision.leaseKey)
+            } catch {
+                Set-SquadDispatchLeaseState -Operation "release" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -Reason "watch-start-failed" | Out-Null
+                throw
+            }
+            Set-SquadDispatchLeaseState -Operation "dispatched" -Repository $repo -LeaseKey ([string]$decision.leaseKey) | Out-Null
         }
         "stop" {
             $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
             if (-not $repo) { $repo = "unused/unused" }
             & (Join-Path $ScriptDir "start-watch.ps1") -ResourceGroupName $config.resourceGroup -WatchAppName $config.watchApp -Repository $repo -Stop
+            if ($repo -ne "unused/unused") {
+                $decision = Get-SquadDispatchDecision -SessionId "watch" -DispatchSource "watch" -Repository $repo
+                Set-SquadDispatchLeaseState -Operation "complete" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -State "cancelled" -Reason "watch-stopped" | Out-Null
+            }
         }
         "status" {
             az containerapp show --name $config.watchApp --resource-group $config.resourceGroup --query "{name:name,provisioningState:properties.provisioningState,runningStatus:properties.runningStatus,minReplicas:properties.template.scale.minReplicas,maxReplicas:properties.template.scale.maxReplicas}" -o table
@@ -769,7 +903,7 @@ function Invoke-Telemetry {
         -DispatchSource "local-cli" `
         -Repository $repo `
         -Mode "telemetry-smoke"
-    Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Request $request
+    Start-LeasedExecution -Config $config -Request $request
     if ($config.aspireLoginUrl) { Write-Output "Aspire: $($config.aspireLoginUrl)" }
 }
 
@@ -848,6 +982,7 @@ switch ($Command.ToLowerInvariant()) {
     "init" { Invoke-Init $Arguments }
     "run" { Invoke-Run $Arguments }
     "sessions" { Invoke-Sessions $Arguments }
+    "leases" { Invoke-Leases $Arguments }
     "logs" { Invoke-Logs $Arguments }
     "stop" { Invoke-Stop $Arguments }
     "open" { Invoke-Open $Arguments }
@@ -881,7 +1016,7 @@ switch ($Command.ToLowerInvariant()) {
             -Repository $repo `
             -Mode "smoke" `
             -RunCopilotSmoke $true
-        Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Request $request
+        Start-LeasedExecution -Config $config -Request $request
     }
     "status" {
         $config = Assert-AcaConfigured

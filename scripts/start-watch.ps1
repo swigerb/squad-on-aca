@@ -8,6 +8,8 @@ param(
     [int]$IntervalMinutes = 5,
     [int]$TimeoutMinutes = 45,
     [int]$MaxConcurrent = 1,
+    [string]$DispatchRoute = "",
+    [string]$LeaseKey = "",
     [switch]$Stop
 )
 
@@ -43,6 +45,11 @@ $envVars = @(
     "ENABLE_GITHUB_REMOTE=true"
 )
 if ($SubSquad) { $envVars += "SQUAD_TEAM=$SubSquad" }
+# Sprint 6 (PRD #6): the route and lease the caller resolved and claimed BEFORE
+# this update, so the watcher is observable and can heartbeat its own lease.
+$envVars += "SQUAD_DISPATCH_SOURCE=watch"
+if ($DispatchRoute) { $envVars += "SQUAD_DISPATCH_ROUTE=$DispatchRoute" }
+if ($LeaseKey) { $envVars += "SQUAD_LEASE_KEY=$LeaseKey" }
 
 az containerapp update `
     --name $WatchAppName `

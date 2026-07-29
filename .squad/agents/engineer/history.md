@@ -253,3 +253,130 @@ Re-verified after the merge:
   Sprint 3's own sections, 86 once #16's 15 logs checks merged in).
 - Worker suite: **6 suites / 302 assertions (123/11/62/40/23/43), 0 failed, 0
   skipped** - unchanged from `main`; this sprint added no bash tests.
+
+## Sprint 6 - one dispatch decision for every dispatcher, plus durable leases
+
+PRD #6 asked for two things that turn out to be the same thing: "Ralph, Watch,
+and local CLI share one routing decision", and "claim and session state are
+written before compute is requested". A shared decision that each dispatcher
+recomputes is not shared; a claim written by three different code paths is
+three different claims.
+
+### One implementation, two thin callers
+
+The routing decision and the whole lease lifecycle live in Node under
+`worker/lib/` (`dispatch-decision.js`, `dispatch-lease.js`, and the CLI seam
+`squad-dispatch.js`). `worker/lib/ralph-dispatch.sh` and the new
+`scripts/lib/dispatch-contract.ps1` are shims: they shell out to
+`node worker/lib/squad-dispatch.js` and parse JSON. Neither contains a routing
+rule.
+
+Node was chosen because it needed no new runtime anywhere: the Sprint 2
+capability resolver this wraps is already Node, Ralph already shells to `node`,
+and the worker image already ships it. Porting the resolver to PowerShell (or
+re-deriving it in bash) would have created the second implementation the sprint
+exists to prevent. `validate.ps1` now asserts, on the file itself, that
+`dispatch-contract.ps1` contains no route literal in executable code - so a
+future "small PowerShell adjustment" to the route fails a check rather than
+drifting.
+
+The `routing` object deliberately excludes dispatcher identity (that lives one
+level up in `dispatchSource`), which lets the tests compare the three
+dispatchers' decisions **byte-for-byte** instead of field-by-field.
+
+If `node` is missing, dispatch fails closed. A local fallback guess would be the
+second routing rule.
+
+### Lease state lives in GitHub
+
+On an orphan ref `squad-aca-leases`, one JSON blob per lease under `leases/`,
+via the Contents API. Reasons, in order of weight:
+
+1. **No new infrastructure.** GitHub is already this project's durable system of
+   record, and Ralph already claimed work by labelling an issue - this extends a
+   model that exists rather than adding a table, queue or storage account.
+2. **Every dispatcher can already reach it** with the credential it already has.
+3. **It survives a laptop reboot**, which the PRD explicitly requires.
+4. **The Contents API supplies both lock primitives**: create-once (PUT without
+   `sha` -> 422 if present) is the atomic claim; compare-and-swap (PUT with the
+   read `sha` -> 409 if stale) is the atomic update. No lock service needed.
+5. **Off the default branch**, so lease churn never pollutes `main`, never
+   triggers CI, and never shows up in a PR diff.
+
+The cost is a new hard dependency on `contents: write`, documented in the
+runbook. That was accepted rather than degraded: running unleased work would
+defeat the invariant the lease exists to enforce.
+
+The lease key is the idempotency key - `issue-<n>` when an issue exists, else
+`session-<id>`. Two dispatchers that pick different session names for the same
+issue converge on one lease, which is what makes "Ralph ran twice" and "Ralph
+and the CLI both fired" the same, already-handled case.
+
+### `reclaimed` must be re-claimable (a real bug, caught by a test)
+
+`reclaimed` is terminal for the sweeper (never swept twice) but repairable for a
+claimer. The first implementation treated it as terminal for both, which meant
+the sweeper permanently retired the work it reclaimed - every transient stall
+became lost work, the exact opposite of reclaiming. `test_dispatch_contract.sh`
+case 7 ("the reclaimed work can be claimed again") found it.
+
+### Cleanup follows the existing pattern, not a new one
+
+Gone-classification mirrors `Test-AcaJobExecutionGone` in
+`squad-aca-job-provider.ps1`: deny-list first, so a message mentioning both
+`401` and `not found` is a failure; `127`/`-1` exit codes are never "gone"; an
+unrecognised failure is a failure. Already-cleaned, already-terminal and
+externally-deleted are SUCCESS; auth, RBAC, throttling and network surface.
+
+### Verification
+
+- `scripts/validate.ps1`: **117 passed / 0 failed** (baseline 104 / 0; 13 new
+  checks).
+- Worker suite (WSL): **7 suites / 361 assertions, 0 failed, 0 skipped**
+  (baseline 6 / 302). Ralph's suite went 23 -> 47 assertions; the no-secret and
+  no-prompt-leak assertions are untouched.
+- `verify-cli-golden.ps1`: **22/22**, after a deliberate `-Update`.
+- `compare-cli-baseline.ps1 -BaselineRef main`: 9/22 byte-identical, 12/22
+  ignoring error line numbers; 10 goldens changed for three intended reasons
+  (the `leases` help line; `Route`/`Source` columns in `sessions`; three new
+  `SQUAD_DISPATCH_*` env vars on `az containerapp job start`). The remaining
+  three differ only by PowerShell error-record line annotations, which moved
+  because `squad-aca.ps1` grew.
+
+### `Format-Table` silently drops columns
+
+Adding `Route` and `Source` pushed `sessions` past the implicit 120-column
+width, and `Format-Table -AutoSize` responded by **omitting** `Source`
+entirely - not truncating it. `-Wrap` fixes truncation but not omission. Pinned
+with `Out-String -Width 200`, and recorded in `docs/validation.md` as a golden
+portability pin, because a golden captured on a wide console and verified on a
+narrow one would otherwise diff for reasons no user caused.
+
+### Mutation results
+
+Every new assertion was mutation-tested; each mutation was caught by the check
+that exists for it:
+
+| Mutation | Check that failed |
+| --- | --- |
+| `isGoneResult` returns true for any non-zero exit (401 read as "gone") | "Sweeping under an auth failure reported success" + "Completing a lease under an auth failure reported success" |
+| A live lease no longer blocks a second claim | "Duplicate claim handling changed (first=created second=repaired)" + "Duplicate dispatch started 1 execution(s) on the second run" |
+| `sweepLeases` never reclaims a stale lease | "Sweeper behaviour changed (first=0 second=0)" |
+| PowerShell claims *after* `az containerapp job start` | "Claim-before-compute ordering broken (lease index=6, compute index=0)" |
+| Ralph claims *after* `az containerapp job start` | "ordering: lease write index (7) precedes compute request index (1)" + "duplicate: az job start called exactly once across two runs (actual: 2)" |
+| `reclaimed` no longer repairable | "sweeper: the reclaimed work can be claimed again" |
+
+The ordering mutations are the ones that matter: both ordering checks compare
+**indices in a shared, ordered call log** that the fake `az` and the fake `gh`
+both append to. A presence-based check would have survived every one of them.
+
+### Not done, deliberately
+
+- No Sandboxes provider, no `aca` binary, no credential brokerage (Sprints 5/7).
+  A `sandbox` route resolves but falls back to `aca-job` with
+  `fallbackReason: sandbox-provider-unavailable`, so this branch does not depend
+  on PR #19 landing.
+- `scripts/show-status.ps1` still does not show route/source. It renders raw
+  Azure JMESPath projections and has no access to the lease ledger; surfacing it
+  there would mean a second rendering path for the same data. `sessions` and the
+  new `leases` command are the surfaces.

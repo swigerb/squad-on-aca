@@ -122,6 +122,38 @@ else
 fi
 log "Copilot flags: ${COPILOT_FLAGS}"
 
+# --- Lease heartbeat (Sprint 6, PRD #6) --------------------------------------
+# A session started by any dispatcher carries SQUAD_LEASE_KEY. Report liveness
+# once at start and record a terminal state on exit, so the sweeper can tell a
+# live execution from an orphaned claim. Every call is best-effort: a lease that
+# cannot be updated must never take down a session that is doing real work, and
+# the sweeper reclaims it on heartbeat expiry anyway.
+SQUAD_DISPATCH_CLI="${SQUAD_DISPATCH_CLI:-/usr/local/lib/squad-on-aca/squad-dispatch.js}"
+squad_lease_report() {
+  local op="$1"
+  shift
+  [[ -n "${SQUAD_LEASE_KEY:-}" && -n "${GITHUB_REPOSITORY:-}" ]] || return 0
+  [[ -f "$SQUAD_DISPATCH_CLI" ]] || return 0
+  node "$SQUAD_DISPATCH_CLI" "$op" \
+    --repository "$GITHUB_REPOSITORY" \
+    --lease-key "$SQUAD_LEASE_KEY" "$@" >/dev/null 2>&1 || true
+}
+
+squad_lease_finish() {
+  local code=$?
+  if [[ "$code" -eq 0 ]]; then
+    squad_lease_report complete --state succeeded
+  else
+    squad_lease_report complete --state failed --reason "exit-${code}"
+  fi
+  return "$code"
+}
+
+if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
+  squad_lease_report heartbeat
+  trap squad_lease_finish EXIT
+fi
+
 commit_and_push_if_needed() {
   if [[ "${PUSH_CHANGES:-false}" != "true" ]]; then
     return 0

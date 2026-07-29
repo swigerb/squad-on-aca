@@ -15,6 +15,7 @@ Usage:
   squad-aca status
   squad-aca doctor
   squad-aca sessions [--limit 10]
+  squad-aca leases [list|sweep] [--repo owner/repo]
   squad-aca logs <session-or-execution> [--tail 100]
   squad-aca stop <session-or-execution>
   squad-aca open [session-or-execution]

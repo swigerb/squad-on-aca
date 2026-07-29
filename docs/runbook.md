@@ -403,6 +403,86 @@ procedures in [rollback.md](rollback.md). They run from least to most disruptive
 Each procedure ends with the post-rollback verification checklist in
 [rollback.md](rollback.md#post-rollback-verification).
 
+## Dispatch leases
+
+Every dispatch — local CLI, Ralph, or Watch — writes a durable **lease** before
+it asks Azure for compute. The lease is the record of who owns a piece of work,
+which route was chosen, and whether that work is still alive. See
+[architecture.md](architecture.md#unified-dispatch-contract-and-durable-leases)
+for the model.
+
+**Where it lives.** In this repository, on an orphan ref named
+`squad-aca-leases`, one JSON blob per lease under `leases/`. It is off the
+default branch, so it never appears in a PR diff and never triggers CI.
+
+**Prerequisite.** Dispatch now needs `contents: write` on the repository (a
+GitHub token with `repo` scope, or a fine-grained token granting *Contents:
+Read and write*). Without it, dispatch **fails closed** rather than running
+unleased work. This is a new requirement as of Sprint 6.
+
+### Inspect leases
+
+```powershell
+squad-aca leases                      # list every lease for the current repo
+squad-aca leases list --repo owner/repo
+```
+
+Each row shows the lease key, state, resolved route, dispatcher source, session
+id, start time and last heartbeat. `squad-aca sessions` shows `Route` and
+`Source` alongside each execution.
+
+You can also read the ledger directly:
+
+```powershell
+gh api repos/OWNER/REPO/contents/leases?ref=squad-aca-leases --jq '.[].name'
+gh api repos/OWNER/REPO/contents/leases/issue-42.json?ref=squad-aca-leases --jq '.content' | base64 -d
+```
+
+### Clear a stuck lease
+
+A lease is "stuck" when work is not running but the lease still reads
+`claimed`, `dispatched` or `running` — usually a dispatcher that died between
+claiming and starting compute, or a worker killed before it could write its
+terminal state.
+
+1. **Confirm nothing is actually running.**
+
+   ```powershell
+   squad-aca sessions
+   ```
+
+   If an execution is genuinely alive, stop it first: `squad-aca stop <session>`.
+
+2. **Sweep.** This is the supported route and is safe to run at any time.
+
+   ```powershell
+   squad-aca leases sweep
+   ```
+
+   The sweeper reclaims only leases whose heartbeat has aged out past the TTL
+   (`SQUAD_LEASE_TTL_SECONDS`, default 1 hour) and leaves live ones alone. It is
+   idempotent: running it twice reclaims nothing the second time. Ralph sweeps
+   automatically at the start of every run.
+
+3. **Re-dispatch.** A reclaimed lease is *repairable*, not retired — the next
+   dispatch of the same work adopts it and starts cleanly. You do not need to
+   delete anything.
+
+4. **Only if the ledger itself is corrupt**, delete the blob by hand:
+
+   ```powershell
+   gh api -X DELETE repos/OWNER/REPO/contents/leases/issue-42.json `
+     -f message="clear corrupt lease" -f branch=squad-aca-leases -f sha=<blob-sha>
+   ```
+
+   Deleting a lease is always safe from an idempotency standpoint — a missing
+   lease is treated as "gone", which is a SUCCESS — but you lose the audit trail
+   for that piece of work.
+
+**If a sweep errors, do not ignore it.** Auth, RBAC, throttling and network
+failures are surfaced deliberately and never reported as a clean sweep. A
+failing sweep almost always means the token lost `contents: write`.
+
 ## Security notes
 
 - Use a separate GitHub token for GitHub API work and Copilot headless auth when your policy requires separation.

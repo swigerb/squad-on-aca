@@ -68,6 +68,24 @@ function New-AcaJobExecutionProvider {
         $start = Join-Path $Context.ScriptDir "start-session.ps1"
         $prefs = $request.executionPreferences
 
+        # Sprint 6: the shared routing decision travels on the request as
+        # capabilityResolution (the slot New-SquadDispatchRequest reserved for
+        # it). The adapter does not interpret the route -- it only stamps the
+        # route, the dispatcher source and the lease key into the session env so
+        # `squad-aca sessions` can show them and a running session can heartbeat
+        # its own lease. A request without a resolution behaves exactly as before.
+        $decision = $request.capabilityResolution
+        $dispatchRoute = ""
+        $leaseKey = ""
+        if ($decision) {
+            if ($decision.PSObject.Properties.Match("routing").Count -gt 0 -and $decision.routing) {
+                $dispatchRoute = [string]$decision.routing.route
+            }
+            if ($decision.PSObject.Properties.Match("leaseKey").Count -gt 0) {
+                $leaseKey = [string]$decision.leaseKey
+            }
+        }
+
         & $start `
             -ResourceGroupName $Context.Config.resourceGroup `
             -JobName $Context.Config.sessionJob `
@@ -79,7 +97,10 @@ function New-AcaJobExecutionProvider {
             -SubSquad $prefs.subSquad `
             -RunCopilotSmoke:$prefs.runCopilotSmoke `
             -PushChanges:$prefs.pushChanges `
-            -OutputBranch $request.git.outputBranch
+            -OutputBranch $request.git.outputBranch `
+            -DispatchRoute $dispatchRoute `
+            -DispatchSource ([string]$request.dispatchSource) `
+            -LeaseKey $leaseKey
 
         # The response travels through Outcome, never the pipeline, so the
         # pass-through dispatch output above stays the only thing a caller sees.
@@ -370,9 +391,14 @@ function ConvertTo-AcaJobExecutionRecord {
         provider-neutral record.
 
     .DESCRIPTION
-        The Display object MUST keep the property set and order the CLI has
-        always rendered (Execution, Status, Session, Mode, Repository, Branch,
-        Started, Ended) so `Format-Table -AutoSize` output is unchanged.
+        The Display object keeps the property set and order the CLI has always
+        rendered (Execution, Status, Session, Mode, Repository, Branch, Started,
+        Ended) so `Format-Table -AutoSize` output for those columns is unchanged.
+        Sprint 6 APPENDS Route and Source: PRD #6 requires the dispatcher source
+        and the resolved route to be observable, and both are already stamped
+        into the session env by every dispatch path, so they are read from the
+        execution itself rather than by querying the lease ledger (which would
+        make `sessions` depend on a network round-trip it has never needed).
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Config,
@@ -394,6 +420,8 @@ function ConvertTo-AcaJobExecutionRecord {
         Branch = $env["GITHUB_REF"]
         Started = $Execution.properties.startTime
         Ended = $Execution.properties.endTime
+        Route = $env["SQUAD_DISPATCH_ROUTE"]
+        Source = $env["SQUAD_DISPATCH_SOURCE"]
     }
 
     return New-SquadExecutionRecord `
