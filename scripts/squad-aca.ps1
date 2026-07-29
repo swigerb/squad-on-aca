@@ -177,6 +177,16 @@ function Get-AcaConfig {
         aspireApp = "ca-squad-aca-aspire"
         aspireLoginUrl = ""
         logAnalyticsWorkspace = "law-squad-aca"
+        # ACA Sandboxes deployment settings (issue #25). Empty by default: a
+        # deployment with no sandbox group configured cannot reach the sandbox
+        # plane at all, which is the same posture as the feature flag being off.
+        # The Sandboxes provider reads these off the config object by name, and
+        # until #25 they were dropped here -- so the group name could never
+        # travel from configuration to the provider, and every sandbox create
+        # would have refused on the identity-free precondition.
+        sandboxGroup = ""
+        sandboxDiskId = ""
+        sandboxDiskLabel = ""
     }
 
     foreach ($source in @($deployOutputs, $userConfig)) {
@@ -398,6 +408,10 @@ function Invoke-Init {
     Write-Output "Next: copilot --agent squad-aca"
 }
 
+function Get-SessionSandboxCatalogPath {
+    return (Join-Path $RepoRoot "config\sandbox-classes.json")
+}
+
 function New-SessionExecutionProvider {
     <#
     .SYNOPSIS
@@ -414,19 +428,26 @@ function New-SessionExecutionProvider {
         to a build with no sandbox code in it, and it is what the CLI golden gate
         and compare-cli-baseline.ps1 verify.
 
-        With the flag ON, the Sprint 2 capability resolution (when the caller has
-        one) is routed through Resolve-SquadExecutionRoute, which can return
-        `sandbox` only for an administrator-approved class in a non-provisional
-        catalog, and returns `fail-closed` rather than quietly downgrading a
-        session whose required capabilities the default worker cannot satisfy.
+        With the flag ON, the capability resolution the caller supplies is routed
+        through Resolve-SquadExecutionRoute, which can return `sandbox` only for
+        an administrator-approved class in a non-provisional catalog, and returns
+        `fail-closed` rather than quietly downgrading a session whose required
+        capabilities the default worker cannot satisfy.
 
-        NOTHING PASSES -CapabilityResolution YET. Every call site in this file
-        omits it, so the gate is always reached with no decision and the
-        `sandbox` branch is unreachable from the CLI even with the flag on. That
-        is deliberate for a default-off sprint -- the gate and the provider are
-        proven in isolation first -- and wiring the resolution through is later
-        work (PRD #6, Sprint 6+). Do not describe this as the capability
-        decision being acted on end to end; it is not, yet.
+        WHERE THE RESOLUTION COMES FROM (issue #25). Start-LeasedExecution asks
+        the shared dispatch core -- worker/lib/squad-dispatch.js, the same file
+        Ralph and Watch call -- for the routing decision BEFORE any compute is
+        requested, and hands the Sprint 2 capability decision it carries
+        (`decision.routing.capability`) to this function as
+        -CapabilityResolution. The route is therefore decided by exactly one
+        implementation, in Node, and this file only acts on it. Nothing here
+        re-derives a route, and scripts/validate.ps1 asserts that the PowerShell
+        dispatch shim contains no route literal at all.
+
+        -CapabilityResolution is still optional and still defaults to $null,
+        because the lifecycle call sites (`sessions`, `logs`, `stop`) must NOT
+        re-resolve: they recover the substrate from the opaque execution handle
+        they already hold, via New-SessionExecutionProviderForHandle.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Config,
@@ -440,10 +461,22 @@ function New-SessionExecutionProvider {
         }
     }
 
-    if (-not (Test-SquadSandboxEnabled -Config $Config)) { return (& $acaJob) }
-
+    # The feature flag is enforced INSIDE Resolve-SquadExecutionRoute, not by
+    # short-circuiting to ACA Jobs here. Until issue #25 wired a real resolution
+    # in, this function returned the Jobs provider whenever the flag was off and
+    # never consulted the gate at all -- which was harmless only because
+    # -CapabilityResolution was always $null. With a real decision flowing in,
+    # that early return IS the silent downgrade PRD #6 forbids: a repository
+    # whose required capabilities the default worker cannot meet would have been
+    # run on the default worker anyway, unsafely and without a word.
+    #
+    # The gate distinguishes the two flag-off cases that matter:
+    #   default image sufficient  -> aca-job      (a genuine, safe fall back)
+    #   default image insufficient -> fail-closed (refuse; nothing is started)
+    # and with no resolution at all it returns aca-job, so the no-manifest path
+    # is byte-identical to what it has always been.
     $route = Resolve-SquadExecutionRoute -Decision $CapabilityResolution -Config $Config `
-        -CatalogPath (Join-Path $RepoRoot "config\sandbox-classes.json")
+        -CatalogPath (Get-SessionSandboxCatalogPath)
 
     switch ($route.Route) {
         "sandbox" {
@@ -454,10 +487,192 @@ function New-SessionExecutionProvider {
             }
         }
         "fail-closed" {
-            throw "Refusing to dispatch this session: capability routing failed closed ($($route.Reason)). Nothing was started. Review the repository's squad-capabilities.yml and config/sandbox-classes.json, or unset SQUAD_ACA_ENABLE_SANDBOX to return to the ACA Jobs path."
+            $advice = "Review the repository's squad-capabilities.yml and config/sandbox-classes.json."
+            if ($route.Reason -eq "sandbox-feature-disabled-and-default-insufficient") {
+                # Do NOT advise unsetting the flag here: the flag is already off,
+                # and it is the manifest's requirements the default worker cannot
+                # meet. Turning the sandbox plane ON is the fix, not off.
+                $advice = "This repository requires capabilities the default worker image does not provide, so it cannot be run on the ACA Jobs path. Set SQUAD_ACA_ENABLE_SANDBOX=1 to use an approved sandbox class, or relax squad-capabilities.yml."
+            } elseif (-not $route.FeatureEnabled) {
+                $advice = "$advice Set SQUAD_ACA_ENABLE_SANDBOX=1 to use an approved sandbox class."
+            } else {
+                $advice = "$advice Or unset SQUAD_ACA_ENABLE_SANDBOX to return to the ACA Jobs path."
+            }
+            throw "Refusing to dispatch this session: capability routing failed closed ($($route.Reason)). Nothing was started. $advice"
         }
     }
     return (& $acaJob)
+}
+
+function New-SessionSandboxOperationsProvider {
+    <#
+    .SYNOPSIS
+        A Sandboxes provider for LIFECYCLE operations (status / logs / cancel /
+        terminate) -- never for create.
+
+    .DESCRIPTION
+        New-SandboxExecutionProvider requires an approved class, and that
+        requirement is a security assertion that must not be relaxed. But a class
+        is only ever READ by `create`: it supplies the egress template, the CPU
+        and memory shape, and the concurrency ceiling. status, logs, cancel and
+        terminate address a sandbox purely by the label carried in its opaque
+        handle and never touch Context.Class.
+
+        So a lifecycle call supplies the class named in the handle when there is
+        one, and otherwise the first administrator-approved class in the catalog,
+        purely to construct the provider. That cannot widen anything: the only
+        operation that could act on a class is create, and create is never
+        reached from a handle.
+
+        Returns $null when the catalog offers no approved class, so a caller can
+        decide whether that is fatal (operating a specific sandbox) or simply
+        means there is nothing to list.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Config,
+        [string]$ClassId = ""
+    )
+
+    $catalog = Get-SquadSandboxCatalog -CatalogPath (Get-SessionSandboxCatalogPath)
+    if (-not $catalog) { return $null }
+
+    $resolved = $null
+    if ($ClassId) {
+        $resolved = Get-SquadSandboxClass -ClassId $ClassId -Catalog $catalog
+        if (-not $resolved.Class) { return $null }
+    } else {
+        foreach ($candidate in @($catalog.classes)) {
+            $attempt = Get-SquadSandboxClass -ClassId ([string]$candidate.id) -Catalog $catalog
+            if ($attempt.Class) { $resolved = $attempt; break }
+        }
+        if (-not $resolved) { return $null }
+    }
+
+    return New-SquadExecutionProvider -Kind "sandbox" -Options @{
+        Class     = $resolved.Class
+        Config    = $Config
+        ScriptDir = $ScriptDir
+    }
+}
+
+function New-SessionExecutionProviderForHandle {
+    <#
+    .SYNOPSIS
+        The provider that OWNS an existing execution, recovered from its handle.
+
+    .DESCRIPTION
+        `status`, `logs` and `stop` operate on work that has already been
+        dispatched, so the route is a property of that execution and must not be
+        computed again. Re-resolving would read today's manifest, today's catalog
+        and today's feature flag to answer a question about a session that was
+        routed yesterday -- and would happily hand an ACA Job execution to the
+        Sandboxes adapter after someone edited squad-capabilities.yml.
+
+        A handle already carries the identity of the provider that minted it, so
+        that is the only thing consulted here. A handle from an unknown provider
+        is an error, never a guess.
+
+        A sandbox handle still requires the feature flag: operating the sandbox
+        plane with it unset would defeat the kill switch, whose whole promise is
+        that unsetting it stops this control plane touching `aca` at all.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Config,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Handle
+    )
+
+    $decoded = ConvertFrom-SquadExecutionHandle -Handle $Handle
+    switch ($decoded.ProviderId) {
+        "aca-job" {
+            return New-SquadExecutionProvider -Kind "aca-job" -Options @{
+                Config    = $Config
+                ScriptDir = $ScriptDir
+            }
+        }
+        "sandbox" {
+            if (-not (Test-SquadSandboxEnabled -Config $Config)) {
+                throw "This session runs on the ACA Sandboxes plane, which is disabled here. Set SQUAD_ACA_ENABLE_SANDBOX=1 to inspect or stop it; nothing was contacted."
+            }
+            $classId = ""
+            if ($decoded.Payload -and ($decoded.Payload.PSObject.Properties.Name -contains "class")) {
+                $classId = [string]$decoded.Payload.class
+            }
+            $provider = New-SessionSandboxOperationsProvider -Config $Config -ClassId $classId
+            if (-not $provider) {
+                throw "This session runs on the ACA Sandboxes plane, but config/sandbox-classes.json offers no administrator-approved class to operate it with. Review the catalog; nothing was contacted."
+            }
+            return $provider
+        }
+    }
+    throw "Execution handle belongs to provider '$($decoded.ProviderId)', which this CLI does not know how to operate."
+}
+
+function Get-CapabilityManifestSource {
+    <#
+    .SYNOPSIS
+        Where the control plane reads the repository's capability manifest from,
+        BEFORE anything is dispatched.
+
+    .DESCRIPTION
+        The route has to be decided before compute is requested, which means the
+        manifest has to be read before the worker has cloned anything. The source
+        is the LOCAL WORKING TREE, and only when that tree is provably the
+        repository being dispatched.
+
+        Why the working tree and not `gh api` against the requested ref:
+
+          * it is what the developer is actually dispatching -- `squad-aca run`
+            syncs the working tree to the branch the worker will clone
+            (Sync-LocalSquadState) immediately before this runs, and already
+            warns when uncommitted changes mean the two can differ;
+          * it adds no network call, so a dispatch cannot fail, stall, or be
+            rate-limited by a routing lookup;
+          * it keeps the no-manifest path free of any new observable behaviour,
+            which is what the 22 CLI goldens pin.
+
+        Reading it can only produce a routing HINT that is re-checked: the
+        in-worker preflight (worker/lib/squad-capability-preflight.sh) runs
+        against the real clone before any repository code and fails closed if a
+        required capability is missing. So working-tree drift can cost a refused
+        session; it can never grant one.
+
+        THE FAILURE MODE IS EXPLICIT, NOT A GUESS. Two different things can go
+        wrong and they are deliberately handled differently:
+
+          * No readable tree for THIS repository -- `--repo other/repo`, or a
+            directory that is not a git work tree. There is no manifest to read,
+            so the decision is the same one a repository with no manifest gets:
+            the default ACA Jobs route. The caller says so out loud
+            (Start-LeasedExecution warns and names the reason) and the in-worker
+            preflight is the backstop. This is a documented fall back, not a
+            silent guess, and it is the pre-existing behaviour of every dispatch
+            before issue #25.
+          * A manifest that IS present but cannot be read, parsed or validated.
+            That is decided by the shared resolver, which returns `fail-closed`,
+            and Get-SquadDispatchDecision throws. Nothing is dispatched.
+
+    .OUTPUTS
+        PSCustomObject with Path ("" when there is none) and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Repository,
+        [AllowEmptyString()][string]$CurrentRepository = ""
+    )
+
+    $top = ""
+    try {
+        $top = (git rev-parse --show-toplevel 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -ne 0) { $top = "" }
+    } catch {
+        $top = ""
+    }
+    if (-not $top) {
+        return [pscustomobject]@{ Path = ""; Reason = "this directory is not a git working tree" }
+    }
+    if (-not $CurrentRepository -or $CurrentRepository -ne $Repository) {
+        return [pscustomobject]@{ Path = ""; Reason = "the working tree here is not '$Repository'" }
+    }
+    return [pscustomobject]@{ Path = ([string]$top).Trim(); Reason = "local working tree" }
 }
 
 function Invoke-Run {
@@ -465,7 +680,12 @@ function Invoke-Run {
     $config = Assert-AcaConfigured
     Ensure-ExistingSquad
 
-    $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
+    # Captured once: Get-CurrentRepo shells out to `gh`, and the capability
+    # manifest source below needs to know whether the working tree IS the
+    # repository being dispatched. Calling it twice would add an observable `gh`
+    # invocation to every run.
+    $currentRepo = Get-CurrentRepo
+    $repo = Get-OptionValue $Items @("--repo", "-Repository") $currentRepo
     if (-not $repo) { throw "No GitHub repo detected. Run 'squad-aca init' first or pass --repo <owner/repo>." }
     $session = Get-OptionValue $Items @("--name", "-SessionName") "session-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     $branch = Get-OptionValue $Items @("--branch", "-OutputBranch") "squad/$session"
@@ -474,6 +694,7 @@ function Invoke-Run {
     if (-not $prompt) { throw "Provide a prompt, e.g. squad-aca `"Build the API and open a PR`"." }
 
     $ref = Sync-LocalSquadState -SyncAll:(Has-Option $Items @("--sync-all"))
+    $manifestSource = Get-CapabilityManifestSource -Repository $repo -CurrentRepository $currentRepo
     $request = New-SquadDispatchRequest `
         -SessionId $session `
         -DispatchSource "local-cli" `
@@ -484,7 +705,7 @@ function Invoke-Run {
         -SubSquad $subSquad `
         -PushChanges (-not (Has-Option $Items @("--no-push"))) `
         -OutputBranch $branch
-    Start-LeasedExecution -Config $config -Request $request
+    Start-LeasedExecution -Config $config -Request $request -ManifestSource $manifestSource
 }
 
 function Start-LeasedExecution {
@@ -509,19 +730,46 @@ function Start-LeasedExecution {
         already owns this work, so nothing is started -- that is what stops a
         duplicate run from double-dispatching. If step 3 throws, the lease is
         released so the work retries instead of being pinned by a dead claim.
+
+        Step 1 is also where the capability manifest is read (issue #25). The
+        shared dispatch core resolves the route against -ManifestSource, and the
+        capability decision it produces is what selects the execution provider in
+        step 3 -- so the substrate is chosen from the manifest BEFORE compute is
+        requested, using the same Node implementation Ralph and Watch use.
+
+    .PARAMETER ManifestSource
+        Optional result of Get-CapabilityManifestSource. Omitted (or carrying no
+        Path) means there is no readable working tree for this repository, which
+        resolves exactly like a repository with no manifest: the default ACA Jobs
+        route. That is reported, not assumed silently.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Config,
         [Parameter(Mandatory = $true)][object]$Request,
-        [string]$IssueNumber = ""
+        [string]$IssueNumber = "",
+        [object]$ManifestSource = $null
     )
 
     $repo = [string]$Request.repository.fullName
+    $repoDir = ""
+    if ($ManifestSource -and $ManifestSource.Path) { $repoDir = [string]$ManifestSource.Path }
+
     $decision = Get-SquadDispatchDecision `
         -SessionId ([string]$Request.sessionId) `
         -DispatchSource ([string]$Request.dispatchSource) `
         -Repository $repo `
-        -IssueNumber $IssueNumber
+        -IssueNumber $IssueNumber `
+        -RepoDir $repoDir
+
+    # Say so when the route was decided WITHOUT reading a manifest. Silence here
+    # is what would make the fall back a guess: an operator who believes a
+    # sandbox manifest is being honoured, while the manifest was never opened,
+    # has no way to tell from the output. Only warn when the sandbox plane is
+    # switched on, so the default path stays byte-identical.
+    if (-not $repoDir -and $ManifestSource -and (Test-SquadSandboxEnabled -Config $Config)) {
+        Write-Warning ("Capability routing read no manifest for '$repo' ($($ManifestSource.Reason)), so this dispatch " +
+            "uses the default ACA Jobs route. The in-worker capability preflight still applies after the clone.")
+    }
 
     $claim = New-SquadDispatchLease -Decision $decision -Repository $repo
     # Fail-closed on the outcome vocabulary: ONLY `created` and `repaired` mean
@@ -538,8 +786,20 @@ function Start-LeasedExecution {
 
     $Request.capabilityResolution = $decision
 
+    # THE wiring issue #25 exists for. The provider is selected from the SPRINT 2
+    # capability decision the shared core just produced -- `routing.capability`,
+    # not `routing` -- because that object is what Resolve-SquadExecutionRoute
+    # reads: it carries `route`, `sandboxClass` AND `defaultImageSufficient`, and
+    # the last of those is what lets the flag-off path tell "the default worker
+    # can run this anyway" apart from "the default worker cannot, so refuse".
+    # `routing` deliberately omits it.
+    $capability = $null
+    if ($decision.routing -and ($decision.routing.PSObject.Properties.Name -contains "capability")) {
+        $capability = $decision.routing.capability
+    }
+
     try {
-        Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $Config) -Request $Request
+        Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $Config -CapabilityResolution $capability) -Request $Request
     } catch {
         Set-SquadDispatchLeaseState -Operation "release" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -Reason "dispatch-failed" | Out-Null
         throw
@@ -737,9 +997,26 @@ function Get-SessionExecutions {
         Callers use $record.Handle for every lifecycle operation and
         $record.Display purely for rendering. Nothing here knows the handle is
         an ACA Job execution name.
+
+        ACA Jobs are listed unconditionally and FIRST, so the flag-off path makes
+        exactly the calls it always made, in the same order. With the sandbox
+        plane switched on, live sandboxes are appended: a session dispatched to a
+        sandbox that `sessions` could not see is a session `logs` and `stop`
+        could not address either, since both resolve through this list.
     #>
     param([object]$Config, [int]$Limit = 10)
-    return Get-SquadExecutionList -Provider (New-SessionExecutionProvider -Config $Config) -Limit $Limit
+    $records = @(Get-SquadExecutionList -Provider (New-SessionExecutionProvider -Config $Config) -Limit $Limit)
+    if (Test-SquadSandboxEnabled -Config $Config) {
+        $sandbox = New-SessionSandboxOperationsProvider -Config $Config
+        if ($sandbox) { $records += @(Get-SquadExecutionList -Provider $sandbox -Limit $Limit) }
+    }
+    return $records
+}
+
+function Test-SessionSandboxRecord {
+    param([object]$Record)
+    if (-not $Record -or -not $Record.Display) { return $false }
+    return ($Record.Display.PSObject.Properties.Name -contains "Sandbox")
 }
 
 function Get-FirstPositional {
@@ -769,7 +1046,12 @@ function Resolve-SessionExecution {
         throw "No session executions found."
     }
     $items = Get-SessionExecutions -Config $Config -Limit 50
-    $match = $items | Where-Object { $_.Display.Execution -eq $Session -or $_.Display.Session -eq $Session } | Select-Object -First 1
+    # Sandbox records name the substrate object `Sandbox`, ACA Job records name
+    # it `Execution`. Both are matched so a user identifies a session the same
+    # way whichever plane it landed on.
+    $match = $items | Where-Object {
+        $_.Display.Execution -eq $Session -or $_.Display.Session -eq $Session -or $_.Display.Sandbox -eq $Session
+    } | Select-Object -First 1
     if (-not $match) {
         throw "Could not find session or execution '$Session'. Run 'squad-aca sessions' to list recent sessions."
     }
@@ -781,6 +1063,7 @@ function Invoke-Sessions {
     $config = Assert-AcaConfigured
     $limitText = Get-OptionValue $Items @("--limit", "-Limit") "10"
     $limit = [int]$limitText
+    $records = @(Get-SessionExecutions -Config $config -Limit $limit)
     # Out-String -Width pins the render width instead of inheriting the host's
     # console width. Sprint 6 appends Route and Source, which pushes the table
     # past the default 120 columns -- and Format-Table silently DROPS trailing
@@ -788,12 +1071,31 @@ function Invoke-Sessions {
     # would vanish on a narrow terminal. Pinning the width also removes the last
     # implicit host dependency from this golden (docs/validation.md, "What makes
     # a golden portable").
-    Get-SessionExecutions -Config $config -Limit $limit |
+    $records |
+        Where-Object { -not (Test-SessionSandboxRecord -Record $_) } |
         ForEach-Object { $_.Display } |
         Format-Table -AutoSize |
         Out-String -Width 200 |
         ForEach-Object { $_.TrimEnd() } |
         Write-Output
+
+    # Sandbox records carry a different, smaller column set (Sandbox, Status,
+    # Session, Class, Phase, ExitCode, Inconclusive), so they get their own
+    # table: Format-Table renders one shape and would blank every column the
+    # first row did not have. This block emits nothing at all unless a sandbox
+    # execution exists, which cannot happen with the feature flag off -- that is
+    # what keeps the `sessions` golden byte-identical.
+    $sandboxRecords = @($records | Where-Object { Test-SessionSandboxRecord -Record $_ })
+    if ($sandboxRecords.Count -gt 0) {
+        Write-Output ""
+        Write-Output "Route: sandbox (ACA Sandboxes)"
+        $sandboxRecords |
+            ForEach-Object { $_.Display } |
+            Format-Table -AutoSize |
+            Out-String -Width 200 |
+            ForEach-Object { $_.TrimEnd() } |
+            Write-Output
+    }
 }
 
 function Invoke-Logs {
@@ -807,7 +1109,7 @@ function Invoke-Logs {
     # path and the Log Analytics fallback fail, so a run that produced no logs
     # can never exit 0). This function owns only presentation.
     $result = Get-SquadExecutionLog `
-        -Provider (New-SessionExecutionProvider -Config $config) `
+        -Provider (New-SessionExecutionProviderForHandle -Config $config -Handle $execution.Handle) `
         -Handle $execution.Handle `
         -Tail $tail
     if ($result.Notice) { Write-Host $result.Notice }
@@ -873,7 +1175,13 @@ function Invoke-Stop {
     # cancel, not terminate: `stop` keeps the substrate's own result and output
     # verbatim, including failures. The idempotent teardown lives on the
     # provider's terminate operation and is deliberately not wired here.
-    Stop-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Handle $execution.Handle
+    #
+    # The provider comes from the HANDLE, so a sandbox session is stopped on the
+    # sandbox plane and an ACA Job execution on the Jobs plane -- whatever
+    # today's manifest, catalog or flag would resolve to.
+    Stop-SquadExecution `
+        -Provider (New-SessionExecutionProviderForHandle -Config $config -Handle $execution.Handle) `
+        -Handle $execution.Handle
 }
 
 function Invoke-Watch {
@@ -1038,14 +1346,16 @@ function Invoke-Telemetry {
     $sub = if ($Items.Count -gt 0) { $Items[0].ToLowerInvariant() } else { "smoke" }
     if ($sub -ne "smoke") { throw "Usage: squad-aca telemetry smoke" }
     $config = Assert-AcaConfigured
-    $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
+    $currentRepo = Get-CurrentRepo
+    $repo = Get-OptionValue $Items @("--repo", "-Repository") $currentRepo
     if (-not $repo) { throw "No GitHub repo detected. Pass --repo <owner/repo>." }
     $request = New-SquadDispatchRequest `
         -SessionId "telemetry-$(Get-Date -Format 'yyyyMMdd-HHmmss')" `
         -DispatchSource "local-cli" `
         -Repository $repo `
         -Mode "telemetry-smoke"
-    Start-LeasedExecution -Config $config -Request $request
+    Start-LeasedExecution -Config $config -Request $request `
+        -ManifestSource (Get-CapabilityManifestSource -Repository $repo -CurrentRepository $currentRepo)
     if ($config.aspireLoginUrl) { Write-Output "Aspire: $($config.aspireLoginUrl)" }
 }
 
@@ -1150,7 +1460,8 @@ switch ($Command.ToLowerInvariant()) {
     }
     "smoke" {
         $config = Assert-AcaConfigured
-        $repo = Get-OptionValue $Arguments @("--repo", "-Repository") (Get-CurrentRepo)
+        $currentRepo = Get-CurrentRepo
+        $repo = Get-OptionValue $Arguments @("--repo", "-Repository") $currentRepo
         if (-not $repo) { throw "No GitHub repo detected. Pass --repo <owner/repo>." }
         $request = New-SquadDispatchRequest `
             -SessionId "smoke-$(Get-Date -Format 'yyyyMMdd-HHmmss')" `
@@ -1158,7 +1469,8 @@ switch ($Command.ToLowerInvariant()) {
             -Repository $repo `
             -Mode "smoke" `
             -RunCopilotSmoke $true
-        Start-LeasedExecution -Config $config -Request $request
+        Start-LeasedExecution -Config $config -Request $request `
+            -ManifestSource (Get-CapabilityManifestSource -Repository $repo -CurrentRepository $currentRepo)
     }
     "status" {
         $config = Assert-AcaConfigured

@@ -292,7 +292,7 @@ assert_eq "70" "$rc" "unsupported catalog schema: exits 70"
 assert_contains "$out" '"reason": "catalog-unavailable"' "unsupported catalog schema: fails closed"
 rm -rf "$repo"
 
-# --- 9. The shipped catalog is well-formed and honest about being provisional -
+# --- 9. The shipped catalog is well-formed, reviewed, and pinned by digest ----
 
 out="$(node -e '
 const { validateCatalog } = require(process.argv[1]);
@@ -306,13 +306,64 @@ out="$(node -e '
 const catalog = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 process.stdout.write(String(catalog.provisional));
 ' "$CATALOG" 2>&1)"
-assert_eq "true" "$out" "shipped catalog: is marked provisional (report-only until reviewed)"
+assert_eq "false" "$out" "shipped catalog: is marked reviewed (issue #25 cleared the provisional interlock)"
 
 out="$(node -e '
 const catalog = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-process.stdout.write(Array.isArray(catalog.$comment) && catalog.$comment.join(" ").includes("PROVISIONAL") ? "documented" : "missing");
+process.stdout.write(Array.isArray(catalog.$comment) && catalog.$comment.join(" ").includes("REVIEWED AND PINNED") ? "documented" : "missing");
 ' "$CATALOG" 2>&1)"
-assert_eq "documented" "$out" "shipped catalog: carries the provisional header comment"
+assert_eq "documented" "$out" "shipped catalog: carries the reviewed header comment"
+
+# Every APPROVED class must name an immutable image. A moving tag means
+# re-tagging the registry silently changes what runs inside a sandbox that
+# executes repository code, and nothing downstream would notice.
+out="$(node -e '
+const catalog = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const bad = catalog.classes
+  .filter((c) => c.approved === true)
+  .filter((c) => c.image.pinned !== true || !/^sha256:[0-9a-f]{64}$/.test(String(c.image.digest)))
+  .map((c) => c.id);
+process.stdout.write(bad.length === 0 ? "pinned" : bad.join(","));
+' "$CATALOG" 2>&1)"
+assert_eq "pinned" "$out" "shipped catalog: every approved class is pinned to a sha256 digest"
+
+out="$(node -e '
+const catalog = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const placeholders = JSON.stringify(catalog).includes("REPLACE-ME");
+process.stdout.write(placeholders ? "placeholders" : "none");
+' "$CATALOG" 2>&1)"
+assert_eq "none" "$out" "shipped catalog: carries no REPLACE-ME placeholder image reference"
+
+# The unapproved class is a deliberate NEGATIVE fixture, not an oversight: it
+# proves the approved-only filter still bites in a reviewed catalog.
+out="$(node -e '
+const catalog = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+process.stdout.write(String(catalog.classes.filter((c) => c.approved !== true).length));
+' "$CATALOG" 2>&1)"
+assert_eq "1" "$out" "shipped catalog: keeps an unapproved class as the approved-only filter's negative fixture"
+
+# The pinning rule is ENFORCED by validateCatalog, not just observed here: an
+# approved-but-unpinned class in a reviewed catalog must be a catalog fault.
+out="$(node -e '
+const { validateCatalog } = require(process.argv[1]);
+const catalog = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+catalog.classes.filter((c) => c.approved === true).forEach((c) => { c.image.pinned = false; c.image.digest = null; });
+const errors = validateCatalog(catalog);
+process.stdout.write(errors.length > 0 ? "rejected" : "accepted");
+' "$RESOLVER" "$CATALOG" 2>&1)"
+assert_eq "rejected" "$out" "reviewed catalog: an approved class that is not pinned by digest is a catalog fault"
+
+# ...and only once the catalog claims to be reviewed. A provisional catalog is
+# allowed to carry placeholders; that is what provisional means.
+out="$(node -e '
+const { validateCatalog } = require(process.argv[1]);
+const catalog = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+catalog.provisional = true;
+catalog.classes.filter((c) => c.approved === true).forEach((c) => { c.image.pinned = false; c.image.digest = null; });
+const errors = validateCatalog(catalog);
+process.stdout.write(errors.length === 0 ? "allowed" : errors.join("; "));
+' "$RESOLVER" "$CATALOG" 2>&1)"
+assert_eq "allowed" "$out" "provisional catalog: unpinned placeholder images are still allowed"
 
 # --- 10. Egress template matching semantics ----------------------------------
 

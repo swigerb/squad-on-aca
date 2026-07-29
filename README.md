@@ -263,11 +263,22 @@ by default and stays off until you turn it on for a specific invocation.
 
 ### What it does today
 
-Enabling the flag opens the route gate and nothing more. No `squad-aca` command
-yet passes the capability resolution to `New-SessionExecutionProvider`, so every
-dispatch reaches the gate with no decision and routes to `aca-job`. Turning the
-flag on changes nothing observable yet. Wiring the resolution through is later
-work, so do not plan real sessions on this plane.
+Enabling the flag makes the plane reachable. `squad-aca run` reads the
+repository's `squad-capabilities.yml` from your working tree **before** it
+requests any compute, resolves it through the same Node routing core Ralph and
+Watch use, and dispatches to whichever plane the decision names. A repository
+whose manifest an approved sandbox class satisfies runs in a sandbox with
+default-deny egress applied before any repository code; `sessions`, `logs`, and
+`stop` then address that session on the plane it actually runs on, recovered
+from its execution handle rather than re-resolved.
+
+ACA Jobs remain the default and the rollback path. A repository with no
+manifest, or one the default worker image already satisfies, is unaffected —
+byte for byte.
+
+With the flag **off**, a repository that genuinely needs a non-default
+capability is **refused**, not quietly run on the default worker. That is
+deliberate: silently downgrading is the one outcome worse than not starting.
 
 ### How to enable it
 
@@ -280,19 +291,26 @@ The flag is an environment variable rather than a config key on purpose: it is
 per-invocation, nothing that syncs config can turn it on, and rolling back needs
 no file edit. `0`, `false`, `no`, and `off` are an explicit kill switch.
 
+Your deployment also needs a sandbox group and a disk in
+`~/.squad-on-aca/config.json` (`sandboxGroup`, `sandboxDiskId`). Without them
+nothing can reach the plane, which is a third, accidental-but-real interlock.
+
 ### Two independent fail-closed interlocks
 
-Both must be open before a dispatch can reach a sandbox, so clearing either one
-returns every dispatch to ACA Jobs:
+Both must be open before a dispatch can reach a sandbox, so closing either one
+returns every *satisfiable* dispatch to ACA Jobs:
 
-1. **The feature flag defaults off.** With it unset, `New-SessionExecutionProvider`
-   returns the ACA Jobs adapter before it reads the class catalog, resolves a
-   route, or looks for the `aca` binary.
-2. **The class catalog ships provisional.** `config/sandbox-classes.json` sets
-   `"provisional": true` with placeholder images, egress rules, and cost
-   ceilings, so the sandbox route fails closed **even with the flag on**
-   (`reason: catalog-provisional`). An administrator must review each class,
-   pin real image references, and set `"provisional": false`.
+1. **The feature flag defaults off.** With it unset, the route gate resolves
+   `aca-job` for a repository the default worker image can serve, and
+   `fail-closed` for one it cannot. Nothing reads the class catalog or looks for
+   the `aca` binary.
+2. **The class catalog must be reviewed.** `config/sandbox-classes.json` carries
+   `"provisional": false` only because an administrator reviewed every approved
+   class and pinned it to an immutable `sha256` digest — an approved class
+   without one is a catalog fault, not a warning. Setting `"provisional": true`
+   fails every sandbox route closed again (`reason: catalog-provisional`), and
+   the shipped catalog keeps one deliberately unapproved class as proof the
+   approved-only filter still bites.
 
 ### Why the plane exists
 

@@ -89,13 +89,20 @@ function New-SquadCliStubEnvironment {
     .SYNOPSIS
         Creates a throwaway stub environment (bin shims, fake HOME, fixtures).
 
+    .PARAMETER WithSandboxConfig
+        Adds the ACA Sandboxes deployment keys (sandboxGroup / sandboxRegion) to
+        the synthetic config. Default OFF, so the config file that backs every
+        committed golden is unchanged: only the non-golden sandbox-plane checks
+        in validate.ps1 ask for it.
+
     .OUTPUTS
         PSCustomObject with Root, BinDir, HomeDir, FixtureDir, WorkDir, AzLog
         and GhLog properties. Pass it to Invoke-SquadCliCapture and dispose of
         it with Remove-SquadCliStubEnvironment.
     #>
     param(
-        [string]$Root = (Join-Path ([System.IO.Path]::GetTempPath()) ("squad-cli-stub-" + [guid]::NewGuid().ToString("N")))
+        [string]$Root = (Join-Path ([System.IO.Path]::GetTempPath()) ("squad-cli-stub-" + [guid]::NewGuid().ToString("N"))),
+        [switch]$WithSandboxConfig
     )
 
     $binDir = Join-Path $Root "bin"
@@ -134,6 +141,16 @@ function New-SquadCliStubEnvironment {
         watchApp       = "ca-squad-aca-watch"
         aspireApp      = "ca-squad-aca-aspire"
         aspireLoginUrl = "https://aspire.stub.invalid/login"
+    }
+    # Deliberately absent by default: a golden capture must describe a
+    # deployment with no sandbox plane configured, which is what every
+    # committed golden was taken against.
+    if ($WithSandboxConfig) {
+        $config["sandboxGroup"] = "sbg-squad-stub"
+        # A private ACR image needs `--disk-id <GUID>`; `--disk` accepts public
+        # images only. The provider refuses to dispatch without one, so the stub
+        # deployment carries a fixed synthetic disk id.
+        $config["sandboxDiskId"] = "11111111-2222-3333-4444-555555555555"
     }
     $config | ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $homeDir ".squad-on-aca\config.json") -Encoding utf8
@@ -682,6 +699,14 @@ function Invoke-SquadCliCapture {
         Exit code the fake `gh api` returns. Non-zero drives the probe-failed
         fallback, where a diagnostic must not replace the real error.
 
+    .PARAMETER SandboxFlag
+        Value for SQUAD_ACA_ENABLE_SANDBOX. Defaults to "" (OFF), which is the
+        golden-portability pin: every capture that backs a committed golden takes
+        the default, so "flag off is byte-identical" stays a property the golden
+        gate tests rather than an accident of the developer's shell. Only the
+        non-golden sandbox-plane checks in validate.ps1 pass "1"; a validate.ps1
+        assertion proves scripts/tests/cli-capture-cases.ps1 never does.
+
     .PARAMETER GhFailMode / GhFailPath / GhPermissions / GhLogin
         Passed through to worker/tests/lib/fake-gh.js, which backs the lease
         store. Same knobs the bash suite uses, so both languages are driven
@@ -698,7 +723,8 @@ function Invoke-SquadCliCapture {
         [int]$GhApiExitCode = 0,
         [string]$GhFailMode = "",
         [string]$GhFailPath = "",
-        [string]$GhPermissions = ""
+        [string]$GhPermissions = "",
+        [string]$SandboxFlag = ""
     )
 
     $hostExe = (Get-Process -Id $PID).Path
@@ -777,8 +803,10 @@ function Invoke-SquadCliCapture {
         # taken with the sandbox feature flag OFF, whatever the developer's shell
         # happens to have exported -- that is what makes "flag off is
         # byte-identical to main" a property the golden gate actually tests
-        # rather than an accident of the machine it ran on.
-        $env:SQUAD_ACA_ENABLE_SANDBOX = ""
+        # rather than an accident of the machine it ran on. -SandboxFlag defaults
+        # to "" so every golden capture is still pinned OFF; only the non-golden
+        # sandbox-plane checks in validate.ps1 turn it on.
+        $env:SQUAD_ACA_ENABLE_SANDBOX = $SandboxFlag
         $env:SQUAD_ACA_SANDBOX_CLI = ""
         # --- Dispatch leases (Sprint 6) -------------------------------------
         # Every dispatch now writes a durable lease through `gh` before compute

@@ -16,6 +16,6 @@
   "unsatisfiedCredentials": [],
   "unsatisfiedEgressHosts": [],
   "catalogSchemaVersion": 1,
-  "catalogProvisional": true,
+  "catalogProvisional": false,
   "detail": "The capability manifest failed schema validation. Fix the manifest and retry; run the capability parser locally for the redacted field-level errors. See docs/capability-manifest.md."
 }

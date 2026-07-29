@@ -22,6 +22,6 @@
     "exfil.example.net"
   ],
   "catalogSchemaVersion": 1,
-  "catalogProvisional": true,
+  "catalogProvisional": false,
   "detail": "Required capabilities exceed the default worker profile and no administrator-approved sandbox class provides all of them. Extend the worker image, relax the requirement, or ask an administrator to approve a class that covers it. See docs/capability-manifest.md."
 }

@@ -16,6 +16,6 @@
   "unsatisfiedCredentials": [],
   "unsatisfiedEgressHosts": [],
   "catalogSchemaVersion": 1,
-  "catalogProvisional": true,
+  "catalogProvisional": false,
   "detail": "No capability manifest is present, so the repository is routed to the existing ACA job unchanged."
 }

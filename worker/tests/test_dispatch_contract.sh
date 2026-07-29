@@ -504,4 +504,91 @@ assert_eq "65" "$claim_rc" "fail-closed: claim refuses the same decision"
 lease_after="$(node "$CLI" list --repository octo/demo 2>/dev/null)"
 assert_not_contains "$lease_after" '"leaseKey":"issue-50"' "fail-closed: no lease was written for refused work"
 
+# ---------------------------------------------------------------------------
+# 13. Issue #25: a SANDBOX capability route reaches the control plane as an
+#     executionMode of `sandbox`. Sprint 5 landed the provider; until #25 the
+#     shared core still emitted executionMode `aca-job` with a
+#     `sandbox-provider-unavailable` fallback, so the sandbox plane was
+#     unreachable no matter what a manifest asked for. These assertions are the
+#     reason that downgrade cannot come back silently.
+# ---------------------------------------------------------------------------
+reset_state
+SANDBOX_FIXTURE="${TEST_TMP_ROOT}/sandboxrepo"
+mkdir -p "$SANDBOX_FIXTURE"
+cp "${TEST_DIR}/fixtures/routing-sandbox-python.yml" "${SANDBOX_FIXTURE}/squad-capabilities.yml"
+
+sandbox_decision="$(node "$CLI" decide --session-id issue-25-a --dispatch-source local-cli --repository octo/demo --issue 25 --repo-dir "$SANDBOX_FIXTURE")"
+sandbox_rc=$?
+assert_eq "0" "$sandbox_rc" "sandbox route: a satisfiable sandbox manifest is dispatchable"
+assert_contains "$sandbox_decision" '"executionMode":"sandbox"' "sandbox route: the control plane is told to use the sandbox substrate"
+assert_contains "$sandbox_decision" '"action":"dispatch"' "sandbox route: a sandbox decision dispatches rather than refusing"
+assert_not_contains "$sandbox_decision" '"fallbackReason":"sandbox-provider-unavailable"' "sandbox route: the pre-#25 provider-unavailable downgrade is gone"
+assert_contains "$sandbox_decision" '"fallbackReason":null' "sandbox route: nothing was fallen back FROM"
+assert_contains "$sandbox_decision" '"sandboxClass":"sandbox-python-3-12"' "sandbox route: the resolved class travels with the decision"
+
+# The routing DETAIL must describe the sandbox, not the Jobs path. Before #25
+# the sandbox branch reused the aca-job detail string, so an operator reading
+# `squad-aca` output was told a sandbox session was "routed to the default ACA
+# Jobs execution path".
+assert_not_contains "$sandbox_decision" 'Routed to the default ACA Jobs execution path","route":"sandbox' "sandbox route: the detail text is not the ACA Jobs wording"
+
+# The capability decision must be reachable AS a capability decision. This is
+# the exact object the CLI hands to Resolve-SquadExecutionRoute, and it is
+# distinct from `routing`: it alone carries defaultImageSufficient, which is
+# what lets the flag-off path tell "the default worker can run this anyway"
+# apart from "the default worker cannot, so refuse".
+cap_shape="$(printf '%s' "$sandbox_decision" | node -e '
+let s = "";
+process.stdin.on("data", (d) => (s += d)).on("end", () => {
+  const cap = JSON.parse(s).routing.capability;
+  process.stdout.write([
+    cap.route,
+    cap.sandboxClass,
+    String(cap.defaultImageSufficient),
+  ].join("|"));
+});
+')"
+assert_eq "sandbox|sandbox-python-3-12|false" "$cap_shape" "sandbox route: routing.capability carries route, class and defaultImageSufficient"
+
+# A repository the DEFAULT image already satisfies must still take the Jobs
+# path. ACA Jobs is the default and the rollback path; #25 must not have made
+# the sandbox the new default by accident.
+reset_state
+DEFAULT_FIXTURE="${TEST_TMP_ROOT}/defaultrepo"
+mkdir -p "$DEFAULT_FIXTURE"
+cp "${TEST_DIR}/fixtures/routing-default-satisfied.yml" "${DEFAULT_FIXTURE}/squad-capabilities.yml"
+default_decision="$(node "$CLI" decide --session-id issue-25-b --dispatch-source local-cli --repository octo/demo --issue 25 --repo-dir "$DEFAULT_FIXTURE")"
+assert_contains "$default_decision" '"executionMode":"aca-job"' "default satisfied: a manifest the default image covers still uses ACA Jobs"
+assert_contains "$default_decision" '"manifestPresent":true' "default satisfied: the manifest was actually read"
+
+# No manifest at all is the byte-identical status quo: ACA Jobs, nothing read.
+reset_state
+EMPTY_FIXTURE="${TEST_TMP_ROOT}/emptyrepo"
+mkdir -p "$EMPTY_FIXTURE"
+empty_decision="$(node "$CLI" decide --session-id issue-25-c --dispatch-source local-cli --repository octo/demo --issue 25 --repo-dir "$EMPTY_FIXTURE")"
+assert_contains "$empty_decision" '"executionMode":"aca-job"' "no manifest: unchanged ACA Jobs route"
+assert_contains "$empty_decision" '"manifestPresent":false' "no manifest: nothing was read"
+
+# An UNAPPROVED capability still fails closed AFTER #25. Reachability of the
+# sandbox plane must not have turned the approved-only filter into advice.
+reset_state
+UNAPPROVED_FIXTURE="${TEST_TMP_ROOT}/unapprovedrepo"
+mkdir -p "$UNAPPROVED_FIXTURE"
+cp "${TEST_DIR}/fixtures/routing-unapproved-egress.yml" "${UNAPPROVED_FIXTURE}/squad-capabilities.yml"
+unapproved_out="$(node "$CLI" decide --session-id issue-25-d --dispatch-source local-cli --repository octo/demo --issue 25 --repo-dir "$UNAPPROVED_FIXTURE" 2>/dev/null)"
+unapproved_rc=$?
+assert_eq "65" "$unapproved_rc" "unapproved capability: still refused after the sandbox plane became reachable"
+assert_contains "$unapproved_out" '"action":"refuse"' "unapproved capability: the decision refuses"
+assert_not_contains "$unapproved_out" '"executionMode":"sandbox"' "unapproved capability: never routed to a sandbox"
+
+# All three dispatch sources must agree on the SANDBOX route too, byte for byte
+# -- otherwise Ralph and the CLI could disagree about which substrate runs a
+# repository, which is the exact failure the shared core exists to prevent.
+reset_state
+r_ralph="$(node "$CLI" decide --session-id issue-25-e --dispatch-source ralph --repository octo/demo --issue 25 --repo-dir "$SANDBOX_FIXTURE" | routing_of)"
+r_watch="$(node "$CLI" decide --session-id issue-25-e --dispatch-source watch --repository octo/demo --issue 25 --repo-dir "$SANDBOX_FIXTURE" | routing_of)"
+r_cli="$(node "$CLI" decide --session-id issue-25-e --dispatch-source local-cli --repository octo/demo --issue 25 --repo-dir "$SANDBOX_FIXTURE" | routing_of)"
+assert_eq "$r_ralph" "$r_watch" "sandbox route: ralph and watch agree byte-for-byte"
+assert_eq "$r_ralph" "$r_cli" "sandbox route: ralph and the local CLI agree byte-for-byte"
+
 test_summary
