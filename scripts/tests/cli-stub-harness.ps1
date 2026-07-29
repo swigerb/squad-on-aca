@@ -114,10 +114,16 @@ function New-SquadCliStubEnvironment {
     $ghLog = Join-Path $Root "gh-calls.log"
     $squadLog = Join-Path $Root "squad-calls.log"
     $acaLog = Join-Path $Root "aca-calls.log"
+    # Shared, ordered, cross-tool call log. `az` and the lease store both append
+    # to it, so a test can assert that the lease write precedes the compute
+    # request BY INDEX. It is deliberately NOT part of the golden capture: the
+    # goldens cover observable CLI output, this covers ordering.
+    $callLog = Join-Path $Root "dispatch-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $ghLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $squadLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $acaLog -Value "" -NoNewline -Encoding ascii
+    Set-Content -LiteralPath $callLog -Value "" -NoNewline -Encoding ascii
 
     # --- Synthetic deployment config (never the developer's real one) --------
     $config = [ordered]@{
@@ -462,6 +468,9 @@ exit /b 0
         GhLog      = $ghLog
         SquadLog   = $squadLog
         AcaLog     = $acaLog
+        LeaseDir   = $leaseDir
+        CallLog    = $callLog
+        FakeGhPath = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "worker\tests\lib\fake-gh.js")
     }
 }
 
@@ -582,7 +591,9 @@ function Invoke-SquadCliCapture {
                   "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
                   "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
                   "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
-                  "SQUAD_ACA_ENABLE_SANDBOX", "SQUAD_ACA_SANDBOX_CLI")
+                  "SQUAD_ACA_ENABLE_SANDBOX", "SQUAD_ACA_SANDBOX_CLI",
+                  "SQUAD_GH_BIN", "FAKE_GH_STATE", "FAKE_GH_FAIL_MODE", "SQUAD_CALL_LOG",
+                  "SQUAD_LEASE_NOW", "SQUAD_LEASE_TTL_SECONDS", "SQUAD_LEASE_BRANCH")
     $saved = @{}
     foreach ($name in $envNames) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
@@ -640,6 +651,20 @@ function Invoke-SquadCliCapture {
         # rather than an accident of the machine it ran on.
         $env:SQUAD_ACA_ENABLE_SANDBOX = ""
         $env:SQUAD_ACA_SANDBOX_CLI = ""
+        # --- Dispatch leases (Sprint 6) -------------------------------------
+        # Every dispatch now writes a durable lease through `gh` before compute
+        # is requested. The lease store spawns `gh` itself, so it is pointed at
+        # the SAME offline fake the worker suite uses -- one implementation of
+        # GitHub's semantics for both languages. The clock and TTL are pinned so
+        # a capture can never depend on how long the run took, and the ledger is
+        # a throwaway directory inside the stub root.
+        $env:SQUAD_GH_BIN = $Stub.FakeGhPath
+        $env:FAKE_GH_STATE = $Stub.LeaseDir
+        $env:FAKE_GH_FAIL_MODE = ""
+        $env:SQUAD_CALL_LOG = $Stub.CallLog
+        $env:SQUAD_LEASE_NOW = "2024-05-01T00:00:00.000Z"
+        $env:SQUAD_LEASE_TTL_SECONDS = "3600"
+        $env:SQUAD_LEASE_BRANCH = "squad-aca-leases"
 
         $argList = @("-NoProfile", "-NonInteractive", "-File", $ScriptPath) + $CliArguments
         $proc = Start-Process -FilePath $hostExe -ArgumentList $argList `

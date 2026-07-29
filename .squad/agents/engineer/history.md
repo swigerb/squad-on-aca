@@ -473,3 +473,70 @@ is explicitly turned on.
   2 resolver runs inside the worker. `New-SessionExecutionProvider` accepts a
   `-CapabilityResolution` so the wiring is a one-line change when a control-plane
   resolution exists.
+
+## 2026-07-29 — Sprint 6: repairing the Sprint 5 merge into `squad/6-s6-unified-dispatch`
+
+`origin/main` (Sprint 5, PR #19) was merged into this branch as `72af864`. The
+sole conflict was `scripts/tests/cli-stub-harness.ps1`, and the resolution was
+**not** a union: it parsed, but it silently dropped four of Sprint 6's seven
+hunks in that file. Comparing the merge result against both parents is the only
+way this shows up — `git diff HEAD^1 HEAD` listed Sprint 6 lines as *removals*.
+
+Kept from Sprint 6 (3 hunks): the `$leaseDir` ledger directory, the
+`SQUAD_DISPATCH_ROUTE` / `SQUAD_DISPATCH_SOURCE` entries in the job-show
+fixture, and the `SQUAD_CALL_LOG` append in the fake `az` `:sqjobstart` label.
+
+Dropped from Sprint 6 (4 hunks), now restored:
+
+- `$callLog = Join-Path $Root "dispatch-calls.log"` and its truncation.
+- The `LeaseDir` / `CallLog` / `FakeGhPath` properties on the stub object.
+- `SQUAD_GH_BIN`, `FAKE_GH_STATE`, `FAKE_GH_FAIL_MODE`, `SQUAD_CALL_LOG`,
+  `SQUAD_LEASE_NOW`, `SQUAD_LEASE_TTL_SECONDS`, `SQUAD_LEASE_BRANCH` in the
+  save/restore env-name list.
+- The whole "Dispatch leases (Sprint 6)" assignment block in
+  `Invoke-SquadCliCapture`.
+
+Both env-var lists — the `envNames` save/restore list and the reset block — are
+exactly the place both sprints appended, and exactly where the loss happened.
+Sprint 5's additions were intact; Sprint 6's were gone.
+
+**One root cause, two symptoms.** With `$Stub.CallLog` absent,
+`Get-Content -LiteralPath $null` threw — that is the "Dispatch ordering checks
+threw: Cannot bind argument to parameter 'LiteralPath' because it is null."
+With `SQUAD_GH_BIN` / `FAKE_GH_STATE` unset, the lease store in every capture
+shelled out to a `gh` that could not serve the offline ledger, so the
+claim-before-compute step failed and `smoke` never reached
+`az containerapp job start` — that is "squad-aca smoke dispatch changed:" with
+an empty call list. Neither was a golden problem.
+
+The repaired file is now a strict union: the only lines it drops relative to
+`HEAD^1` are three doc/comment lines main legitimately rewrote, and the only
+lines it drops relative to `HEAD^2` are the three main lines Sprint 6 extends.
+
+**Goldens: no regeneration was needed.** The 22 captures auto-merged correctly —
+they already carry Sprint 6's `Route`/`Source` columns and
+`SQUAD_DISPATCH_ROUTE` / `SQUAD_DISPATCH_SOURCE` / `SQUAD_LEASE_KEY` env stamps
+*and* main's `### ACA CALLS` section. That section is empty in all 22, which is
+the Sprint 5 claim ("nothing shells out to `aca` with the flag off") holding
+under Sprint 6's dispatch path. `verify-cli-golden.ps1` is 22/22 with no
+`-Update`. Portability pins are untouched: offset-free fixture timestamps,
+`DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`, the stubbed `squad` on PATH, and the
+forced `SQUAD_ACA_ENABLE_SANDBOX=""` in every capture.
+
+**Verification.** `validate.ps1` 163 passed / 0 failed / 0 skipped (was 161/2/0).
+`verify-cli-golden.ps1` 22/22, exit 0. `verify-launch-detachment.ps1` PASS
+(streams EOF in 2ms against a 3s worker). Worker suite under WSL: 7 suites,
+361 assertions (123/35/11/62/40/47/43), 0 failed, 0 skipped.
+
+**Mutations re-run against the merged harness** — all three still caught, with
+the same messages recorded when they were first written:
+
+| Mutation | Check that failed |
+| --- | --- |
+| PowerShell claims *after* `az containerapp job start` | "Claim-before-compute ordering broken (lease index=6, compute index=0)" + "Duplicate dispatch started 1 execution(s) on the second run" |
+| Ralph claims *after* `az containerapp job start` | "ordering: lease write index (7) precedes compute request index (1)" + "duplicate: az job start called exactly once across two runs (actual: 2)" |
+| `isGoneResult` returns true for any non-zero exit | 14 worker assertions across two suites (auth/forbidden/throttle/network sweep classification, missing-gh) + "Sweeping under an auth failure reported success" + "Completing a lease under an auth failure reported success" |
+
+The ordering assertions are still by INDEX, not by presence, and the merged
+`aca` call log is a separate file from `dispatch-calls.log`, so main's `aca`
+stub reset cannot disturb the ordering evidence.
