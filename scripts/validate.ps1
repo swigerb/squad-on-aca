@@ -20,6 +20,18 @@
       4. .NET scaffold check- validates the optional aspire/ integration scaffold
                               structure (solution + AppHost project + README) and
                               optionally runs `dotnet build` with -RunDotnet.
+      5. Env key parity     - session-managed env keys agree between the
+                              PowerShell and worker sides.
+      6. Sync guard         - the Squad state sync blocklist covers every file
+                              `git add -A` would stage.
+      7. Provider contract  - the execution provider seam is exercised offline
+                              against the filesystem-backed fake provider
+                              (state transitions, idempotent terminate, handle
+                              opacity, unknown/foreign handle rejection).
+      8. CLI regression     - `squad-aca` is driven end to end with stub `az`
+                              and `gh` binaries on PATH, asserting the observable
+                              output, exit codes, and az call sequences that the
+                              provider refactor must not change.
 
     Exit code is 0 when all checks pass, 1 otherwise. Use this before pushing
     and as the E2E "sprint gate" documented in docs/validation.md.
@@ -43,6 +55,9 @@ $RepoRoot = Split-Path -Parent $ScriptDir
 
 $script:Failures = @()
 $script:Passes = @()
+
+# $IsWindows only exists in PowerShell 6+; this file also has to run under 5.1.
+$IsWindowsHost = if ($null -ne $PSVersionTable.Platform) { $PSVersionTable.Platform -eq "Win32NT" } else { $true }
 
 function Write-Section($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 function Add-Pass($text) { $script:Passes += $text; Write-Host "  [PASS] $text" -ForegroundColor Green }
@@ -470,6 +485,303 @@ if (-not (Test-Path $syncSafetyFile)) {
             $env:SQUAD_ACA_ALLOW_UNSAFE_SYNC = $prevAllow
             Remove-Item -Recurse -Force $tmpRepo -ErrorAction SilentlyContinue
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 7. Execution provider contract (offline, against the fake provider)
+# ---------------------------------------------------------------------------
+Write-Section "Execution provider contract"
+$providerLib = Join-Path $RepoRoot "scripts\lib\squad-aca-provider.ps1"
+if (-not (Test-Path $providerLib)) {
+    Add-Fail "scripts/lib/squad-aca-provider.ps1 is missing (execution provider seam)"
+} else {
+    . $providerLib
+
+    $providerTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("squad-provider-" + [guid]::NewGuid().ToString("N"))
+    try {
+        $fake = New-SquadExecutionProvider -Kind "fake" -Options @{ StateRoot = $providerTmp }
+
+        # -- structural conformance -----------------------------------------
+        if (@(Test-SquadExecutionProvider -Provider $fake).Count -eq 0) {
+            Add-Pass "Fake provider satisfies the execution provider contract"
+        } else {
+            Add-Fail "Fake provider does not satisfy the execution provider contract"
+        }
+
+        $acaProvider = New-SquadExecutionProvider -Kind "aca-job" -Options @{
+            Config    = [pscustomobject]@{ resourceGroup = "rg"; sessionJob = "job"; subscriptionId = "" }
+            ScriptDir = (Join-Path $RepoRoot "scripts")
+        }
+        if (@(Test-SquadExecutionProvider -Provider $acaProvider).Count -eq 0) {
+            Add-Pass "ACA Job provider satisfies the execution provider contract"
+        } else {
+            Add-Fail "ACA Job provider does not satisfy the execution provider contract"
+        }
+
+        $missingOps = @($script:SquadProviderOperations | Where-Object { -not $fake.Operations.Contains($_) })
+        if ($missingOps.Count -eq 0) {
+            Add-Pass "Contract declares create/wait/status/logs/cancel/terminate and the fake implements all six"
+        } else {
+            Add-Fail "Fake provider is missing contract operations: $($missingOps -join ', ')"
+        }
+
+        try {
+            Invoke-SquadProviderOperation -Provider $fake -Operation "resize" | Out-Null
+            Add-Fail "Off-contract operation 'resize' was dispatched instead of rejected"
+        } catch {
+            Add-Pass "Off-contract operations are rejected at the dispatch choke point"
+        }
+
+        # -- dispatch request / response shape (PRD #6) ----------------------
+        $request = New-SquadDispatchRequest -SessionId "sess-a" -Repository "octo/demo" -Ref "main" `
+            -Prompt "do the thing" -Mode "prompt" -OutputBranch "squad/sess-a" -PushChanges $true
+        $requiredRequestFields = @("schemaVersion", "sessionId", "dispatchSource", "repository", "task",
+            "capabilityManifest", "capabilityResolution", "executionPreferences", "git")
+        $missingReq = @($requiredRequestFields | Where-Object { $request.PSObject.Properties.Name -notcontains $_ })
+        if ($missingReq.Count -eq 0) {
+            Add-Pass "Dispatch request carries every PRD #6 field"
+        } else {
+            Add-Fail "Dispatch request is missing PRD #6 fields: $($missingReq -join ', ')"
+        }
+
+        $response = New-SquadDispatchResponse -SessionId "sess-a" -ExecutionMode "aca-job" -Status "provisioning" -SessionHandle "sqx1.abc"
+        $requiredResponseFields = @("executionMode", "sandboxClass", "sessionHandle", "status", "statusPollRef", "fallbackReason")
+        $missingResp = @($requiredResponseFields | Where-Object { $response.PSObject.Properties.Name -notcontains $_ })
+        if ($missingResp.Count -eq 0) {
+            Add-Pass "Dispatch response carries every PRD #6 field"
+        } else {
+            Add-Fail "Dispatch response is missing PRD #6 fields: $($missingResp -join ', ')"
+        }
+
+        # -- create ----------------------------------------------------------
+        $outcome = @{}
+        $created = @(Start-SquadExecution -Provider $fake -Request $request -Outcome $outcome)
+        if ($created.Count -eq 0) {
+            Add-Pass "create writes nothing of its own to the pipeline (substrate output passes through untouched)"
+        } else {
+            Add-Fail "create polluted the pipeline with $($created.Count) object(s); run/smoke output would change"
+        }
+        $handle = $outcome["Response"].sessionHandle
+        if ($outcome["Response"] -and $handle) {
+            Add-Pass "create returns the provider-neutral response through -Outcome"
+        } else {
+            Add-Fail "create did not return a dispatch response through -Outcome"
+        }
+
+        # -- handle opacity --------------------------------------------------
+        $status = Get-SquadExecutionStatus -Provider $fake -Handle $handle
+        $execId = $status.Display.Execution
+        if ($handle -ne $execId -and $handle -notlike "*$execId*") {
+            Add-Pass "Execution handles are opaque (the execution id is not recoverable by string inspection)"
+        } else {
+            Add-Fail "Execution handle leaks the underlying execution id '$execId'"
+        }
+
+        # -- state transitions -----------------------------------------------
+        if ($status.Status -eq "Provisioning") {
+            Add-Pass "create leaves the execution in Provisioning"
+        } else {
+            Add-Fail "create left the execution in '$($status.Status)', expected Provisioning"
+        }
+        $waited = Wait-SquadExecution -Provider $fake -Handle $handle
+        if ($waited.Status -eq "Running") {
+            Add-Pass "wait advances Provisioning -> Running"
+        } else {
+            Add-Fail "wait left the execution in '$($waited.Status)', expected Running"
+        }
+        $logLines = @(Get-SquadExecutionLog -Provider $fake -Handle $handle -Tail 10)
+        if ($logLines.Count -gt 0) {
+            Add-Pass "logs returns output for a known handle"
+        } else {
+            Add-Fail "logs returned nothing for a known handle"
+        }
+        $listed = @(Get-SquadExecutionList -Provider $fake -Limit 10)
+        if ($listed.Count -ge 1 -and $listed[0].PSObject.Properties.Name -contains "Display") {
+            Add-Pass "status (list form) returns Handle/Status/Display records"
+        } else {
+            Add-Fail "status (list form) did not return contract records"
+        }
+
+        # -- cancel, twice ----------------------------------------------------
+        Stop-SquadExecution -Provider $fake -Handle $handle | Out-Null
+        $afterCancel = Get-SquadExecutionStatus -Provider $fake -Handle $handle
+        if ($afterCancel.Status -eq "Cancelled") {
+            Add-Pass "cancel moves a running execution to Cancelled"
+        } else {
+            Add-Fail "cancel left the execution in '$($afterCancel.Status)', expected Cancelled"
+        }
+        $doubleCancelOk = $true
+        try { Stop-SquadExecution -Provider $fake -Handle $handle | Out-Null } catch { $doubleCancelOk = $false }
+        if ($doubleCancelOk) {
+            Add-Pass "cancel is safe to call twice (second cancel is a no-op success)"
+        } else {
+            Add-Fail "second cancel threw; cancel must tolerate an already-terminal execution"
+        }
+
+        # -- terminate: idempotent -------------------------------------------
+        $t1 = Remove-SquadExecution -Provider $fake -Handle $handle
+        $t2 = Remove-SquadExecution -Provider $fake -Handle $handle
+        if ($t1.Terminated -and $t2.Terminated) {
+            Add-Pass "terminate is idempotent (terminating an already-terminated execution succeeds)"
+        } else {
+            Add-Fail "terminate was not idempotent"
+        }
+
+        $outcome2 = @{}
+        Start-SquadExecution -Provider $fake -Request $request -Outcome $outcome2 | Out-Null
+        $handle2 = $outcome2["Response"].sessionHandle
+        $id2 = (Get-SquadExecutionStatus -Provider $fake -Handle $handle2).Display.Execution
+        Remove-Item -LiteralPath (Join-Path $providerTmp "$id2.json") -Force
+        $externalOk = $true
+        try {
+            $t3 = Remove-SquadExecution -Provider $fake -Handle $handle2
+            if (-not $t3.Terminated) { $externalOk = $false }
+        } catch { $externalOk = $false }
+        if ($externalOk) {
+            Add-Pass "terminate succeeds after the execution was deleted externally"
+        } else {
+            Add-Fail "terminate failed for an externally-deleted execution; PRD #6 requires success"
+        }
+
+        # -- unknown / malformed / cross-provider handles ---------------------
+        $unknownHandle = New-SquadExecutionHandle -ProviderId "fake" -Payload ([ordered]@{ id = "fake-exec-9999" })
+        try {
+            Get-SquadExecutionStatus -Provider $fake -Handle $unknownHandle | Out-Null
+            Add-Fail "status accepted a well-formed handle for an execution that does not exist"
+        } catch {
+            Add-Pass "status rejects a well-formed handle for an unknown execution"
+        }
+        try {
+            Get-SquadExecutionStatus -Provider $fake -Handle "not-a-handle" | Out-Null
+            Add-Fail "status accepted a malformed execution handle"
+        } catch {
+            Add-Pass "status rejects a malformed execution handle"
+        }
+        $foreignHandle = New-SquadExecutionHandle -ProviderId "aca-job" -Payload ([ordered]@{ job = "j"; rg = "r"; execution = "e" })
+        try {
+            Remove-SquadExecution -Provider $fake -Handle $foreignHandle | Out-Null
+            Add-Fail "terminate accepted a handle minted by a different provider"
+        } catch {
+            Add-Pass "terminate rejects a handle minted by a different provider (caller bug, not a race)"
+        }
+    } catch {
+        Add-Fail "Execution provider contract checks threw: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -Recurse -Force $providerTmp -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 8. CLI behaviour regression (offline, stubbed az/gh)
+# ---------------------------------------------------------------------------
+Write-Section "CLI behaviour regression"
+$harness = Join-Path $RepoRoot "scripts\tests\cli-stub-harness.ps1"
+$cliScript = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+if (-not (Test-Path $harness)) {
+    Add-Fail "scripts/tests/cli-stub-harness.ps1 is missing (CLI regression harness)"
+} elseif (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] CLI regression harness requires Windows (.cmd stubs)" -ForegroundColor Yellow
+} else {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment
+
+        # sessions: exact az call sequence and rendered table.
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("sessions")
+        if ($r.ExitCode -eq 0) { Add-Pass "squad-aca sessions exits 0" }
+        else { Add-Fail "squad-aca sessions exited $($r.ExitCode), expected 0" }
+        $listCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job execution list*" })
+        if ($listCall.Count -eq 1 -and $listCall[0] -like "*--name caj-squad-aca-session --resource-group rg-squad-stub*") {
+            Add-Pass "squad-aca sessions issues exactly one 'az containerapp job execution list' with the configured job/resource group"
+        } else {
+            Add-Fail "squad-aca sessions az call sequence changed: $($r.AzCalls -join ' | ')"
+        }
+        $headerCols = @("Execution", "Status", "Session", "Mode", "Repository", "Branch", "Started", "Ended")
+        $missingCols = @($headerCols | Where-Object { $r.StdOut -notmatch [regex]::Escape($_) })
+        if ($missingCols.Count -eq 0) {
+            Add-Pass "squad-aca sessions renders the original eight columns (no handle column leaked into the table)"
+        } else {
+            Add-Fail "squad-aca sessions table lost columns: $($missingCols -join ', ')"
+        }
+        if ($r.StdOut -notmatch "sqx1\.") {
+            Add-Pass "squad-aca sessions does not print opaque execution handles"
+        } else {
+            Add-Fail "squad-aca sessions leaked an opaque execution handle into user-visible output"
+        }
+
+        # logs: default tail and explicit tail must reach az unchanged.
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("logs")
+        $logCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job logs show*" })
+        if ($r.ExitCode -eq 0 -and $logCall.Count -eq 1 -and $logCall[0] -like "*--tail 100*" -and $logCall[0] -like "*--execution *") {
+            Add-Pass "squad-aca logs defaults to --tail 100 against the worker container"
+        } else {
+            Add-Fail "squad-aca logs default call changed: $($logCall -join ' | ')"
+        }
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("logs", "--tail", "5")
+        $logCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job logs show*" })
+        if ($r.ExitCode -eq 0 -and $logCall.Count -eq 1 -and $logCall[0] -like "*--tail 5*") {
+            Add-Pass "squad-aca logs --tail 5 is forwarded to az unchanged"
+        } else {
+            Add-Fail "squad-aca logs --tail 5 call changed: $($logCall -join ' | ')"
+        }
+
+        # stop: must map to az job stop (cancel), NOT to idempotent terminate.
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("stop")
+        $stopCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job stop*" })
+        if ($r.ExitCode -eq 0 -and $stopCall.Count -eq 1 -and $stopCall[0] -like "*--job-execution-name *") {
+            Add-Pass "squad-aca stop issues exactly one 'az containerapp job stop' for the resolved execution"
+        } else {
+            Add-Fail "squad-aca stop az call sequence changed: $($r.AzCalls -join ' | ')"
+        }
+
+        # Anti-regression for PR #9: a failing az stop must still surface exactly
+        # one stop call and must not be swallowed into a success path of our own.
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("stop") -StopExitCode 3
+        $stopCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job stop*" })
+        if ($stopCall.Count -eq 1 -and $r.ExitCode -eq 0) {
+            Add-Pass "squad-aca stop preserves today's pass-through behaviour when az stop fails (no swallowing, no retry)"
+        } else {
+            Add-Fail "squad-aca stop changed behaviour on az failure (calls=$($stopCall.Count), exit=$($r.ExitCode))"
+        }
+
+        # Unresolvable session: message text and exit code are observable.
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("stop", "no-such-session")
+        if ($r.ExitCode -eq 1 -and $r.StdErr -match "Could not find session or execution 'no-such-session'") {
+            Add-Pass "squad-aca stop on an unknown session keeps its error text and exit code 1"
+        } else {
+            Add-Fail "squad-aca stop on an unknown session changed (exit=$($r.ExitCode))"
+        }
+
+        # smoke: dispatch still goes through az containerapp job start.
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("smoke", "--repo", "octo/demo")
+        $startCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($r.ExitCode -eq 0 -and $startCall.Count -eq 1 -and $startCall[0] -like "*SQUAD_MODE=smoke*" -and $startCall[0] -like "*RUN_COPILOT_SMOKE=true*") {
+            Add-Pass "squad-aca smoke dispatches one 'az containerapp job start' with the smoke env-vars"
+        } else {
+            Add-Fail "squad-aca smoke dispatch changed: $($startCall -join ' | ')"
+        }
+
+        # doctor is not routed through the provider; assert it is still intact.
+        Reset-SquadCliStubLog -Stub $stub
+        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($r.ExitCode -eq 0 -and $r.StdOut -match "Azure auth" -and $r.StdOut -match "GitHub repo") {
+            Add-Pass "squad-aca doctor output is unchanged"
+        } else {
+            Add-Fail "squad-aca doctor output changed (exit=$($r.ExitCode))"
+        }
+    } catch {
+        Add-Fail "CLI behaviour regression checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
     }
 }
 
