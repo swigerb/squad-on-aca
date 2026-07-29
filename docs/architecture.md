@@ -10,6 +10,7 @@ be layered on top without changing that default.
 | --- | --- | --- |
 | Orchestration | Decide what work runs and coordinate the Squad team | Squad CLI inside the worker (`worker/entrypoint.sh`) |
 | Control plane | Dispatch sessions, sync state, inspect runs | `scripts/squad-aca.ps1`, `scripts/*.ps1` |
+| Execution provider | Provider-neutral session lifecycle (create/wait/status/logs/cancel/terminate) | `scripts/lib/squad-aca-provider.ps1`, `scripts/lib/providers/*.ps1` |
 | Execution substrate | Run each session in isolation | Azure Container Apps Jobs |
 | Telemetry sink | Collect logs/traces/metrics | Standalone Aspire Dashboard (default OTLP sink) |
 | Resource modeling (optional) | Model resources as code | .NET Aspire AppHost (`aspire/`) |
@@ -39,6 +40,95 @@ Worker container (squad-worker image) emits telemetry
 
 See [runbook.md](runbook.md) for resource details and
 [feature-parity.md](feature-parity.md) for the mapping to `squad-on-aks`.
+
+## Execution provider boundary
+
+The control plane no longer talks to an execution substrate directly. Everything
+that starts, watches, or stops a session goes through a **provider seam**:
+
+```
+scripts/squad-aca.ps1            control plane / CLI
+        │  dispatch request  (provider-neutral, PRD #6 shape)
+        ▼
+scripts/lib/squad-aca-provider.ps1        the contract
+        │  create / wait / status / logs / cancel / terminate
+        ├── scripts/lib/providers/squad-aca-job-provider.ps1   (production: ACA Jobs)
+        └── scripts/lib/providers/squad-fake-provider.ps1      (offline tests)
+```
+
+### The contract
+
+| Operation | Meaning |
+| --- | --- |
+| `create` | Dispatch a new execution from a provider-neutral request. |
+| `wait` | Block until the execution is ready (running) or terminal. |
+| `status` | List recent executions, or describe the one behind a handle. |
+| `logs` | Return an execution's logs as `Lines` plus an optional `Notice` the caller prints verbatim. Which of a substrate's log paths produced them is the provider's business. |
+| `cancel` | Ask the substrate to stop a running execution, reporting the substrate's own result. |
+| `terminate` | **Idempotent** teardown. Already-terminated, already-terminal, or externally-deleted is a success. Idempotent is not "ignore every failure": a substrate error that says nothing about the execution's state (auth, RBAC, throttling, network, wrong subscription, a missing CLI binary) must surface as an error. |
+
+`cancel` and `terminate` are deliberately different operations. `squad-aca stop`
+maps to `cancel`, because its observable contract today is "run the substrate's
+stop and show me what happened" — including failures. `terminate` is the
+idempotent teardown PRD #6 requires for cleanup paths, and is not wired to a CLI
+command yet.
+
+The ACA Job adapter classifies a failed `az containerapp job stop`
+**fail-closed**: a known real-failure signature wins over a "not found" reading,
+Azure CLI's `ResourceNotFoundError` (exit 3) and the not-found/already-terminal
+messages report `AlreadyTerminal`, and anything unrecognised is an error. It runs
+`az` through `Invoke-AzPromptSafe` (`scripts/lib/aca-logs.ps1`), which captures
+stderr and reports a distinct exit code when `az` cannot be run at all — so a
+stale `$LASTEXITCODE` from an earlier command can never be read as a successful
+stop. `scripts/validate.ps1` exercises all of this against a stubbed `az`.
+
+### Opaque handles
+
+Every operation after `create` takes an **opaque execution handle** — a `sqx1.`
+prefixed token that encodes the owning provider plus a provider-private payload.
+Opacity here is a *convention*, not a security boundary: the payload is base64
+and anyone who wants to decode it can. What the convention buys is that no call
+site can accidentally depend on "the handle is an ACA Job execution name".
+Callers must pass it back verbatim, and decoding a handle for a different
+provider is an error. Records returned by `status` keep the handle separate from
+a `Display` object, so the CLI renders substrate-shaped columns without any call
+site being able to round-trip an identifier out of them.
+
+### Request and response
+
+The dispatch request carries `schemaVersion`, `sessionId`, `dispatchSource`,
+`repository`, `task`, `capabilityManifest`, `capabilityResolution`,
+`executionPreferences`, and `git` — nothing in it names an Azure resource, an
+image, a job, or a sandbox. The response carries `executionMode`,
+`sandboxClass`, `sessionHandle`, `status`, `statusPollRef`, and
+`fallbackReason`. `capabilityResolution` is the slot the Sprint 2 capability
+resolver fills; the seam passes `$null` today.
+
+`create` never writes its own response to the pipeline — it returns it through an
+`-Outcome` hashtable — so substrate dispatch output still passes through to the
+user byte for byte.
+
+The ACA Job adapter's `logs` operation delegates to `Get-AcaExecutionLog`
+(`scripts/lib/aca-logs.ps1`), which prefers the `containerapp` CLI extension,
+falls back to Log Analytics, and throws when both fail (issue #13). The seam
+does not change that behaviour; it only moves the decision of *how* to fetch
+logs behind the provider, leaving `Invoke-Logs` responsible for presentation.
+`scripts/lib/squad-aca-provider.ps1` dot-sources `aca-logs.ps1` itself, so the
+adapter's `logs` and `terminate` operations do not depend on the caller having
+loaded it first.
+
+### What is deliberately *not* behind the seam
+
+`Assert-AcaConfigured`, `doctor`, `ralph`, `watch`, `secrets`, `destroy`,
+`status`, and `new` still call `az`/`gh` directly. They are infrastructure and
+configuration-plane operations, not per-execution lifecycle, so routing them
+through an execution provider would add risk without helping a future substrate.
+
+### Extension point
+
+`New-SquadExecutionProvider -Kind` accepts `aca-job` and `fake` today. A
+Sandboxes provider plugs in there without touching CLI plumbing. Sandboxes are
+**not** implemented yet.
 
 ## Optional .NET/Aspire integration path
 

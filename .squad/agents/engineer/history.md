@@ -47,6 +47,73 @@ separators), so the PowerShell CI job runs on `windows-latest` rather than
 `ubuntu-latest`. Making it cross-platform is a control-plane change, out of
 scope for a tests/CI/docs-only sprint; recorded as a follow-up in
 `docs/validation.md`.
+## 2026-07-29: Sprint 3 - provider-neutral execution boundary (issue #6)
+
+**Branch:** `squad/6-s3-provider-abstraction`
+
+Introduced the execution provider seam PRD #6 needs before a Sandboxes provider
+can exist. Sprint 3 is a **zero-observable-behaviour-change** sprint: the seam
+goes in, nothing a user sees moves.
+
+- **Contract.** `scripts/lib/squad-aca-provider.ps1` defines six operations -
+  `create` / `wait` / `status` / `logs` / `cancel` / `terminate` - dispatched
+  through one choke point (`Invoke-SquadProviderOperation`) so an off-contract
+  operation cannot be called. Includes the PRD #6 request
+  (`schemaVersion`, `sessionId`, `dispatchSource`, `repository`, `task`,
+  `capabilityManifest`, `capabilityResolution`, `executionPreferences`, `git`)
+  and response (`executionMode`, `sandboxClass`, `sessionHandle`, `status`,
+  `statusPollRef`, `fallbackReason`).
+- **Opaque handles.** `sqx1.`-prefixed tokens encoding provider id + a
+  provider-private payload. Decoding rejects malformed handles and handles
+  minted by another provider, so no call site can assume a handle is an ACA Job
+  execution name.
+- **ACA Job adapter.** `scripts/lib/providers/squad-aca-job-provider.ps1`
+  preserves today's behaviour exactly. `create` and `cancel` write nothing of
+  their own to the pipeline so substrate output still passes through untouched;
+  records keep the opaque handle separate from a `Display` object so
+  `squad-aca sessions` renders the same eight columns.
+- **Fake provider.** `scripts/lib/providers/squad-fake-provider.ps1` - state in
+  JSON files, no network, no clock dependence, `wait` never sleeps. This is what
+  makes Sprint 5 testable without a live subscription.
+- **`cancel` vs `terminate`.** `squad-aca stop` maps to `cancel` (substrate
+  semantics, failures passed through). `terminate` is the idempotent teardown
+  PRD #6 requires and is deliberately **not** wired to a CLI command this
+  sprint. Conflating the two is what produced the PR #9 `stop` regression.
+- **CLI routed through the seam:** `run`, `smoke`, `telemetry smoke`,
+  `sessions`, `logs`, `stop`, `open`. Left alone on purpose:
+  `Assert-AcaConfigured`, `doctor`, `ralph`, `watch`, `secrets`, `destroy`,
+  `status`, `new` - infrastructure/config-plane calls, not per-execution
+  lifecycle, so moving them adds risk with no Sprint 5 payoff.
+- **No Sandboxes code.** `New-SquadExecutionProvider -Kind` accepts `aca-job`
+  and `fake` only. No `aca` binary invocation, no feature flag.
+
+**Evidence.**
+
+Differential CLI capture: `git archive main scripts` materialised main's
+scripts; a 22-case harness ran both revisions under stub `az`/`gh` binaries
+(fake `HOME`, synthetic config, local bare-repo `origin` for the `run` cases)
+recording exit code, stdout, stderr, and every `az`/`gh` argv. **19 of 22 cases
+are byte-identical by SHA-256.** The 3 that differ (`stop` on an unknown
+session, `secrets` usage error, `run` with no prompt) differ **only** in the
+source line number PowerShell prints in its own error-record annotation
+(`squad-aca.ps1:528` -> `:538`); the exception text, exit code, and az/gh call
+sequences match exactly. Normalising that annotation gives **22 of 22
+identical**. Line numbers shift whenever a file gains lines, so this is not
+removable without freezing the file layout.
+
+`scripts/validate.ps1`: before 35 passed / 0 failed, after **70 passed / 0
+failed** - 20 new provider contract checks (section 7) and 11 new CLI
+regression checks (section 8), the latter driving the real CLI against stub
+`az`/`gh` and asserting exit codes, rendered columns, and exact az call
+sequences. Worker suite unchanged: **5 suites / 179 assertions
+(11/62/40/23/43), 0 failed, 0 skipped.**
+
+**Not done:** no bash suite was added. The worker CI job fails on any SKIP, and
+a PowerShell-dependent suite would skip on a runner without `pwsh`; the new
+PowerShell tests therefore live in `validate.ps1`, which CI already runs on
+`windows-latest`. Section 8 skips (does not fail) on non-Windows because the
+stub binaries are `.cmd` - the same Windows-only constraint `validate.ps1`
+already carries.
 
 ## 2026-07-28: `squad-aca logs` exit-code + Log Analytics fallback (issue #13)
 
@@ -160,3 +227,29 @@ preflight's hardened manifest-path resolution, because modifying the shipped
 preflight was out of scope; unifying them is recorded as a follow-up in
 `docs/capability-manifest.md`. The catalog remains `provisional: true` and must
 be reviewed before Sprint 5 acts on any decision.
+### Sprint 3 addendum: merged `main` (Sprints 2 and 4, plus the #16 logs fix)
+
+`main` advanced from `742e20e` to `9fe6823` mid-sprint (#14 Sandboxes
+feasibility, #15 capability routing, #16 `squad-aca logs` exit-code and Log
+Analytics fallback). #16 rewrote the exact `Invoke-Logs` body this sprint
+routed through the provider, so `main` was merged in rather than left to
+conflict - shipping the seam unmerged would have silently reverted the #13
+fix.
+
+Resolution: the ACA Job adapter's `logs` operation now delegates to
+`Get-AcaExecutionLog` (`scripts/lib/aca-logs.ps1`), keeping the extension ->
+Log Analytics -> throw behaviour intact, and the contract's `logs` operation
+returns a provider-neutral `Lines` + optional `Notice` result instead of
+streaming. `Invoke-Logs` keeps the presentation (fallback notice, empty-result
+warning, line output); the provider owns the fetch.
+
+Re-verified after the merge:
+- `compare-cli-baseline.ps1 -BaselineRef main` (now `9fe6823`): **19/22
+  byte-identical, 22/22 identical ignoring PowerShell's error-record line
+  annotation**, exit 0.
+- `compare-cli-baseline.ps1 -BaselineRef 742e20e` (the pre-merge branch base):
+  same result, exit 0 - Sprint 3 in isolation was already clean.
+- `scripts/validate.ps1`: **86 passed / 0 failed** (35 at Sprint 0, 71 after
+  Sprint 3's own sections, 86 once #16's 15 logs checks merged in).
+- Worker suite: **6 suites / 302 assertions (123/11/62/40/23/43), 0 failed, 0
+  skipped** - unchanged from `main`; this sprint added no bash tests.

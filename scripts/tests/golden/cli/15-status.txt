@@ -1,0 +1,30 @@
+### CASE 15-status: squad-aca status
+### EXITCODE: 0
+### AZ CALLS
+account set --subscription 00000000-0000-0000-0000-000000000000
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
+containerapp list --resource-group rg-squad-stub --query [].{name:name,provisioningState:properties.provisioningState,runningStatus:properties.runningStatus,fqdn:properties.configuration.ingress.fqdn} -o table
+containerapp job execution list --name caj-squad-aca-session --resource-group rg-squad-stub --query [0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime} -o table
+containerapp job execution list --name caj-squad-aca-ralph --resource-group rg-squad-stub --query [0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime} -o table
+containerapp show --name ca-squad-aca-aspire --resource-group rg-squad-stub --query properties.configuration.ingress.fqdn -o tsv
+### GH CALLS
+### SQUAD CALLS
+### STDOUT
+Container Apps:
+
+Recent job executions:
+[
+  "caj-squad-aca-session-stub01",
+  "caj-squad-aca-session-stub02"
+]
+
+Recent Ralph executions:
+[
+  "caj-squad-aca-session-stub01",
+  "caj-squad-aca-session-stub02"
+]
+
+Aspire dashboard: https://
+
+### STDERR
+

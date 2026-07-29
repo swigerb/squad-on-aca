@@ -1,0 +1,18 @@
+### CASE 05-logs-byname: squad-aca logs stub-session --tail 5
+### EXITCODE: 0
+### AZ CALLS
+account set --subscription 00000000-0000-0000-0000-000000000000
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
+containerapp job execution list --name caj-squad-aca-session --resource-group rg-squad-stub --query [0:50].name -o json
+containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub01 -o json
+containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub02 -o json
+extension show --name containerapp --only-show-errors -o none
+containerapp job logs show --name caj-squad-aca-session --resource-group rg-squad-stub --execution caj-squad-aca-session-stub01 --container caj-squad-aca-session --tail 5 --only-show-errors
+### GH CALLS
+### SQUAD CALLS
+### STDOUT
+STUB-LOG-LINE-1
+STUB-LOG-LINE-2
+
+### STDERR
+

@@ -1,0 +1,19 @@
+### CASE 19-run-nopush: squad-aca run Do the thing --name fixedtwo --no-push --sub-squad alpha
+### EXITCODE: 0
+### AZ CALLS
+account set --subscription 00000000-0000-0000-0000-000000000000
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query properties.template.containers[0].env -o json
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query properties.template.containers[0] -o json
+containerapp job start --name caj-squad-aca-session --resource-group rg-squad-stub --image ghcr.io/example/squad-worker:stub --cpu 1 --memory 2.0Gi --container-name squad-worker --env-vars ASPIRE_OTLP_GRPC_ENDPOINT=http://ca-squad-aca-aspire:18889 GITHUB_REPOSITORY=octo/demo GITHUB_REF=main SQUAD_MODE=prompt SESSION_NAME=fixedtwo SQUAD_DEPLOYMENT_MODE=squad-per-pod SQUAD_POD_ID=fixedtwo OTEL_SERVICE_NAME=squad-fixedtwo ENABLE_GITHUB_REMOTE=true GITHUB_TOKEN=secretref:github-token COPILOT_GITHUB_TOKEN=secretref:copilot-github-token OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers "SQUAD_PROMPT=Do the thing" SQUAD_TEAM=alpha OUTPUT_BRANCH=squad/fixedtwo
+### GH CALLS
+repo view --json nameWithOwner --jq .nameWithOwner
+auth status
+auth setup-git
+### SQUAD CALLS
+### STDOUT
+STUB-START-ACK
+
+### STDERR
+Everything up-to-date
+

@@ -28,6 +28,10 @@ pre-push hook.
 | Sync guard enumeration | Asserts `Test-SyncSafety` (`scripts/lib/sync-safety.ps1`) uses repository-rooted, byte-safe NUL-delimited `git diff`/`git ls-files` enumeration with ordinal path de-duplication, then runs the real guard against a throwaway repo with nested, ignored, non-ASCII, and newline-parser regression cases | Proves every file `git add -A` would stage is scanned before `--sync-all`, including nested untracked files and quoted/escaped paths, while git-ignored files stay excluded |
 | Logs fallback + exit code | Drives `Get-AcaExecutionLog` (`scripts/lib/aca-logs.ps1`) against a fake `az` placed first on `PATH`: extension present, extension absent, extension call failing, Log Analytics query failing, both paths unavailable, and a child-process exit-code assertion. Also re-runs the Log Analytics path under Windows PowerShell 5.1, the host the `squad-aca` shim uses | Regression guard for issue #13: `logs` must never exit 0 after a failed fetch, must never trigger the interactive extension-install prompt, and must fall back to Log Analytics when the `containerapp` extension is unavailable |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
+| Execution provider contract | Exercises `scripts/lib/squad-aca-provider.ps1` offline against the filesystem-backed fake provider: create/wait/status/logs/cancel/terminate state transitions, idempotent `terminate` (repeat and after external deletion), double `cancel`, handle opacity, and rejection of unknown, malformed, and foreign-provider handles | Proves the provider seam behaves per PRD #6 with no Azure subscription, so a future Sandboxes provider can be developed and tested offline |
+| ACA Job adapter | Drives the **production** adapter (`scripts/lib/providers/squad-aca-job-provider.ps1`) against the fake `az` from `scripts/tests/cli-stub-harness.ps1`: `terminate` on a live execution, on an already-terminal/not-found one, under an auth failure, under RBAC/throttling/network/wrong-subscription/unrecognised failures, and with no `az` on `PATH`; plus `wait` polling `Provisioning -> Running` and timing out on an execution that never becomes ready | The fake provider proves the seam, not the adapter that ships. `terminate` used to return `Terminated = $true` for *every* non-zero `az` exit and label it `AlreadyTerminal`, so an auth failure read as a successful teardown; these checks fail if that returns |
+| CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, **stdout content**, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through output and exit code when `az` fails |
+| CLI golden gate wiring | Asserts every capture case in `scripts/tests/cli-capture-cases.ps1` has a committed golden, that the `stop` golden records `az` stdout, and that `.github/workflows/worker-tests.yml` actually runs `verify-cli-golden.ps1` | A guard that is not automated is not a guard; PR #9's regression class shipped once because the only stdout-comparing tool was a manual one |
 | Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, the capability routing decision, preflight contract, Ralph transactional dispatch, and the harness itself |
 
 The capability manifest contract itself is documented in
@@ -36,6 +40,110 @@ tool/credential allowlists, the advisory-only handling of `services`/`egress`
 (required services are rejected at validation), the routing contract and
 administrator sandbox class catalog, and the entrypoint fail-closed
 behavior when the packaged preflight script is missing.
+
+## Proving the CLI has not changed
+
+Two guards drive the same 22-invocation matrix (`scripts/tests/cli-capture-cases.ps1`)
+through the stubbed `az`/`gh`/`squad` environment. A capture records the exit
+code, every recorded `az`/`gh`/`squad` argv, **stdout**, and stderr — stdout
+deliberately, because PR #9 was closed for an observable `stop` output
+regression and a guard that only counts `az` calls cannot see one. Neither
+touches Azure, GitHub, or the network.
+
+### Golden gate (automated, runs in CI)
+
+```powershell
+pwsh -NoProfile -File .\scripts\tests\verify-cli-golden.ps1           # verify
+pwsh -NoProfile -File .\scripts\tests\verify-cli-golden.ps1 -Update   # regenerate
+```
+
+Captures are compared against files committed under `scripts/tests/golden/cli/`,
+the same pattern the worker suite uses for routing decisions. The
+`powershell-validation` job in `.github/workflows/worker-tests.yml` runs the
+verify form on every push and pull request, so a change to what `squad-aca`
+prints fails a job instead of reaching review unnoticed. An **intended** CLI
+change is a reviewable diff: regenerate with `-Update`, read the diff, commit it.
+
+#### What makes a golden portable
+
+The first CI run of this gate failed on two environment dependencies that a
+single-machine capture cannot expose: rendered timestamps moved with the host
+time zone, and `doctor`'s `squad` row read `ok` on a machine with Squad
+installed and `optional` on the runner — and because `Format-Table -AutoSize`
+sizes each column to its widest cell, that one word re-padded every row of the
+table. Both are now **pinned at the source** rather than masked, because a mask
+throws away the value it hides:
+
+| Environment dependence | How it is pinned | Where |
+| --- | --- | --- |
+| Host time zone | The stub `az` execution fixtures carry an **offset-free** `startTime`. `ConvertFrom-Json` parses an offset-bearing instant as `Kind=Local` and `sessions` would then render it in the host's zone; offset-free parses as `Kind=Unspecified`, so no conversion happens and every machine renders the identical wall clock. The `Started` column is still compared character for character. | `cli-stub-harness.ps1` |
+| Host culture (date/number formats) | The CLI child process is started with `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`, so output renders under the invariant culture instead of the machine's locale. .NET honours this on Windows, where there is no per-process culture or time-zone override. | `cli-stub-harness.ps1` |
+| Optional tool availability | `squad` is stubbed onto PATH next to the `az`/`gh` shims, so `doctor` reports it installed on every machine. The stub logs its argv like the others, so if a command ever starts shelling out to `squad` that is a visible capture diff, not a silent change. | `cli-stub-harness.ps1` |
+
+What is left genuinely cannot be pinned, so it is masked. This is the
+**complete** list of masks applied to a golden (`Get-NormalizedCapture` and
+`Get-PortableCapture` in `cli-capture-cases.ps1`):
+
+1. `<TS>` — timestamps of the form `yyyyMMdd-HHmmss` (generated session/branch names).
+2. `<SCRIPTS>` — the absolute path of the `scripts/` tree under capture.
+3. `<STUB>` — the GUID in the throwaway stub root directory name.
+4. `<LINE>` — the line number in a `squad-aca.ps1:<n>` error header.
+5. `<TMP>` — the temp root (`GetTempPath()`, `%TEMP%`, `%TMP%`, and the 8.3 form `C:\Users\X~1\AppData\Local\Temp`).
+6. `<HOME>` — the user profile root (`%USERPROFILE%`, `$HOME`, and any `C:\Users\<name>` prefix).
+7. `<SHA>` — 40-hex git object ids from the stub repo's throwaway commits.
+8. ANSI SGR colour sequences (PowerShell 7 colourises error records) are deleted.
+9. PowerShell's error-record source decoration — the `Line |` header, the `<LINE> |` echo of the offending source line, and its `|  ~~~~` caret underline — is dropped. Its content is truncated to the host console width, so it is not portable. The `Exception: <file>:<line>` header, the message text, and the exit code are kept.
+10. CRLF is folded to LF.
+
+Nothing else is touched. Exit codes, every recorded `az`/`gh`/`squad` argv, and
+all message text — including the `az containerapp job stop` stdout that PR #9
+lost — are compared byte for byte.
+
+Generate and verify goldens with **PowerShell 7** (`pwsh`), the host CI uses;
+Windows PowerShell 5.1 renders error records differently. The goldens are
+LF-normalized via `.gitattributes` (`scripts/tests/golden/cli/*.txt text eol=lf`)
+so a Windows checkout does not diff on line endings.
+
+Before pushing a change to the harness or the goldens, reproduce the runner's
+environment locally — the whole point of this section is that passing on one
+machine proves nothing:
+
+```powershell
+# CI runs in UTC and has no `squad` installed.
+$orig = (tzutil /g)
+try {
+    tzutil /s "UTC"
+    pwsh -NoProfile -Command @'
+$env:PATH = (($env:PATH -split ';') | Where-Object { $_ -notlike '*npm*' }) -join ';'
+./scripts/tests/verify-cli-golden.ps1
+'@
+} finally { tzutil /s "$orig" }
+```
+
+### Differential capture (manual, strongest claim)
+
+When a change touches the control plane — particularly the execution provider
+seam — also prove the stronger claim against another revision:
+
+```powershell
+pwsh -NoProfile -File .\scripts\tests\compare-cli-baseline.ps1 -BaselineRef main
+```
+
+It materialises the baseline revision's `scripts/` with `git archive`, drives
+both revisions through the same stub environment (`help`, `sessions`, `logs`,
+`stop`, `smoke`, `telemetry smoke`, `status`, `doctor`, `run`, `sync`, plus
+failure paths), and compares exit code, stdout, stderr, and every recorded
+`az`/`gh`/`squad` argv. It exits non-zero if observable behaviour differs.
+
+This one stays a developer tool rather than a CI gate: it needs a second
+revision materialised, and it fails permanently once a CLI change is *intended*.
+
+It reports two counts. The raw count is byte-for-byte. The second ignores the
+two things that cannot survive a refactor: PowerShell annotates an uncaught
+error with the **source line number** of the `throw`, so any change to a file's
+length shifts that annotation, and PowerShell 7 wraps error records in **ANSI
+SGR colour sequences**. The exception text, exit code, and call sequences are
+still compared unnormalised.
 
 ## Worker test harness guarantees
 
@@ -176,6 +284,13 @@ Run these in order. Static checks first (fast, no Azure), then E2E.
 ### 1. Static (no Azure required)
 
 - [ ] `.\scripts\validate.ps1` passes.
+- [ ] The **Execution provider contract** and **CLI behaviour regression**
+      sections of `validate.ps1` report 0 failures. Any change to
+      `scripts/squad-aca.ps1` must keep the CLI regression section green — it is
+      the guard against a behaviour change slipping in behind the provider seam.
+- [ ] If the sprint touched the control plane,
+      `.\scripts\tests\compare-cli-baseline.ps1 -BaselineRef main` exits 0 (see
+      [Proving the CLI has not changed](#proving-the-cli-has-not-changed)).
 - [ ] `bash -n worker/entrypoint.sh` passes (also covered by validate.ps1).
 - [ ] `node --check worker/lib/parse-capabilities.js` passes.
 - [ ] `node --check worker/lib/resolve-capability-route.js` passes and

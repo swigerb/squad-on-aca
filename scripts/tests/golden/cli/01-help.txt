@@ -1,0 +1,46 @@
+### CASE 01-help: squad-aca help
+### EXITCODE: 0
+### AZ CALLS
+### GH CALLS
+### SQUAD CALLS
+### STDOUT
+Squad on ACA
+
+Usage:
+  squad-aca init [--owner <github-owner>] [--name <repo-name>] [--public|--private]
+  squad-aca run "prompt" [--repo <owner/repo>] [--name <session>] [--branch <branch>] [--no-push]
+  squad-aca "prompt"
+  squad-aca new --owner <github-owner> --name <repo-name> [--description "..."]
+  squad-aca smoke [--repo <owner/repo>]
+  squad-aca status
+  squad-aca doctor
+  squad-aca sessions [--limit 10]
+  squad-aca logs <session-or-execution> [--tail 100]
+  squad-aca stop <session-or-execution>
+  squad-aca open [session-or-execution]
+  squad-aca sync [--sync-all|--dry-run]
+  squad-aca watch <start|stop|status> [--repo <owner/repo>]
+  squad-aca ralph <status|run|pause|resume>
+  squad-aca subsquad <list|activate|run> [name] ["prompt"]
+  squad-aca upgrade [--deploy]
+  squad-aca telemetry smoke
+  squad-aca secrets rotate [--github-token <token>] [--copilot-token <token>]
+  squad-aca destroy --yes
+  squad-aca export [file]
+  squad-aca import <file>
+  squad-aca dashboard
+  squad-aca configure --resource-group <rg> --session-job <job> [--subscription <id>]
+  squad-aca install-agent
+  squad-aca install-command
+
+Typical existing repo flow:
+  cd my-existing-squad-repo
+  squad-aca "Build the feature and open a PR"
+
+Typical new repo flow:
+  mkdir my-app; cd my-app
+  squad-aca init --owner my-github-user --name my-app
+  copilot --agent squad-aca
+
+### STDERR
+
