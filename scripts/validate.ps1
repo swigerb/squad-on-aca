@@ -1159,17 +1159,20 @@ if (-not (Test-Path $providerLib)) {
         Reset-SquadCliStubLog -Stub $adapterStub
         $env:SQUAD_STUB_EXEC_STUCK = "1"
         $stuckThrew = $false
+        $stuckError = ""
         $stuckStatus = ""
         try {
             $stuckStatus = (Wait-SquadExecution -Provider $acaAdapter -Handle $acaHandle -TimeoutSeconds 1 -PollSeconds 1).Status
         } catch {
             $stuckThrew = $true
+            $stuckError = [string]$_.Exception.Message
         }
         $env:SQUAD_STUB_EXEC_STUCK = ""
-        if ($stuckThrew) {
-            Add-Pass "ACA adapter wait times out instead of returning a still-Provisioning execution as ready"
+        $stuckPolls = @(Get-SquadCliStubCall -Stub $adapterStub -Tool az | Where-Object { $_ -like "containerapp job execution show*" })
+        if ($stuckThrew -and $stuckError -match "Timed out" -and $stuckPolls.Count -ge 1) {
+            Add-Pass "ACA adapter wait polls, then times out instead of returning a still-Provisioning execution as ready"
         } else {
-            Add-Fail "ACA adapter wait returned status '$stuckStatus' for an execution that never left Provisioning"
+            Add-Fail "ACA adapter wait did not time out on a never-ready execution (status=$stuckStatus polls=$($stuckPolls.Count) error=$stuckError)"
         }
     } catch {
         Add-Fail "ACA Job adapter checks threw: $($_.Exception.Message)"
