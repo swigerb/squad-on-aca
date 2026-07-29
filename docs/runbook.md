@@ -143,6 +143,7 @@ Both tiers get `--allow-all-tools` (the CLI documents it as required for non-int
 | `--no-ask-user` (cannot block on a prompt) | no | **yes** |
 | writes outside the checkout | denied | denied |
 | writes to a governance path | denied | denied |
+| appends to `.squad/agents/<name>/history.md` | allowed (append-only) | allowed (append-only) |
 
 Destructive infrastructure verbs are **unavailable** to an unattended run rather than approval-gated, because there is no one to approve them. On an attended run they remain available and are gated by the human who started it.
 
@@ -152,7 +153,35 @@ These are made read-only before the agent starts and their SHA-256 hashes are re
 
 `.squad/policies`, `.squad/agents`, `.squad/identity`, `.squad/config.json`, `.squad/routing.md`, `.squad/casting-policy.json`, `.squad/casting/policy.json`, `.squad/memory/config.json`, `.squad/memory/audit.jsonl`, `.squad/fact-checker/policy.md`, `.squad/fact-checker/audit-trail.md`, `.squad/rai/policy.md`, `.squad/rai/audit-trail.md`
 
-The set is identical for both tiers. **An autonomous session can no longer append to `.squad/agents/<name>/history.md`** — that is a deliberate behaviour change, not an oversight. Agent history is governance state, and a run that can rewrite the record of what it did is not auditable. Record session outcomes in the issue, the PR, or `.squad/decisions.md` instead.
+The set is identical for both tiers.
+
+#### The one exclusion: agent history is append-only, not locked
+
+`.squad/agents/<name>/history.md` is **excluded from the write lock**, so an autonomous run *can* append to its own work log. Nothing else under `.squad/agents/` is excluded — in particular `.squad/agents/<name>/charter.md` stays locked, because a charter defines what an agent is *permitted to do* and is squarely governance.
+
+The reasoning, recorded here so the exception is not later mistaken for an oversight and "fixed" back:
+
+- `history.md` is an **append-only work log**, not policy. It records what an agent *did*; it grants an agent nothing.
+- Locking it therefore prevents **no** privilege escalation. What it does prevent is the run recording what it did — it destroys the audit trail PRD #6 explicitly asks for ("every lifecycle event is correlated by one stable session/run ID", and auditability generally).
+- Ralph and Watch are autonomous by definition. "A human can write it up afterwards" is not available on exactly the paths where the record matters most.
+
+Excluded from the *lock* does **not** mean excluded from the *check*. A path that neither layer covers is a foothold, so history stays in the integrity manifest under a different rule:
+
+| | locked governance paths | `.squad/agents/<name>/history.md` |
+| --- | --- | --- |
+| Mode bits | `a-w` | `u+w` on the **file only** |
+| Containing directory | `a-w` | `a-w` — unchanged |
+| Manifest line | `file <path> <sha256>` | `append-only <path> <sha256> <bytes>` |
+| Rule at verification | must be byte-identical | may **grow**; the first `<bytes>` bytes must still hash to `<sha256>` |
+| A permitted change | none | logged as `Agent history appended (permitted): … +N bytes` |
+| Truncation / rewrite / deletion | exit 78 | exit 78 |
+
+Two consequences worth knowing before you file a bug about them:
+
+- **The agent directory does not open.** Hardening runs `chmod -R a-w` over `.squad/agents` *first*, then puts `u+w` back on the matching files. `chmod` on a file needs ownership, not write permission on its parent, so `.squad/agents/<name>/` stays mode-locked and still refuses `creat()` and `unlink()`. A run can append to `history.md`; it cannot create a file beside it, delete one, add a new agent directory, or touch `charter.md`.
+- **A run may append to history, not mint it.** A `history.md` that did not exist when the session started is a *new governance file* and fails the session, exactly like any other. If you add an agent, seed its `history.md` in the same reviewed PR that adds its charter.
+
+Nothing else changed: an autonomous session still cannot write `.squad/policies`, `.squad/identity`, `.squad/config.json`, `.squad/routing.md`, or any memory/approval/audit state. Record decisions in the issue, the PR, or `.squad/decisions.md` as before.
 
 ### Operator extras
 
@@ -172,6 +201,9 @@ All policy output is prefixed `[squad-policy]` in the session log (`.\scripts\lo
 | `Could not create a private policy state directory outside the checkout` | `$HOME` is unset or unwritable in the container | check the job's user and `HOME`; the baseline must not live inside the repository |
 | `GOVERNANCE VIOLATION: a protected path changed during this session` | the agent modified a governance file | the following `+`/`-` lines name the exact files; nothing was pushed. Make the change yourself in a reviewed PR |
 | `GOVERNANCE VIOLATION: protected path(s) changed in commits made during this session` | the change was committed rather than left in the working tree | same — the commit is still local to the dead container |
+| `GOVERNANCE VIOLATION: … was REWRITTEN, not appended to` | the run edited or truncated an agent's `history.md` instead of appending to it | history is append-only; the bytes recorded before the session started must still be there. Re-run appending, or make the edit yourself in a reviewed PR |
+| `GOVERNANCE VIOLATION: the work log … did not exist when this session started` | the run created a `history.md` for an agent that had none | a session may append to history, not mint it. Seed the file in the PR that adds the agent |
+| `Agent history appended (permitted): … +N bytes` | informational — the audit trail grew by `N` bytes and the prior content is intact | none; this is the exclusion working as intended |
 | `Permission denied` writing under `.squad/` in agent output | the agent tried to edit governance state | expected; the agent should route the change through a PR |
 | `NOT enforced on this path: shell(git config) …` | informational, on `squad watch` / `squad loop` only | see the limitation note below; governance enforcement is unaffected |
 
@@ -180,6 +212,13 @@ To see the tier a session chose without running it:
 ```powershell
 $env:SQUAD_MODE = "ralph"; $env:SQUAD_DISPATCH_SOURCE = "ralph"
 node .\worker\lib\agent-policy.js json
+```
+
+To ask whether a specific path is locked or append-only — the same question the worker asks, from the same resolver:
+
+```powershell
+node .\worker\lib\agent-policy.js classify-governance-path .squad/agents/security/history.md   # append-only
+node .\worker\lib\agent-policy.js classify-governance-path .squad/agents/security/charter.md   # locked
 ```
 
 ## Deploy

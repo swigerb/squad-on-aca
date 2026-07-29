@@ -231,6 +231,42 @@ assert_eq "$(policy prompt local-cli '' aca-job governance-paths)" "$gov" \
   "the protected set is identical for attended and autonomous runs"
 
 # ---------------------------------------------------------------------------
+# 6b. The append-only exclusion
+# ---------------------------------------------------------------------------
+# `.squad/agents/<name>/history.md` is an append-only WORK LOG, not policy.
+# Excluding it from the write lock is what lets an autonomous run record what it
+# did; the exclusion is only safe while it is anchored at BOTH ends, because one
+# segment of slack re-opens `charter.md`, which is what an agent is permitted to
+# do. The resolver owns the pattern, so the resolver is where it is asserted.
+echo "-- append-only exclusion --"
+
+pat="$(policy ralph ralph '' aca-job mutable-governance-patterns)"
+assert_eq "^\\.squad/agents/[^/]+/history\\.md\$" "$pat" \
+  "the resolver publishes exactly one, fully anchored, append-only pattern"
+assert_eq "$(policy prompt local-cli '' aca-job mutable-governance-patterns)" "$pat" \
+  "the append-only exclusion is identical for attended and autonomous runs"
+
+classify_path() {
+  policy ralph ralph '' aca-job classify-governance-path "$1"
+}
+assert_eq "append-only" "$(classify_path '.squad/agents/security/history.md')" \
+  "an agent's own history file is append-only, so an autonomous run can record what it did"
+assert_eq "append-only" "$(classify_path '.squad\agents\security\history.md')" \
+  "a Windows-shaped path classifies the same way, so the boundary does not depend on who produced the path"
+for locked in \
+  '.squad/agents/security/charter.md' \
+  '.squad/agents/security/history.md.bak' \
+  '.squad/agents/security/sub/history.md' \
+  '.squad/agents/history.md' \
+  '.squad/policies/history.md' \
+  '.squad/config.json'
+do
+  assert_eq "locked" "$(classify_path "$locked")" "${locked} stays locked"
+done
+assert_eq "78" "$(policy_status ralph ralph '' aca-job classify-governance-path '')" \
+  "classifying an empty path exits 78 rather than answering for it"
+
+# ---------------------------------------------------------------------------
 # 7. Determinism
 # ---------------------------------------------------------------------------
 echo "-- determinism --"

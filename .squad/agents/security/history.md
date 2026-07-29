@@ -600,3 +600,85 @@ written, and only reading the pinned binary's own help - and then running it -
 revealed which. The related habit: when a mutation you expected to be caught
 isn't, the first hypothesis should be that the control does less than its comment
 claims, not that the test is weak.
+
+## Issue #26 follow-up: narrowing the governance lock so an agent can still record what it did
+
+**What I flagged, and what the owner decided.** Locking `.squad/agents` wholesale
+meant an autonomous ACA run could no longer append to
+`.squad/agents/<name>/history.md`. I surfaced that as a deliberate behaviour
+change rather than quietly exempting it. The owner's decision: narrow the lock.
+The reasoning is worth keeping, because the exception will look like an oversight
+to whoever reads it next. `history.md` is an **append-only work log**, not
+policy. It records what an agent *did*; it grants an agent nothing. Locking it
+prevents **no** privilege escalation - it only destroys the audit trail PRD #6
+asks for, on exactly the unattended paths (Ralph, Watch) where nobody else is
+around to write the record. A charter is the opposite: it states what an agent is
+*permitted to do*. That distinction - *log of what happened* versus *statement of
+what is allowed* - is where the boundary now sits.
+
+**What is excluded.** Exactly `^\.squad/agents/[^/]+/history\.md$`, anchored at
+both ends. Not `.squad/agents/**`. `charter.md` beside it,
+`.squad/agents/history.md`, `a/b/history.md` and `history.md.bak` all stay
+locked, and each of those is a named assertion rather than a claim.
+
+**The part I nearly got wrong: the directory.** `history.md` sits inside a
+directory whose other contents are locked, so the real question was not "can the
+run append?" but "does unlocking the file unlock the directory?". It must not, or
+"history is writable" becomes "the agents directory is writable" and an agent can
+add or delete files beside a charter it cannot edit. The answer is ordering, not
+exclusion: hardening runs `chmod -R a-w` over `.squad/agents` **first** and only
+then restores `u+w` on the matching files. `chmod` on a file needs ownership, not
+write on its parent, so the file opens and the directory does not. Expressing it
+the other way round - excluding the path from the recursive `chmod` - could not
+have produced that shape, because the directory would have had to be writable for
+the file to be creatable. Create, delete, new-agent-directory and charter-write
+are each asserted against a real hardened filesystem.
+
+**The detector: I did not drop history from the manifest.** A path excluded from
+both the lock and the integrity check is a foothold. History stays in the
+baseline under a different rule - `append-only <path> <sha256> <bytes>` instead of
+`file <path> <sha256>` - and verification re-hashes the first `<bytes>` bytes. An
+append passes and is **reported with its byte delta**; a truncation, a rewrite
+(even a longer one, which a size-only check would wave through), a deletion, or a
+history file that did not exist at hardening time all fail the session at 78.
+
+**I chose to add the append-only check rather than call it over-engineering.**
+The argument for skipping it is that a work log is low-value. The argument
+against - which won - is that the *stated reason* for unlocking the file is that
+it is the audit trail, and an audit trail an agent can rewrite is not one; the
+exclusion would otherwise have bought an attacker a silent, freely writable file
+inside the governance tree. It costs one `head -c | sha256sum` per file, and it is
+directly testable, which is the bar. The committed form gets the same check, so
+an agent cannot commit a truncated history and hide it by restoring the working
+tree. What I did **not** add is any validation of *what* gets appended: that needs
+a schema this log does not have, and a control that only appears to check is
+worse than none.
+
+**Accepted consequence, documented rather than hidden.** A `history.md` that did
+not exist when the session started cannot be created by the run - that is a new
+governance file. Three agents in this repository (`devrel`, `lead`, `reviewer`)
+have no history file; theirs must be seeded in the PR that adds them.
+
+**Mutation.** Widening the pattern to `^\.squad/agents/.+$` failed 9 governance-
+guard assertions, 5 agent-policy assertions and 2 validate checks. The one that
+matters names the real defect behaviourally: *"an autonomous run CANNOT write
+.squad/agents/<name>/charter.md - a charter is what an agent is permitted to do
+(expected: 'original ...', actual: 'TAMPERED')"* - a real write to a real charter
+on a real hardened filesystem, not a grep.
+
+**Verification.** `validate.ps1` 240 -> **247 passed / 0 failed / 0 skipped**;
+worker suite **9 suites, 623 -> 668 assertions, 0 failed / 0 skipped**
+(governance guard 70 -> 104, agent policy 127 -> 138); `verify-cli-golden.ps1`
+22/22 and `compare-cli-baseline.ps1` byte-identical 22/22 - **no golden
+changed**; `verify-launch-detachment.ps1` PASS. Tier resolution, exit-78
+fail-closed behaviour, the blanket-allow rejection, the `SQUAD_DISPATCH_SOURCE`
+parity fix and the baseline-outside-checkout abort are all untouched.
+
+**Lesson recorded.** "Lock the governance directory" was the right instinct and
+the wrong granularity. The useful question is not *is this path under governance?*
+but *does writing here change what the agent is allowed to do, or only the record
+of what it did?* - and when the answer is the second, locking it costs
+auditability and buys nothing. The follow-on discipline: an exception to a
+security control must be narrower than the control, must stay inside the
+detective layer, and must be documented with its reasoning, or the next reader
+will "fix" it back.

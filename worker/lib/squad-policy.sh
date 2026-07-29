@@ -47,6 +47,36 @@
 #     is why `chmod`/`chown`/`chattr`/`setfacl` are denied at the CLI in every
 #     tier AND why the baseline lives outside the checkout.
 #
+# THE ONE NARROW EXCLUSION: AGENT HISTORY
+# ---------------------------------------
+# `.squad/agents/<name>/history.md` is an append-only WORK LOG, not policy. See
+# MUTABLE_GOVERNANCE_PATTERNS in agent-policy.js for why locking it protects
+# nothing and costs the audit trail. Two properties make the exclusion narrow
+# rather than a hole, and both are behavioural assertions in
+# worker/tests/test_governance_guard.sh:
+#
+#   1. It is the FILE that is unlocked, never the DIRECTORY. Hardening does
+#      `chmod -R a-w` over `.squad/agents` first and only then puts `u+w` back on
+#      the matching files. `chmod` on a file needs ownership, not parent write,
+#      so this ordering is expressible: `.squad/agents/<name>/` stays mode-locked
+#      and therefore still refuses `creat()` and `unlink()`. "history is
+#      writable" cannot become "the agents directory is writable", and
+#      `charter.md` beside it is untouched.
+#   2. It stays in the manifest under a DIFFERENT RULE rather than being dropped
+#      from it. The baseline records `append-only <path> <sha256> <bytes>`;
+#      verification re-hashes the first `<bytes>` bytes of the current file. An
+#      append passes and is REPORTED with its size; a truncation, a rewrite of
+#      already-written history, a deletion, or a history file that did not exist
+#      at hardening time all fail the session exactly like any other governance
+#      violation.
+#
+# The prefix check is deliberate, not decoration: the stated reason for
+# unlocking history is that it is the audit trail, and an audit trail an agent
+# can rewrite is not one. It costs one `head -c | sha256sum` per file and is
+# directly testable, so it clears the "do not add a control you cannot test"
+# bar. What is NOT attempted is semantic validation of what gets appended --
+# that would need a schema this log does not have.
+#
 # FAIL CLOSED. Every failure path in this file aborts the session. There is no
 # branch that logs a warning and continues, and no branch that falls back to a
 # permissive flag set: "the policy could not be applied" and "the session runs
@@ -70,6 +100,8 @@ SQUAD_POLICY_SQUAD_FLAGS=""
 SQUAD_POLICY_UNDELIVERABLE=()
 SQUAD_POLICY_STATE_DIR="${SQUAD_POLICY_STATE_DIR:-}"
 SQUAD_POLICY_HARDENED_PATHS=()
+SQUAD_POLICY_MUTABLE_PATTERNS=()
+SQUAD_POLICY_UNLOCKED_FILES=()
 
 squad_policy_log() {
   printf '[squad-policy] %s\n' "$*"
@@ -202,10 +234,79 @@ squad_policy_state_dir() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Manifest
+# 3. Governance path classification
 # ---------------------------------------------------------------------------
-# One SHA-256 line per governance FILE, plus an explicit marker for every
-# governance path that is absent.
+# The append-only exclusion is defined ONCE, in agent-policy.js, and read from
+# here. Restating the pattern in bash would be a second source of truth for a
+# security boundary, and the copy that drifts is always the one nobody reads.
+#
+# Loaded once per process and cached: the classifier is called for every
+# governance file in the tree, twice per session, and a `node` fork per file
+# would be the slowest thing in the worker.
+#
+# Fail closed: if the resolver cannot produce the patterns, the array stays
+# empty, which means NOTHING is excluded and every governance file is locked and
+# hash-pinned. A broken exclusion must degrade towards more protection, never
+# less.
+squad_policy_load_mutable_patterns() {
+  if [[ "${SQUAD_POLICY_MUTABLE_PATTERNS_LOADED:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  SQUAD_POLICY_MUTABLE_PATTERNS=()
+  local pattern
+  while IFS= read -r pattern; do
+    if [[ -n "$pattern" ]]; then
+      SQUAD_POLICY_MUTABLE_PATTERNS+=("$pattern")
+    fi
+  done < <(node "$SQUAD_POLICY_RESOLVER" mutable-governance-patterns 2>/dev/null)
+  SQUAD_POLICY_MUTABLE_PATTERNS_LOADED=1
+  return 0
+}
+
+# squad_policy_is_mutable <repo-relative-path>
+# 0 == append-only (excluded from the write lock, still integrity-checked)
+# 1 == locked
+squad_policy_is_mutable() {
+  local rel="$1" pattern
+  squad_policy_load_mutable_patterns
+  for pattern in "${SQUAD_POLICY_MUTABLE_PATTERNS[@]:-}"; do
+    [[ -n "$pattern" ]] || continue
+    if [[ "$rel" =~ $pattern ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# SHA-256 of the FIRST <bytes> bytes of a file. This is the whole append-only
+# check: if the prefix still hashes to what the baseline recorded, everything
+# that was already written is still there, byte for byte, and whatever follows
+# was added after it.
+squad_policy_prefix_sha() {
+  local file="$1" bytes="$2"
+  head -c "$bytes" "$file" 2>/dev/null | sha256sum 2>/dev/null | awk '{print $1}'
+}
+
+squad_policy_byte_len() {
+  wc -c <"$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+# ---------------------------------------------------------------------------
+# 4. Manifest
+# ---------------------------------------------------------------------------
+# One line per governance FILE, plus an explicit marker for every governance
+# path that is absent. Three line kinds:
+#
+#   dir <path>                          a protected directory was walked
+#   file <path> <sha256>                MUST NOT CHANGE
+#   append-only <path> <sha256> <bytes> MAY GROW; the first <bytes> bytes must
+#                                       still hash to <sha256>
+#   absent <path>                       protected path not present at baseline
+#
+# The append-only kind exists so that "expected to change" and "must not change"
+# are distinguishable IN THE BASELINE rather than by dropping the path from it.
+# A dropped path is invisible to an operator reading the manifest and invisible
+# to the diff; a differently-typed path is neither.
 #
 # NOTE ON THE `absent` MARKERS. They are manifest COMPLETENESS, not an
 # independent control, and this file will not claim otherwise: the baseline-vs-
@@ -229,16 +330,10 @@ squad_policy_write_manifest() {
       # -print0/sort -z keeps ordering stable regardless of locale or readdir
       # order, so an identical tree always produces an identical manifest.
       while IFS= read -r -d '' file; do
-        local sum
-        sum="$(sha256sum "$file" 2>/dev/null | awk '{print $1}')" || return 1
-        [[ -n "$sum" ]] || return 1
-        printf 'file %s %s\n' "${file#"${repo_dir}/"}" "$sum" >>"$out"
+        squad_policy_manifest_line "$file" "${file#"${repo_dir}/"}" >>"$out" || return 1
       done < <(find "$target" -type f -print0 2>/dev/null | sort -z)
     elif [[ -f "$target" ]]; then
-      local sum
-      sum="$(sha256sum "$target" 2>/dev/null | awk '{print $1}')" || return 1
-      [[ -n "$sum" ]] || return 1
-      printf 'file %s %s\n' "$path" "$sum" >>"$out"
+      squad_policy_manifest_line "$target" "$path" >>"$out" || return 1
     else
       printf 'absent %s\n' "$path" >>"$out"
     fi
@@ -247,8 +342,24 @@ squad_policy_write_manifest() {
   return 0
 }
 
+squad_policy_manifest_line() {
+  local file="$1" rel="$2"
+  local sum
+  sum="$(sha256sum "$file" 2>/dev/null | awk '{print $1}')" || return 1
+  [[ -n "$sum" ]] || return 1
+  if squad_policy_is_mutable "$rel"; then
+    local len
+    len="$(squad_policy_byte_len "$file")"
+    [[ -n "$len" ]] || return 1
+    printf 'append-only %s %s %s\n' "$rel" "$sum" "$len"
+  else
+    printf 'file %s %s\n' "$rel" "$sum"
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
-# 4. Harden
+# 5. Harden
 # ---------------------------------------------------------------------------
 # Called AFTER session bootstrap (`squad init`, SubSquad activation) and
 # immediately BEFORE the agent runs, because bootstrap legitimately creates the
@@ -284,26 +395,72 @@ squad_policy_harden() {
     SQUAD_POLICY_HARDENED_PATHS+=("$path")
   done < <(node "$SQUAD_POLICY_RESOLVER" governance-paths)
 
+  # SECOND PASS, and the ordering is the control. The recursive lock above has
+  # already frozen every governance directory; this puts the owner write bit
+  # back on the append-only FILES only. `chmod` on a file requires ownership,
+  # not write permission on its parent, so an unlocked `history.md` can sit
+  # inside a directory that still refuses `creat()` and `unlink()`. Doing it the
+  # other way round -- excluding the path from the recursive `chmod` -- would
+  # not express that, because the exclusion would have to be a directory to
+  # allow the file to be created, and a writable directory is a writable
+  # directory.
+  SQUAD_POLICY_UNLOCKED_FILES=()
+  local file rel
+  for path in "${SQUAD_POLICY_HARDENED_PATHS[@]:-}"; do
+    [[ -n "$path" ]] || continue
+    target="${repo_dir}/${path}"
+    if [[ -d "$target" ]]; then
+      while IFS= read -r -d '' file; do
+        rel="${file#"${repo_dir}/"}"
+        squad_policy_is_mutable "$rel" || continue
+        if ! chmod u+w "$file" 2>/dev/null; then
+          squad_policy_abort "Could not restore append access to '${rel}'."
+        fi
+        SQUAD_POLICY_UNLOCKED_FILES+=("$rel")
+      done < <(find "$target" -type f -print0 2>/dev/null | sort -z)
+    else
+      squad_policy_is_mutable "$path" || continue
+      if ! chmod u+w "$target" 2>/dev/null; then
+        squad_policy_abort "Could not restore append access to '${path}'."
+      fi
+      SQUAD_POLICY_UNLOCKED_FILES+=("$path")
+    fi
+  done
+
   if [[ "${#SQUAD_POLICY_HARDENED_PATHS[@]}" -gt 0 ]]; then
     squad_policy_log "Governance paths locked read-only: ${SQUAD_POLICY_HARDENED_PATHS[*]}"
   else
     squad_policy_log "Governance paths locked read-only: none present in this repository."
+  fi
+  if [[ "${#SQUAD_POLICY_UNLOCKED_FILES[@]}" -gt 0 ]]; then
+    squad_policy_log "Append-only exception (work log, not policy; still integrity-checked): ${SQUAD_POLICY_UNLOCKED_FILES[*]}"
+    squad_policy_log "  Their containing directories stay locked, so no file can be created or deleted beside them."
   fi
   squad_policy_log "Governance baseline recorded at ${state}/governance.sha256"
   return 0
 }
 
 # ---------------------------------------------------------------------------
-# 5. Verify
+# 6. Verify
 # ---------------------------------------------------------------------------
 # Returns 0 when governance is intact, 1 when it changed, and ABORTS (78) when
 # the check itself could not run -- an unverifiable session is not a passing
 # one. Restores write bits on success so ordinary git operations downstream are
 # unaffected.
+#
+# Three detectors, evaluated independently and OR'd into one verdict:
+#   a. the `dir`/`file`/`absent` lines must be IDENTICAL to the baseline;
+#   b. every `append-only` line must still be present, and may only have GROWN
+#      from the prefix the baseline pinned -- a permitted append is logged with
+#      its byte delta, so "history changed" is visible in the session log rather
+#      than silently allowed;
+#   c. nothing under a governance path may differ between the base commit and
+#      the working tree, except an append-only path, whose committed form is
+#      prefix-checked the same way.
 squad_policy_verify() {
   local repo_dir="$1"
   local state="$SQUAD_POLICY_STATE_DIR"
-  local baseline current violated=0
+  local baseline current violated=0 appended=0
 
   if [[ -z "$state" || ! -d "$state" ]]; then
     squad_policy_abort "The governance baseline is missing; this session cannot be verified."
@@ -318,7 +475,14 @@ squad_policy_verify() {
     squad_policy_abort "Could not recompute the governance manifest; this session cannot be verified."
   fi
 
-  if ! diff -u "$baseline" "$current" >"${state}/governance.diff" 2>&1; then
+  # --- (a) the immutable half -----------------------------------------------
+  # `append-only` lines are held out of this comparison ON PURPOSE and checked
+  # by (b) instead. They are NOT dropped from the manifest: an operator reading
+  # either file still sees the path, its hash and its length, which is what
+  # makes "this was expected to change" reviewable rather than invisible.
+  grep -v '^append-only ' "$baseline" >"${state}/governance.locked.baseline" 2>/dev/null || true
+  grep -v '^append-only ' "$current"  >"${state}/governance.locked.now" 2>/dev/null || true
+  if ! diff -u "${state}/governance.locked.baseline" "${state}/governance.locked.now" >"${state}/governance.diff" 2>&1; then
     violated=1
     squad_policy_log "GOVERNANCE VIOLATION: a protected path changed during this session."
     while IFS= read -r line; do
@@ -329,24 +493,95 @@ squad_policy_verify() {
     done <"${state}/governance.diff"
   fi
 
-  # Second, independent detector: a change that was committed rather than left
-  # in the working tree. `git diff <base>..HEAD` sees it even if the working
-  # tree hashes match the baseline again.
+  # --- (b) the append-only half ---------------------------------------------
+  local kind rel bsum blen csum clen now_line
+  while read -r kind rel bsum blen; do
+    [[ "$kind" == "append-only" ]] || continue
+    now_line="$(awk -v P="$rel" '$1=="append-only" && $2==P {print $3" "$4; exit}' "$current")"
+    if [[ -z "$now_line" ]]; then
+      violated=1
+      squad_policy_log "GOVERNANCE VIOLATION: the append-only work log ${rel} was DELETED during this session."
+      continue
+    fi
+    csum="${now_line%% *}"
+    clen="${now_line##* }"
+    [[ "$csum" == "$bsum" ]] && continue
+    if [[ "$clen" -lt "$blen" ]] || [[ "$(squad_policy_prefix_sha "${repo_dir}/${rel}" "$blen")" != "$bsum" ]]; then
+      violated=1
+      squad_policy_log "GOVERNANCE VIOLATION: ${rel} was REWRITTEN, not appended to. A work log an agent can edit is not an audit trail."
+      squad_policy_log "  baseline: ${blen} bytes / ${bsum}"
+      squad_policy_log "  now:      ${clen} bytes / ${csum}"
+      continue
+    fi
+    appended=$((appended + 1))
+    squad_policy_log "Agent history appended (permitted): ${rel} +$((clen - blen)) bytes, prior ${blen} bytes unchanged."
+  done <"$baseline"
+
+  # A path that is append-only NOW but was not in the baseline is a new
+  # governance file, not a permitted append. (a) cannot see it, because both
+  # sides hold `append-only` lines out of the comparison, so it is caught here.
+  while read -r kind rel csum clen; do
+    [[ "$kind" == "append-only" ]] || continue
+    if ! grep -q "^append-only ${rel} " "$baseline" 2>/dev/null; then
+      violated=1
+      squad_policy_log "GOVERNANCE VIOLATION: the work log ${rel} did not exist when this session started; a session may append to history, not create it."
+    fi
+  done <"$current"
+
+  # --- (c) committed changes -------------------------------------------------
+  # A change that was committed rather than left in the working tree.
+  # `git diff <base>` sees it even if the working tree hashes match the baseline
+  # again.
   local base_commit
   base_commit="$(cat "${state}/base-commit" 2>/dev/null || true)"
   if [[ -n "$base_commit" ]]; then
-    local paths=() p committed
+    local paths=() p committed committed_head violating=()
     while IFS= read -r p; do
       [[ -n "$p" ]] && paths+=("$p")
     done < <(node "$SQUAD_POLICY_RESOLVER" governance-paths)
     committed="$(cd "$repo_dir" && git diff --name-only "$base_commit" -- "${paths[@]}" 2>/dev/null || true)"
-    if [[ -n "$committed" ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      squad_policy_is_mutable "$p" && continue
+      violating+=("$p")
+    done <<<"$committed"
+    if [[ "${#violating[@]}" -gt 0 ]]; then
       violated=1
       squad_policy_log "GOVERNANCE VIOLATION: protected path(s) changed in commits made during this session:"
-      while IFS= read -r p; do
-        [[ -n "$p" ]] && squad_policy_log "  ${p}"
-      done <<<"$committed"
+      for p in "${violating[@]}"; do
+        squad_policy_log "  ${p}"
+      done
     fi
+
+    # The append-only paths get the same treatment against their COMMITTED
+    # form. Without this, an agent could commit a truncated history file and
+    # then restore the working-tree copy: (b) would compare clean and the
+    # truncation would still be what gets pushed.
+    committed_head="$(cd "$repo_dir" && git diff --name-only "$base_commit" HEAD -- "${paths[@]}" 2>/dev/null || true)"
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      squad_policy_is_mutable "$p" || continue
+      now_line="$(awk -v P="$p" '$1=="append-only" && $2==P {print $3" "$4; exit}' "$baseline")"
+      if [[ -z "$now_line" ]]; then
+        violated=1
+        squad_policy_log "GOVERNANCE VIOLATION: ${p} was committed during this session but was not in the governance baseline."
+        continue
+      fi
+      bsum="${now_line%% *}"
+      blen="${now_line##* }"
+      if ! ( cd "$repo_dir" && git show "HEAD:${p}" ) >"${state}/committed-blob" 2>/dev/null; then
+        violated=1
+        squad_policy_log "GOVERNANCE VIOLATION: the append-only work log ${p} was DELETED in a commit made during this session."
+        continue
+      fi
+      clen="$(squad_policy_byte_len "${state}/committed-blob")"
+      if [[ "${clen:-0}" -lt "$blen" ]] || [[ "$(squad_policy_prefix_sha "${state}/committed-blob" "$blen")" != "$bsum" ]]; then
+        violated=1
+        squad_policy_log "GOVERNANCE VIOLATION: ${p} was REWRITTEN, not appended to, in a commit made during this session."
+      else
+        squad_policy_log "Agent history appended in a commit (permitted): ${p} +$((clen - blen)) bytes."
+      fi
+    done <<<"$committed_head"
   fi
 
   # Restore write bits regardless of the outcome so the workspace stays usable
@@ -362,6 +597,10 @@ squad_policy_verify() {
     return 1
   fi
 
-  squad_policy_log "Governance integrity verified: no protected path changed."
+  if [[ "$appended" -gt 0 ]]; then
+    squad_policy_log "Governance integrity verified: no protected path changed (${appended} permitted append-only work-log update(s), listed above)."
+  else
+    squad_policy_log "Governance integrity verified: no protected path changed."
+  fi
   return 0
 }

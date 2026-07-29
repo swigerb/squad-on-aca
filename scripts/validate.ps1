@@ -3624,6 +3624,101 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
     }
 }
 
+# --- 7. The append-only exclusion is narrow, and is still detected -----------
+# `.squad/agents/<name>/history.md` is excluded from the WRITE LOCK because it is
+# an append-only work log, not policy: locking it prevented no escalation and
+# destroyed the audit trail PRD #6 asks for. The exclusion is only safe while it
+# stays anchored at both ends and stays inside the integrity check, so both
+# properties are asserted here against the REAL resolver rather than described.
+if ($nodeCmd -and (Test-Path $policyResolver)) {
+    function Get-GovernanceClass {
+        param([string]$Path)
+        return ((& node $policyResolver classify-governance-path $Path 2>&1) -join '').Trim()
+    }
+
+    # The thing the narrowing exists to allow.
+    if ((Get-GovernanceClass '.squad/agents/security/history.md') -eq 'append-only') {
+        Add-Pass "An agent history file is classified append-only, so an autonomous run can record what it did"
+    } else {
+        Add-Fail "An agent history file is not classified append-only; autonomous runs cannot write .squad/agents/<name>/history.md and the audit trail is lost"
+    }
+
+    # The thing it must NOT allow. A charter states what an agent is permitted to
+    # do; an agent that can rewrite its charter has rewritten its authorisation.
+    $mustStayLocked = @(
+        @{ Path = '.squad/agents/security/charter.md';     Why = 'a charter defines what an agent is permitted to do' },
+        @{ Path = '.squad/agents/security/history.md.bak'; Why = 'a lookalike filename must not inherit the exclusion' },
+        @{ Path = '.squad/agents/history.md';              Why = 'the exclusion is anchored to <name>/history.md, not anything named history.md under .squad/agents' },
+        @{ Path = '.squad/agents/a/b/history.md';          Why = 'exactly one path segment may stand for the agent name' },
+        @{ Path = '.squad/policies/history.md';            Why = 'the exclusion is scoped to .squad/agents' },
+        @{ Path = '.squad/identity/identity.md';           Why = 'identity is governance' },
+        @{ Path = '.squad/config.json';                    Why = 'config is governance' },
+        @{ Path = '.squad/routing.md';                     Why = 'routing is governance' },
+        @{ Path = '.squad/memory/audit.jsonl';             Why = 'audit state is governance' }
+    )
+    $leaked = @($mustStayLocked | Where-Object { (Get-GovernanceClass $_.Path) -ne 'locked' })
+    if ($leaked.Count -eq 0) {
+        Add-Pass "The append-only exclusion is anchored: all $($mustStayLocked.Count) neighbouring governance paths -- charter.md included -- stay locked"
+    } else {
+        Add-Fail "The append-only exclusion is too wide; these should be locked but are not: $(($leaked | ForEach-Object { "$($_.Path) ($($_.Why))" }) -join '; ')"
+    }
+
+    # Widening the pattern to `.squad/agents/**` is the specific regression this
+    # guards against, so assert it on the pattern itself as well as on the
+    # classification -- a pattern that stopped anchoring the filename would fail
+    # here even if someone also loosened the cases above.
+    $patterns = @((& node $policyResolver mutable-governance-patterns 2>&1) | Where-Object { $_ -match '\S' })
+    $unanchored = @($patterns | Where-Object { $_ -notmatch 'history' -or $_ -notmatch '\$$' -or $_ -notmatch '\^' })
+    if ($patterns.Count -ge 1 -and $unanchored.Count -eq 0) {
+        Add-Pass "Every append-only pattern is fully anchored and filename-specific ($($patterns -join ', '))"
+    } else {
+        Add-Fail "An append-only pattern is unanchored or not filename-specific: $($unanchored -join ', '); a wildcard here re-opens charter.md"
+    }
+}
+
+# --- 8. Excluded from the LOCK is not excluded from the DETECTOR -------------
+# A path that neither layer covers is a foothold: whoever can write there writes
+# invisibly. These are structural checks on the enforcement library, because the
+# behavioural proof lives in worker/tests/test_governance_guard.sh (which cannot
+# run on Windows).
+if (Test-Path $policyLib) {
+    $libText = Get-Content -LiteralPath $policyLib -Raw
+
+    if ($libText -match [regex]::Escape("printf 'append-only %s %s %s")) {
+        Add-Pass "The manifest records excluded paths under an 'append-only' rule rather than dropping them, so an operator can still see what changed and by how much"
+    } else {
+        Add-Fail "The manifest does not record append-only entries; an excluded path would be invisible to both the lock and the integrity check"
+    }
+
+    # The prefix hash IS the append-only control. Without it the entry is a
+    # comment: the file could be truncated or rewritten and still 'match'.
+    if ($libText -match 'squad_policy_prefix_sha' -and $libText -match 'head -c "\$bytes"') {
+        Add-Pass "Append-only is enforced by re-hashing the baseline byte prefix, so a truncation or a rewrite of existing history fails the session"
+    } else {
+        Add-Fail "There is no prefix-hash check; 'append-only' would be an unenforced label and an agent could rewrite its own work log"
+    }
+
+    # ORDERING IS THE CONTROL. The recursive lock must run first and the file
+    # unlock second: `chmod` on a file needs ownership, not parent write, so
+    # this ordering is what keeps the DIRECTORY locked against create/delete
+    # while the file inside it is writable. Reversed, or expressed as an
+    # exclusion from the recursive chmod, the directory would have to be
+    # writable and the exclusion would open the whole agent directory.
+    $lockIdx   = $libText.IndexOf('chmod -R a-w')
+    $unlockIdx = $libText.IndexOf('SQUAD_POLICY_UNLOCKED_FILES=()')
+    if ($lockIdx -ge 0 -and $unlockIdx -gt $lockIdx) {
+        Add-Pass "Hardening locks every governance path recursively FIRST and re-opens only the append-only files afterwards, so their directories still refuse create and delete"
+    } else {
+        Add-Fail "The append-only files are unlocked before or instead of the recursive lock; the containing agent directory would become writable and new files could be added beside a locked charter"
+    }
+
+    if ($libText -match 'git diff --name-only "\$base_commit" HEAD') {
+        Add-Pass "The committed form of an append-only path is prefix-checked too, so a truncation cannot be committed and then hidden by restoring the working tree"
+    } else {
+        Add-Fail "The commit detector does not check the committed form of append-only paths; a history rewrite could be committed, hidden in the working tree, and pushed"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

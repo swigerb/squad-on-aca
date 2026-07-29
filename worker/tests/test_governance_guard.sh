@@ -55,11 +55,11 @@ git config --global init.defaultBranch main >/dev/null 2>&1 || true
 git config --global user.name "Test" >/dev/null 2>&1 || true
 git config --global user.email "test@example.com" >/dev/null 2>&1 || true
 
-# Every governance path PRD #6 names, plus the audit/approval state.
+# Every governance path PRD #6 names, plus the audit/approval state. These stay
+# LOCKED: nothing in this list may be written, appended to, created or deleted.
 GOVERNANCE_FILES=(
   ".squad/policies/security.md"
   ".squad/agents/security/charter.md"
-  ".squad/agents/security/history.md"
   ".squad/identity/identity.md"
   ".squad/config.json"
   ".squad/routing.md"
@@ -68,12 +68,24 @@ GOVERNANCE_FILES=(
   ".squad/rai/audit-trail.md"
 )
 
+# The ONE narrow exclusion. `.squad/agents/<name>/history.md` is an append-only
+# WORK LOG, not policy: it records what an agent did and grants it nothing.
+# Locking it prevented no escalation and destroyed the audit trail PRD #6 asks
+# for, so it is excluded from the write lock and held to an append-only
+# integrity rule instead. `charter.md` in the SAME DIRECTORY stays locked —
+# a charter defines what an agent is permitted to do, which is governance.
+APPEND_ONLY_FILES=(
+  ".squad/agents/security/history.md"
+)
+
+ALL_FIXTURE_FILES=("${GOVERNANCE_FILES[@]}" "${APPEND_ONLY_FILES[@]}")
+
 make_repo() {
   local repo="$1" f
   rm -rf "$repo"
   mkdir -p "$repo"
   ( cd "$repo" && git init --quiet . ) || return 1
-  for f in "${GOVERNANCE_FILES[@]}"; do
+  for f in "${ALL_FIXTURE_FILES[@]}"; do
     mkdir -p "${repo}/$(dirname "$f")"
     printf 'original %s\n' "$f" >"${repo}/${f}"
   done
@@ -164,6 +176,67 @@ printf 'new\n' >"${REPO}/src/new.js" 2>/dev/null
 assert_eq "1" "$([[ -f "${REPO}/src/new.js" ]] && echo 1 || echo 0)" "new non-governance files can still be created"
 
 # ---------------------------------------------------------------------------
+# 1b. THE NARROW EXCLUSION — agent history is appendable, and nothing else is
+# ---------------------------------------------------------------------------
+# `.squad/agents/<name>/history.md` sits INSIDE a directory whose other contents
+# are locked, so the interesting question is not "can the run append?" but
+# "does making the file writable make the DIRECTORY writable?". It must not:
+# otherwise "history is writable" quietly becomes "the agents directory is
+# writable", and an agent can add or remove files beside a charter it cannot
+# edit. Every assertion below is against the SAME hardened repository used
+# above, so it is one filesystem state answering all of the questions.
+echo "-- narrow exclusion: history appends, the directory does not open --"
+
+# The reason the exclusion exists at all: an autonomous run must be able to
+# record what it did.
+( printf 'SESSION 42: appended by an autonomous run\n' >>"${REPO}/.squad/agents/security/history.md" ) 2>/dev/null
+assert_contains "$(cat "${REPO}/.squad/agents/security/history.md" 2>/dev/null)" "SESSION 42" \
+  "an autonomous run CAN append to .squad/agents/<name>/history.md"
+assert_contains "$(cat "${REPO}/.squad/agents/security/history.md" 2>/dev/null)" "original .squad/agents/security/history.md" \
+  "appending does not disturb the history that was already there"
+
+# The charter sits in the same directory and is the thing that actually grants
+# authority. It must be exactly as locked as before.
+( printf 'TAMPERED\n' >"${REPO}/.squad/agents/security/charter.md" ) 2>/dev/null
+assert_eq "original .squad/agents/security/charter.md" "$(cat "${REPO}/.squad/agents/security/charter.md" 2>/dev/null)" \
+  "an autonomous run CANNOT write .squad/agents/<name>/charter.md — a charter is what an agent is permitted to do"
+( printf 'APPENDED\n' >>"${REPO}/.squad/agents/security/charter.md" ) 2>/dev/null
+assert_not_contains "$(cat "${REPO}/.squad/agents/security/charter.md" 2>/dev/null)" "APPENDED" \
+  "the charter cannot be appended to either"
+
+# Directory mode: creating a NEW file beside history.md must still fail. This is
+# the assertion that proves the file was unlocked and not its parent.
+( : >"${REPO}/.squad/agents/security/policy.md" ) 2>/dev/null
+assert_eq "0" "$([[ -f "${REPO}/.squad/agents/security/policy.md" ]] && echo 1 || echo 0)" \
+  "an autonomous run CANNOT create a new file in .squad/agents/<name>/"
+( : >"${REPO}/.squad/agents/attacker-history.md" ) 2>/dev/null
+assert_eq "0" "$([[ -f "${REPO}/.squad/agents/attacker-history.md" ]] && echo 1 || echo 0)" \
+  "an autonomous run CANNOT create a file directly in .squad/agents/"
+mkdir -p "${REPO}/.squad/agents/impostor" 2>/dev/null
+assert_eq "0" "$([[ -d "${REPO}/.squad/agents/impostor" ]] && echo 1 || echo 0)" \
+  "an autonomous run CANNOT create a whole new agent directory"
+
+# ... and deleting an existing file there must still fail.
+rm -f "${REPO}/.squad/agents/security/charter.md" 2>/dev/null
+assert_eq "1" "$([[ -f "${REPO}/.squad/agents/security/charter.md" ]] && echo 1 || echo 0)" \
+  "an autonomous run CANNOT delete an existing file in .squad/agents/<name>/"
+rm -f "${REPO}/.squad/agents/security/history.md" 2>/dev/null
+assert_eq "1" "$([[ -f "${REPO}/.squad/agents/security/history.md" ]] && echo 1 || echo 0)" \
+  "the unlocked history file itself cannot be deleted — unlink needs write on the parent, which stays locked"
+
+# The exclusion is a PATTERN, and a pattern that matched one segment too many
+# would re-open the charter. Ask the resolver directly, because it is the single
+# source of truth that squad-policy.sh and validate.ps1 both read.
+classify() { node "${WORKER_DIR}/lib/agent-policy.js" classify-governance-path "$1" 2>&1; }
+assert_eq "append-only" "$(classify '.squad/agents/security/history.md')" "the resolver classifies an agent history file as append-only"
+assert_eq "locked"      "$(classify '.squad/agents/security/charter.md')" "the resolver keeps charter.md locked"
+assert_eq "locked"      "$(classify '.squad/agents/history.md')"          "a history.md directly under .squad/agents is NOT excluded"
+assert_eq "locked"      "$(classify '.squad/agents/a/b/history.md')"      "a nested history.md is NOT excluded"
+assert_eq "locked"      "$(classify '.squad/agents/security/history.md.bak')" "a lookalike filename is NOT excluded"
+assert_eq "locked"      "$(classify '.squad/policies/history.md')"        "history.md outside .squad/agents is NOT excluded"
+assert_eq "locked"      "$(classify '.squad/identity/identity.md')"       "an unrelated governance file is locked"
+
+# ---------------------------------------------------------------------------
 # 2. DETECTIVE — a governance change fails the session
 # ---------------------------------------------------------------------------
 # The preventive layer is mode bits, and the agent owns the checkout, so a
@@ -249,8 +322,131 @@ out="$(scenario "$REPO" "$STATE" '
 assert_contains "$out" "VERIFY_RC=1"                  "verify FAILS when the governance change was committed"
 assert_contains "$out" "changed in commits made during this session" "the commit detector fires, not just the hash manifest"
 
-# A clean session must PASS — a control that fails everything protects nothing
-# and would simply be turned off.
+# ---------------------------------------------------------------------------
+# 2b. DETECTIVE — the excluded path is NOT excluded from the detector
+# ---------------------------------------------------------------------------
+# A path that is excluded from BOTH the lock and the integrity check is a
+# foothold: anyone who can write there can write freely and invisibly. So the
+# history files stay in the manifest under a different rule — they may GROW, and
+# the bytes the baseline already pinned must still be there. An append passes
+# and is reported with its size; a rewrite fails the session like any other
+# governance violation.
+echo "-- detective: history may grow, and only grow --"
+
+# The permitted case. This is the whole point of the narrowing, so it must be
+# demonstrably green, not merely "not red".
+REPO="${TEST_TMP_ROOT}/repo-append"; STATE="${TEST_TMP_ROOT}/state-append"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  printf "## Session 42\nDid the work.\n" >> "'"$REPO"'/.squad/agents/security/history.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=0"                  "an autonomous run that appends to history PASSES verification"
+assert_not_contains "$out" "GOVERNANCE VIOLATION"     "appending to history is not reported as a violation"
+assert_contains "$out" "Agent history appended (permitted)" "the detector still REPORTS that history changed"
+assert_contains "$out" ".squad/agents/security/history.md +28 bytes" \
+  "the report says HOW MUCH history grew, so the audit trail is reviewable"
+assert_contains "$out" "1 permitted append-only work-log update" "the summary line counts the permitted updates"
+
+# Truncation — the exact way an agent would erase the record of what it did.
+REPO="${TEST_TMP_ROOT}/repo-truncate"; STATE="${TEST_TMP_ROOT}/state-truncate"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  : > "'"$REPO"'/.squad/agents/security/history.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1"                  "verify FAILS when history is TRUNCATED — the file is appendable, not editable"
+assert_contains "$out" "REWRITTEN, not appended to"   "the violation says the file was rewritten rather than appended to"
+
+# Rewrite that keeps the file the same length or longer, so a size-only check
+# would wave it through. This is why the baseline pins a prefix HASH.
+REPO="${TEST_TMP_ROOT}/repo-rewrite"; STATE="${TEST_TMP_ROOT}/state-rewrite"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  printf "FABRICATED HISTORY THAT IS LONGER THAN THE ORIGINAL\n" > "'"$REPO"'/.squad/agents/security/history.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1"                       "verify FAILS when history is rewritten with LONGER content (a size check alone would pass it)"
+assert_contains "$out" ".squad/agents/security/history.md" "the violation names the rewritten history file"
+
+# Deleting the work log needs a chmod, and must still be caught after one.
+REPO="${TEST_TMP_ROOT}/repo-histdel"; STATE="${TEST_TMP_ROOT}/state-histdel"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  chmod -R u+w "'"$REPO"'/.squad"
+  rm -f "'"$REPO"'/.squad/agents/security/history.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1"   "verify FAILS when the append-only work log is deleted"
+assert_contains "$out" "was DELETED"   "the violation says the work log was deleted"
+
+# A history file that did not exist at hardening time. "May append to history"
+# must not become "may mint history", or an agent could fabricate a record for
+# an identity that never ran.
+REPO="${TEST_TMP_ROOT}/repo-histnew"; STATE="${TEST_TMP_ROOT}/state-histnew"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  chmod -R u+w "'"$REPO"'/.squad"
+  mkdir -p "'"$REPO"'/.squad/agents/impostor"
+  printf "invented\n" > "'"$REPO"'/.squad/agents/impostor/history.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1"                        "verify FAILS when a NEW agent history file appears mid-session"
+assert_contains "$out" ".squad/agents/impostor/history.md"  "the violation names the invented work log"
+
+# The committed form gets the same rule. Without this, an agent could commit a
+# truncated history and restore the working-tree copy: the manifest would
+# compare clean and the truncation is what would be pushed.
+REPO="${TEST_TMP_ROOT}/repo-histcommit"; STATE="${TEST_TMP_ROOT}/state-histcommit"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  chmod -R u+w "'"$REPO"'/.squad"
+  printf "FABRICATED\n" > "'"$REPO"'/.squad/agents/security/history.md"
+  ( cd "'"$REPO"'" && git add -A && git commit --quiet -m "sneak" )
+  printf "original .squad/agents/security/history.md\n" > "'"$REPO"'/.squad/agents/security/history.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1"                          "verify FAILS when a history REWRITE was committed and the working tree restored"
+assert_contains "$out" "in a commit made during this session" "the commit detector is what catches the restored-working-tree case"
+
+# ... and a committed APPEND is permitted and reported, because that is exactly
+# what an autonomous run is supposed to do with its work log.
+REPO="${TEST_TMP_ROOT}/repo-histcommitok"; STATE="${TEST_TMP_ROOT}/state-histcommitok"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  printf "## Session 42\n" >> "'"$REPO"'/.squad/agents/security/history.md"
+  ( cd "'"$REPO"'" && git add -A && git commit --quiet -m "record the run" )
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=0"                             "a run that COMMITS a history append passes verification"
+assert_contains "$out" "Agent history appended in a commit (permitted)" "the commit detector reports the permitted committed append"
+assert_not_contains "$out" "GOVERNANCE VIOLATION"                "a committed history append is not a violation"
+
+# The manifest must still DESCRIBE the excluded path rather than omit it. A path
+# dropped from the baseline is invisible to an operator reviewing it.
+REPO="${TEST_TMP_ROOT}/repo-manifest"; STATE="${TEST_TMP_ROOT}/state-manifest"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+scenario "$REPO" "$STATE" 'squad_policy_harden "'"$REPO"'"' >/dev/null
+assert_contains "$(cat "${STATE}/governance.sha256" 2>/dev/null)" "append-only .squad/agents/security/history.md" \
+  "the baseline records the excluded path under an 'append-only' rule instead of dropping it"
+assert_contains "$(cat "${STATE}/governance.sha256" 2>/dev/null)" "file .squad/agents/security/charter.md" \
+  "the baseline still pins charter.md as immutable"
+
+
 REPO="${TEST_TMP_ROOT}/repo-clean"; STATE="${TEST_TMP_ROOT}/state-clean"; rm -rf "$STATE"
 make_repo "$REPO" >/dev/null
 out="$(scenario "$REPO" "$STATE" '

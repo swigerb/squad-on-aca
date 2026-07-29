@@ -175,6 +175,9 @@ const FORBIDDEN_EXTRA_FLAGS = [
  * attended runs would reintroduce exactly the asymmetry the PRD forbids, and
  * "the human was watching" is not a reviewable audit trail for a policy
  * rewrite -- a pull request is.
+ *
+ * One narrow exception is carved out of this set by MUTABLE_GOVERNANCE_PATTERNS
+ * below; it is also the same for both tiers.
  */
 const GOVERNANCE_PATHS = [
   '.squad/policies',
@@ -191,6 +194,62 @@ const GOVERNANCE_PATHS = [
   '.squad/rai/policy.md',
   '.squad/rai/audit-trail.md',
 ];
+
+/**
+ * The ONE narrow exception to the write lock: an agent's own history file.
+ *
+ * WHY THIS IS EXCLUDED
+ * --------------------
+ * `.squad/agents/<name>/history.md` is an APPEND-ONLY WORK LOG, not policy. It
+ * records what an agent did; it does not grant an agent anything. Locking it
+ * therefore prevents no privilege escalation whatsoever -- it only destroys the
+ * audit trail PRD #6 explicitly asks for ("Every lifecycle event is correlated
+ * by one stable session/run ID", and auditability generally). A run that cannot
+ * record what it did is less auditable, not more governed. Ralph and Watch are
+ * autonomous by definition, so "the human can write it up afterwards" is not
+ * available on the paths where the record matters most.
+ *
+ * WHY THE PATTERN IS THIS NARROW, AND NOT `.squad/agents/**`
+ * ----------------------------------------------------------
+ * `.squad/agents/<name>/charter.md` defines what an agent is PERMITTED TO DO.
+ * That is squarely governance: an agent that can rewrite its own charter has
+ * rewritten its own authorisation, which is the escalation this whole change
+ * exists to prevent. So the exception is anchored at both ends -- exactly one
+ * path segment for the agent name, and exactly the filename `history.md`. It
+ * matches neither `.squad/agents/security/charter.md`, nor
+ * `.squad/agents/history.md`, nor `.squad/agents/a/b/history.md`.
+ *
+ * EXCLUDED FROM THE LOCK IS NOT EXCLUDED FROM THE DETECTOR
+ * -------------------------------------------------------
+ * A path that both layers ignore is a foothold. These paths stay in the
+ * manifest under a different rule: they must be APPEND-ONLY. The baseline
+ * records the SHA-256 and the byte length at hardening time, and verification
+ * re-hashes the first `length` bytes -- so an append passes and reports its
+ * size, while a truncation or a rewrite of the existing record fails the
+ * session exactly like any other governance violation. See
+ * worker/lib/squad-policy.sh.
+ *
+ * Emitted as regular expressions, in a dialect that is simultaneously valid as
+ * a JS RegExp, a POSIX ERE (bash `[[ =~ ]]`) and a .NET regex, because all
+ * three consume it (this file, squad-policy.sh, scripts/validate.ps1). One
+ * pattern, three readers, no restatement to drift.
+ */
+const MUTABLE_GOVERNANCE_PATTERNS = ['^\\.squad/agents/[^/]+/history\\.md$'];
+
+/**
+ * True when a repository-relative path is a governance path that a session is
+ * permitted to APPEND to. Backslashes are normalised so a Windows-produced path
+ * classifies the same way as a container-produced one.
+ */
+function isMutableGovernancePath(relativePath) {
+  const p = String(relativePath === undefined || relativePath === null ? '' : relativePath)
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '');
+  if (p === '') {
+    return false;
+  }
+  return MUTABLE_GOVERNANCE_PATTERNS.some((pattern) => new RegExp(pattern).test(p));
+}
 
 const TIER_ATTENDED = 'attended';
 const TIER_AUTONOMOUS = 'autonomous';
@@ -349,6 +408,7 @@ function resolvePolicy(input) {
     executionPlane: normalize(opts.executionPlane) || 'aca-job',
     denyTools,
     governancePaths: GOVERNANCE_PATHS.slice(),
+    mutableGovernancePatterns: MUTABLE_GOVERNANCE_PATTERNS.slice(),
     flags,
     // A single shell-ready string. Only safe where the caller can hand it to a
     // process as an argv array; see squadFlagString for the other path.
@@ -381,10 +441,12 @@ module.exports = {
   AUTONOMOUS_DENY_TOOLS,
   FORBIDDEN_EXTRA_FLAGS,
   GOVERNANCE_PATHS,
+  MUTABLE_GOVERNANCE_PATTERNS,
   TIER_ATTENDED,
   TIER_AUTONOMOUS,
   AgentPolicyError,
   resolveTier,
+  isMutableGovernancePath,
   resolvePolicy,
   resolvePolicyFromEnv,
 };
@@ -439,9 +501,30 @@ function main(argv) {
     case 'governance-paths':
       process.stdout.write(`${policy.governancePaths.join('\n')}\n`);
       return 0;
+    // One regular expression per line, matched against a repository-relative
+    // path. A governance path that matches is excluded from the write lock and
+    // held to the append-only rule instead -- it is NOT excluded from the
+    // integrity check. worker/lib/squad-policy.sh is the only consumer that
+    // acts on this; scripts/validate.ps1 reads it to assert the boundary.
+    case 'mutable-governance-patterns':
+      process.stdout.write(`${policy.mutableGovernancePatterns.join('\n')}\n`);
+      return 0;
+    // `classify-governance-path <relative-path>` -> `append-only` | `locked`.
+    // Exists so a test (and an operator diagnosing a run) can ask the SAME
+    // resolver the shell asks, rather than restating the pattern.
+    case 'classify-governance-path': {
+      const target = argv[1];
+      if (target === undefined || String(target).trim() === '') {
+        process.stderr.write('Usage: agent-policy.js classify-governance-path <repo-relative-path>\n');
+        return 78;
+      }
+      process.stdout.write(`${isMutableGovernancePath(target) ? 'append-only' : 'locked'}\n`);
+      return 0;
+    }
     default:
       process.stderr.write(
-        'Usage: agent-policy.js [json|flags|argv|squad-flags|undeliverable|tier|reason|governance-paths]\n'
+        'Usage: agent-policy.js [json|flags|argv|squad-flags|undeliverable|tier|reason|' +
+          'governance-paths|mutable-governance-patterns|classify-governance-path <path>]\n'
       );
       return 78;
   }
