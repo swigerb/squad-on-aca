@@ -17,7 +17,7 @@
 #     tools, or open any egress. It only *checks* what's already present
 #     and reports actionable gaps. See docs/capability-manifest.md for the
 #     documented extension points (custom worker images, controlled
-#     egress, short-lived credentials, SandboxGroup-per-task selection).
+#     egress, short-lived credentials, per-task Sandboxes selection).
 #   - Manifest content is never executed as shell. Tool and credential names
 #     map to fixed, built-in checks implemented below.
 #
@@ -355,7 +355,7 @@ while IFS=$'\t' read -r kind name required; do
       echo "Declared egress dependency (advisory only, not enforced yet); inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
       ;;
     image)
-      echo "Manifest declares a custom worker image hint; current worker image is fixed. See docs/capability-manifest.md#future-per-task-images-and-sandboxgroups and inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
+      echo "Manifest declares a custom worker image hint; current worker image is fixed. See docs/capability-manifest.md#future-per-task-images-and-sandboxes and inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
       ;;
   esac
 done <"$ROWS_FILE"

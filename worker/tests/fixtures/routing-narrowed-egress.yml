@@ -1,0 +1,9 @@
+version: 1
+tools:
+  - name: pnpm
+    required: true
+credentials:
+  - name: NPM_TOKEN
+    required: true
+egress:
+  - host: registry.npmjs.org

@@ -33,6 +33,8 @@ jobs:
       - name: Syntax-check worker sources
         run: |
           node --check worker/lib/parse-capabilities.js
+          node --check worker/lib/resolve-capability-route.js
+          node -e "JSON.parse(require('fs').readFileSync('config/sandbox-classes.json','utf8'))"
           bash -n worker/lib/squad-capability-preflight.sh
           bash -n worker/lib/ralph-dispatch.sh
           bash -n worker/entrypoint.sh

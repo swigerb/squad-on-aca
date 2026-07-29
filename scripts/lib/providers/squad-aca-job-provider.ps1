@@ -150,7 +150,13 @@ function New-AcaJobExecutionProvider {
     }
 
     # -- logs ----------------------------------------------------------------
-    # Pure pass-through: `az` renders, we do not.
+    # Delegates to Get-AcaExecutionLog (scripts/lib/aca-logs.ps1), which tries
+    # the containerapp extension first, falls back to Log Analytics, inspects
+    # every az exit code, and throws when both paths fail (issue #13).
+    #
+    # The contract's shape is provider-neutral: Lines, plus an optional Notice
+    # the caller prints verbatim. Which substrate produced the lines is the
+    # provider's business, not the caller's.
     $operations["logs"] = {
         param($Context, $Arguments)
 
@@ -159,12 +165,27 @@ function New-AcaJobExecutionProvider {
         $tail = 100
         if ($Arguments.Contains("Tail") -and $Arguments["Tail"]) { $tail = [int]$Arguments["Tail"] }
 
-        az containerapp job logs show `
-            --name $payload.job `
-            --resource-group $payload.rg `
-            --execution $payload.execution `
-            --container $payload.container `
-            --tail $tail
+        $workspace = ""
+        if ($Context.Config -and ($Context.Config.PSObject.Properties.Name -contains "logAnalyticsWorkspace")) {
+            $workspace = [string]$Context.Config.logAnalyticsWorkspace
+        }
+
+        $result = Get-AcaExecutionLog `
+            -ResourceGroup $payload.rg `
+            -JobName $payload.job `
+            -ExecutionName $payload.execution `
+            -ContainerName $payload.container `
+            -Tail $tail `
+            -WorkspaceName $workspace
+
+        $notice = ""
+        if ($result.Source -eq "log-analytics") {
+            $notice = "[squad-aca] containerapp CLI extension unavailable; read logs from Log Analytics workspace '$($result.Workspace)'."
+        }
+        return [pscustomobject]@{
+            Lines  = @($result.Lines)
+            Notice = $notice
+        }
     }
 
     # -- cancel --------------------------------------------------------------

@@ -26,20 +26,22 @@ pre-push hook.
 | Secret scan | Scans tracked `docs/`, `scripts/`, `worker/`, and `aspire/` for token patterns and credential filenames (skips `bin/`, `obj/`, `node_modules/`, and binary files) | Keeps the public repo free of secrets |
 | Session-managed env parity | Compares the session-managed env key lists in `scripts/lib/session-env.ps1` and `worker/lib/ralph-dispatch.sh` | Fails on drift so both dispatch paths strip the same keys and session isolation cannot regress |
 | Sync guard enumeration | Asserts `Test-SyncSafety` (`scripts/lib/sync-safety.ps1`) uses repository-rooted, byte-safe NUL-delimited `git diff`/`git ls-files` enumeration with ordinal path de-duplication, then runs the real guard against a throwaway repo with nested, ignored, non-ASCII, and newline-parser regression cases | Proves every file `git add -A` would stage is scanned before `--sync-all`, including nested untracked files and quoted/escaped paths, while git-ignored files stay excluded |
+| Logs fallback + exit code | Drives `Get-AcaExecutionLog` (`scripts/lib/aca-logs.ps1`) against a fake `az` placed first on `PATH`: extension present, extension absent, extension call failing, Log Analytics query failing, both paths unavailable, and a child-process exit-code assertion. Also re-runs the Log Analytics path under Windows PowerShell 5.1, the host the `squad-aca` shim uses | Regression guard for issue #13: `logs` must never exit 0 after a failed fetch, must never trigger the interactive extension-install prompt, and must fall back to Log Analytics when the `containerapp` extension is unavailable |
 | .NET scaffold | Verifies `aspire/` structure and `.csproj` XML; optional `dotnet build` | Ensures the optional integration path stays coherent |
 | Execution provider contract | Exercises `scripts/lib/squad-aca-provider.ps1` offline against the filesystem-backed fake provider: create/wait/status/logs/cancel/terminate state transitions, idempotent `terminate` (repeat and after external deletion), double `cancel`, handle opacity, and rejection of unknown, malformed, and foreign-provider handles | Proves the provider seam behaves per PRD #6 with no Azure subscription, so a future Sandboxes provider can be developed and tested offline |
 | CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, rendered output, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through behaviour when `az` fails |
-| Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, preflight contract, Ralph transactional dispatch, and the harness itself |
+| Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, the capability routing decision, preflight contract, Ralph transactional dispatch, and the harness itself |
 
 The capability manifest contract itself is documented in
 [capability-manifest.md](capability-manifest.md): manifest schema, built-in
 tool/credential allowlists, the advisory-only handling of `services`/`egress`
-(required services are rejected at validation), and the entrypoint fail-closed
+(required services are rejected at validation), the routing contract and
+administrator sandbox class catalog, and the entrypoint fail-closed
 behavior when the packaged preflight script is missing.
 
 ## Proving the CLI has not changed
 
-`validate.ps1` section 8 asserts specific properties of `squad-aca` output. When
+`validate.ps1` section 9 asserts specific properties of `squad-aca` output. When
 a change touches the control plane — particularly the execution provider seam —
 prove the stronger claim with a differential capture against another revision:
 
@@ -90,6 +92,26 @@ The runner also refuses to print the success banner when **no suite actually
 executed** — an empty test directory or a run where every suite skipped exits
 non-zero, because a run that proved nothing must never read as green.
 
+### Golden decision fixtures
+
+`worker/tests/test_capability_routing.sh` asserts the capability routing
+decision byte-for-byte against golden JSON in `worker/tests/expected/`, using
+manifests from `worker/tests/fixtures/routing-*.yml`. The resolver emits keys in
+a fixed order and sorts/de-duplicates every array specifically so those goldens
+are meaningful: a decision that changes for any reason shows up as a readable
+diff rather than as a reshuffle.
+
+Regenerate a golden only when the change to the decision is intended, and review
+the diff:
+
+```bash
+node worker/lib/resolve-capability-route.js <repo-with-manifest> --pretty \
+  > worker/tests/expected/<golden>.json
+```
+
+Golden files are LF-normalized via `.gitattributes` so they stay byte-stable on
+Windows checkouts.
+
 ### Declared dependencies and skip semantics
 
 Each suite declares what it needs up front via `worker/tests/lib/deps.sh`:
@@ -101,6 +123,7 @@ require_deps node git
 
 | Suite | Declared dependencies |
 | --- | --- |
+| `test_capability_routing.sh` | `node` |
 | `test_git_checkout.sh` | `git` |
 | `test_parse_capabilities.sh` | `node` |
 | `test_preflight.sh` | `node` |
@@ -150,6 +173,13 @@ the guard. This is also why `validate.ps1` only runs `bash -n` on the worker
 scripts (a syntax check, which Git Bash handles fine) and leaves the behavioural
 suite to WSL/CI.
 
+Run it from a **checkout path that contains no digits**. Several redaction
+assertions prove the parser never echoes a raw manifest value by asserting that
+value's absence from the error output, and those errors legitimately include the
+manifest's absolute path. A working copy at, say, `~/sq-s2` puts a `2` in every
+error line and trips the "does not echo the raw manifest version" assertion —
+a false failure caused by the path, not by the code.
+
 ### PowerShell validation in CI
 
 The `powershell-validation` job runs `scripts/validate.ps1` on `windows-latest`.
@@ -180,9 +210,12 @@ Run these in order. Static checks first (fast, no Azure), then E2E.
       [Proving the CLI has not changed](#proving-the-cli-has-not-changed)).
 - [ ] `bash -n worker/entrypoint.sh` passes (also covered by validate.ps1).
 - [ ] `node --check worker/lib/parse-capabilities.js` passes.
+- [ ] `node --check worker/lib/resolve-capability-route.js` passes and
+      `config/sandbox-classes.json` parses as JSON.
 - [ ] `bash worker/tests/run-tests.sh` passes on Linux/WSL (capability parser,
-      preflight, Ralph dispatch, and the harness self-test) with **0 failed and
-      0 skipped** — see [Worker test harness guarantees](#worker-test-harness-guarantees).
+      capability routing, preflight, Ralph dispatch, and the harness self-test)
+      with **0 failed and 0 skipped** — see
+      [Worker test harness guarantees](#worker-test-harness-guarantees).
 - [ ] `git grep` finds no personal subscription IDs, tenant IDs, tokens, or user
       handles in tracked files (see [Secret scans](#secret-scans)).
 - [ ] Optional: `.\scripts\validate.ps1 -RunDotnet` builds `aspire/Squad.Aca.sln`.

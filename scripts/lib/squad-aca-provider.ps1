@@ -481,10 +481,16 @@ function Get-SquadExecutionLog {
         logs: emit the execution's logs.
 
     .DESCRIPTION
-        A provider MAY stream straight to the host rather than returning
-        strings. The ACA Job adapter does exactly that, because `az containerapp
-        job logs show` owns the rendering today and wrapping it would change
-        what the user sees.
+        Returns a result object, not rendered text, so presentation stays with
+        the caller and every provider looks the same:
+
+          Lines  - the log lines, newest last.
+          Notice - an optional single line the caller prints verbatim before the
+                   log body (the ACA Job adapter uses it to say it fell back to
+                   Log Analytics). Empty when there is nothing to say.
+
+        How the lines were obtained -- and from which of a substrate's several
+        log paths -- is the provider's business.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Provider,

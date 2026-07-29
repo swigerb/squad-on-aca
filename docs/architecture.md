@@ -63,7 +63,7 @@ scripts/lib/squad-aca-provider.ps1        the contract
 | `create` | Dispatch a new execution from a provider-neutral request. |
 | `wait` | Block until the execution is ready (running) or terminal. |
 | `status` | List recent executions, or describe the one behind a handle. |
-| `logs` | Emit an execution's logs. |
+| `logs` | Return an execution's logs as `Lines` plus an optional `Notice` the caller prints verbatim. Which of a substrate's log paths produced them is the provider's business. |
 | `cancel` | Ask the substrate to stop a running execution, reporting the substrate's own result. |
 | `terminate` | **Idempotent** teardown. Already-terminated, already-terminal, or externally-deleted is a success. |
 
@@ -96,6 +96,12 @@ resolver fills; the seam passes `$null` today.
 `create` never writes its own response to the pipeline — it returns it through an
 `-Outcome` hashtable — so substrate dispatch output still passes through to the
 user byte for byte.
+
+The ACA Job adapter's `logs` operation delegates to `Get-AcaExecutionLog`
+(`scripts/lib/aca-logs.ps1`), which prefers the `containerapp` CLI extension,
+falls back to Log Analytics, and throws when both fail (issue #13). The seam
+does not change that behaviour; it only moves the decision of *how* to fetch
+logs behind the provider, leaving `Invoke-Logs` responsible for presentation.
 
 ### What is deliberately *not* behind the seam
 

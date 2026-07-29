@@ -145,10 +145,12 @@ function New-FakeExecutionProvider {
         if ($Arguments.Contains("Tail") -and $Arguments["Tail"]) { $tail = [int]$Arguments["Tail"] }
 
         $logPath = Join-Path $Context.StateRoot "$id.log"
-        if (-not (Test-Path $logPath)) { return @() }
-        $lines = @(Get-Content -LiteralPath $logPath)
-        if ($lines.Count -gt $tail) { $lines = $lines[($lines.Count - $tail)..($lines.Count - 1)] }
-        return $lines
+        $lines = @()
+        if (Test-Path $logPath) {
+            $lines = @(Get-Content -LiteralPath $logPath)
+            if ($lines.Count -gt $tail) { $lines = $lines[($lines.Count - $tail)..($lines.Count - 1)] }
+        }
+        return [pscustomobject]@{ Lines = $lines; Notice = "" }
     }
 
     # -- cancel --------------------------------------------------------------

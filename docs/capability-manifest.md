@@ -25,10 +25,18 @@ actionable error, instead of Squad and the RAI/QA loop it drives.
 - A **preflight validation step** that runs after the repository is cloned
   and before Squad/Copilot starts working, so unsupported tools/capabilities
   fail fast with an actionable message instead of failing mid-task.
+- A **routing decision** (`worker/lib/resolve-capability-route.js`) that turns a
+  manifest into deterministic, machine-readable JSON: run on the existing ACA
+  job, run in an administrator-approved sandbox class, or fail closed. The
+  decision is **computed and reported but not acted upon** — see
+  [Capability routing](#capability-routing).
+- An **administrator sandbox class catalog** (`config/sandbox-classes.json`)
+  that is the only source of grantable capability — see
+  [The sandbox class catalog](#the-sandbox-class-catalog).
 - **Backward compatibility by default**: repositories with no manifest are
   completely unaffected. Nothing changes for existing sessions.
 - Documented **extension points** for the harder, deliberately out-of-scope
-  problems: per-task ACA SandboxGroup/image selection, controlled egress,
+  problems: per-task ACA Sandboxes/image selection, controlled egress,
   short-lived credentials, and least-privilege per-task identities. These
   are not implemented here — this phase adds the seams they will plug into.
 
@@ -199,6 +207,198 @@ When no manifest is present, or preflight is explicitly disabled, a missing
 script is logged and the session continues — preserving backward compatibility
 for repositories that never adopted a manifest.
 
+## Capability routing
+
+Preflight answers "can *this* worker satisfy the manifest?" at session start.
+Routing answers the earlier question: "**which** execution environment should
+this repository get at all?"
+
+```bash
+node worker/lib/resolve-capability-route.js <repo-dir> \
+  [--manifest-path <relative>] [--catalog <path>] [--pretty]
+```
+
+> **The decision is computed and reported, not acted upon.** Nothing in this
+> phase creates a sandbox, changes dispatch, or changes the execution path. The
+> in-worker preflight remains the **final** safety check no matter what the
+> resolver decided earlier — a route is a hint about where to run, never a
+> substitute for verifying the environment that actually booted.
+
+The resolver consumes the manifest that `parse-capabilities.js` already parses
+and validates; it never re-implements parsing or relaxes validation.
+
+### The routing contract
+
+The resolver writes one JSON object to stdout. Keys are emitted in a fixed
+order and every array is de-duplicated and sorted by code unit, so the output is
+stable enough to golden-test and to diff between runs.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schemaVersion` | integer | Decision schema version. Currently `1`. |
+| `route` | `aca-job` \| `sandbox` \| `fail-closed` | Where this repository should run. |
+| `reason` | string | A stable code from a fixed vocabulary (below). Never interpolated from manifest input. |
+| `requiredTools[]` | string[] | Sorted, de-duplicated `tools[].name` where `required: true`. |
+| `requiredCredentials[]` | string[] | Sorted, de-duplicated `credentials[].name` where `required: true`. |
+| `egressHosts[]` | string[] | Sorted, de-duplicated `egress[].host`. |
+| `imageHint` | string \| null | **Always a catalog-owned string or `null`** — the matched `imageHintAliases` entry, never raw manifest text. |
+| `defaultImageSufficient` | boolean | Whether the default worker profile already satisfies every required capability. |
+| `sandboxClass` | string \| null | The selected approved class id, or `null`. |
+| `manifestPresent` | boolean | Whether a manifest file exists at the configured path. |
+| `manifestVersion` | integer \| null | The manifest's declared `version`, or `null` when it could not be established. |
+| `imageHintPresent` | boolean | Whether the manifest declared `image.hint` at all. |
+| `imageHintRecognized` | boolean | Whether that hint matched an approved class alias. |
+| `unsatisfiedTools[]` | string[] | Required tools that **no** approved class provides. |
+| `unsatisfiedCredentials[]` | string[] | Required credentials that **no** approved class permits. |
+| `unsatisfiedEgressHosts[]` | string[] | Declared hosts that **no** approved class's egress template permits. |
+| `catalogSchemaVersion` | integer \| null | Schema version of the catalog that produced this decision. |
+| `catalogProvisional` | boolean | `true` while the catalog is unreviewed. Consumers must treat a provisional catalog as report-only. |
+| `detail` | string | A fixed, actionable sentence for the `reason`. Never contains manifest text. |
+
+### Routing rules
+
+| Situation | Route | `reason` |
+| --- | --- | --- |
+| No manifest at the configured path | `aca-job` | `no-manifest` |
+| Every required capability is in the default worker profile | `aca-job` | `default-profile-satisfies-manifest` |
+| Requirements exceed the default profile and an **approved** class provides all of them | `sandbox` | `approved-sandbox-class-matched` |
+| Requirements exceed the default profile and no approved class covers them | `fail-closed` | `no-approved-sandbox-class` |
+| Manifest fails parsing or schema validation | `fail-closed` | `manifest-invalid` |
+| Manifest exists but cannot be read | `fail-closed` | `manifest-unreadable` |
+| Manifest path is absolute, escapes the repo, or is a symlink | `fail-closed` | `manifest-path-unsafe` |
+| A manifest identifier is character-safe but out of bounds | `fail-closed` | `manifest-identifier-unsafe` |
+| The administrator catalog is missing, unreadable, or invalid | `fail-closed` | `catalog-unavailable` |
+
+The **no-manifest case is the overwhelmingly common one and is preserved exactly**:
+it routes to the existing ACA job with no requirements, no class, and no
+image hint. A malformed manifest is never quietly downgraded to `aca-job`.
+
+Exit codes: `0` whenever a decision was produced (including `fail-closed`, since
+the decision itself carries the outcome), `64` for a usage error, and `70` when
+the administrator catalog is unusable — a control-plane fault rather than a
+repository fault. Even on `70` a `fail-closed` decision is still written to
+stdout, so a caller that ignores exit codes still fails closed.
+
+### Security invariants
+
+These are non-negotiable and are covered by
+`worker/tests/test_capability_routing.sh`:
+
+1. **A manifest only requests capabilities; it can never grant them.** Every
+   grantable capability comes from the administrator catalog. A manifest cannot
+   add a class, add an egress destination, widen a credential list, name a
+   shell command, or bypass approval.
+2. **`image.hint` can only select among approved classes.** It is matched
+   against a class's `imageHintAliases` purely to disambiguate, and is *never*
+   used as, or turned into, an image reference. Because the emitted `imageHint`
+   is echoed from the catalog rather than from the manifest, a
+   path-traversal-shaped or otherwise hostile hint resolves to `null` and never
+   appears in the output.
+3. **Repository entries may only narrow.** A declared egress host that a
+   class's template does not already permit disqualifies that class; it never
+   widens it.
+4. **Diagnostics are redacted.** Only allowlisted identifier *names*, fixed
+   reason codes, and counts are emitted. Free-form manifest text (`reason`,
+   `notes`, raw key names, values) never reaches the output, logs, or errors.
+   An identifier that passes the parser's character allowlist but is
+   implausibly long is refused **without being echoed**
+   (`manifest-identifier-unsafe`).
+5. **Anything ambiguous fails closed.** Malformed manifests, unsafe manifest
+   paths, unreadable manifests, and unusable catalogs all produce
+   `fail-closed`, never a silent `aca-job`.
+
+### Configuration
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `CAPABILITY_MANIFEST_PATH` | `squad-capabilities.yml` | Manifest path, relative to the repository root. Same variable the preflight uses. |
+| `SQUAD_SANDBOX_CLASS_CATALOG` | _(unset)_ | Absolute path to the sandbox class catalog. When set (or when `--catalog` is passed) that path is **authoritative**: an unusable catalog is an error, never a silent fall back to another one. |
+
+With neither set, the resolver looks for a catalog packaged beside the worker
+libraries, then for `config/sandbox-classes.json` in this repository.
+
+## The sandbox class catalog
+
+`config/sandbox-classes.json` is the administrator-controlled catalog of what an
+execution environment may provide. It is owned by the **Squad on ACA control
+plane** (this repository) and is deliberately **not** repository-controlled: a
+worked-on repository can request capabilities in its manifest, but only this
+catalog can grant them.
+
+| Key | Meaning |
+| --- | --- |
+| `schemaVersion` | Catalog schema version. Currently `1`. |
+| `provisional` | `true` until an administrator has reviewed every entry. Consumers must treat a provisional catalog as report-only. |
+| `defaultWorker` | The current fixed `squad-worker` ACA job profile: `id`, `tools[]`, `credentials[]`, `egress`. This is what "satisfied by the default image" is measured against. |
+| `classes[]` | The sandbox classes. |
+
+Each class pins:
+
+| Key | Meaning |
+| --- | --- |
+| `id` | Stable class identifier — the only class-derived value the routing decision emits. |
+| `approved` | Whether an administrator has approved the class. **Only `true` classes can ever be selected.** |
+| `image` | Pinned image reference (`reference`, `tag`, `digest`, `pinned`). Never emitted in a decision. |
+| `imageHintAliases[]` | Manifest `image.hint` values that may disambiguate *to this class*. Matching is exact. |
+| `resources` | CPU / memory / ephemeral storage limits. |
+| `tools[]` | Built-in tools the class provides. |
+| `allowedCredentials[]` | Credential types that may be injected into the class. |
+| `egress` | The permitted-destination template (below). |
+| `limits` | Concurrency and cost ceilings (`maxConcurrentSandboxes`, `maxSessionMinutes`, `maxMonthlyCostUsd`). |
+
+### Egress templates
+
+`egress` mirrors the real Azure Container Apps Sandboxes network policy shape
+(ARM type `Microsoft.App/sandboxGroups`, api-version `2026-02-01-preview`) so a
+later sprint maps onto it without translation:
+
+```jsonc
+"egress": {
+  "defaultAction": "Deny",
+  "trafficInspection": "Full",
+  "hostRules": [
+    { "pattern": "*.github.com", "action": "Allow" },
+    { "pattern": "registry.npmjs.org", "action": "Allow" }
+  ]
+}
+```
+
+Matching semantics, as implemented and tested:
+
+- `*.example.com` matches any host ending in `.example.com` (one or more leading
+  labels) and deliberately **does not** match the bare apex `example.com`, which
+  must be listed explicitly.
+- Any other pattern is an exact, case-insensitive host match. An explicit
+  `:<port>` on a declared host does not defeat the host match.
+- Rules are evaluated in order; the **first match wins**; `defaultAction` applies
+  when nothing matches.
+- No other wildcard form is supported. Suffix-smuggling hosts such as
+  `github.com.evil.net` do not match `*.github.com`.
+
+`defaultWorker` is modelled with `defaultAction: "Allow"` because the current ACA
+job has unrestricted egress. That is an accurate description of today's posture,
+not an endorsement of it.
+
+### Provisional status
+
+Everything currently in the catalog is **placeholder data** captured during the
+routing sprint. Nothing reads it as authority. Before any code acts on it, an
+administrator must review and replace the image references and digests, the
+resource and cost limits, every egress rule, every `allowedCredentials` entry,
+and each `approved` flag — and then set `"provisional": false`. The file carries
+a `$comment` header saying exactly this, and the routing decision surfaces it as
+`catalogProvisional`.
+
+The `defaultWorker.tools` list is deliberately **conservative**: it lists only
+tools guaranteed by `worker/Dockerfile`. Under-claiming routes a repository
+toward review rather than toward an unchecked run, which is the fail-closed
+direction.
+
+Squad workers must run in a **dedicated, identity-free sandbox group**: managed
+identity on ACA Sandboxes is group-scoped, so an identity attached to the group
+would be reachable from inside the sandbox. With no identity on the group,
+in-sandbox token minting fails closed.
+
 ## Extending the worker image
 
 If a repository needs tools the fixed `squad-worker` image doesn't carry
@@ -225,13 +425,35 @@ self-documenting even before automatic image selection exists (see below).
 These are real, valuable next steps that the manifest is designed to feed,
 but they need more design/security review than fits in one PR:
 
-### Future: per-task images and SandboxGroups
+### Future: per-task images and Sandboxes
 
-ACA SandboxGroups (or a fleet of prebuilt, purpose-specific worker images)
-could let a task's declared `image.hint` or `tools[]` list drive **automatic
-selection** of the execution environment, instead of a human manually
-rebuilding and repointing jobs. The manifest's `image` field and `tools[]`
-list are the intended input to that selection logic once it exists.
+Azure Container Apps Sandboxes (or a fleet of prebuilt, purpose-specific worker
+images) could let a task's declared `image.hint` or `tools[]` list drive
+**automatic selection** of the execution environment, instead of a human
+manually rebuilding and repointing jobs.
+
+The selection *decision* now exists — see
+[Capability routing](#capability-routing) — but nothing acts on it. Still to
+come:
+
+- **Packaging.** `worker/lib/resolve-capability-route.js` and
+  `config/sandbox-classes.json` are repository artifacts today; neither is
+  copied into the worker image yet, because nothing in the execution path calls
+  the resolver.
+- **A provider seam.** The decision needs a consumer that can create and tear
+  down a sandbox, with the ACA job remaining the default provider.
+- **Acting on the decision.** Dispatch must honour `route`, and `fail-closed`
+  must actually stop a session rather than only being reported.
+- **One manifest-path implementation.** The resolver mirrors the preflight's
+  hardened manifest-path resolution rather than sharing it, because this phase
+  deliberately did not modify the shipped `squad-capability-preflight.sh`. The
+  two should be unified when the provider seam lands.
+- **Catalog review.** The catalog is `provisional: true` and must be reviewed
+  before anything treats it as authority.
+
+Whatever consumes the decision, the in-worker preflight stays the final safety
+check: routing chooses *where* to run, and preflight still verifies the
+environment that actually booted.
 
 ### Future: controlled egress
 
