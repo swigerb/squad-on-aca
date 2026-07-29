@@ -610,6 +610,54 @@ function Test-Command {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Get-GitHubPushAccessCheck {
+    <#
+    .SYNOPSIS
+        Whether the ACTIVE `gh` identity can WRITE to this repository.
+
+    .DESCRIPTION
+        `gh auth status` only proves that some account is signed in. Every
+        dispatch writes a durable lease to this repository through `gh`, and
+        GitHub answers a write to a repository you can only READ with
+        `404 Not Found`, not `403 Forbidden` -- so a read-only identity gets a
+        green "GitHub auth ok" here and an unexplained 404 at lease claim.
+        That is exactly how issue #22 reached a live E2E run on a machine with
+        two authenticated accounts, where `gh` uses the ACTIVE one.
+
+        Reports the login as well as the permission, because in the
+        multi-account case the useful question is not "is push allowed" but
+        "which account is `gh` using right now".
+    #>
+    param([string]$Repository)
+
+    if (-not $Repository) {
+        return [pscustomobject]@{ Check = "GitHub push"; Status = "missing"; Detail = "No repo detected; run squad-aca init or pass --repo" }
+    }
+
+    $login = (gh api user --jq .login 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0 -or -not $login) { $login = "unknown identity" }
+
+    $permissionsJson = (gh api "repos/$Repository" --jq .permissions 2>$null | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not $permissionsJson.Trim()) {
+        return [pscustomobject]@{ Check = "GitHub push"; Status = "unknown"; Detail = "Could not read permissions on $Repository as $login" }
+    }
+
+    $permissions = $null
+    try { $permissions = $permissionsJson | ConvertFrom-Json } catch { $permissions = $null }
+    if ($null -eq $permissions -or $null -eq $permissions.push) {
+        return [pscustomobject]@{ Check = "GitHub push"; Status = "unknown"; Detail = "Could not read permissions on $Repository as $login" }
+    }
+
+    if ($permissions.push) {
+        return [pscustomobject]@{ Check = "GitHub push"; Status = "ok"; Detail = "$login has push access to $Repository" }
+    }
+    return [pscustomobject]@{
+        Check  = "GitHub push"
+        Status = "failed"
+        Detail = "$login has push=false on $Repository; GitHub reports this as 404 Not Found. Run 'gh auth status' and switch account"
+    }
+}
+
 function Invoke-Doctor {
     $checks = @()
     $config = Get-AcaConfig
@@ -625,9 +673,22 @@ function Invoke-Doctor {
 
     try {
         gh auth status 1>$null 2>$null
-        $checks += [pscustomobject]@{ Check = "GitHub auth"; Status = "ok"; Detail = "gh auth status succeeded" }
+        # A native command sets $LASTEXITCODE; it does not throw, so the catch
+        # below never fired and this row read "ok" for any machine that had
+        # `gh` at all.
+        if ($LASTEXITCODE -eq 0) {
+            $checks += [pscustomobject]@{ Check = "GitHub auth"; Status = "ok"; Detail = "gh auth status succeeded" }
+        } else {
+            $checks += [pscustomobject]@{ Check = "GitHub auth"; Status = "failed"; Detail = "gh auth status exited $LASTEXITCODE; run 'gh auth login'" }
+        }
     } catch {
         $checks += [pscustomobject]@{ Check = "GitHub auth"; Status = "failed"; Detail = $_.Exception.Message }
+    }
+
+    try {
+        $checks += Get-GitHubPushAccessCheck -Repository $repo
+    } catch {
+        $checks += [pscustomobject]@{ Check = "GitHub push"; Status = "unknown"; Detail = $_.Exception.Message }
     }
 
     try {

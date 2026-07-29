@@ -656,3 +656,109 @@ mutation reverts *everything* uncommitted in that file — I lost all four
 provider edits once and had to reapply them. Commit before mutation-testing.
 Also: a PowerShell hashtable's missing key yields `$null` and `@($null)` has
 Count 1, so ambiguity declarations must be read with `.ContainsKey()`.
+
+## Sprint 9 — issues #17 and #22 (`fix/issues-seventeen-twentytwo`)
+
+**#17 — a test whose result depended on where the repo was checked out.**
+`test_parse_capabilities.sh:52` asserted `assert_not_contains "$out" '2'` to
+prove the parser does not echo an invalid manifest version. The intent was
+right; the assertion was not. The parser prefixes every error with the manifest
+path it was handed, so the assertion also asserted something about the
+developer's home directory. Same commit, correct parser, two answers:
+`~/verifys2` -> 62 assertions run, 1 failed; digit-free path -> 62 run, 0
+failed. CI stayed green only because the runner's workspace path contains no
+`2`.
+
+The fix asserts the specific thing the test cares about. `run_parser` sets
+`out`, `rc` and `body`, where `body` is the output with the manifest path the
+test itself supplied masked to `<manifest-path>`. All 21 invocations were
+converted; every `assert_not_contains` now runs against `body`, presence
+assertions still use `out`. The mask pattern is quoted *inside* the expansion
+(`${out//"$manifest"/...}`) so bash matches it literally — a checkout path with
+glob metacharacters cannot mis-mask and silently weaken the assertion. The
+version literal is read out of the fixture with `sed` and pinned with
+`assert_eq "2"`, so the absence assertion cannot become vacuous if someone
+edits `invalid-version.yml`.
+
+I rejected stripping the first output line: the parse-error path (`malformed.yml`
+and the leak-token fixture) emits the path AND the message on ONE line, so
+line-stripping would have made those absence assertions vacuous — a worse
+defect than the one being fixed.
+
+**Environment-coupling audit (the "while you are there" ask).** I read every
+`assert_not_contains` in the worker suite and looked for coupling to checkout
+path, temp path, hostname, timezone, locale and username. Only the parse suite
+was affected. The routing resolver emits a pure JSON decision object with no
+filesystem paths, so `test_capability_routing.sh`'s `assert_not_contains "$out"
+".."` is safe. `test_preflight.sh` matches long distinctive sentinels, not bare
+characters. No hostname/TZ/locale/username coupling anywhere; the CLI harness
+already pins `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT` and offset-free timestamps.
+Nothing else needed fixing, so nothing else was touched.
+
+**#22 — a 404 that meant "you cannot write here".** The final live E2E run
+failed at lease claim with a bare `gh: Not Found (HTTP 404)`. The repository
+existed and was readable; the active `gh` account simply had `push: false`.
+GitHub masks a write denial on a readable repository as 404, never 403, so the
+real cause was invisible.
+
+The handling was already correct and I changed none of it. The 404 was NOT
+misread as "already gone", the lease store failed closed, and dispatch stopped
+rather than starting compute without a durable claim. `classifyGhFailure`,
+`REAL_FAILURE_PATTERNS`, `GONE_PATTERNS`, `isGoneResult` and the deny-list-first
+ordering are byte-identical, and I added an assertion pinning that the exact
+404 text from the incident still classifies as `gone`. This programme rejected
+that defect class five times; a confusing message is the cheaper problem.
+
+The four lease WRITE sites (base commit, ref, lease write, prune) now report
+through `ghWriteFailure`. When — and only when — a write failure looks like a
+404, it reads `repos/{owner}/{repo} --jq .permissions` once and, on `push:false`,
+names the identity, the repository, the 404-masking rule and the fix. Costs
+nothing on the success path (pinned by an assertion counting `gh` calls). If the
+probe itself fails, the original message is reported verbatim: a diagnostic must
+never mask the error it was explaining, and must never claim a permission it did
+not observe. `probeLogin` reads raw text rather than JSON, because real
+`gh api --jq .login` prints a bare unquoted string, and constrains it to the
+GitHub username grammar so a diagnostic cannot become an injection vector.
+
+`doctor` gained a `GitHub push` row. It previously reported `GitHub auth ok` for
+an identity that could not write — that is precisely what let this reach a live
+run. "`gh auth status` succeeded" answers a different question from "can this
+identity write here". It reports `unknown` rather than guessing when the
+permission cannot be read. While there I found that the `GitHub auth` row could
+never report failure: native commands set `$LASTEXITCODE` but do not throw, so
+the surrounding `catch` was dead code and the row was unconditionally `ok`
+whenever `gh` existed. Now it checks the exit code.
+
+**Other GitHub write paths — checked, reported, not "fixed".**
+`deleteLeaseRecord` treats a 404 as "already gone", which is correct and
+required for idempotency; with `push:false`, `claimLease` fails first, so a
+prune is unreachable. Ralph's `gh issue edit --add-label` writes swallow all
+failures by design (labelling must never fail a dispatch) and are equally
+unreachable once the claim has failed. The exposure is confined to the lease
+writes fixed here. I did not widen the change to satisfy symmetry.
+
+**Goldens.** `11-doctor.txt` only, regenerated deliberately with `-Update`.
+Exactly three added lines: `api user --jq .login` and
+`api repos/octo/demo --jq .permissions` under `### GH CALLS`, and
+`GitHub push     ok      octo-stub has push access to octo/demo` under
+`### STDOUT`. No other golden moved; `### ACA CALLS` is empty in all 22.
+
+**Verification.** `validate.ps1` 213 passed / 0 failed / 0 skipped (was
+205/0/0). `verify-cli-golden.ps1` 22/22. `verify-launch-detachment.ps1` PASS.
+`compare-cli-baseline.ps1 -BaselineRef HEAD` 22/22. Worker suite under WSL:
+7 suites, 426 assertions (123/92/11/63/40/54/43), 0 failed, 0 skipped, **at a
+digit-free path AND at a path containing `2`** — that pair is the #17 proof.
+Parse suite 62 -> 63; dispatch contract 76 -> 92.
+
+**Mutations** — all caught, all reverted, tree clean afterwards:
+
+| Mutation | Check that failed |
+| --- | --- |
+| parser echoes the raw version (`${manifest.version}`) | `invalid-version.yml does not echo the raw manifest version`, plus three related redaction assertions — 63 run, **4 failed at BOTH** `~/mutfree` and `~/mut2dir`, identically. Before the fix the same suite failed at one path and passed at the other. |
+| base-commit write reverted to `ghFailure` | `404 on write: names the identity and the permission it lacks`; `... explains why the status code is misleading`; `... tells the operator how to fix it` (92 run, 3 failed) and `validate.ps1` "A 404 lease write no longer explains the push-permission cause" (212/1) |
+| `doctor` push row removed | `validate.ps1` "doctor no longer reports GitHub push access", "still reports a read-only identity as healthy", "does not fail safe when the permission read fails" (210/3) and `verify-cli-golden.ps1` 21/22 |
+
+**Lesson recorded.** A validate guard written as a bare regex over a test file
+matched my own explanatory comment about the old assertion and failed the build.
+Anchor structural guards to `^\s*` so prose that quotes the banned pattern is
+still allowed — a rule you cannot document is a rule people will route around.

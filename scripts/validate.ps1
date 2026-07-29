@@ -3098,6 +3098,94 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
     }
 }
 
+# --- Issue #22: a 404 on a lease write must be DIAGNOSED, not just quoted -----
+# GitHub answers a write to a repository the caller may only READ with
+# `404 Not Found`, never `403 Forbidden`, so "this identity cannot write here"
+# is invisible in the raw message. A live E2E run lost an afternoon to it. The
+# classification is deliberately NOT changed: these checks pin that the failure
+# is still a failure AND that the operator is now told why.
+if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment
+        Initialize-SquadCliStubRepository -Stub $stub | Out-Null
+
+        $denied = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript `
+            -CliArguments @("smoke", "--repo", "octo/demo") `
+            -GhFailMode "notfound404" -GhFailPath "git/commits" `
+            -GhPermissions "nopush" -GhLogin "read-only-bot"
+        $deniedText = "$($denied.StdErr)`n$($denied.StdOut)"
+        if ($denied.ExitCode -ne 0 -and
+            $deniedText -match "has push=false on octo/demo" -and
+            $deniedText -match "404 Not Found" -and
+            $deniedText -match "read-only-bot") {
+            Add-Pass "A lease write that fails with 404 names the gh identity and its missing push permission, and still exits $($denied.ExitCode) (the failure is diagnosed, not reclassified)"
+        } else {
+            Add-Fail "A 404 lease write no longer explains the push-permission cause (exit=$($denied.ExitCode)): $deniedText"
+        }
+        # The compute request must never happen: a diagnostic may not turn a
+        # failed claim into a dispatch.
+        if (@($denied.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count -eq 0) {
+            Add-Pass "A failed lease claim still starts no execution, so the improved diagnostic did not weaken claim-before-compute"
+        } else {
+            Add-Fail "A failed lease claim started an execution; the 404 diagnosis changed the classification"
+        }
+
+        # The probe is a diagnostic, not a dependency. When it cannot answer,
+        # the ORIGINAL failure must survive unchanged.
+        $stubFallback = New-SquadCliStubEnvironment
+        try {
+            Initialize-SquadCliStubRepository -Stub $stubFallback | Out-Null
+            $fallback = Invoke-SquadCliCapture -Stub $stubFallback -ScriptPath $cliScript `
+                -CliArguments @("smoke", "--repo", "octo/demo") `
+                -GhFailMode "notfound404" -GhFailPath "git/commits" -GhPermissions "fail"
+            $fallbackText = "$($fallback.StdErr)`n$($fallback.StdOut)"
+            if ($fallback.ExitCode -ne 0 -and
+                $fallbackText -match "already gone or already terminal" -and
+                $fallbackText -notmatch "push=false") {
+                Add-Pass "When the permission probe itself fails, the original lease error is reported unchanged instead of being masked by the probe's error"
+            } else {
+                Add-Fail "The permission probe masked the real lease failure (exit=$($fallback.ExitCode)): $fallbackText"
+            }
+        } finally {
+            Remove-SquadCliStubEnvironment -Stub $stubFallback
+        }
+
+        # doctor must verify push, not merely that `gh auth status` exited 0:
+        # reporting "GitHub auth ok" for a read-only identity is what let this
+        # reach a live run.
+        $doctorOk = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorOk.StdOut -match "GitHub push\s+ok\s+octo-stub has push access to octo/demo") {
+            Add-Pass "squad-aca doctor reports which gh identity is active and that it can push"
+        } else {
+            Add-Fail "squad-aca doctor no longer reports GitHub push access: $($doctorOk.StdOut)"
+        }
+
+        $doctorDenied = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor") `
+            -GhPush "false" -GhLogin "read-only-bot"
+        if ($doctorDenied.StdOut -match "GitHub push\s+failed" -and
+            $doctorDenied.StdOut -match "read-only-bot has push=false" -and
+            $doctorDenied.StdOut -match "GitHub auth\s+ok") {
+            Add-Pass "squad-aca doctor fails the push row for a read-only identity even though 'gh auth status' succeeds, which is the gap that let issue #22 reach a live run"
+        } else {
+            Add-Fail "squad-aca doctor still reports a read-only identity as healthy: $($doctorDenied.StdOut)"
+        }
+
+        $doctorUnknown = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor") `
+            -GhApiExitCode 1
+        if ($doctorUnknown.StdOut -match "GitHub push\s+unknown") {
+            Add-Pass "squad-aca doctor reports push access as 'unknown' when the permission read fails, rather than guessing either way"
+        } else {
+            Add-Fail "squad-aca doctor does not fail safe when the permission read fails: $($doctorUnknown.StdOut)"
+        }
+    } catch {
+        Add-Fail "GitHub push-permission diagnosis checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
 # --- Operational invariants around the lease that only source can prove -----
 # These three are cheap to state and expensive to lose. Each is a defect the
 # reviewer found by reading, and each would otherwise be re-introducible with a
@@ -3151,6 +3239,38 @@ if (Test-Path $cliSource) {
         Add-Pass "All $($markLines.Count) 'dispatched' lease writes in squad-aca.ps1 sit inside a try that warns rather than throwing or releasing, so a fault after compute started cannot strand the lease as 'claimed'"
     } else {
         Add-Fail "Unguarded 'dispatched' lease write(s) in squad-aca.ps1 at line(s) $($unguarded -join ', ') (found $($markLines.Count) write(s)); a 429 there throws to the user after compute started, and the retry is told 'repaired' and starts a second execution"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 9e. Worker assertions must not depend on WHERE the repo is checked out
+# ---------------------------------------------------------------------------
+# worker/lib/parse-capabilities.js prefixes every error with the manifest path,
+# so `assert_not_contains "$out" '2'` was really asserting something about the
+# developer's home directory: the same commit failed from `~/verifys2` and
+# passed from a digit-free path, with the parser behaving correctly both times
+# (issue #17). A false negative on a security property is worse than no test at
+# all, because it teaches people to distrust the suite.
+#
+# The suite now masks the manifest path it supplied and asserts against the
+# message body. These two checks make going back to raw output a failing check
+# here rather than a surprise on someone else's machine months later.
+Write-Section "Environment-independent worker assertions"
+$parseSuite = Join-Path $RepoRoot "worker\tests\test_parse_capabilities.sh"
+if (-not (Test-Path $parseSuite)) {
+    Add-Fail "worker/tests/test_parse_capabilities.sh is missing"
+} else {
+    $parseText = Get-Content -LiteralPath $parseSuite -Raw
+    $coupled = @(Select-String -LiteralPath $parseSuite -Pattern '^\s*assert_not_contains\s+"\$out"' -AllMatches)
+    if ($coupled.Count -eq 0) {
+        Add-Pass "No absence assertion in test_parse_capabilities.sh runs against raw parser output; each uses the path-masked body, so a checkout path that happens to contain the needle cannot fail the suite (issue #17)"
+    } else {
+        Add-Fail "test_parse_capabilities.sh asserts absence against unmasked parser output at line(s) $(($coupled.LineNumber) -join ', '); the parser prefixes its errors with the manifest path, so those assertions depend on the checkout directory"
+    }
+    if ($parseText -match 'run_parser\(\)' -and $parseText -match '\$\{out//"\$manifest"/') {
+        Add-Pass "test_parse_capabilities.sh masks the manifest path with a LITERAL (quoted) pattern, so a checkout path containing glob metacharacters cannot silently mis-mask and weaken an absence assertion"
+    } else {
+        Add-Fail "test_parse_capabilities.sh no longer masks the manifest path out of parser output; its absence assertions are coupled to the checkout location again"
     }
 }
 

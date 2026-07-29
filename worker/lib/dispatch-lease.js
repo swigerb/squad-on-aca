@@ -273,6 +273,97 @@ function ghFailure(action, result) {
 }
 
 // ---------------------------------------------------------------------------
+// 404-on-write diagnosis (issue #22)
+// ---------------------------------------------------------------------------
+//
+// GitHub answers a WRITE to a repository the caller may read but not write with
+// `404 Not Found`, not `403 Forbidden`. It does that deliberately, so that the
+// existence of a private resource is not disclosed -- but it means the single
+// most common real cause of a failed lease write, "the active `gh` account is
+// not the account that owns this repository", is completely invisible in the
+// message. On a machine with two authenticated accounts (`gh` uses the ACTIVE
+// one) that cost a live E2E run an afternoon.
+//
+// THIS CHANGES NO CLASSIFICATION. `classifyGhFailure` and its deny-list-first
+// ordering are untouched: a 404 on a write was a hard failure before and is a
+// hard failure after, dispatch still stops rather than starting compute without
+// a durable claim. The only difference is what the operator is told.
+//
+// Cost: the probe runs ONLY on a path that has already failed, and only when
+// the failure actually looks like a 404. The success path is unchanged. The
+// permission read is one call; the identity read costs a second call only once
+// a denial has been CONFIRMED, so the common case adds one request.
+//
+// If the probe itself fails we return the original message unchanged. Masking
+// one error with another would be strictly worse than the problem being fixed.
+
+const NOT_FOUND_PATTERNS = [/HTTP 404/i, /\bNot Found\b/i];
+
+function looksLikeNotFound(result) {
+  const text = [result.stderr, result.stdout].filter(Boolean).join(' ');
+  return NOT_FOUND_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function probeJson(args) {
+  const result = invokeGhSafe(args);
+  if (result.exitCode !== 0) return null;
+  const text = String(result.stdout || '').trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    return null;
+  }
+}
+
+// `gh api ... --jq .login` prints a bare string, not JSON, so the login is read
+// as text. It is then constrained to the character set GitHub actually allows
+// in a login before it is interpolated into an error message -- a diagnostic
+// must not become an injection vector.
+function probeLogin() {
+  const result = invokeGhSafe(['api', 'user', '--jq', '.login']);
+  if (result.exitCode !== 0) return null;
+  const text = String(result.stdout || '').trim();
+  return /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(text) ? text : null;
+}
+
+/**
+ * probePushAccess -- "can the identity `gh` is currently using write here?"
+ *
+ * Returns null when the answer cannot be established (probe failed, no
+ * permissions block, or the field is not a boolean), which the caller treats as
+ * "say nothing extra". Returns { push, login } otherwise; `login` may be null
+ * when the identity read failed, because a confirmed denial is still worth
+ * reporting without a name.
+ */
+function probePushAccess(repository) {
+  const permissions = probeJson(['api', `repos/${repository}`, '--jq', '.permissions']);
+  if (!permissions || typeof permissions.push !== 'boolean') return null;
+  if (permissions.push) return { push: true, login: null };
+  return { push: false, login: probeLogin() };
+}
+
+function ghWriteFailure(action, result, repository) {
+  const base = ghFailure(action, result);
+  if (!looksLikeNotFound(result)) return base;
+
+  let access = null;
+  try {
+    access = probePushAccess(repository);
+  } catch (err) {
+    access = null;
+  }
+  if (!access || access.push !== false) return base;
+
+  const who = access.login ? `(${access.login}) ` : '';
+  return new LeaseError(
+    `${base.message} The authenticated gh identity ${who}has push=false on ${repository}. ` +
+      'GitHub reports a write denial on a readable repository as 404 Not Found. ' +
+      "Run 'gh auth status' and select an account with write access."
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Clock (pinnable so offline tests are deterministic)
 // ---------------------------------------------------------------------------
 
@@ -354,7 +445,7 @@ function ensureLeaseRef(repository) {
     ['api', '--method', 'POST', `repos/${repository}/git/commits`, '--input', '-'],
     { input: JSON.stringify({ message: 'Squad on ACA lease ledger', tree: EMPTY_TREE_SHA, parents: [] }) }
   );
-  if (commit.exitCode !== 0) throw ghFailure(`create the '${branch}' base commit`, commit);
+  if (commit.exitCode !== 0) throw ghWriteFailure(`create the '${branch}' base commit`, commit, repository);
   const commitJson = parseJsonOrThrow(commit.stdout, 'commit');
 
   const ref = invokeGhSafe(
@@ -364,7 +455,7 @@ function ensureLeaseRef(repository) {
   if (ref.exitCode === 0) return 'created';
   // A concurrent dispatcher won the race and created it first. That is success.
   if (/already exists/i.test(failureText(ref))) return 'present';
-  throw ghFailure(`create the '${branch}' ref`, ref);
+  throw ghWriteFailure(`create the '${branch}' ref`, ref, repository);
 }
 
 function readLeaseRecord(repository, key) {
@@ -403,7 +494,7 @@ function writeLeaseRecord(repository, key, lease, sha) {
   if (/HTTP 409/i.test(text) || /HTTP 422/i.test(text) || /sha.*wasn't supplied/i.test(text)) {
     throw Object.assign(new LeaseError(`Lease '${key}' was written concurrently.`), { conflict: true });
   }
-  throw ghFailure(`write lease '${key}'`, result);
+  throw ghWriteFailure(`write lease '${key}'`, result, repository);
 }
 
 /**
@@ -427,7 +518,7 @@ function deleteLeaseRecord(repository, key, sha) {
   // record simply is not ours to prune this run.
   if (/HTTP 409/i.test(text) || /HTTP 422/i.test(text)) return false;
   if (isGoneResult(result)) return true;
-  throw ghFailure(`prune lease '${key}'`, result);
+  throw ghWriteFailure(`prune lease '${key}'`, result, repository);
 }
 
 function listLeaseRecords(repository) {
@@ -835,8 +926,10 @@ module.exports = {
   leaseBranch,
   listLeaseRecords,
   listLeases,
+  looksLikeNotFound,
   markDispatched,
   nowIso,
+  probePushAccess,
   readLeaseRecord,
   releaseLease,
   retentionSeconds,

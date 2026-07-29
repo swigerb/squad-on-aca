@@ -33,7 +33,14 @@
  *                     real-failure signature and a "gone" token, which is what
  *                     makes the deny-list-FIRST ordering testable at all.
  *                     unrecognised carries neither, and must fail closed.
+ *                     notfound404 is the bare 404 GitHub returns for a WRITE to
+ *                     a repository the caller can only READ (issue #22).
  *   FAKE_GH_FAIL_PATH substring; only api calls whose path contains it fail.
+ *   FAKE_GH_PERMISSIONS  push (default) | nopush | fail — what the
+ *                     `repos/<owner>/<name>` permission probe reports. `fail`
+ *                     makes the probe itself error, which is the fallback path:
+ *                     a failing probe must never mask the original failure.
+ *   FAKE_GH_LOGIN     login reported by `api user` (default `octo-stub`).
  */
 
 const fs = require('fs');
@@ -77,6 +84,21 @@ function slug(value) {
   return String(value).replace(/[^A-Za-z0-9._-]+/g, '_');
 }
 
+// Minimal `--jq` support: enough for the dotted field selections the lease
+// store uses (`.permissions`, `.login`), matching real `gh`, which prints a
+// string result raw and anything else as JSON.
+function emitJq(expr, value) {
+  let current = value;
+  for (const part of String(expr || '').split('.').filter(Boolean)) {
+    current = current === null || current === undefined ? undefined : current[part];
+  }
+  if (current === undefined) {
+    process.stdout.write('\n');
+    return;
+  }
+  process.stdout.write(`${typeof current === 'string' ? current : JSON.stringify(current)}\n`);
+}
+
 function refFile(branch) {
   return path.join(state, 'refs', `${slug(branch)}.sha`);
 }
@@ -108,6 +130,14 @@ const FAILURES = {
   masked429: 'gh: HTTP 429: API rate limit exceeded (the resource does not exist)',
   masked500: 'gh: HTTP 502: Bad gateway - Not Found',
 
+  // The real shape of issue #22: GitHub answers a WRITE to a repository the
+  // caller can only READ with a bare 404 carrying no permission signal at all.
+  // Copied from the live failure, so a test drives the exact bytes an operator
+  // saw.
+  notfound404:
+    'gh: Not Found (HTTP 404) {"message":"Not Found","documentation_url":' +
+    '"https://docs.github.com/rest/git/commits#create-a-commit","status":"404"}',
+
   // Neither list matches. The documented rule is that this fails CLOSED.
   unrecognised: 'gh: the remote end did something nobody wrote down'
 };
@@ -116,6 +146,7 @@ function handleApi(args) {
   let method = 'GET';
   let target = '';
   let readInput = false;
+  let jq = '';
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--method' || arg === '-X') {
@@ -123,6 +154,9 @@ function handleApi(args) {
       i += 1;
     } else if (arg === '--input') {
       readInput = String(args[i + 1] || '') === '-';
+      i += 1;
+    } else if (arg === '--jq' || arg === '-q') {
+      jq = String(args[i + 1] || '');
       i += 1;
     } else if (!arg.startsWith('-') && !target) {
       target = arg;
@@ -138,16 +172,42 @@ function handleApi(args) {
 
   appendLog(process.env.SQUAD_CALL_LOG, `gh api ${method} ${rawPath}`);
 
+  const segments = rawPath.split('/');
+
   const mode = process.env.FAKE_GH_FAIL_MODE || '';
   const failPath = process.env.FAKE_GH_FAIL_PATH || '';
   if (mode && FAILURES[mode] && (!failPath || rawPath.includes(failPath))) {
     die(FAILURES[mode]);
   }
 
+  // --- identity and permission probes (issue #22) ---------------------------
+  // The lease store asks these two questions only after a write has already
+  // failed with a 404, to tell an operator that the ACTIVE `gh` account cannot
+  // write to this repository. They are answered before the FAKE_GH_STATE check
+  // because they are properties of the identity, not of the ledger.
+  const permissionsMode = process.env.FAKE_GH_PERMISSIONS || 'push';
+  if (rawPath === 'user') {
+    emitJq(jq, { login: process.env.FAKE_GH_LOGIN || 'octo-stub' });
+    return;
+  }
+  if (segments[0] === 'repos' && segments.length === 3) {
+    // A probe that cannot answer must leave the original failure untouched, so
+    // there has to be a way to make the probe ITSELF fail.
+    if (permissionsMode === 'fail') die('gh: Bad credentials (HTTP 401)');
+    emitJq(jq, {
+      full_name: segments.slice(1).join('/'),
+      permissions: {
+        admin: permissionsMode === 'push',
+        push: permissionsMode === 'push',
+        pull: true
+      }
+    });
+    return;
+  }
+
   if (!state) die('gh: fake-gh requires FAKE_GH_STATE');
 
   const body = readInput ? JSON.parse(readStdin() || '{}') : {};
-  const segments = rawPath.split('/');
   // repos/<owner>/<name>/<rest...>
   const rest = segments.slice(3).join('/');
 
