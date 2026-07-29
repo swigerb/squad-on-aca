@@ -540,3 +540,119 @@ the same messages recorded when they were first written:
 The ordering assertions are still by INDEX, not by presence, and the merged
 `aca` call log is a separate file from `dispatch-calls.log`, so main's `aca`
 stub reset cannot disturb the ordering evidence.
+
+## 2026-07-29 — PR #21 reviewer rejection: sandbox failure classifier + baseline archive scope
+
+Not my PR. The author (**security**) is locked out, and the reviewer assigned
+me on the merits: B1 is a classifier-ordering and test-sensitivity problem, and
+B2's root cause is a dependency my own Sprint 6 (PR #20) introduced without
+widening the baseline tool's archive scope. Scope was deliberately narrow — the
+credential design, the egress matcher and the merge tree were all verified sound
+by the reviewer and I did not touch them.
+
+**B1 part 2 — the classifier was actually wrong.** `Get-SandboxFailureKind`
+matched `"429"`, `"401"` and `"403"` as bare substrings through
+`[regex]::Escape()`, with `"429"` first in an ordered classifier. Azure decorates
+every auth failure with a correlation, object or trace GUID, and GUIDs are hex,
+so `AuthorizationFailed … Correlation ID: 1b8f429c-…` classified as `quota`. The
+direction of failure is the harmful one: a rotated-out credential surfaced as
+`[squad-sandbox:quota]` — "a ceiling was hit, retry later" — and an unattended
+dispatcher would retry a credential fault forever. That is the exact harm the
+taxonomy was added to prevent, inverted.
+
+Numeric codes are now written `(?<![0-9A-Za-z-])429(?![0-9A-Za-z-])`. A plain
+`\b` is **not** sufficient: `\b` treats `-` as a word boundary, so
+`Correlation ID: 1b8f-429c` would still match. Requiring the delimiter to be
+neither alphanumeric nor a hyphen kills every GUID occurrence — GUID groups are
+4/4/4/4/12 hex characters, so a group is never exactly `429`, and every embedded
+occurrence is bounded by a hex digit or a hyphen on at least one side. A real
+code (`HTTP 429`, `(403)`, `status=401,`) always is delimited by a space,
+parenthesis, comma or colon. I also pulled the named-code discipline across from
+`Test-AcaJobExecutionGone`: `throttl`, `rate limit`, `Retry-After` on the quota
+side; `AuthorizationPermissionMismatch`, `does not have authorization`,
+`ExpiredAuthenticationToken`, `InvalidAuthenticationToken`,
+`authentication failed` on the auth side.
+
+**B1 part 1 — the guard could not see the property it was named for.** The
+reviewer moved `$auth` ahead of `$quota` and the suite still reported 200/0/0.
+No fixture was ambiguous between the two lists, so both orderings agreed on
+every input. This is the *fifth* recurrence of this defect class in the
+programme (PR #9's runner, Sprint 3 B1, Sprint 5 `cancel`, Sprint 6 B3, now
+here), so the fix had to be structural, not another hand-written case.
+
+Three devices, in order of how much they cost to bypass:
+
+1. **Order is now data.** `$script:SandboxFailureRules` is an ordered array of
+   `[pscustomobject]@{ Kind; Patterns }`, so a test can *walk* the classifier
+   instead of only calling it.
+2. **`DecidedBy`.** `Get-SandboxFailureClassification` returns
+   `Kind` / `DecidedBy` / `Pattern`, mirroring `classifyGhFailure`'s `decidedBy`
+   in `worker/lib/dispatch-lease.js` after Sprint 6's B3 fix.
+   `Get-SandboxFailureKind` is a one-line wrapper, so no caller changed. Without
+   this a precedence is not assertable at all: where only one list matches, both
+   orderings agree.
+3. **An adjacency audit.** validate computes, from the *shipping* pattern lists,
+   which rules match each fixture; each ambiguous fixture declares
+   `Also = @(...)`; the suite asserts the declared ambiguity really holds, and
+   then asserts that **every adjacent pair of rules has at least one spanning
+   fixture**. Adding a rule or deleting a discriminating fixture is now itself a
+   failing check. A separate structural assertion rejects any pattern matching
+   `^\d{3}$`, so the bare-substring mistake cannot be reintroduced.
+
+Discriminating fixtures added: `403 Forbidden (QuotaExceeded)` (quota∩auth),
+`AuthorizationFailed … 1b8f429c-…`, `AADSTS700016 … 5c429abc-…`,
+`401 Unauthorized (request id 0000429f-…)`,
+`still provisioning. Request ID: 4291aaaa-…`,
+`(AuthorizationFailed) the sandbox is still provisioning` (auth∩readiness), and
+`429 TooManyRequests (connection reset by peer)` (transport∩quota).
+
+**B2 — the tool could not report "unchanged".** `compare-cli-baseline.ps1`
+materialised the baseline with `git archive … $BaselineRef scripts`.
+`scripts/lib/dispatch-contract.ps1` resolves `worker/lib/squad-dispatch.js` as a
+*sibling* of `scripts/`, so six baseline cases died with `Cannot find module`
+and the tool reported 16/22 "OBSERVABLE BEHAVIOUR CHANGED" even for two
+identical trees. I archived the whole ref rather than adding `worker` to the
+pathspec, so no future cross-directory dependency can recur this — the repo is
+296 tracked files. A fail-loud guard now asserts the materialised baseline
+contains `scripts\squad-aca.ps1` and `worker\lib\squad-dispatch.js`, which is
+what turns a re-narrowed scope into a loud failure instead of a silent 16/22.
+`-BaselineRef HEAD` and `-BaselineRef main` are both 22/22 byte-identical.
+
+**Non-blocking items 3-6.** `Test-SandboxHostCoveredByPattern` got 22 direct
+assertions using the reviewer's fuzz list (`github.com.evil.net`,
+`evilgithub.com`, bare `*`, `*.`, `**`, trailing dot, `gıthub.com`,
+`xn--gthub-jua.com`). `Invoke-CliSafeWithStdin`'s `"timed out after 120s"` is
+now an inconclusive pattern *and* exit 124 is an explicit transport rule, so a
+client timeout on the credential broker is `transport`, not `execution`.
+Service-supplied labels from `Get-SquadSandboxInventory` now go through
+`Assert-SandboxIdentifier` on both listing paths — I chose throw over skip
+because silently dropping a malformed `squad-` label under-counts the
+concurrency ceiling, which spends money. Two hostile listing fixtures (path
+traversal, embedded newline) back that. The two tautological detachment
+assertions were replaced with (a) the launch generator's refusal of a
+credential-bearing env assignment, exercised *with* the probe token, and (b) a
+behavioural `ARGVLEAK` sweep taken inside the worker.
+
+**Verification.** `validate.ps1` 205 passed / 0 failed / 0 skipped (was
+200/0/0). `verify-cli-golden.ps1` 22/22. `verify-launch-detachment.ps1` PASS
+(CREDMODE=600, ARGVLEAK=absent, CREDFILE_AFTER=absent).
+`compare-cli-baseline.ps1` 22/22 against both `HEAD` and `main` (was 16/22).
+Worker suite under WSL: 7 suites, 409 assertions (123/76/11/62/40/54/43),
+0 failed, 0 skipped. `### ACA CALLS` empty in all 22 goldens.
+
+**Mutations** — all six caught, all reverted, tree clean afterwards:
+
+| Mutation | Check that failed |
+| --- | --- |
+| `$auth` block moved ahead of `$quota` | "'ERROR: 403 Forbidden (QuotaExceede' -> auth (wanted quota)"; "was decided by 'auth', wanted 'quota'"; "Classification rule order is wrong: transport > auth > quota > readiness" (202/3) |
+| bare `"429"` restored | four GUID-bearing auth/readiness fixtures all -> quota; "Bare HTTP status codes … will fire on GUIDs: quota: '429'" (203/2) |
+| host matcher -> `$Host_.EndsWith($Pattern.Substring(2))` | `evilgithub.com`, `xgithub.com`, `notgithub.com`, `github.com` and `evil.example.com` vs `*.` all covered (wanted False) (204/1) |
+| archive scope back to `$BaselineRef scripts` | "the materialised baseline (HEAD) has no worker\lib\squad-dispatch.js -- the archive scope is wrong" |
+| launch leaks the token into argv | "ARGVLEAK=present … the staged token appeared in a process ARGUMENT VECTOR" |
+| `$script:SandboxSecretEnvNames` guard removed | "the launch generator accepted a credential-bearing env assignment (GH_TOKEN) instead of refusing it" |
+
+**Lesson recorded for the next agent.** `git checkout -- <file>` to revert a
+mutation reverts *everything* uncommitted in that file — I lost all four
+provider edits once and had to reapply them. Commit before mutation-testing.
+Also: a PowerShell hashtable's missing key yields `$null` and `@($null)` has
+Count 1, so ambiguity declarations must be read with `.ContainsKey()`.

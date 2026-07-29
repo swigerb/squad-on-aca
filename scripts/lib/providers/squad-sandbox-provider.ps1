@@ -62,6 +62,22 @@
        and the completion marker is written only after the worker process exits,
        so a caller that waits for terminal status has the push already done. The
        sandbox disk is scratch and never the sole copy.
+    7. Worker credentials NEVER appear in an argument vector. Sprint 5 shipped
+       them as `env GH_TOKEN='...' <entrypoint>` inside the launch command, which
+       is world-readable at /proc/<pid>/cmdline for the life of the exec. Two
+       mechanisms replace that (Sprint 7):
+         * the Copilot plane uses the platform's own credential brokerage --
+           `aca sandboxgroup credential create --type github-copilot` with the
+           token on STDIN, then `sandbox create --credential <opaque id>`;
+         * the git/`gh` push plane, for which the platform exposes no
+           `--type`, is delivered on the STDIN of a dedicated `sandbox exec`
+           that writes a umask-077 file the launch command sources and deletes.
+       Both are behaviourally testable offline: the token must be absent from
+       every recorded argv and must still arrive at the worker.
+    8. Blast radius is bounded before a sandbox exists: per-class concurrency is
+       enforced against the live sandbox list, auto-suspend is pinned instead of
+       inherited, and every failure carries a machine-readable kind so quota
+       exhaustion is never mistaken for an auth or readiness problem.
 #>
 
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here.
@@ -102,8 +118,88 @@ $script:SandboxInconclusivePatterns = @(
     "connection aborted",
     "read timed out",
     "operation timed out",
+    # Invoke-CliSafeWithStdin (scripts/lib/aca-logs.ps1) reports its OWN client
+    # timeout as exit 124 with "timed out after <n>s". That is this process
+    # giving up on a wait, not the service reaching a verdict, so it is
+    # inconclusive for exactly the same reason as the `aca` client's ~120s
+    # give-up. Without this, a timeout on the credential broker or the seed exec
+    # classified as `execution` -- a definite statement nothing observed.
+    "timed out after",
     "temporary failure in name resolution",
     "EOF occurred in violation of protocol"
+)
+
+# ---------------------------------------------------------------------------
+# Failure classification rules -- ORDERED, and exposed for exactly that reason
+# ---------------------------------------------------------------------------
+#
+# The order of these blocks is load-bearing, so it lives in DATA a test can walk
+# rather than in the control flow of a function a test can only call. Two
+# properties depend on it:
+#
+#   * transport first  -- a failure that says nothing about the sandbox must not
+#                         be read as a verdict about it;
+#   * quota before auth -- several services phrase a quota rejection as a 403,
+#                         and reading "you have hit your ceiling" as "your
+#                         credentials are bad" sends an operator to rotate a
+#                         perfectly good token.
+#
+# NUMERIC HTTP CODES ARE NEVER MATCHED AS BARE SUBSTRINGS. Test-AcaJobExecutionGone
+# (squad-aca-job-provider.ps1) has always used only NAMED codes -- "TooManyRequests",
+# "throttl", "Retry-After" -- and never "429", precisely because Azure decorates
+# every auth failure with object-, subscription- and correlation-GUIDs. A bare
+# "429" matched the hex of `Correlation ID: 1b8f429c-...` and, being first in an
+# ordered classifier, turned every GUID-bearing AuthorizationFailed / AADSTS
+# message into `quota` -- i.e. "a ceiling was hit, retry later" -- so an
+# unattended dispatcher would retry a rotated-out credential forever. The
+# taxonomy exists to prevent that, and a bare substring inverted it.
+#
+# Where a numeric code is still useful it is written with a hardened boundary:
+#
+#     (?<![0-9A-Za-z-])429(?![0-9A-Za-z-])
+#
+# The code must be delimited by something that is neither alphanumeric NOR a
+# hyphen. Every GUID/trace-id occurrence is bounded by a hex digit or a hyphen
+# on at least one side (`1b8f429c`, `0000429f`, `-429c-`, `4291aaaa`), so none of
+# them can match; a real code -- `HTTP 429`, `(403)`, `status=401,` -- always is
+# not. A plain `\b` is NOT enough: `\b` treats `-` as a boundary, so
+# `Correlation ID: 1b8f-429c` would still match.
+$script:SandboxFailureRules = @(
+    [pscustomobject]@{
+        Kind     = "transport"
+        Patterns = $script:SandboxInconclusivePatterns
+    },
+    [pscustomobject]@{
+        Kind     = "quota"
+        # "quota" is case-insensitive here and therefore already covers
+        # "QuotaExceeded"; the named throttling codes mirror Test-AcaJobExecutionGone.
+        Patterns = @(
+            "quota",
+            "exceeded the limit", "limit exceeded",
+            "insufficient capacity", "no capacity", "out of capacity",
+            "TooManyRequests", "SubscriptionRequestsThrottled",
+            "throttl", "rate limit", "Retry-After",
+            "(?<![0-9A-Za-z-])429(?![0-9A-Za-z-])"
+        )
+    },
+    [pscustomobject]@{
+        Kind     = "auth"
+        # "unauthorized" covers "Unauthorized" and "unauthorized_client".
+        Patterns = @(
+            "AADSTS", "unauthorized", "invalid_client", "Forbidden",
+            "CheckAccess", "AuthorizationFailed", "AuthorizationPermissionMismatch",
+            "does not have authorization", "aca login", "az login",
+            "refresh token has expired", "ExpiredAuthenticationToken",
+            "InvalidAuthenticationToken", "authentication failed",
+            "(?<![0-9A-Za-z-])401(?![0-9A-Za-z-])",
+            "(?<![0-9A-Za-z-])403(?![0-9A-Za-z-])"
+        )
+    },
+    [pscustomobject]@{
+        Kind     = "readiness"
+        Patterns = @("not ready", "NotReady", "still provisioning", "Provisioning",
+                     "is starting", "suspended", "Suspended")
+    }
 )
 
 # Flags whose VALUE must never reach a log, an error message, or a test capture:
@@ -113,6 +209,87 @@ $script:SandboxRedactedFlags = @(
     "--token", "--password", "--secret",
     "--rule", "--default", "--traffic-inspection",
     "-c", "--command"
+)
+
+# ---------------------------------------------------------------------------
+# Credential brokerage (PRD #6 Sprint 7)
+# ---------------------------------------------------------------------------
+
+# The platform's own credential types, live-verified. The token is validated
+# HERE, before the CLI is invoked, because the platform's rejection of a classic
+# `ghp_` token for the Copilot type arrives as an opaque failure after a network
+# round trip -- and by then the operator has no idea which of their two tokens
+# was wrong. `scripts/deploy.ps1` currently defaults -CopilotGitHubToken to the
+# SAME value as -GitHubToken, so the two planes are one token in practice and a
+# `gh auth token` value (classic, `ghp_`) is the likely input. That is exactly
+# the footgun this table exists to catch.
+$script:SandboxCredentialTypes = [ordered]@{
+    "github-copilot"   = [pscustomobject]@{
+        RequiredPrefix = "github_pat_"
+        Description    = "a GitHub fine-grained personal access token"
+        Rejected       = @(
+            [pscustomobject]@{ Prefix = "ghp_"; Why = "a CLASSIC personal access token" },
+            [pscustomobject]@{ Prefix = "gho_"; Why = "an OAuth token" },
+            [pscustomobject]@{ Prefix = "ghs_"; Why = "a GitHub App server-to-server token" },
+            [pscustomobject]@{ Prefix = "ghu_"; Why = "a GitHub App user-to-server token" }
+        )
+    }
+    "anthropic-claude" = [pscustomobject]@{
+        RequiredPrefix = "sk-ant-"
+        Description    = "an Anthropic API key"
+        Rejected       = @()
+    }
+}
+
+# Where the git/`gh` credential lands inside the sandbox. It is written by a
+# stdin-fed exec, sourced by the launch command, and deleted in the same
+# breath, so its on-disk lifetime is the gap between two execs rather than the
+# life of the session.
+$script:SandboxCredentialFileName = ".squad-creds"
+
+# Worker environment variables that carry a credential. These are delivered
+# through the credential file, never as an `env NAME=value` assignment in the
+# launch command -- an assignment is argv, and argv is world-readable inside the
+# sandbox.
+$script:SandboxSecretEnvNames = @("GH_TOKEN", "GITHUB_TOKEN")
+
+# Token character allowlist. Every credential this provider handles is an opaque
+# bearer string from a small alphabet; anything outside it is either an attack
+# (quote-breaking out of the credential file, argv injection) or a value that was
+# mangled in transit. Refusing early beats sending it and guessing at the error.
+$script:SandboxTokenPattern = "^[A-Za-z0-9_\-\.~+/=]+$"
+
+# `aca` subcommands whose OUTPUT is a credential or policy dump. ADR 0001 risk
+# R2: these values are readable to anyone with group read access, and once this
+# provider has them in a result object they are one Write-Host away from a CI
+# log. The provider has no legitimate need for any of them -- it writes policy,
+# it never reads it back -- so they are refused at the argv gate rather than
+# merely redacted. `egress decisions` is deliberately NOT refused: it is the
+# audit trail (allow/deny, host, matchedRule), not the policy.
+$script:SandboxForbiddenReadbacks = @(
+    @("sandbox", "egress", "show"),
+    @("sandbox", "egress", "export"),
+    @("sandboxgroup", "credential", "list"),
+    @("sandboxgroup", "credential", "show")
+)
+
+# ---------------------------------------------------------------------------
+# Failure taxonomy
+# ---------------------------------------------------------------------------
+
+# PRD #6 requires that quota exhaustion be separately identifiable from auth,
+# capability, readiness and execution failures. A caller that cannot tell them
+# apart retries the wrong thing: retrying an auth failure is noise, retrying a
+# quota failure is correct, and retrying a capability failure is never correct.
+# Every error this provider raises is tagged `[squad-sandbox:<kind>]`.
+$script:SandboxFailureKinds = @(
+    "auth",       # credentials rejected / RBAC denial -- do not retry
+    "capability", # the request cannot be satisfied safely -- never retry
+    "quota",      # a ceiling was hit -- retry later, or raise the ceiling
+    "readiness",  # the substrate is not ready yet -- retry soon
+    "execution",  # the worker itself failed -- inspect the session
+    "transport",  # the call told us nothing -- re-poll
+    "config"      # the control plane is misconfigured -- fix the deployment
 )
 
 # ---------------------------------------------------------------------------
@@ -246,6 +423,196 @@ function Get-SandboxErrorText {
 # Invocation
 # ---------------------------------------------------------------------------
 
+function New-SandboxFailure {
+    <#
+    .SYNOPSIS
+        Build a tagged, machine-classifiable failure message.
+
+    .DESCRIPTION
+        `[squad-sandbox:<kind>] <text>`. The tag is the whole point: PRD #6
+        requires quota exhaustion to be separately identifiable from auth,
+        capability, readiness and execution failures, and a caller that has to
+        regex the prose to work out which one it got will get it wrong the first
+        time the CLI changes its wording.
+
+        The kind is validated, so a typo is a loud error here rather than a
+        silently unclassifiable failure at 3am.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message
+    )
+    if ($script:SandboxFailureKinds -notcontains $Kind) {
+        throw "'$Kind' is not a recognised sandbox failure kind."
+    }
+    return "[squad-sandbox:$Kind] $Message"
+}
+
+function Get-SandboxFailureClassification {
+    <#
+    .SYNOPSIS
+        Classify a raw CLI failure, and report WHICH RULE DECIDED.
+
+    .DESCRIPTION
+        Returns `Kind` (the failure kind), `DecidedBy` (the rule that produced
+        it) and `Pattern` (the literal pattern that matched).
+
+        `DecidedBy`/`Pattern` are not decoration. A precedence between two rule
+        blocks is UNOBSERVABLE through the kind alone: for every input where
+        only one list matches, both orderings return the same kind, so a test
+        built from unambiguous fixtures passes under either. Only an input that
+        matches BOTH lists distinguishes them, and only the reported rule says
+        which one won. This mirrors classifyGhFailure in
+        worker/lib/dispatch-lease.js, which was given the same treatment after
+        Sprint 6's B3 -- the same defect class, now for the fifth time in this
+        programme (PR #9's runner, Sprint 3 B1, Sprint 5 `cancel`, Sprint 6 B3,
+        and this classifier).
+
+        Ordering, and the deny-list-first discipline, live in
+        $script:SandboxFailureRules; this function only walks them. Rule order
+        and the presence of a genuinely ambiguous fixture for every ADJACENT
+        pair of rules are both asserted in scripts/validate.ps1, so removing the
+        discriminating fixtures is itself a failing change.
+
+        DecidedBy values:
+          success      exit 0; nothing to classify.
+          transport    the failure said nothing about the sandbox.
+          quota/auth/readiness   that rule's pattern list matched first.
+          fallthrough  no rule matched -> `execution`, the last resort.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Result)
+
+    if ($Result.ExitCode -eq 0) {
+        return [pscustomobject]@{ Kind = ""; DecidedBy = "success"; Pattern = "" }
+    }
+    # Same rule as Test-SandboxTransportInconclusive: exit 124 is our own
+    # give-up, decided without any message text.
+    if ($Result.ExitCode -eq 124) {
+        return [pscustomobject]@{ Kind = "transport"; DecidedBy = "transport"; Pattern = "exit 124" }
+    }
+    $text = ((@($Result.StdErr) + @($Result.StdOut) | Where-Object { $_ }) -join " ")
+
+    foreach ($rule in $script:SandboxFailureRules) {
+        foreach ($pattern in $rule.Patterns) {
+            if ($text -match $pattern) {
+                return [pscustomobject]@{ Kind = $rule.Kind; DecidedBy = $rule.Kind; Pattern = $pattern }
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Kind = "execution"; DecidedBy = "fallthrough"; Pattern = "" }
+}
+
+function Get-SandboxFailureKind {
+    <#
+    .SYNOPSIS
+        Classify a raw CLI failure into one of the failure kinds.
+
+    .DESCRIPTION
+        The kind only. Use Get-SandboxFailureClassification when the rule that
+        decided matters -- which is any time a precedence is being asserted.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Result)
+
+    return (Get-SandboxFailureClassification -Result $Result).Kind
+}
+
+function Assert-SandboxIdentifier {
+    <#
+    .SYNOPSIS
+        Refuse a resource identifier BEFORE it is used to construct an API call.
+
+    .DESCRIPTION
+        Every identifier this provider handles ends up in at least two hostile
+        contexts: a process argument vector, and a POSIX shell command line
+        inside the sandbox. Three distinct injections are possible and all three
+        are rejected here rather than downstream:
+
+          * ARGUMENT injection -- a value beginning with `-` is parsed as a flag
+            by the CLI, not as data. `--identity` arriving as a "disk id" would
+            defeat invariant 4 without ever touching Assert-SandboxArgvIdentityFree,
+            because it would be a VALUE the check walks straight past.
+          * PATH traversal -- `..`, `/` and `\` in an identifier that is
+            concatenated into a REST path reach a sibling resource.
+          * CONTROL characters -- NUL, CR and LF split log lines, forge audit
+            records, and terminate C-string parsers early. `\p{C}` covers the
+            whole category (including the C1 range and unassigned code points),
+            which an explicit `\x00-\x1f` list does not.
+
+        Validation is an ALLOWLIST per kind, not a deny-list of the above: a
+        deny-list is only ever as good as the last attack someone thought of.
+
+    .PARAMETER Kind
+        `label` (a sandbox label / group / disk label), `guid`, `credential`
+        (an opaque brokered-credential id) or `host` (an egress pattern).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [ValidateSet("label", "guid", "credential", "host")]
+        [string]$Kind = "label",
+        [int]$MaxLength = 128
+    )
+
+    $text = [string]$Value
+    if (-not $text) {
+        throw (New-SandboxFailure -Kind "config" -Message "$Name is empty, and an empty identifier cannot address a resource.")
+    }
+    if ($text.Length -gt $MaxLength) {
+        # Deliberately NOT echoed: an over-long value is either an attack or a
+        # bug, and quoting it back is how a hostile string reaches a log.
+        throw (New-SandboxFailure -Kind "capability" -Message "$Name is $($text.Length) characters, over the $MaxLength limit. The value is not echoed.")
+    }
+    if ($text -match "\p{C}") {
+        throw (New-SandboxFailure -Kind "capability" -Message "$Name contains a control character (newline, NUL or similar). The value is not echoed.")
+    }
+    if ($text.StartsWith("-")) {
+        throw (New-SandboxFailure -Kind "capability" -Message "$Name starts with '-', which a CLI parses as a flag rather than as data. Refusing to build a command from it.")
+    }
+
+    $pattern = switch ($Kind) {
+        "guid"       { "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" }
+        "credential" { "^[A-Za-z0-9][A-Za-z0-9_\-\.]*$" }
+        "host"       { "^(\*\.)?[A-Za-z0-9]([A-Za-z0-9_\-\.]*[A-Za-z0-9])?$" }
+        default      { "^[A-Za-z0-9][A-Za-z0-9_\-\.]*$" }
+    }
+    if ($text -notmatch $pattern) {
+        throw (New-SandboxFailure -Kind "capability" -Message "$Name is not a well-formed $Kind identifier. Only unreserved characters are accepted; the value is not echoed.")
+    }
+    return $true
+}
+
+function Assert-SandboxArgvNoReadback {
+    <#
+    .SYNOPSIS
+        Refuse any `aca` command whose output would be a credential or policy
+        dump (ADR 0001 risk R2).
+
+    .DESCRIPTION
+        The provider writes egress policy and creates credentials; it never
+        reads either back. So the safest possible handling of a value that is
+        "readable to anyone with group read access" is never to obtain it: a
+        value this process never holds cannot be logged, cannot land in a
+        captured golden, and cannot be echoed by an error path nobody audited.
+
+        `sandbox egress decisions` is intentionally still allowed -- it is the
+        allow/deny audit trail, not the policy.
+    #>
+    param([string[]]$Argv = @())
+
+    $words = @(@($Argv) | Where-Object { -not ([string]$_).StartsWith("-") } | ForEach-Object { [string]$_ })
+    foreach ($forbidden in $script:SandboxForbiddenReadbacks) {
+        if ($words.Count -lt $forbidden.Count) { continue }
+        $match = $true
+        for ($i = 0; $i -lt $forbidden.Count; $i++) {
+            if ($words[$i] -ne $forbidden[$i]) { $match = $false; break }
+        }
+        if ($match) {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to run 'aca $($forbidden -join ' ')': its output is a credential or egress-policy dump, which is readable to anyone with group read access and must never enter this process (ADR 0001 risk R2).")
+        }
+    }
+}
+
 function Assert-SandboxArgvIdentityFree {
     <#
     .SYNOPSIS
@@ -291,7 +658,46 @@ function Invoke-SandboxCli {
     )
 
     Assert-SandboxArgvIdentityFree -Argv $Argv
+    Assert-SandboxArgvNoReadback -Argv $Argv
     $result = Invoke-CliSafe -FilePath $Context.AcaPath -Arguments $Argv
+    Add-Member -InputObject $result -MemberType NoteProperty -Name SafeArgv -Value (Get-SandboxSafeArgv -Argv $Argv) -Force
+    return $result
+}
+
+function Invoke-SandboxCliWithSecretStdin {
+    <#
+    .SYNOPSIS
+        Run one `aca` command with a credential delivered on STANDARD INPUT.
+
+    .DESCRIPTION
+        The only way this provider is allowed to hand a token to `aca`. An
+        argument vector is not private -- /proc/<pid>/cmdline, `ps`, shell
+        history and every error renderer can see it -- so a credential that
+        appears as `--token <value>` has already been disclosed no matter how
+        carefully the rendering is redacted afterwards. `aca` documents that the
+        token may be omitted from the command line and read from stdin, so this
+        is the platform's supported path.
+
+        Two invariants, both asserted by the caller's tests:
+
+          * the secret is never an element of $Argv,
+          * the secret is registered for scrubbing, so a CLI that echoes it back
+            in its own error text still cannot reach a thrown message.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][string[]]$Argv,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Secret
+    )
+
+    Assert-SandboxArgvIdentityFree -Argv $Argv
+    Assert-SandboxArgvNoReadback -Argv $Argv
+    foreach ($arg in @($Argv)) {
+        if ($Secret -and ([string]$arg).Contains($Secret)) {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to run 'aca': a credential was found in the argument vector, which is world-readable at /proc/<pid>/cmdline. It must be delivered on stdin.")
+        }
+    }
+    $result = Invoke-CliSafeWithStdin -FilePath $Context.AcaPath -Arguments $Argv -StandardInput $Secret
     Add-Member -InputObject $result -MemberType NoteProperty -Name SafeArgv -Value (Get-SandboxSafeArgv -Argv $Argv) -Force
     return $result
 }
@@ -307,10 +713,16 @@ function Test-SandboxTransportInconclusive {
         on running. Reading that as a session failure would report a healthy
         60-minute run as failed at the two-minute mark. It is INCONCLUSIVE:
         status re-polls, and terminate refuses to claim a teardown happened.
+
+        Exit 124 is Invoke-CliSafeWithStdin's own give-up marker (aca-logs.ps1).
+        It is THIS process deciding to stop waiting, never a service verdict, so
+        it is inconclusive by construction and does not depend on the wording of
+        the message that accompanies it.
     #>
     param([Parameter(Mandatory = $true)][object]$Result)
 
     if ($Result.ExitCode -eq 0) { return $false }
+    if ($Result.ExitCode -eq 124) { return $true }
     $text = (@($Result.StdErr) + @($Result.StdOut) | Where-Object { $_ }) -join " "
     foreach ($pattern in $script:SandboxInconclusivePatterns) {
         if ($text -match [regex]::Escape($pattern)) { return $true }
@@ -387,18 +799,28 @@ function New-SandboxExecutionHandle {
     <#
     .SYNOPSIS
         PROVIDER-INTERNAL. Mints the opaque handle for one sandbox session.
+
+    .DESCRIPTION
+        The handle carries the ids of any credentials brokered for this session
+        (`creds`). Those are opaque service-side references, NOT credential
+        values -- but they are what `terminate` needs in order to revoke, and a
+        credential nothing can name is a credential nothing can revoke. A
+        brokered credential lives on the GROUP and inherits group RBAC (ADR 0001
+        risk R2), so failing to revoke it is a real, lasting exposure.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$SandboxName,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$SessionId,
         [AllowEmptyString()][string]$ClassId = "",
-        [AllowEmptyString()][string]$SandboxGroup = ""
+        [AllowEmptyString()][string]$SandboxGroup = "",
+        [string[]]$CredentialIds = @()
     )
     return New-SquadExecutionHandle -ProviderId $script:SandboxProviderId -Payload ([ordered]@{
         name    = $SandboxName
         session = $SessionId
         class   = $ClassId
         group   = $SandboxGroup
+        creds   = @(@($CredentialIds) | Where-Object { $_ })
     })
 }
 
@@ -576,6 +998,566 @@ function New-SquadSandboxDisk {
 }
 
 # ---------------------------------------------------------------------------
+# Credential brokerage
+# ---------------------------------------------------------------------------
+
+function Test-SandboxCredentialToken {
+    <#
+    .SYNOPSIS
+        Why this token cannot be brokered as this type -- "" when it can.
+
+    .DESCRIPTION
+        Returns a reason instead of throwing so the rule is directly testable
+        (and so a caller can report several planes' problems at once).
+        Assert-SandboxCredentialToken is the throwing wrapper.
+
+        The classic-token footgun this exists for: the platform accepts ONLY a
+        fine-grained `github_pat_` token for `--type github-copilot` and rejects
+        a classic `ghp_` one. `gh auth token` -- the thing an operator reaches
+        for, and the thing `scripts/deploy.ps1` itself calls at line 61 -- yields
+        a CLASSIC token, and deploy.ps1 then defaults -CopilotGitHubToken to the
+        SAME value. So the single most likely real-world input is exactly the one
+        the platform rejects, and its rejection arrives from the service as an
+        opaque failure after a network round trip. Catching it here turns that
+        into an actionable sentence naming both the prefix seen and the fix.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Type,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Token
+    )
+
+    if (-not $script:SandboxCredentialTypes.Contains($Type)) {
+        return "'$Type' is not a credential type this platform brokers. Supported: $(@($script:SandboxCredentialTypes.Keys) -join ', ')."
+    }
+    $spec = $script:SandboxCredentialTypes[$Type]
+
+    if (-not $Token) { return "no token was supplied for credential type '$Type'." }
+    if ($Token -ne $Token.Trim()) {
+        return "the token for '$Type' has leading or trailing whitespace, which the service will reject as part of the value."
+    }
+    if ($Token -notmatch $script:SandboxTokenPattern) {
+        return "the token for '$Type' contains characters outside the unreserved set. The value is not echoed."
+    }
+
+    foreach ($bad in @($spec.Rejected)) {
+        if ($Token.StartsWith($bad.Prefix)) {
+            return ("the token for '$Type' starts with '$($bad.Prefix)', which is $($bad.Why). " +
+                    "This platform accepts only $($spec.Description) (prefix '$($spec.RequiredPrefix)') for that type and will reject anything else. " +
+                    "Note that 'gh auth token' returns a classic token, and scripts/deploy.ps1 defaults -CopilotGitHubToken to the SAME value as -GitHubToken, " +
+                    "so the two credential planes are one token unless you pass -CopilotGitHubToken explicitly. Mint a fine-grained PAT for the Copilot plane.")
+        }
+    }
+    if (-not $Token.StartsWith($spec.RequiredPrefix)) {
+        return ("the token for '$Type' does not start with '$($spec.RequiredPrefix)'. This platform accepts only $($spec.Description) for that type. The value is not echoed.")
+    }
+    return ""
+}
+
+function Assert-SandboxCredentialToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$Type,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Token
+    )
+    $issue = Test-SandboxCredentialToken -Type $Type -Token $Token
+    if ($issue) {
+        throw (New-SandboxFailure -Kind "capability" -Message "Refusing to broker a credential: $issue")
+    }
+    return $true
+}
+
+function New-SandboxBrokeredCredential {
+    <#
+    .SYNOPSIS
+        Broker one credential on the sandbox GROUP and return its opaque id.
+
+    .DESCRIPTION
+        `aca sandboxgroup credential create --type <type>` with the token on
+        stdin. The returned id is what `sandbox create --credential <id>`
+        references, so the token itself is never an argument, never an
+        environment variable, and never part of the sandbox's own environment.
+
+        The id is validated with Assert-SandboxIdentifier before it is allowed
+        anywhere near another command line: it is service-controlled input, and
+        a service-controlled string that begins with `-` is a flag.
+
+        LIFECYCLE. A brokered credential lives on the GROUP and inherits group
+        RBAC (ADR 0001 risk R2), so it outlives the sandbox that used it unless
+        something deletes it. The id therefore travels in the execution handle
+        and `terminate` revokes it. Rotation is incident response, not
+        housekeeping: see docs/runbook.md.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][string]$Type,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Token
+    )
+
+    Assert-SandboxCredentialToken -Type $Type -Token $Token | Out-Null
+
+    $scoped = $Context.PSObject.Copy()
+    $scoped.Secrets = @($Context.Secrets) + @($Token)
+
+    $result = Invoke-SandboxCliWithSecretStdin -Context $scoped -Secret $Token -Argv @(
+        "sandboxgroup", "credential", "create",
+        "--type", $Type,
+        "-o", "json"
+    )
+    if ($result.ExitCode -ne 0) {
+        $kind = Get-SandboxFailureKind -Result $result
+        if (-not $kind) { $kind = "execution" }
+        throw (New-SandboxFailure -Kind $kind -Message "Could not broker a '$Type' credential ($($result.SafeArgv), exit $($result.ExitCode)): $(Get-SandboxErrorText -Result $result -Secrets $scoped.Secrets)")
+    }
+
+    $raw = (@($result.StdOut) -join "`n").Trim()
+    $id = ""
+    if ($raw) {
+        try {
+            $parsed = $raw | ConvertFrom-Json
+            foreach ($property in @("id", "credentialId", "name")) {
+                if (($parsed.PSObject.Properties.Name -contains $property) -and $parsed.$property) {
+                    $id = [string]$parsed.$property
+                    break
+                }
+            }
+        } catch {
+            throw (New-SandboxFailure -Kind "execution" -Message "Could not broker a '$Type' credential: 'aca sandboxgroup credential create' returned output that is not valid JSON.")
+        }
+    }
+    if (-not $id) {
+        throw (New-SandboxFailure -Kind "execution" -Message "Could not broker a '$Type' credential: the service returned no credential id.")
+    }
+    Assert-SandboxIdentifier -Value $id -Name "the brokered credential id" -Kind "credential" -MaxLength 200 | Out-Null
+    return $id
+}
+
+function Remove-SandboxBrokeredCredential {
+    <#
+    .SYNOPSIS
+        Revoke a brokered credential. Idempotent; never throws.
+
+    .DESCRIPTION
+        Called from teardown paths that already carry a more important failure,
+        so it reports rather than raises -- a revocation that could not be
+        completed must not mask the original error. It returns the outcome so
+        the caller can surface "this credential is still live" without losing
+        its own exception.
+
+        Failing to revoke is a real exposure (the credential remains readable to
+        anyone with group read access), so the outcome is not silently dropped:
+        `terminate` reports it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$CredentialId
+    )
+
+    if (-not $CredentialId) { return [pscustomobject]@{ Revoked = $false; Reason = "no credential" } }
+    try {
+        Assert-SandboxIdentifier -Value $CredentialId -Name "the brokered credential id" -Kind "credential" -MaxLength 200 | Out-Null
+    } catch {
+        return [pscustomobject]@{ Revoked = $false; Reason = "malformed credential id" }
+    }
+
+    $result = $null
+    try {
+        $result = Invoke-SandboxCli -Context $Context -Argv @("sandboxgroup", "credential", "delete", "--id", $CredentialId, "--yes")
+    } catch {
+        return [pscustomobject]@{ Revoked = $false; Reason = "revocation call failed" }
+    }
+    if ($result.ExitCode -eq 0) { return [pscustomobject]@{ Revoked = $true; Reason = "" } }
+    if (Test-SandboxGone -Result $result) { return [pscustomobject]@{ Revoked = $true; Reason = "already gone" } }
+    return [pscustomobject]@{ Revoked = $false; Reason = "exit $($result.ExitCode)" }
+}
+
+function New-SandboxCredentialSeedCommand {
+    <#
+    .SYNOPSIS
+        The exec that receives the git/`gh` token on STDIN and stages it inside
+        the sandbox.
+
+    .DESCRIPTION
+        The platform brokers `github-copilot` and `anthropic-claude` natively.
+        It exposes no type for a plain git push token, so that plane cannot use
+        `--credential` -- but it must still stay out of every argument vector,
+        because argv inside the sandbox is readable by every process in it.
+
+        Shape, and why each piece is there:
+
+          umask 077          the file is created 0600 from the outset; a chmod
+                             after the fact leaves a window where it is not.
+          IFS= read -r       preserves the value exactly: no field splitting, no
+                             backslash processing, no trailing-whitespace loss.
+          printf '%s'        never interprets the value (unlike `echo -e`).
+          '...'             the value is single-quoted INSIDE the file, so a
+                             sourcing shell treats it as a literal. Tokens are
+                             validated against $script:SandboxTokenPattern first,
+                             which excludes `'`, so this quoting cannot be
+                             escaped from.
+          unset             the variable does not survive into the environment
+                             of anything this exec later spawns.
+
+        The launch command sources this file and deletes it immediately, so its
+        on-disk lifetime is the gap between two execs.
+    #>
+    param(
+        [string]$StateDir = $script:SandboxStateDir,
+        [string[]]$Names = $script:SandboxSecretEnvNames
+    )
+
+    $writes = @()
+    foreach ($name in @($Names)) {
+        if ($name -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage a credential: '$name' is not a valid environment variable name.")
+        }
+        $writes += "printf 'export $name=%s\n' ""'`$__squad_tok'"" >> $StateDir/$($script:SandboxCredentialFileName)"
+    }
+
+    return "umask 077; mkdir -p $StateDir && rm -f $StateDir/$($script:SandboxCredentialFileName) && " +
+           "IFS= read -r __squad_tok && " + ($writes -join " && ") +
+           " && unset __squad_tok && echo squad-credentials-staged"
+}
+
+# ---------------------------------------------------------------------------
+# Egress policy generation
+# ---------------------------------------------------------------------------
+
+function New-SandboxEgressPolicy {
+    <#
+    .SYNOPSIS
+        Generate the egress policy from the APPROVED class template plus the
+        manifest's request, where the request may only narrow.
+
+    .DESCRIPTION
+        THE enforcement point for "a repository requests, it never grants"
+        (docs/capability-manifest.md, security invariant 3) at the moment policy
+        is actually generated. Sprint 2 enforces the same rule when it picks a
+        class; enforcing it only there means the rule holds exactly as long as
+        nobody ever constructs a policy by another route -- and this provider is
+        another route.
+
+        Rules:
+
+          1. Every emitted pattern and action is copied from the class template.
+             Nothing derived from manifest text is ever emitted, which is why a
+             hostile host string cannot reach the policy even in a rejected
+             build: the emitted set is a subset of the template by construction,
+             and the provenance assertion below proves it rather than asserting
+             it in a comment.
+          2. A requested host NOT covered by the template is a hard failure, not
+             a silently dropped entry. Dropping it would run the session with
+             less network than it asked for and blame the failure on the code.
+          3. Requested hosts narrow: when the manifest declares any, the emitted
+             rule set keeps only the template rules that cover a requested host
+             (plus the template's own non-Allow rules, which can only tighten).
+             A manifest asking for nothing gets the full template, unchanged.
+          4. defaultAction and trafficInspection come from the template only.
+             A class whose defaultAction is not Deny is refused outright.
+
+    .OUTPUTS
+        PSCustomObject: DefaultAction, TrafficInspection, Rules[] (pattern,
+        action), Narrowed (bool), RequestedCount.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Class,
+        [string[]]$RequestedHosts = @()
+    )
+
+    if (-not $Class -or -not $Class.egress) {
+        throw (New-SandboxFailure -Kind "config" -Message "Sandbox class '$($Class.id)' has no egress template. Refusing to run repository code without one (PRD #6 invariant 3).")
+    }
+    $defaultAction = [string]$Class.egress.defaultAction
+    if ($defaultAction -ne "Deny") {
+        throw (New-SandboxFailure -Kind "config" -Message "Sandbox class '$($Class.id)' has egress defaultAction '$defaultAction'. Only 'Deny' is acceptable: an allow-by-default class is not a sandbox (PRD #6 invariant 3).")
+    }
+
+    $template = @()
+    foreach ($rule in @($Class.egress.hostRules)) {
+        $pattern = [string]$rule.pattern
+        $action = [string]$rule.action
+        # The catalog is administrator-owned, but it is still a file -- and a
+        # malformed pattern here becomes an argv element.
+        Assert-SandboxIdentifier -Value $pattern -Name "an egress pattern in class '$($Class.id)'" -Kind "host" -MaxLength 253 | Out-Null
+        if ($action -ne "Allow" -and $action -ne "Deny") {
+            throw (New-SandboxFailure -Kind "config" -Message "Sandbox class '$($Class.id)' has an egress rule with action '$action'. Only 'Allow' and 'Deny' are understood.")
+        }
+        $template += [pscustomobject]@{ Pattern = $pattern; Action = $action }
+    }
+
+    $requested = @(@($RequestedHosts) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $unsatisfied = @()
+    $covered = @{}
+    foreach ($host_ in $requested) {
+        $hit = $null
+        foreach ($rule in $template) {
+            if ($rule.Action -ne "Allow") { continue }
+            if (Test-SandboxHostCoveredByPattern -Host_ $host_ -Pattern $rule.Pattern) { $hit = $rule; break }
+        }
+        if (-not $hit) {
+            # The host is NOT echoed. It is repository-controlled text, and the
+            # count plus the class id is enough to act on.
+            $unsatisfied += $host_
+        } else {
+            $covered[$hit.Pattern] = $true
+        }
+    }
+    if ($unsatisfied.Count -gt 0) {
+        throw (New-SandboxFailure -Kind "capability" -Message "The repository's capability manifest requests $($unsatisfied.Count) egress destination(s) that sandbox class '$($Class.id)' does not permit. A repository may only narrow an approved class's egress template, never widen it. The requested hosts are not echoed. Add the destination to the class in config/sandbox-classes.json, with review, or pick a class that already permits it.")
+    }
+
+    $rules = @()
+    $narrowed = $false
+    if ($requested.Count -gt 0) {
+        foreach ($rule in $template) {
+            if ($rule.Action -ne "Allow" -or $covered.ContainsKey($rule.Pattern)) { $rules += $rule }
+        }
+        $narrowed = ($rules.Count -lt $template.Count)
+    } else {
+        $rules = $template
+    }
+
+    # PROVENANCE. Every emitted rule must be object-identical in value to a
+    # template rule. This is what makes "manifest text never reaches the policy"
+    # a checked property rather than a claim about the code above it.
+    foreach ($rule in $rules) {
+        $match = @($template | Where-Object { $_.Pattern -eq $rule.Pattern -and $_.Action -eq $rule.Action })
+        if ($match.Count -eq 0) {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to apply an egress policy: a generated rule is not present in the approved class template. Only administrator-approved rules may be applied.")
+        }
+    }
+
+    return [pscustomobject]@{
+        DefaultAction     = $defaultAction
+        TrafficInspection = [string]$Class.egress.trafficInspection
+        Rules             = $rules
+        Narrowed          = $narrowed
+        RequestedCount    = $requested.Count
+    }
+}
+
+function Test-SandboxHostCoveredByPattern {
+    <#
+    .SYNOPSIS
+        Does an egress template pattern permit this host?
+
+    .DESCRIPTION
+        The catalog's documented semantics: an exact host, or a leading-wildcard
+        suffix where `*.github.com` matches any host ending in `.github.com` and
+        does NOT match the bare apex. Comparison is ordinal and case-insensitive
+        (DNS is case-insensitive; ordinal keeps it culture-independent, so a
+        Turkish-locale host cannot change the answer).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Host_,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Pattern
+    )
+
+    if (-not $Host_ -or -not $Pattern) { return $false }
+    $cmp = [StringComparison]::OrdinalIgnoreCase
+    if ($Pattern.StartsWith("*.")) {
+        $suffix = $Pattern.Substring(1)   # ".github.com"
+        return ($Host_.Length -gt $suffix.Length -and $Host_.EndsWith($suffix, $cmp))
+    }
+    return [string]::Equals($Host_, $Pattern, $cmp)
+}
+
+# ---------------------------------------------------------------------------
+# Concurrency, cost and orphan control
+# ---------------------------------------------------------------------------
+
+function Get-SquadSandboxInventory {
+    <#
+    .SYNOPSIS
+        The sandboxes THIS control plane owns, from the live list.
+
+    .DESCRIPTION
+        `squad-` prefixed labels are the ownership marker (ADR 0001 risk R7):
+        without it "is this sandbox ours?" is undecidable and a reaper is either
+        useless or dangerous. Anything not so labelled is ignored entirely --
+        this function is used by both the concurrency ceiling and the reaper, and
+        a reaper that could delete a stranger's sandbox is worse than no reaper.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Context)
+
+    $listed = Invoke-SandboxCli -Context $Context -Argv @("sandbox", "list", "-o", "json")
+    if ($listed.ExitCode -ne 0) {
+        $kind = Get-SandboxFailureKind -Result $listed
+        if (-not $kind) { $kind = "execution" }
+        throw (New-SandboxFailure -Kind $kind -Message "Could not list sandboxes ($($listed.SafeArgv), exit $($listed.ExitCode)): $(Get-SandboxErrorText -Result $listed -Secrets $Context.Secrets)")
+    }
+    $raw = (@($listed.StdOut) -join "`n").Trim()
+    if (-not $raw) { return @() }
+    $parsed = $null
+    try { $parsed = $raw | ConvertFrom-Json } catch {
+        throw (New-SandboxFailure -Kind "execution" -Message "'aca sandbox list' returned output that is not valid JSON.")
+    }
+
+    $items = @()
+    foreach ($entry in @($parsed)) {
+        if ($null -eq $entry) { continue }
+        $label = ""
+        if (($entry.PSObject.Properties.Name -contains "labels") -and $entry.labels) {
+            if ($entry.labels.PSObject.Properties.Name -contains "name") { $label = [string]$entry.labels.name }
+        } elseif ($entry.PSObject.Properties.Name -contains "name") {
+            $label = [string]$entry.name
+        }
+        if ($label -notlike "squad-*") { continue }
+        # The label reaches an argv: `sandbox delete -l name=<label>`. Whether it
+        # came from config or from the service's own listing, an identifier this
+        # process did not mint is untrusted input -- exactly the reasoning
+        # already applied to the disk id resolved from this same service. A label
+        # carrying a control character forges a log line; one carrying `/` or
+        # `..` addresses a sibling resource. New-SandboxLabelName can never
+        # produce either, so a malformed `squad-` label is a squatter or an
+        # attack. Refusing loudly beats skipping it: skipping under-counts the
+        # concurrency ceiling, and that spends money.
+        Assert-SandboxIdentifier -Value $label -Name "a sandbox label returned by 'aca sandbox list'" -Kind "label" -MaxLength 63 | Out-Null
+        $status = "Unknown"
+        if ($entry.PSObject.Properties.Name -contains "status") { $status = [string]$entry.status }
+        $created = $null
+        foreach ($property in @("createdAt", "creationTime", "startTime")) {
+            if (($entry.PSObject.Properties.Name -contains $property) -and $entry.$property) {
+                try { $created = [datetime]$entry.$property } catch { }
+                if ($created) { break }
+            }
+        }
+        $items += [pscustomobject]@{
+            Label     = $label
+            SessionId = (Get-SandboxSessionIdFromLabel -Label $label)
+            Status    = $status
+            CreatedAt = $created
+        }
+    }
+    return $items
+}
+
+function Assert-SandboxConcurrencyBudget {
+    <#
+    .SYNOPSIS
+        Refuse to create a sandbox that would exceed the class's concurrency
+        ceiling -- BEFORE it exists.
+
+    .DESCRIPTION
+        Every sandbox bills from the moment it is created, so the cheapest place
+        to enforce a ceiling is before the create call. `limits.maxConcurrentSandboxes`
+        is administrator-owned per class (config/sandbox-classes.json); a class
+        with no ceiling is a configuration error, not "unlimited" -- treating a
+        missing ceiling as unlimited is how an unattended dispatcher runs up a
+        bill nobody authorised.
+
+        The failure is tagged `quota`, which is the whole point: PRD #6 requires
+        quota exhaustion to be distinguishable from auth, capability, readiness
+        and execution failures. A caller can retry a `quota` failure later; it
+        must never retry a `capability` one.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [AllowEmptyString()][string]$SessionId = ""
+    )
+
+    $class = $Context.Class
+    $limit = 0
+    if ($class -and ($class.PSObject.Properties.Name -contains "limits") -and $class.limits) {
+        if (($class.limits.PSObject.Properties.Name -contains "maxConcurrentSandboxes") -and $null -ne $class.limits.maxConcurrentSandboxes) {
+            $limit = [int]$class.limits.maxConcurrentSandboxes
+        }
+    }
+    if ($limit -le 0) {
+        throw (New-SandboxFailure -Kind "config" -Message "Sandbox class '$($class.id)' declares no positive limits.maxConcurrentSandboxes. A missing ceiling is a configuration error, not 'unlimited': refusing to create a sandbox that nothing would bound.")
+    }
+
+    $live = @(Get-SquadSandboxInventory -Context $Context | Where-Object { $_.Status -ne "Deleted" -and $_.Status -ne "Terminated" })
+    # A re-dispatch of the SAME session replaces its own sandbox; it must not
+    # count against the ceiling twice or a retry could never succeed.
+    $wanted = New-SandboxLabelName -SessionId ([string]$SessionId)
+    $others = @($live | Where-Object { $_.Label -ne $wanted })
+
+    if ($others.Count -ge $limit) {
+        throw (New-SandboxFailure -Kind "quota" -Message "Sandbox class '$($class.id)' already has $($others.Count) live sandbox(es) and its ceiling is $limit. Refusing to create another. Wait for one to finish, terminate one ('squad-aca stop'), or raise limits.maxConcurrentSandboxes in config/sandbox-classes.json after a cost review.")
+    }
+    return $true
+}
+
+function Invoke-SquadSandboxReaper {
+    <#
+    .SYNOPSIS
+        Delete orphaned `squad-` sandboxes (ADR 0001 risk R7).
+
+    .DESCRIPTION
+        Auto-suspend stops the meter for an idle sandbox but does not delete it,
+        and an orchestrator that dies between `create` and `terminate` leaves one
+        behind with nothing tracking it. The label prefix is what makes this
+        decidable: only `squad-` sandboxes are ever considered, and a sandbox
+        whose age cannot be established is left alone rather than guessed at.
+
+        Defaults to a DRY RUN. A reaper that deletes by default is a footgun in
+        exactly the situation you reach for it -- an incident, at speed.
+
+    .PARAMETER MaxAgeMinutes
+        Only sandboxes older than this are candidates. Defaults to twice the
+        class's maxSessionMinutes (or 120), so a healthy long session is never a
+        candidate.
+
+    .PARAMETER KeepSessionIds
+        Sessions the caller knows are live. Never candidates.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [int]$MaxAgeMinutes = 0,
+        [string[]]$KeepSessionIds = @(),
+        [switch]$Delete
+    )
+
+    if ($MaxAgeMinutes -le 0) {
+        $session = 60
+        if ($Context.Class -and ($Context.Class.PSObject.Properties.Name -contains "limits") -and $Context.Class.limits `
+            -and ($Context.Class.limits.PSObject.Properties.Name -contains "maxSessionMinutes") -and $Context.Class.limits.maxSessionMinutes) {
+            $session = [int]$Context.Class.limits.maxSessionMinutes
+        }
+        $MaxAgeMinutes = [math]::Max(120, $session * 2)
+    }
+
+    $cutoff = (Get-Date).AddMinutes(-1 * $MaxAgeMinutes)
+    $keep = @{}
+    foreach ($id in @($KeepSessionIds)) {
+        if ($id) { $keep[(New-SandboxLabelName -SessionId ([string]$id))] = $true }
+    }
+
+    $candidates = @()
+    $skipped = @()
+    foreach ($item in @(Get-SquadSandboxInventory -Context $Context)) {
+        if ($keep.ContainsKey($item.Label)) { continue }
+        if ($null -eq $item.CreatedAt) {
+            # Undecidable age. Report it; never delete on a guess.
+            $skipped += $item.Label
+            continue
+        }
+        if ($item.CreatedAt -le $cutoff) { $candidates += $item }
+    }
+
+    $deleted = @()
+    $failed = @()
+    if ($Delete) {
+        foreach ($item in $candidates) {
+            $result = Invoke-SandboxCli -Context $Context -Argv @("sandbox", "delete", "-l", "name=$($item.Label)", "--yes")
+            if ($result.ExitCode -eq 0 -or (Test-SandboxGone -Result $result)) {
+                $deleted += $item.Label
+            } else {
+                $failed += $item.Label
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        MaxAgeMinutes  = $MaxAgeMinutes
+        Candidates     = @($candidates | ForEach-Object { $_.Label })
+        UndecidableAge = $skipped
+        Deleted        = $deleted
+        Failed         = $failed
+        DryRun         = (-not $Delete)
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Command construction
 # ---------------------------------------------------------------------------
 
@@ -619,15 +1601,13 @@ function New-SandboxWorkerEnvironment {
     if ($prefs.subSquad) { $vars["SQUAD_SUB_SQUAD"] = [string]$prefs.subSquad }
     if ($Request.task.prompt) { $vars["SQUAD_PROMPT"] = [string]$Request.task.prompt }
 
-    # Credential delivery is deliberately minimal here: PRD #6 Sprint 7 owns
-    # credential brokerage. Whatever the operator supplied is passed through and
-    # is a registered secret, so it can never reach an error message or a log.
-    foreach ($name in @("GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN")) {
-        if ($Context.WorkerSecrets -and $Context.WorkerSecrets.Contains($name) -and $Context.WorkerSecrets[$name]) {
-            $vars[$name] = [string]$Context.WorkerSecrets[$name]
-        }
-    }
-
+    # Credentials are DELIBERATELY absent here. An `env NAME=value` assignment in
+    # the launch command is argv, and argv inside the sandbox is readable by
+    # every process in it via /proc/<pid>/cmdline for the whole run. The Copilot
+    # plane is brokered by the platform (`sandbox create --credential <id>`); the
+    # git/`gh` plane is staged by a stdin-fed exec into a umask-077 file that the
+    # launch command sources and deletes. Nothing secret belongs in this map --
+    # adding a token back here silently re-opens the disclosure.
     return $vars
 }
 
@@ -689,10 +1669,21 @@ function New-SandboxLaunchCommand {
         if ($name -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
             throw "Refusing to launch the worker: '$name' is not a valid environment variable name."
         }
+        if ($script:SandboxSecretEnvNames -contains $name) {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to launch the worker: '$name' carries a credential and must not be an 'env NAME=value' assignment. Argv is readable by every process in the sandbox; credentials are staged on stdin instead.")
+        }
         $assignments += "$name=$(ConvertTo-SandboxShellSingleQuoted ([string]$Environment[$name]))"
     }
 
-    $inner = "env " + ($assignments -join " ") + " $Entrypoint >> $StateDir/session.log 2>&1; " +
+    # Credentials staged by the stdin-fed seed exec are sourced here and deleted
+    # in the same command, so they exist on disk only between two execs and never
+    # appear in any argv. The `[ -f ]` guard keeps the launch working unchanged
+    # when there is nothing to stage (and is what lets the detachment probe run
+    # the shipping command with no credentials at all).
+    $creds = "$StateDir/$($script:SandboxCredentialFileName)"
+    $loadCreds = "if [ -f $creds ]; then . $creds; rm -f $creds; fi; "
+
+    $inner = $loadCreds + "env " + ($assignments -join " ") + " $Entrypoint >> $StateDir/session.log 2>&1; " +
              "printf %s `$? > $StateDir/exit-code; " +
              "printf %s done > $StateDir/phase; " +
              "touch $StateDir/done"
@@ -882,60 +1873,112 @@ function New-SandboxExecutionProvider {
 
     # -- create --------------------------------------------------------------
     # Ordering is a security control, not a style choice:
-    #   1. prove the group is identity-free  (invariant 4)
-    #   2. create the sandbox
-    #   3. apply default-deny egress          (invariant 3)
-    #   4. pin auto-suspend
-    #   5. launch the worker DETACHED         <- the first repository code to run
-    # Any failure before step 5 tears the sandbox down and throws, so repository
-    # code can never run in a sandbox whose egress policy was not applied.
+    #   1. prove the group is identity-free   (invariant 4)
+    #   2. enforce the concurrency ceiling     <- before anything starts billing
+    #   3. broker credentials on the group     (tokens on stdin, never argv)
+    #   4. create the sandbox, referencing the credentials by opaque id
+    #   5. apply default-deny egress           (invariant 3)
+    #   6. pin auto-suspend
+    #   7. stage the git credential on stdin   (never argv)
+    #   8. launch the worker DETACHED          <- the first repository code to run
+    # Any failure after step 3 revokes the brokered credentials and tears the
+    # sandbox down, so repository code can never run in a sandbox whose egress
+    # policy was not applied, and a failed dispatch never leaves a live
+    # credential on the group.
     $operations["create"] = {
         param($Context, $Arguments)
 
         $request = $Arguments["Request"]
-        if (-not $request) { throw "The Sandboxes provider requires a dispatch request." }
+        if (-not $request) { throw (New-SandboxFailure -Kind "config" -Message "The Sandboxes provider requires a dispatch request.") }
 
         Assert-SandboxGroupIdentityFree -Context $Context | Out-Null
+
+        $class = $Context.Class
+        # Cost ceiling before anything exists. A sandbox bills from creation, so
+        # this is the only place the check is free.
+        Assert-SandboxConcurrencyBudget -Context $Context -SessionId ([string]$request.sessionId) | Out-Null
 
         $diskId = $Context.DiskId
         if (-not $diskId) {
             if (-not $Context.DiskLabel) {
-                throw "No sandbox disk configured. Set a disk id (or a disk label to resolve) before dispatching to a sandbox; '--disk' accepts public images only, so a private image needs '--disk-id <GUID>'."
+                throw (New-SandboxFailure -Kind "config" -Message "No sandbox disk configured. Set a disk id (or a disk label to resolve) before dispatching to a sandbox; '--disk' accepts public images only, so a private image needs '--disk-id <GUID>'.")
             }
             $diskId = Resolve-SandboxDiskId -Context $Context -DiskLabel $Context.DiskLabel
         }
+        # The disk id reaches an argv. Whether it came from config or from the
+        # service's own listing, a value starting with '-' is a FLAG, not data.
+        Assert-SandboxIdentifier -Value $diskId -Name "the sandbox disk id" -Kind "guid" -MaxLength 64 | Out-Null
 
         $name = New-SandboxLabelName -SessionId ([string]$request.sessionId)
-        $class = $Context.Class
+        Assert-SandboxIdentifier -Value $name -Name "the sandbox label" -Kind "label" -MaxLength 63 | Out-Null
+
+        # --- egress policy, generated and validated BEFORE anything exists ---
+        # Generating it here means a widening attempt costs nothing: no sandbox
+        # is created, no credential is brokered, nothing bills.
+        $requestedHosts = @()
+        if ($request.PSObject.Properties.Name -contains "capabilityResolution" -and $request.capabilityResolution) {
+            if ($request.capabilityResolution.PSObject.Properties.Name -contains "egressHosts") {
+                $requestedHosts = @($request.capabilityResolution.egressHosts | Where-Object { $_ })
+            }
+        }
+        $policy = New-SandboxEgressPolicy -Class $class -RequestedHosts $requestedHosts
+
         $cpu = [int]([math]::Max(1, [double]$class.resources.cpu))
         $memory = [int]([math]::Max(1, [double]$class.resources.memoryGi))
 
-        $created = Invoke-SandboxCli -Context $Context -Argv @(
+        # --- credential brokerage (PRD #6 Sprint 7) --------------------------
+        # The Copilot plane is a platform primitive: the token goes in on stdin,
+        # an opaque id comes back, and the sandbox references the id. The token
+        # never appears in an argument vector on either side of the boundary.
+        $credentialIds = @()
+        $copilot = ""
+        if ($Context.WorkerSecrets -and $Context.WorkerSecrets.Contains("COPILOT_GITHUB_TOKEN")) {
+            $copilot = [string]$Context.WorkerSecrets["COPILOT_GITHUB_TOKEN"]
+        }
+        if ($copilot) {
+            $credentialIds += (New-SandboxBrokeredCredential -Context $Context -Type "github-copilot" -Token $copilot)
+        }
+
+        $createArgv = @(
             "sandbox", "create",
             "--disk-id", $diskId,
             "--label", "name=$name",
             "--cpu", "$($cpu * 1000)m",
             "--memory", "$($memory * 1024)Mi"
         )
+        foreach ($credentialId in $credentialIds) { $createArgv += @("--credential", $credentialId) }
+
+        $created = $null
+        try {
+            $created = Invoke-SandboxCli -Context $Context -Argv $createArgv
+        } catch {
+            foreach ($credentialId in $credentialIds) { Remove-SandboxBrokeredCredential -Context $Context -CredentialId $credentialId | Out-Null }
+            throw
+        }
         if ($created.ExitCode -ne 0) {
-            throw "Could not create sandbox '$name' ($($created.SafeArgv), exit $($created.ExitCode)): $(Get-SandboxErrorText -Result $created -Secrets $Context.Secrets)"
+            foreach ($credentialId in $credentialIds) { Remove-SandboxBrokeredCredential -Context $Context -CredentialId $credentialId | Out-Null }
+            $kind = Get-SandboxFailureKind -Result $created
+            if (-not $kind) { $kind = "execution" }
+            throw (New-SandboxFailure -Kind $kind -Message "Could not create sandbox '$name' ($($created.SafeArgv), exit $($created.ExitCode)): $(Get-SandboxErrorText -Result $created -Secrets $Context.Secrets)")
         }
 
         $handle = New-SandboxExecutionHandle -SandboxName $name -SessionId ([string]$request.sessionId) `
-            -ClassId ([string]$class.id) -SandboxGroup ([string]$Context.SandboxGroup)
+            -ClassId ([string]$class.id) -SandboxGroup ([string]$Context.SandboxGroup) -CredentialIds $credentialIds
 
         try {
             # --- egress FIRST, before anything from the repository runs ------
             $egressArgv = @("sandbox", "egress", "set", "-l", "name=$name",
-                "--default", [string]$class.egress.defaultAction)
-            foreach ($rule in @($class.egress.hostRules)) {
-                $egressArgv += @("--rule", "$($rule.pattern):$($rule.action)")
+                "--default", $policy.DefaultAction)
+            foreach ($rule in @($policy.Rules)) {
+                $egressArgv += @("--rule", "$($rule.Pattern):$($rule.Action)")
             }
-            $egressArgv += @("--traffic-inspection", [string]$class.egress.trafficInspection)
+            $egressArgv += @("--traffic-inspection", $policy.TrafficInspection)
 
             $egress = Invoke-SandboxCli -Context $Context -Argv $egressArgv
             if ($egress.ExitCode -ne 0) {
-                throw "Could not apply the egress policy to sandbox '$name' ($($egress.SafeArgv), exit $($egress.ExitCode)): $(Get-SandboxErrorText -Result $egress -Secrets $Context.Secrets). Refusing to run repository code without default-deny egress (PRD #6 invariant 3)."
+                $kind = Get-SandboxFailureKind -Result $egress
+                if (-not $kind) { $kind = "execution" }
+                throw (New-SandboxFailure -Kind $kind -Message "Could not apply the egress policy to sandbox '$name' ($($egress.SafeArgv), exit $($egress.ExitCode)): $(Get-SandboxErrorText -Result $egress -Secrets $Context.Secrets). Refusing to run repository code without default-deny egress (PRD #6 invariant 3).")
             }
 
             # --- auto-suspend, pinned ----------------------------------------
@@ -945,7 +1988,36 @@ function New-SandboxExecutionProvider {
                 "--idle-timeout-seconds", "$($Context.IdleTimeoutSeconds)"
             )
             if ($lifecycle.ExitCode -ne 0) {
-                throw "Could not set the auto-suspend policy on sandbox '$name' ($($lifecycle.SafeArgv), exit $($lifecycle.ExitCode)): $(Get-SandboxErrorText -Result $lifecycle -Secrets $Context.Secrets). Auto-suspend defaults to 600s, which would suspend a running session."
+                $kind = Get-SandboxFailureKind -Result $lifecycle
+                if (-not $kind) { $kind = "execution" }
+                throw (New-SandboxFailure -Kind $kind -Message "Could not set the auto-suspend policy on sandbox '$name' ($($lifecycle.SafeArgv), exit $($lifecycle.ExitCode)): $(Get-SandboxErrorText -Result $lifecycle -Secrets $Context.Secrets). Auto-suspend defaults to 600s, which would suspend a running session.")
+            }
+
+            # --- stage the git/`gh` credential on STDIN ----------------------
+            # The platform brokers no type for a plain push token, so it is
+            # delivered on the stdin of this exec into a umask-077 file that the
+            # launch command sources and deletes. It is in no argv on either
+            # side of the boundary.
+            $gitToken = ""
+            foreach ($candidate in @("GH_TOKEN", "GITHUB_TOKEN")) {
+                if ($Context.WorkerSecrets -and $Context.WorkerSecrets.Contains($candidate) -and $Context.WorkerSecrets[$candidate]) {
+                    $gitToken = [string]$Context.WorkerSecrets[$candidate]
+                    break
+                }
+            }
+            if ($gitToken) {
+                if ($gitToken -notmatch $script:SandboxTokenPattern) {
+                    throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage the git credential: it contains characters outside the unreserved set, which could break out of the quoting in the staged credential file. The value is not echoed.")
+                }
+                $seed = New-SandboxCredentialSeedCommand -StateDir $Context.StateDir
+                $staged = Invoke-SandboxCliWithSecretStdin -Context $Context -Secret $gitToken -Argv @(
+                    "sandbox", "exec", "-l", "name=$name", "-c", $seed
+                )
+                if ($staged.ExitCode -ne 0) {
+                    $kind = Get-SandboxFailureKind -Result $staged
+                    if (-not $kind) { $kind = "execution" }
+                    throw (New-SandboxFailure -Kind $kind -Message "Could not stage the git credential in sandbox '$name' ($($staged.SafeArgv), exit $($staged.ExitCode)): $(Get-SandboxErrorText -Result $staged -Secrets $Context.Secrets)")
+                }
             }
 
             # --- launch, DETACHED --------------------------------------------
@@ -953,17 +2025,23 @@ function New-SandboxExecutionProvider {
             $launch = New-SandboxLaunchCommand -Environment $environment -StateDir $Context.StateDir
             $launched = Invoke-SandboxCli -Context $Context -Argv @("sandbox", "exec", "-l", "name=$name", "-c", $launch)
             if ($launched.ExitCode -ne 0) {
-                throw "Could not launch the worker in sandbox '$name' ($($launched.SafeArgv), exit $($launched.ExitCode)): $(Get-SandboxErrorText -Result $launched -Secrets $Context.Secrets)"
+                $kind = Get-SandboxFailureKind -Result $launched
+                if (-not $kind) { $kind = "execution" }
+                throw (New-SandboxFailure -Kind $kind -Message "Could not launch the worker in sandbox '$name' ($($launched.SafeArgv), exit $($launched.ExitCode)): $(Get-SandboxErrorText -Result $launched -Secrets $Context.Secrets)")
             }
         } catch {
             # Leaving a sandbox that has no policy, or one with policy but no
-            # worker, is a leak and a cost. Teardown is best-effort so the
-            # ORIGINAL failure is what the caller sees.
+            # worker, is a leak and a cost -- and a brokered credential that
+            # outlives its failed dispatch is readable to anyone with group read
+            # access (ADR 0001 risk R2). Teardown is best-effort so the ORIGINAL
+            # failure is what the caller sees; `terminate` revokes the
+            # credentials recorded in the handle.
             try { & $Context.Self.Operations["terminate"] $Context @{ Handle = $handle } | Out-Null } catch { }
             throw
         }
 
-        Write-Host "[squad-aca] sandbox ${name}: created, default-deny egress applied, worker launched detached."
+        $narrowNote = if ($policy.Narrowed) { " (egress narrowed to the $($policy.Rules.Count) destination(s) the manifest requested)" } else { "" }
+        Write-Host "[squad-aca] sandbox ${name}: created, default-deny egress applied$narrowNote, worker launched detached."
 
         # Same rule as every other provider: the response travels through
         # Outcome, never the pipeline.
@@ -1028,8 +2106,12 @@ function New-SandboxExecutionProvider {
                     $label = [string]$entry.name
                 }
                 # Only sandboxes this control plane owns. The squad- prefix plus
-                # the session id is what a reaper matches on.
+                # the session id is what a reaper matches on. The label is
+                # service-supplied and lands in a handle and in later argv, so it
+                # is validated here for the same reason as in
+                # Get-SquadSandboxInventory.
                 if ($label -notlike "squad-*") { continue }
+                Assert-SandboxIdentifier -Value $label -Name "a sandbox label returned by 'aca sandbox list'" -Kind "label" -MaxLength 63 | Out-Null
                 $state = [pscustomobject]@{
                     Status   = $(if ($entry.PSObject.Properties.Name -contains "status") { [string]$entry.status } else { "Unknown" })
                     Phase    = ""
@@ -1138,6 +2220,7 @@ function New-SandboxExecutionProvider {
         $payload = Resolve-SandboxHandlePayload -Handle $Arguments["Handle"]
         $stateDir = $Context.StateDir
         $command = "pkill -f $($script:SandboxWorkerEntrypoint) >/dev/null 2>&1; " +
+                   "rm -f $stateDir/$($script:SandboxCredentialFileName); " +
                    "printf %s 143 > $stateDir/exit-code; " +
                    "printf %s cancelled > $stateDir/phase; " +
                    "touch $stateDir/done; echo squad-cancelled"
@@ -1146,11 +2229,29 @@ function New-SandboxExecutionProvider {
         foreach ($line in @($result.StdOut)) {
             Write-Host (Protect-SandboxText -Text ([string]$line) -Secrets $Context.Secrets)
         }
+
+        # The session is over, so its brokered credentials must not outlive it --
+        # they live on the GROUP and are readable to anyone with group read
+        # access (ADR 0001 risk R2). This runs regardless of the cancel result:
+        # a cancel we could not confirm is exactly when a live credential is
+        # most dangerous. Revocation never throws.
+        $credentialIds = @()
+        if ($payload.PSObject.Properties.Name -contains "creds" -and $payload.creds) {
+            $credentialIds = @($payload.creds | Where-Object { $_ })
+        }
+        $unrevoked = 0
+        foreach ($credentialId in $credentialIds) {
+            if (-not (Remove-SandboxBrokeredCredential -Context $Context -CredentialId $credentialId).Revoked) { $unrevoked++ }
+        }
+        if ($unrevoked -gt 0) {
+            Write-Host "[squad-aca] WARNING: $unrevoked brokered credential(s) for this session could NOT be revoked and are still live on sandbox group '$($Context.SandboxGroup)'. Revoke them by hand and treat the tokens as exposed."
+        }
+
         if ($result.ExitCode -eq 0) {
-            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $false }
+            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $false; CredentialsUnrevoked = $unrevoked }
         }
         if (Test-SandboxGone -Result $result) {
-            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $true }
+            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $true; CredentialsUnrevoked = $unrevoked }
         }
 
         $inconclusive = Test-SandboxTransportInconclusive -Result $result
@@ -1159,7 +2260,9 @@ function New-SandboxExecutionProvider {
         } else {
             "the failure is not 'already deleted or gone'"
         }
-        throw "Could not cancel the session in sandbox '$($payload.name)': '$($result.SafeArgv)' failed with exit $($result.ExitCode), and $why. $(Get-SandboxErrorText -Result $result -Secrets $Context.Secrets)"
+        $kind = Get-SandboxFailureKind -Result $result
+        if (-not $kind) { $kind = "execution" }
+        throw (New-SandboxFailure -Kind $kind -Message "Could not cancel the session in sandbox '$($payload.name)': '$($result.SafeArgv)' failed with exit $($result.ExitCode), and $why. $(Get-SandboxErrorText -Result $result -Secrets $Context.Secrets)")
     }
 
     # -- terminate -----------------------------------------------------------
@@ -1176,11 +2279,30 @@ function New-SandboxExecutionProvider {
             "sandbox", "delete", "-l", "name=$($payload.name)", "--yes"
         )
 
+        # Credentials are brokered on the GROUP, so they OUTLIVE the sandbox that
+        # referenced them and remain readable to anyone with group read access
+        # (ADR 0001 risk R2). Revocation therefore runs whether or not the delete
+        # succeeded -- a sandbox we could not delete is exactly the case where a
+        # live credential matters most. Revocation never throws; an unrevoked
+        # credential is reported so it can be dealt with by hand.
+        $credentialIds = @()
+        if ($payload.PSObject.Properties.Name -contains "creds" -and $payload.creds) {
+            $credentialIds = @($payload.creds | Where-Object { $_ })
+        }
+        $unrevoked = @()
+        foreach ($credentialId in $credentialIds) {
+            $revocation = Remove-SandboxBrokeredCredential -Context $Context -CredentialId $credentialId
+            if (-not $revocation.Revoked) { $unrevoked += $credentialId }
+        }
+        if ($unrevoked.Count -gt 0) {
+            Write-Host "[squad-aca] WARNING: $($unrevoked.Count) brokered credential(s) for this session could NOT be revoked and are still live on sandbox group '$($Context.SandboxGroup)'. Revoke them by hand ('aca sandboxgroup credential delete --id <id> --yes') and treat the tokens as exposed."
+        }
+
         if ($result.ExitCode -eq 0) {
-            return [pscustomobject]@{ Terminated = $true; AlreadyTerminal = $false }
+            return [pscustomobject]@{ Terminated = $true; AlreadyTerminal = $false; CredentialsRevoked = ($credentialIds.Count - $unrevoked.Count); CredentialsUnrevoked = $unrevoked.Count }
         }
         if (Test-SandboxGone -Result $result) {
-            return [pscustomobject]@{ Terminated = $true; AlreadyTerminal = $true }
+            return [pscustomobject]@{ Terminated = $true; AlreadyTerminal = $true; CredentialsRevoked = ($credentialIds.Count - $unrevoked.Count); CredentialsUnrevoked = $unrevoked.Count }
         }
 
         $inconclusive = Test-SandboxTransportInconclusive -Result $result
@@ -1189,7 +2311,9 @@ function New-SandboxExecutionProvider {
         } else {
             "the failure is not 'already deleted or gone'"
         }
-        throw "Could not terminate sandbox '$($payload.name)': '$($result.SafeArgv)' failed with exit $($result.ExitCode), and $why. $(Get-SandboxErrorText -Result $result -Secrets $Context.Secrets)"
+        $kind = Get-SandboxFailureKind -Result $result
+        if (-not $kind) { $kind = "execution" }
+        throw (New-SandboxFailure -Kind $kind -Message "Could not terminate sandbox '$($payload.name)': '$($result.SafeArgv)' failed with exit $($result.ExitCode), and $why. $(Get-SandboxErrorText -Result $result -Secrets $Context.Secrets)")
     }
 
     $provider = [pscustomobject]@{

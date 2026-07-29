@@ -441,6 +441,99 @@ no file edit.
 > nothing observable yet; the sandbox path becomes reachable when the resolution
 > is wired through (PRD #6, Sprint 6+).
 
+### Credentials (four planes, kept separate)
+
+PRD #6 requires four credential planes that never collapse into one. What
+actually reaches a sandbox, and how:
+
+| Plane | Reaches the sandbox? | How |
+| --- | --- | --- |
+| Control plane (your `az`/`aca` login) | **Never** | Stays on the operator's machine. Nothing in the sandbox can mint it. |
+| Runtime Azure (managed identity) | **Absent by design** | The group carries no identity, so in-sandbox token minting fails closed (`unauthorized_client`). See R1 below. |
+| GitHub (git / `gh` push) | Yes | Written to the **stdin** of a staging `aca sandbox exec` into a `0600` file that the launch command sources and deletes. In no argument vector. |
+| Copilot | Yes | The platform's **native credential brokerage**: `aca sandboxgroup credential create --type github-copilot` with the token on **stdin**, then `aca sandbox create --credential <opaque id>`. |
+
+Neither token is ever a CLI argument, an environment variable in the launch
+command, or a value this tool prints. On Linux an argument vector is world-
+readable at `/proc/<pid>/cmdline` for the life of the process, which is why
+"we redact it in our logs" is not sufficient.
+
+**The classic-token footgun.** `--type github-copilot` accepts only a
+**fine-grained** PAT (`github_pat_`) and rejects a classic `ghp_` token. But
+`gh auth token` returns a **classic** token, and `scripts/deploy.ps1` defaults
+`-CopilotGitHubToken` to the **same value** as `-GitHubToken` — so the single
+most likely input is exactly the one the platform rejects, and the two
+credential planes are one token unless you pass `-CopilotGitHubToken`
+explicitly. Mint a fine-grained PAT for the Copilot plane:
+
+```powershell
+.\scripts\deploy.ps1 -SubscriptionId "<azure-subscription-id>" `
+  -DefaultRepository "<github-owner>/<repo>" `
+  -CopilotGitHubToken "<a fine-grained PAT, github_pat_...>"
+```
+
+The provider refuses a classic token **before** it calls the CLI, so a
+mis-scoped token is never transmitted or written to a service-side log.
+
+**Revoking a brokered credential.** Credentials are created on the **group**
+and inherit group RBAC, so they outlive the sandbox that used them. `terminate`
+and `cancel` revoke them automatically and warn loudly if a revocation fails. By
+hand:
+
+```powershell
+aca sandboxgroup credential delete --id <credential id> --yes
+```
+
+Do **not** run `aca sandboxgroup credential list` / `show` or
+`aca sandbox egress show` / `export` while capturing a transcript: they return
+the **values**. The provider refuses to run them at all for that reason.
+`aca sandbox egress decisions -l name=squad-<session> -o json` is the safe
+audit trail (timestamp, host, method, path, scheme, `matchedRule`).
+
+### Concurrency, cost and orphans
+
+A sandbox bills from creation until it is deleted; auto-suspend stops the meter
+but does **not** delete. Three controls, all of which must be present:
+
+1. **A per-class ceiling.** Every class in `config/sandbox-classes.json` must
+   declare `limits.maxConcurrentSandboxes`. A class without one is a
+   **configuration error**, not an unbounded budget — dispatch refuses with
+   `[squad-sandbox:quota]`/`[squad-sandbox:config]` before anything is created.
+2. **Pinned auto-suspend.** The platform default is enabled at 600 s, which
+   would suspend a live session; the provider sets it explicitly (1800 s idle,
+   20 s poll).
+3. **A label-based reaper.** Every sandbox is labelled `squad-<session id>`,
+   which is what makes "is this ours?" decidable. Dry run first — it never
+   deletes without `-Delete`, and never deletes a sandbox whose age it cannot
+   establish:
+   ```powershell
+   . .\scripts\lib\providers\squad-sandbox-provider.ps1
+   $ctx = (New-SandboxExecutionProvider -Class $class -SandboxGroup sbg-squad-aca).Context
+   Invoke-SquadSandboxReaper -Context $ctx                          # dry run
+   Invoke-SquadSandboxReaper -Context $ctx -KeepSessionIds @('<live session>') -Delete
+   ```
+   Or by hand: `aca sandbox list -o json`, then
+   `aca sandbox delete -l name=squad-<session> --yes`.
+
+Failures are tagged so they can be told apart:
+`[squad-sandbox:auth]`, `[squad-sandbox:capability]`, `[squad-sandbox:quota]`,
+`[squad-sandbox:readiness]`, `[squad-sandbox:execution]`,
+`[squad-sandbox:transport]`, `[squad-sandbox:config]`. Quota is classified
+**before** auth deliberately: several services return `403` for a quota refusal,
+and reading "you have hit your ceiling" as "your credentials are bad" sends an
+operator to rotate a perfectly good token.
+
+The inverse mistake is worse, so numeric status codes are **never** matched as
+bare substrings. Azure decorates auth failures with correlation, object and
+trace GUIDs, and a GUID such as `1b8f429c-…` contains `429`; matching that would
+tag a rotated-out credential `[squad-sandbox:quota]` — "a ceiling was hit, retry
+later" — and an unattended dispatcher would then retry a credential fault
+indefinitely. A code only counts when it is delimited by something that is
+neither alphanumeric nor a hyphen (`HTTP 429`, `(403)`, `status=401,`), which no
+GUID occurrence ever is. `[squad-sandbox:transport]` wins over everything: our
+own client give-up (exit `124`, "timed out after 120s") is not a verdict about
+the sandbox.
+
 ### Rollback to ACA Jobs
 
 ```powershell
@@ -480,6 +573,101 @@ aca sandbox delete -l name=squad-<session> --yes
 * A `403 CheckAccess` from `aca` that makes no sense is usually
   `az acr login --expose-token` having switched your active subscription. Re-run
   `az account set --subscription <sub>`.
+
+### Incident runbook
+
+Risk IDs are from [adr/0001-aca-sandboxes-feasibility.md](adr/0001-aca-sandboxes-feasibility.md).
+Every one of these is **live-verified behaviour**, not speculation.
+
+#### R1 — managed identity is group-scoped, with no per-sandbox opt-out
+
+*Symptom:* a sandbox can mint Azure tokens, or you discover the group was
+created with `--identity`.
+
+*Why it matters:* identity is a property of the **group**. There is no way to
+give one sandbox an identity and withhold it from another, so a single
+identity-bearing group turns every sandbox in it into an escalation path.
+`IDENTITY_ENDPOINT` and `IDENTITY_HEADER` are injected into every sandbox
+**regardless** — misleading but inert while the group has no identity (raw IMDS
+returns empty and minting fails `unauthorized_client`).
+
+*Response:*
+1. Stop dispatching: `Remove-Item Env:SQUAD_ACA_ENABLE_SANDBOX`.
+2. Delete every `squad-*` sandbox in the group (see the reaper above). Assume
+   anything they could reach with that identity was reachable.
+3. Create a **new** group with no `--identity` and rebuild the disk there.
+   Do not try to strip the identity from the existing group and reuse it.
+4. Review the identity's role assignments for what was actually exposed.
+
+The provider asserts the group is identity-free before every dispatch and
+refuses to run otherwise, and refuses to issue any `aca` command carrying
+`--identity`. This incident should therefore only arise from out-of-band
+changes.
+
+#### R2 — egress and credential values are readable to anyone with group read access
+
+*Symptom:* a person or a CI job with read access to the sandbox group runs
+`aca sandboxgroup credential list` or `aca sandbox egress show`.
+
+*Why it matters:* brokered credentials live on the **group**, not the sandbox,
+and inherit group RBAC. Group read is effectively credential read.
+
+*Response:*
+1. Treat every credential brokered on that group as exposed. Revoke:
+   ```powershell
+   aca sandboxgroup credential delete --id <id> --yes
+   ```
+   (`terminate`/`cancel` do this automatically; do it by hand for anything they
+   reported as **unrevoked**.)
+2. Rotate the upstream tokens — revoking the brokered copy does not invalidate
+   the GitHub/Copilot PAT it was minted from:
+   ```powershell
+   squad-aca secrets rotate --github-token <new> --copilot-token <new fine-grained PAT>
+   ```
+3. Audit group RBAC and remove read access that does not need to exist.
+
+*Prevention:* keep the sandbox group in its own resource group with a minimal
+reader set. This tool never reads those values back; the readback subcommands
+are refused outright so they cannot reach a session log or a CI transcript.
+
+#### R3 — `trafficInspection: Full` means TLS interception
+
+*Symptom:* none — this is a standing property of the approved classes.
+
+*Why it matters:* enforcing an allowlist on **hostnames and paths** requires
+terminating TLS. The inspecting proxy is therefore **inside the trust
+boundary** and sees plaintext request bodies, including anything the worker
+sends to GitHub. This is a deliberate trade: default-deny egress is worth more
+than end-to-end confidentiality to an already-allowlisted host. Say so out loud
+before anyone puts a third party's data through a sandbox.
+
+*Response if the proxy is believed compromised:* treat every credential and every
+request body that transited it as exposed — follow R2 step 1–2, and rotate any
+secret the worker sent to an allowed host. Sessions cannot be made safe
+retroactively by narrowing egress.
+
+*If a workload cannot accept interception,* do not run it in a sandbox: keep it
+on ACA Jobs, where there is no inspecting proxy (and no egress control either —
+that is the trade, in the other direction).
+
+#### R7 — orphan sandboxes
+
+*Symptom:* `aca sandbox list -o json` shows `squad-*` sandboxes with no live
+session; unexplained spend.
+
+*Why it matters:* an orchestrator that dies between `create` and `terminate`
+leaves a sandbox behind with nothing tracking it. Auto-suspend stops the meter
+for an **idle** sandbox but never deletes it, and a sandbox whose worker is
+still looping is never idle.
+
+*Response:*
+1. `Invoke-SquadSandboxReaper -Context $ctx` — dry run, lists candidates.
+2. Cross-check the candidate labels against `squad-aca sessions`.
+3. `Invoke-SquadSandboxReaper -Context $ctx -KeepSessionIds @(<live ids>) -Delete`.
+4. Revoke any credentials that belonged to the orphans (R2 step 1) — deleting a
+   sandbox does **not** delete the group-scoped credentials it referenced.
+
+Run the dry run on a schedule; it is read-only and cheap.
 
 ## Rollback and recovery
 

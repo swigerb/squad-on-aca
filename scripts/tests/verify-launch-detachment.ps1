@@ -146,6 +146,59 @@ $launch = New-SandboxLaunchCommand `
     -Entrypoint "$probeDir/worker.sh"
 
 $settle = $WorkerSeconds + 2
+
+# The credential-staging half of the probe. Sprint 7 delivers the git/`gh`
+# token on the STDIN of a staging exec, into a umask-077 file that the launch
+# command sources and deletes. Every one of those claims is behavioural, so
+# each is checked by running the shipping strings in a real shell:
+#
+#   * the token is written on stdin, never as an argument -- proven by the
+#     command containing none of it while the worker still ends up with it;
+#   * the file is 0600 from the instant it exists -- `umask 077` before the
+#     redirection, not a chmod afterwards, which would leave a window;
+#   * the launch sources it and REMOVES it -- so its on-disk lifetime is the
+#     gap between two execs;
+#   * the value survives verbatim -- `IFS= read -r` plus `printf '%s'`, so no
+#     field splitting, no backslash processing, no lost trailing characters.
+#
+# The token used here is a throwaway literal generated per run; it never
+# leaves the probe's own shell.
+$probeToken = "sq-probe-" + [guid]::NewGuid().ToString("N")
+$seed = New-SandboxCredentialSeedCommand -StateDir $probeDir
+$launchWithCreds = New-SandboxLaunchCommand `
+    -Environment ([ordered]@{ SQUAD_DETACH_PROBE = "1" }) `
+    -StateDir $probeDir `
+    -Entrypoint "$probeDir/worker.sh"
+
+# Anything in the shipping strings that leaks the token defeats the point --
+# but `$seed` and `$launchWithCreds` are produced by generators that never
+# RECEIVE the token, so "does this string contain it?" is a question whose
+# answer is fixed by construction: those two checks could not fail whatever the
+# generators did. They have been replaced by two that can.
+#
+#   1. The generator's own REFUSAL, exercised with the token. Passing a
+#      credential-bearing name to New-SandboxLaunchCommand must throw, because
+#      an `env NAME=value` assignment is argv and argv is readable by every
+#      process in the sandbox. Delete that guard and this check fails.
+#   2. A behavioural argv sweep (below, ARGVLEAK). While the worker holds the
+#      staged token in its ENVIRONMENT -- which is the whole point of the
+#      staging design -- no process on the machine may have it in its argv. Move
+#      the token from stdin into any command line and this check fails.
+$staticLeaks = @()
+$guardErr = ""
+try {
+    New-SandboxLaunchCommand `
+        -Environment ([ordered]@{ SQUAD_DETACH_PROBE = "1"; GH_TOKEN = $probeToken }) `
+        -StateDir $probeDir -Entrypoint "$probeDir/worker.sh" | Out-Null
+} catch { $guardErr = [string]$_.Exception.Message }
+if ($guardErr -notmatch "\[squad-sandbox:capability\]") {
+    $staticLeaks += "the launch generator accepted a credential-bearing env assignment (GH_TOKEN) instead of refusing it -- argv is readable by every process in the sandbox (error was: '$guardErr')"
+}
+if ($guardErr -match [regex]::Escape($probeToken)) {
+    $staticLeaks += "the launch generator's refusal echoed the token value"
+}
+if ($launchWithCreds -match "GH_TOKEN=" -or $launchWithCreds -match "GITHUB_TOKEN=") { $staticLeaks += "the launch command still assigns a token-bearing env var" }
+
 $script = @"
 set -u
 S='$probeDir'
@@ -162,6 +215,28 @@ sleep $settle
 echo "PHASE_FINAL=`$(cat "`$S/phase" 2>/dev/null)"
 echo "EXIT_FILE=`$(cat "`$S/exit-code" 2>/dev/null)"
 if [ -f "`$S/done" ]; then echo "MARKER=done"; else echo "MARKER=absent"; fi
+rm -rf "`$S"
+
+# ---- credential staging -------------------------------------------------
+rm -rf "`$S"; mkdir -p "`$S"
+printf '%s\n' '#!/usr/bin/env bash' '{ ps -ww -eo args= 2>/dev/null; cat /proc/*/cmdline 2>/dev/null | tr "\0" " "; } > "$probeDir/argv-snapshot"' 'printf %s "`${GH_TOKEN:-MISSING}" > "$probeDir/seen-token"' 'printf %s "`${GITHUB_TOKEN:-MISSING}" > "$probeDir/seen-token2"' > "`$S/worker.sh"
+chmod +x "`$S/worker.sh"
+# The token goes in on STDIN. It is in no argument vector of anything below.
+printf '%s\n' '$probeToken' | ( $seed )
+echo "STAGED=`$?"
+if [ -f "`$S/.squad-creds" ]; then echo "CREDFILE=present"; else echo "CREDFILE=absent"; fi
+echo "CREDMODE=`$(stat -c %a "`$S/.squad-creds" 2>/dev/null)"
+out2=`$($launchWithCreds)
+echo "OUT2=`$out2"
+sleep 2
+echo "SEEN=`$(cat "`$S/seen-token" 2>/dev/null)"
+echo "SEEN2=`$(cat "`$S/seen-token2" 2>/dev/null)"
+# The worker held the token in its ENVIRONMENT at the instant of this snapshot
+# (SEEN= above proves that). No process may have held it in its ARGV.
+if [ ! -s "`$S/argv-snapshot" ]; then echo "ARGVLEAK=unchecked"
+elif grep -qF '$probeToken' "`$S/argv-snapshot"; then echo "ARGVLEAK=present"
+else echo "ARGVLEAK=absent"; fi
+if [ -f "`$S/.squad-creds" ]; then echo "CREDFILE_AFTER=present"; else echo "CREDFILE_AFTER=absent"; fi
 rm -rf "`$S"
 "@ -replace "`r`n", "`n"
 
@@ -185,12 +260,25 @@ if ($out -notmatch "PHASE_FINAL=done") { $failures += "the detached worker never
 if ($out -notmatch "EXIT_FILE=0") { $failures += "the detached wrapper did not record the worker's exit code" }
 if ($out -notmatch "MARKER=done") { $failures += "the detached wrapper never touched the completion marker" }
 
+# --- credential staging ---------------------------------------------------
+$failures += $staticLeaks
+if ($out -notmatch "STAGED=0") { $failures += "the staging command did not succeed reading the token from stdin" }
+if ($out -notmatch "CREDFILE=present") { $failures += "the staging command did not create the credential file" }
+if ($out -notmatch "CREDMODE=600") { $failures += "the credential file is not 0600 (umask 077 must apply at creation; a later chmod leaves a readable window)" }
+if ($out -notmatch ("SEEN=" + [regex]::Escape($probeToken))) { $failures += "the worker did not receive the staged token verbatim -- delivery is broken, or the value was mangled by field splitting" }
+if ($out -notmatch ("SEEN2=" + [regex]::Escape($probeToken))) { $failures += "GITHUB_TOKEN was not staged alongside GH_TOKEN" }
+if ($out -notmatch "CREDFILE_AFTER=absent") { $failures += "the credential file survived the launch -- it must be removed as soon as it is sourced, so its on-disk lifetime is the gap between two execs" }
+if ($out -match "ARGVLEAK=present") { $failures += "the staged token appeared in a process ARGUMENT VECTOR while the worker ran -- argv is readable by every process in the sandbox, which is the exposure stdin staging exists to avoid" }
+if ($out -notmatch "ARGVLEAK=(present|absent)") { $failures += "the argv sweep did not run, so 'the token never reaches an argv' is UNVERIFIED (a check that cannot observe is not a pass)" }
+if ($out -match [regex]::Escape($probeToken) -and $out -notmatch ("SEEN=" + [regex]::Escape($probeToken))) { $failures += "the token appeared in probe output outside the worker's own read-back" }
+
 Write-Host ""
 Write-Host "Probe output: $flat"
 Write-Host ""
 
 if ($failures.Count -eq 0) {
     Write-Host "PASS: the emitted launch command detaches - the caller's streams reached EOF in ${elapsed}ms while a ${WorkerSeconds}s worker kept running, and the wrapper recorded exit code then completion marker." -ForegroundColor Green
+    Write-Host "PASS: the credential staged on STDIN reached the worker verbatim through a 0600 file that the launch sourced and removed, the launch generator REFUSES a credential-bearing env assignment, and no process held the token in its argv while the worker held it in its environment." -ForegroundColor Green
     exit 0
 }
 

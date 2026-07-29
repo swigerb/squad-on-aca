@@ -61,6 +61,17 @@ if (-not $GitHubToken) {
     $GitHubToken = (& gh auth token).Trim()
 }
 if (-not $CopilotGitHubToken) {
+    # NOTE (PRD #6, Sprint 7): this collapses two credential planes into one.
+    # `gh auth token` returns a CLASSIC token (`ghp_`), and the ACA Sandboxes
+    # credential broker accepts only a FINE-GRAINED PAT (`github_pat_`) for
+    # --type github-copilot -- so this default is both wider than it needs to be
+    # (the Copilot plane inherits the git plane's write scopes) and the exact
+    # value the sandbox path refuses. The sandbox provider fails closed with an
+    # actionable message rather than sending it. Pass -CopilotGitHubToken with a
+    # fine-grained PAT to keep the planes separate; see docs/runbook.md
+    # ("Credentials (four planes, kept separate)"). The default is retained so
+    # existing ACA Jobs deployments keep working unchanged.
+    Write-Host "[deploy] WARNING: -CopilotGitHubToken was not supplied, so the Copilot plane will reuse the SAME token as the GitHub plane. Pass a fine-grained PAT (github_pat_...) to keep them separate; see docs/runbook.md." -ForegroundColor Yellow
     $CopilotGitHubToken = $GitHubToken
 }
 

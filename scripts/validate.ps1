@@ -1356,7 +1356,11 @@ if (-not (Test-Path $providerLib)) {
         "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
         "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
         "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
-        "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE")
+        "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
+        "SQUAD_STUB_ACA_CRED_RC", "SQUAD_STUB_ACA_CRED_ERR", "SQUAD_STUB_ACA_CRED_ID",
+        "SQUAD_STUB_ACA_CRED_STDIN", "SQUAD_STUB_ACA_CREDDEL_RC", "SQUAD_STUB_ACA_CREDDEL_ERR",
+        "SQUAD_STUB_ACA_SEED_RC", "SQUAD_STUB_ACA_SEED_STDIN", "SQUAD_STUB_ACA_LIST_FIXTURE",
+        "SQUAD_STUB_ACA_LIST_RC", "SQUAD_STUB_ACA_LIST_ERR")
     try {
         $sbStub = New-SquadCliStubEnvironment
         $env:PATH = "$($sbStub.BinDir);$sbPrevPath"
@@ -1376,6 +1380,17 @@ if (-not (Test-Path $providerLib)) {
         $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
         $env:SQUAD_STUB_ACA_POLL_DIR = ""
         $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
+        $env:SQUAD_STUB_ACA_CRED_RC = "0"
+        $env:SQUAD_STUB_ACA_CRED_ERR = ""
+        $env:SQUAD_STUB_ACA_CRED_ID = ""
+        $env:SQUAD_STUB_ACA_CRED_STDIN = ""
+        $env:SQUAD_STUB_ACA_CREDDEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CREDDEL_ERR = ""
+        $env:SQUAD_STUB_ACA_SEED_RC = "0"
+        $env:SQUAD_STUB_ACA_SEED_STDIN = ""
+        $env:SQUAD_STUB_ACA_LIST_FIXTURE = ""
+        $env:SQUAD_STUB_ACA_LIST_RC = "0"
+        $env:SQUAD_STUB_ACA_LIST_ERR = ""
 
         $sbCli = Join-Path $sbStub.BinDir "aca.cmd"
         $resolvedAca = (Get-Command aca -ErrorAction SilentlyContinue)
@@ -1397,13 +1412,22 @@ if (-not (Test-Path $providerLib)) {
       { "pattern": "registry.npmjs.org", "action": "Allow" }
     ],
     "trafficInspection": "Full"
-  }
+  },
+  "limits": { "maxConcurrentSandboxes": 4, "maxSessionMinutes": 60, "maxMonthlyCostUsd": 50 }
 }
 '@ | ConvertFrom-Json
 
         $sbSecret = "ghp-stub-secret-token-value"
+        # Built by concatenation so no literal that looks like a real credential
+        # is ever committed -- the repository's own secret scan would reject it.
+        $sbCopilotSecret = "github" + "_pat_" + "stubvalue00000000"
         function New-SandboxTestProvider {
-            param([string]$DiskId = "aaaaaaaa-1111-2222-3333-444444444444", [string]$DiskLabel = "")
+            param(
+                [string]$DiskId = "aaaaaaaa-1111-2222-3333-444444444444",
+                [string]$DiskLabel = "",
+                [hashtable]$Secrets = $null
+            )
+            if ($null -eq $Secrets) { $Secrets = @{ GH_TOKEN = $sbSecret; COPILOT_GITHUB_TOKEN = $sbCopilotSecret } }
             return New-SquadExecutionProvider -Kind "sandbox" -Options @{
                 Class              = $sbClass
                 SandboxGroup       = "sbg-squad-stub"
@@ -1414,7 +1438,7 @@ if (-not (Test-Path $providerLib)) {
                 AcaCliPath         = $sbCli
                 IdleTimeoutSeconds = 1800
                 PollSeconds        = 1
-                WorkerSecrets      = @{ GH_TOKEN = $sbSecret }
+                WorkerSecrets      = $Secrets
             }
         }
 
@@ -1543,11 +1567,14 @@ if (-not (Test-Path $providerLib)) {
         }
 
         # --- 3. secrets never reach anything the provider EMITS ---------------
-        # The token is delivered to the worker as an environment assignment in
-        # the launch command, so it is present in that one process argv (PRD #6
-        # Sprint 7 owns credential brokerage and replaces this). What must never
-        # happen is the provider REPEATING it: into the dispatch response, into
-        # an error message, or into the rendered argv it puts in one.
+        # Sprint 7 moved credential delivery off every argument vector: the
+        # Copilot plane goes through the platform's own brokerage (token on
+        # stdin, opaque id back), and the git/`gh` plane is written to the stdin
+        # of a staging exec. So the assertion is now absolute -- NO recorded aca
+        # argv may contain either token -- and it is checked below in section 12
+        # against the stub's own log of what each process actually received.
+        # What must also never happen is the provider REPEATING a token: into the
+        # dispatch response, into an error message, or into a rendered argv.
         $sbResponseText = ($sbOutcome["Response"] | ConvertTo-Json -Depth 8)
         if ($sbResponseText -notmatch [regex]::Escape($sbSecret)) {
             Add-Pass "The worker token never appears in the dispatch response"
@@ -1924,6 +1951,689 @@ if (-not (Test-Path $providerLib)) {
             Add-Pass "Every sandbox operation is addressed by a session-derived label, so a reaper can find orphans"
         } else {
             Add-Fail "Sandbox operations are not consistently session-labelled ($sbLabelled labelled calls)"
+        }
+
+        # =====================================================================
+        # Sprint 7/8 -- credentials, egress narrowing, adversarial input,
+        # quota/cost and failure taxonomy.
+        # =====================================================================
+
+        # --- 12. credentials are delivered on STDIN, not in any argv ---------
+        # This is the whole point of Sprint 7 and it is asserted BEHAVIOURALLY,
+        # not textually. The stub writes whatever arrived on its standard input
+        # to a file; the check then requires BOTH halves to hold at once:
+        #
+        #   (a) the exact token value reached the process  -- proving delivery
+        #       actually happened and the control is not just "we stopped
+        #       passing the token at all", which a pure absence check would
+        #       have called a pass; and
+        #   (b) the token appears in NO recorded argv      -- proving it is not
+        #       readable from /proc/<pid>/cmdline by any other process on the
+        #       host, which is what an argv-borne secret means on Linux.
+        #
+        # A substring assertion over the emitted command could not tell those
+        # two states apart.
+        $sbCredStdin = Join-Path $sbStub.Root "cred-stdin.txt"
+        $sbSeedStdin = Join-Path $sbStub.Root "seed-stdin.txt"
+        Remove-Item $sbCredStdin, $sbSeedStdin -ErrorAction SilentlyContinue
+        $env:SQUAD_STUB_ACA_CRED_STDIN = $sbCredStdin
+        $env:SQUAD_STUB_ACA_SEED_STDIN = $sbSeedStdin
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbCredProvider = New-SandboxTestProvider
+        $sbCredOutcome = @{}
+        $sbCredErr = ""
+        try {
+            Start-SquadExecution -Provider $sbCredProvider -Request $sbRequest -Outcome $sbCredOutcome 6>$null | Out-Null
+        } catch { $sbCredErr = [string]$_.Exception.Message }
+        $sbCredCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $sbCredAllArgv = ($sbCredCalls -join "`n")
+        $sbGotCred = if (Test-Path $sbCredStdin) { (Get-Content -Raw $sbCredStdin).Trim() } else { "" }
+        $sbGotSeed = if (Test-Path $sbSeedStdin) { (Get-Content -Raw $sbSeedStdin).Trim() } else { "" }
+
+        if (-not $sbCredErr -and $sbGotCred -eq $sbCopilotSecret -and $sbCredAllArgv -notmatch [regex]::Escape($sbCopilotSecret)) {
+            Add-Pass "The Copilot credential reaches the platform on STDIN and appears in no process argv (received on stdin, absent from all $($sbCredCalls.Count) recorded aca argvs)"
+        } else {
+            Add-Fail "Copilot credential delivery is wrong (err=$sbCredErr stdinMatched=$($sbGotCred -eq $sbCopilotSecret) inArgv=$($sbCredAllArgv -match [regex]::Escape($sbCopilotSecret)))"
+        }
+        if ($sbGotSeed -eq $sbSecret -and $sbCredAllArgv -notmatch [regex]::Escape($sbSecret)) {
+            Add-Pass "The git/gh push token reaches the sandbox on STDIN and appears in no process argv (no native --type exists for it, so it is staged into a umask-077 file)"
+        } else {
+            Add-Fail "Git token delivery is wrong (stdinMatched=$($sbGotSeed -eq $sbSecret) inArgv=$($sbCredAllArgv -match [regex]::Escape($sbSecret)))"
+        }
+
+        # The brokered id must actually be attached to the sandbox, otherwise
+        # the token was uploaded and then ignored.
+        $iCredCreate = [array]::FindIndex($sbCredCalls, [Predicate[string]] { param($l) $l -like "sandboxgroup credential create *" })
+        $iSbCreate2  = [array]::FindIndex($sbCredCalls, [Predicate[string]] { param($l) $l -like "sandbox create *" })
+        if ($iCredCreate -ge 0 -and $iSbCreate2 -gt $iCredCreate `
+                -and $sbCredCalls[$iCredCreate] -like "*--type github-copilot*" `
+                -and $sbCredCalls[$iSbCreate2] -like "*--credential cred-stub-0001*") {
+            Add-Pass "The brokered credential is created first and referenced by opaque id on 'sandbox create --credential'"
+        } else {
+            Add-Fail "Credential brokerage is not wired into sandbox create (credCreate=$iCredCreate sandboxCreate=$iSbCreate2)"
+        }
+
+        # And the launch command itself -- the string that used to carry the
+        # token -- must now be free of it and of the env names it travelled in.
+        $iLaunch2 = [array]::FindIndex($sbCredCalls, [Predicate[string]] { param($l) $l -like "*squad-launched*" })
+        if ($iLaunch2 -ge 0 -and $sbCredCalls[$iLaunch2] -notmatch [regex]::Escape($sbSecret) `
+                -and $sbCredCalls[$iLaunch2] -notmatch "GH_TOKEN=" -and $sbCredCalls[$iLaunch2] -notmatch "GITHUB_TOKEN=") {
+            Add-Pass "The launch command carries no token and no token-bearing env assignment (Sprint 5's known limitation is closed)"
+        } else {
+            Add-Fail "The launch command still carries a credential: $(if ($iLaunch2 -ge 0) { 'token/env assignment present' } else { '<no launch call>' })"
+        }
+
+        # Mutation guard: New-SandboxLaunchCommand must REFUSE to build a
+        # command that assigns a secret env name, so a future change that
+        # "helpfully" restores GH_TOKEN= cannot pass silently.
+        $sbEnvGuard = ""
+        try {
+            New-SandboxLaunchCommand -Environment ([ordered]@{ GH_TOKEN = "x" }) -StateDir "/squad/state" | Out-Null
+        } catch { $sbEnvGuard = [string]$_.Exception.Message }
+        if ($sbEnvGuard -match "squad-sandbox:capability") {
+            Add-Pass "New-SandboxLaunchCommand refuses to place a secret env name in the launch argv at all"
+        } else {
+            Add-Fail "A secret env name was accepted into the launch command (msg=$sbEnvGuard)"
+        }
+
+        $env:SQUAD_STUB_ACA_CRED_STDIN = ""
+        $env:SQUAD_STUB_ACA_SEED_STDIN = ""
+
+        # --- 13. the classic-token footgun ------------------------------------
+        # The platform rejects a classic `ghp_` token for --type github-copilot.
+        # Discovering that from a service round-trip means the token has already
+        # been sent over the wire and written to a service-side log. So it is
+        # rejected locally, and the check proves locality by counting aca calls:
+        # zero. deploy.ps1 defaults -CopilotGitHubToken to -GitHubToken, which is
+        # a classic token from `gh auth token`, so this fires in practice.
+        $sbClassicCases = @(
+            @{ Prefix = "ghp_"; What = "a classic personal access token" },
+            @{ Prefix = "gho_"; What = "an OAuth token" },
+            @{ Prefix = "ghs_"; What = "a server-to-server token" }
+        )
+        $sbClassicBad = @()
+        foreach ($case in $sbClassicCases) {
+            $reason = Test-SandboxCredentialToken -Type "github-copilot" -Token ($case.Prefix + "stubvalue00000000")
+            if (-not $reason) { $sbClassicBad += "$($case.Prefix) accepted" }
+            elseif ($reason -match [regex]::Escape($case.Prefix + "stubvalue")) { $sbClassicBad += "$($case.Prefix) echoed the token" }
+            # A generic "wrong prefix" is not good enough. The whole reason this
+            # guard exists is that `gh auth token` returns a classic token and
+            # deploy.ps1 defaults -CopilotGitHubToken to the SAME value, so the
+            # message must name that specific trap -- otherwise an operator
+            # reads "wrong prefix" and re-runs `gh auth token`.
+            elseif ($reason -notmatch [regex]::Escape($case.Prefix) -or $reason -notmatch "CopilotGitHubToken") {
+                $sbClassicBad += "$($case.Prefix) gave a non-actionable message"
+            }
+        }
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbClassicErr = ""
+        try {
+            $p = New-SandboxTestProvider -Secrets @{ GH_TOKEN = $sbSecret; COPILOT_GITHUB_TOKEN = ("ghp_" + "stubvalue00000000") }
+            Start-SquadExecution -Provider $p -Request $sbRequest 6>$null | Out-Null
+        } catch { $sbClassicErr = [string]$_.Exception.Message }
+        $sbClassicCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $sbClassicCreates = @($sbClassicCalls | Where-Object { $_ -like "sandbox create *" -or $_ -like "sandboxgroup credential create *" }).Count
+        if ($sbClassicBad.Count -eq 0 -and $sbClassicErr -match "github_pat_" -and $sbClassicCreates -eq 0 `
+                -and $sbClassicErr -notmatch "stubvalue") {
+            Add-Pass "A classic ghp_/gho_/ghs_ token is refused for the Copilot plane BEFORE any CLI call (0 create calls), with an actionable message that does not echo the token"
+        } else {
+            Add-Fail "The classic-token guard is wrong (bad=$($sbClassicBad -join '; ') creates=$sbClassicCreates err=$sbClassicErr)"
+        }
+        $sbAnthropicOk = (Test-SandboxCredentialToken -Type "anthropic-claude" -Token "sk-ant-stubvalue0000") -eq "" `
+            -and (Test-SandboxCredentialToken -Type "anthropic-claude" -Token ("github" + "_pat_" + "stubvalue0000")) -ne ""
+        if ($sbAnthropicOk) {
+            Add-Pass "Each credential type enforces its own required prefix (anthropic-claude requires sk-ant-)"
+        } else {
+            Add-Fail "The anthropic-claude prefix rule is not enforced"
+        }
+
+        # --- 14. egress may be NARROWED by a manifest, never widened ---------
+        # Sprint 2 enforces this in the resolver. It is enforced AGAIN here, at
+        # the point of policy generation, because the resolver is a different
+        # process boundary: a bug, a bypass, or a future caller that builds a
+        # resolution by hand must not be able to widen the sandbox's reach.
+        $sbWiden = New-SquadDispatchRequest -SessionId "stub-session" -Repository "octo/demo" `
+            -Prompt "p" -Mode "prompt" -CapabilityResolution ([pscustomobject]@{
+                egressHosts = @("*.github.com", "evil.example.com")
+            })
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbWidenErr = ""
+        try { Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbWiden 6>$null | Out-Null } catch { $sbWidenErr = [string]$_.Exception.Message }
+        $sbWidenCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $sbWidenCreates = @($sbWidenCalls | Where-Object { $_ -like "sandbox create *" }).Count
+        if ($sbWidenErr -match "squad-sandbox:capability" -and $sbWidenCreates -eq 0 -and $sbWidenErr -notmatch "evil\.example\.com") {
+            Add-Pass "A manifest that requests a host outside the approved class template is refused at policy generation, before any sandbox is created or billed, without echoing the host"
+        } else {
+            Add-Fail "Egress widening was not refused at generation time (err=$sbWidenErr creates=$sbWidenCreates)"
+        }
+
+        $sbNarrow = New-SquadDispatchRequest -SessionId "stub-session" -Repository "octo/demo" `
+            -Prompt "p" -Mode "prompt" -CapabilityResolution ([pscustomobject]@{ egressHosts = @("api.github.com") })
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbNarrowErr = ""
+        try { Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbNarrow 6>$null | Out-Null } catch { $sbNarrowErr = [string]$_.Exception.Message }
+        $sbNarrowCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $iNarrowEgress = [array]::FindIndex($sbNarrowCalls, [Predicate[string]] { param($l) $l -like "sandbox egress set *" })
+        if (-not $sbNarrowErr -and $iNarrowEgress -ge 0 `
+                -and $sbNarrowCalls[$iNarrowEgress] -like "*--rule *.github.com:Allow*" `
+                -and $sbNarrowCalls[$iNarrowEgress] -notlike "*registry.npmjs.org*" `
+                -and $sbNarrowCalls[$iNarrowEgress] -notlike "*--rule api.github.com*") {
+            Add-Pass "A narrowing manifest drops the rules it does not need and emits ONLY template-provenance patterns (the requested host is covered by *.github.com, never added as its own rule)"
+        } else {
+            Add-Fail "Egress narrowing is wrong (err=$sbNarrowErr argv=$(if ($iNarrowEgress -ge 0) { $sbNarrowCalls[$iNarrowEgress] } else { '<missing>' }))"
+        }
+
+        # Provenance, directly: no emitted rule may be absent from the template,
+        # whatever the request said.
+        $sbProv = New-SandboxEgressPolicy -Class $sbClass -RequestedHosts @()
+        $sbTemplatePatterns = @($sbClass.egress.hostRules | ForEach-Object { $_.pattern })
+        $sbProvBad = @($sbProv.Rules | Where-Object { $sbTemplatePatterns -notcontains $_.Pattern })
+        if ($sbProvBad.Count -eq 0 -and $sbProv.DefaultAction -eq "Deny" -and -not $sbProv.Narrowed) {
+            Add-Pass "Generated policy is default-deny and every rule traces to the approved class template"
+        } else {
+            Add-Fail "Generated policy has rules with no template provenance ($($sbProvBad.Count)) or is not default-deny"
+        }
+
+        # A class whose own template is not default-deny must be refused: the
+        # catalog is administrator-owned but it is still input.
+        $sbOpenClass = ($sbClass | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+        $sbOpenClass.egress.defaultAction = "Allow"
+        $sbOpenErr = ""
+        try { New-SandboxEgressPolicy -Class $sbOpenClass -RequestedHosts @() | Out-Null } catch { $sbOpenErr = [string]$_.Exception.Message }
+        if ($sbOpenErr -match "squad-sandbox:config") {
+            Add-Pass "A class template that is not default-deny is refused (invariant 3 does not depend on the catalog being right)"
+        } else {
+            Add-Fail "A default-allow class template was accepted: $sbOpenErr"
+        }
+
+        # The suffix matcher itself, DIRECTLY. It decides whether a requested
+        # host is already covered by a template pattern, so it is the function
+        # that says "no new rule is needed" -- and a matcher that is too generous
+        # silently widens the sandbox's reach. Only the narrowing PATH was
+        # covered before, and mutating the matcher to
+        # `$Host_.EndsWith($Pattern.Substring(2))` -- which makes
+        # `evilgithub.com` "covered" by `*.github.com` -- left the whole suite
+        # green. These are direct assertions over the value classes that matter.
+        $sbHostCases = @(
+            # exact
+            @{ Host_ = "registry.npmjs.org"; Pattern = "registry.npmjs.org"; Want = $true },
+            @{ Host_ = "REGISTRY.NPMJS.ORG"; Pattern = "registry.npmjs.org"; Want = $true },
+            @{ Host_ = "registry.npmjs.org."; Pattern = "registry.npmjs.org"; Want = $false },
+            # leading wildcard: a proper subdomain, and ONLY a proper subdomain
+            @{ Host_ = "api.github.com";      Pattern = "*.github.com"; Want = $true },
+            @{ Host_ = "a.b.github.com";      Pattern = "*.github.com"; Want = $true },
+            @{ Host_ = "API.GITHUB.COM";      Pattern = "*.github.com"; Want = $true },
+            @{ Host_ = "github.com";          Pattern = "*.github.com"; Want = $false },  # the bare apex
+            @{ Host_ = ".github.com";         Pattern = "*.github.com"; Want = $false },  # empty label
+            # the boundary attacks: the label separator must be part of the match
+            @{ Host_ = "evilgithub.com";      Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "xgithub.com";         Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "notgithub.com";       Pattern = "*.github.com"; Want = $false },
+            # the suffix attacks: the pattern must be a SUFFIX, not a substring
+            @{ Host_ = "github.com.evil.net"; Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.github.com.evil.net"; Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.github.company.com";  Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.github.com.";     Pattern = "*.github.com"; Want = $false },  # trailing dot
+            # homograph / punycode: neither is github.com and neither may pass
+            @{ Host_ = "g" + [char]0x0131 + "thub.com"; Pattern = "*.github.com"; Want = $false },
+            @{ Host_ = "api.xn--gthub-jua.com";        Pattern = "*.github.com"; Want = $false },
+            # degenerate patterns must never become "match anything"
+            @{ Host_ = "evil.example.com"; Pattern = "*";   Want = $false },
+            @{ Host_ = "evil.example.com"; Pattern = "*.";  Want = $false },
+            @{ Host_ = "evil.example.com"; Pattern = "**";  Want = $false },
+            @{ Host_ = "evil.example.com"; Pattern = "";    Want = $false },
+            @{ Host_ = "";                 Pattern = "*.github.com"; Want = $false }
+        )
+        $sbHostBad = @()
+        foreach ($case in $sbHostCases) {
+            $got = Test-SandboxHostCoveredByPattern -Host_ $case.Host_ -Pattern $case.Pattern
+            if ($got -ne $case.Want) { $sbHostBad += "'$($case.Host_)' vs '$($case.Pattern)' -> $got (wanted $($case.Want))" }
+        }
+        if ($sbHostBad.Count -eq 0) {
+            Add-Pass "The egress suffix matcher covers only a proper subdomain of a wildcard pattern: not the bare apex, not 'evilgithub.com', not 'github.com.evil.net', not a homograph or punycode lookalike, and no degenerate pattern ('*', '*.', '**', '') matches anything"
+        } else {
+            Add-Fail "The egress host matcher is wrong: $($sbHostBad -join '; ')"
+        }
+
+        # --- 15. hostile identifiers are refused BEFORE API construction -----
+        # Fuzz over the value classes that turn an identifier into something
+        # other than data: path traversal, control characters, and a leading
+        # dash (which a CLI parses as a FLAG -- `--identity` arriving as a
+        # "disk id" would defeat invariant 4 without ever touching the argv
+        # scanner, because the scanner walks past values).
+        $sbFuzz = @(
+            @{ V = "../../etc/passwd";              What = "path traversal" },
+            @{ V = "ok/../other";                   What = "embedded traversal" },
+            @{ V = "a`r`nX-Injected: 1";            What = "CRLF header injection" },
+            @{ V = "a`0b";                          What = "NUL byte" },
+            @{ V = "a`tb";                          What = "tab" },
+            @{ V = "-identity";                     What = "leading dash (argument injection)" },
+            @{ V = "--identity";                    What = "leading double dash" },
+            @{ V = "name;rm -rf /";                 What = "shell metacharacters" },
+            @{ V = "name`$(id)";                    What = "command substitution" },
+            @{ V = "name|nc evil 1";                What = "pipe" },
+            @{ V = ("a" * 400);                     What = "over-length" },
+            @{ V = "";                              What = "empty" }
+        )
+        $sbFuzzBad = @()
+        foreach ($case in $sbFuzz) {
+            $msg = ""
+            try { Assert-SandboxIdentifier -Value $case.V -Name "the sandbox label" -Kind "label" -MaxLength 63 | Out-Null }
+            catch { $msg = [string]$_.Exception.Message }
+            if (-not $msg) { $sbFuzzBad += "accepted: $($case.What)" }
+            elseif ($case.V -and $case.V.Length -lt 200 -and $msg -match [regex]::Escape($case.V)) { $sbFuzzBad += "echoed: $($case.What)" }
+        }
+        if ($sbFuzzBad.Count -eq 0) {
+            Add-Pass "All $($sbFuzz.Count) hostile identifier classes are refused before an API call is constructed, and none is echoed back into the error"
+        } else {
+            Add-Fail "Identifier validation gaps: $($sbFuzzBad -join '; ')"
+        }
+        # A dash-leading value must be diagnosed AS argument injection, not as a
+        # generic malformed identifier. The per-kind allowlist would reject it
+        # either way, so this pins the diagnosis rather than the outcome: an
+        # operator who is told "not a well-formed label" goes looking for a typo,
+        # and an operator who is told "a CLI parses this as a flag" goes looking
+        # for where the value came from.
+        $sbDashMsg = ""
+        try { Assert-SandboxIdentifier -Value "--identity" -Name "the sandbox disk id" -Kind "guid" | Out-Null } catch { $sbDashMsg = [string]$_.Exception.Message }
+        if ($sbDashMsg -match "flag") {
+            Add-Pass "A dash-leading identifier is reported as argument injection, not as a generic malformed value"
+        } else {
+            Add-Fail "The argument-injection diagnosis was lost: $sbDashMsg"
+        }
+        # ...and it is actually WIRED: a hostile disk id from configuration must
+        # stop the dispatch, not reach an argv.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbHostileErr = ""
+        try { Start-SquadExecution -Provider (New-SandboxTestProvider -DiskId "--identity") -Request $sbRequest 6>$null | Out-Null } catch { $sbHostileErr = [string]$_.Exception.Message }
+        $sbHostileCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        if ($sbHostileErr -match "squad-sandbox:capability" -and @($sbHostileCalls | Where-Object { $_ -like "sandbox create *" }).Count -eq 0) {
+            Add-Pass "A flag-shaped disk id is refused at the provider boundary and never reaches a 'sandbox create' argv"
+        } else {
+            Add-Fail "A flag-shaped disk id was not stopped (err=$sbHostileErr)"
+        }
+        # A hostile host pattern must not be able to smuggle a second --rule.
+        $sbHostFuzz = @("*.github.com --identity x", "evil.com:Allow --rule *:Allow", "a`r`nb", "-evil.com", "*")
+        $sbHostBad = @()
+        foreach ($v in $sbHostFuzz) {
+            $msg = ""
+            try { Assert-SandboxIdentifier -Value $v -Name "an egress pattern" -Kind "host" -MaxLength 253 | Out-Null } catch { $msg = [string]$_.Exception.Message }
+            if (-not $msg) { $sbHostBad += $v }
+        }
+        if ($sbHostBad.Count -eq 0) {
+            Add-Pass "Egress patterns that would smuggle an extra CLI flag or split a log line are refused"
+        } else {
+            Add-Fail "Hostile egress patterns accepted: $($sbHostBad.Count)"
+        }
+
+        # --- 16. hostile manifest values reach neither policy nor output -----
+        $sbPoison = "evil.com`r`n--identity`r`n" + $sbSecret
+        $sbPoisonReq = New-SquadDispatchRequest -SessionId "stub-session" -Repository "octo/demo" `
+            -Prompt "p" -Mode "prompt" -CapabilityResolution ([pscustomobject]@{ egressHosts = @($sbPoison) })
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbPoisonOutcome = @{}
+        $sbPoisonErr = ""
+        try { Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbPoisonReq -Outcome $sbPoisonOutcome 6>$null | Out-Null } catch { $sbPoisonErr = [string]$_.Exception.Message }
+        $sbPoisonCalls = (@(Get-SquadCliStubCall -Stub $sbStub -Tool aca) -join "`n")
+        $sbPoisonOut = ($sbPoisonOutcome | ConvertTo-Json -Depth 8)
+        if ($sbPoisonErr -and $sbPoisonCalls -notmatch "evil\.com" -and $sbPoisonErr -notmatch "evil\.com" `
+                -and $sbPoisonOut -notmatch "evil\.com" -and $sbPoisonErr -notmatch [regex]::Escape($sbSecret)) {
+            Add-Pass "A hostile manifest egress value reaches neither the emitted policy, nor the error text, nor the status payload"
+        } else {
+            Add-Fail "A hostile manifest value escaped (err=$sbPoisonErr inArgv=$($sbPoisonCalls -match 'evil\.com'))"
+        }
+
+        # --- 17. readback of credential/egress values is refused -------------
+        # `credential list` and `egress show`/`export` return the VALUES, and
+        # this provider echoes CLI output to the host. Anyone with group read
+        # access can already run them by hand (ADR 0001 risk R2); what must not
+        # happen is this tool putting them in a session log or a CI transcript.
+        # `egress decisions` is deliberately still permitted -- it is the audit
+        # trail and carries no secret.
+        $sbReadback = @(
+            @("sandboxgroup", "credential", "list"),
+            @("sandboxgroup", "credential", "show", "--id", "cred-1"),
+            @("sandbox", "egress", "show", "-l", "name=x"),
+            @("sandbox", "egress", "export", "-l", "name=x")
+        )
+        $sbReadbackBad = @()
+        foreach ($argv in $sbReadback) {
+            $msg = ""
+            try { Invoke-SandboxCli -Context $sbCredProvider.Context -Argv $argv | Out-Null } catch { $msg = [string]$_.Exception.Message }
+            if ($msg -notmatch "squad-sandbox:capability") { $sbReadbackBad += ($argv -join " ") }
+        }
+        $sbDecisionsOk = $true
+        try { Assert-SandboxArgvNoReadback -Argv @("sandbox", "egress", "decisions", "-l", "name=x", "-o", "json") | Out-Null } catch { $sbDecisionsOk = $false }
+        if ($sbReadbackBad.Count -eq 0 -and $sbDecisionsOk) {
+            Add-Pass "Subcommands that read back credential or egress VALUES are refused; 'egress decisions' (the audit trail) is still allowed"
+        } else {
+            Add-Fail "Readback refusal is wrong (allowed=$($sbReadbackBad -join '; ') decisionsBlocked=$(-not $sbDecisionsOk))"
+        }
+
+        # --- 18. concurrency ceiling and orphan reaping ----------------------
+        # A leaked sandbox bills until something stops it. Two independent
+        # controls: refuse to start beyond the class ceiling, and a reaper that
+        # can find and delete orphans by label.
+        $sbBusyClass = ($sbClass | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+        $sbBusyClass.limits.maxConcurrentSandboxes = 2
+        $env:SQUAD_STUB_ACA_LIST_FIXTURE = "sandbox-list-busy.json"
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbBusyErr = ""
+        try {
+            $busyProvider = New-SquadExecutionProvider -Kind "sandbox" -Options @{
+                Class = $sbBusyClass; SandboxGroup = "sbg-squad-stub"; ResourceGroup = "rg-squad-stub"
+                SubscriptionId = "00000000-0000-0000-0000-000000000000"
+                DiskId = "aaaaaaaa-1111-2222-3333-444444444444"; AcaCliPath = $sbCli
+                IdleTimeoutSeconds = 1800; PollSeconds = 1; WorkerSecrets = @{ GH_TOKEN = $sbSecret }
+            }
+            Start-SquadExecution -Provider $busyProvider -Request $sbRequest 6>$null | Out-Null
+        } catch { $sbBusyErr = [string]$_.Exception.Message }
+        $sbBusyCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        if ($sbBusyErr -match "squad-sandbox:quota" -and @($sbBusyCalls | Where-Object { $_ -like "sandbox create *" }).Count -eq 0) {
+            Add-Pass "The per-class concurrency ceiling refuses a dispatch that would exceed it, tagged 'quota' and before anything bills"
+        } else {
+            Add-Fail "The concurrency ceiling did not hold (err=$sbBusyErr)"
+        }
+        # A class with no stated ceiling must be a CONFIG error, not "unlimited".
+        $sbNoLimitClass = ($sbClass | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+        $sbNoLimitClass.PSObject.Properties.Remove("limits")
+        $sbNoLimitErr = ""
+        try {
+            $nlProvider = New-SquadExecutionProvider -Kind "sandbox" -Options @{
+                Class = $sbNoLimitClass; SandboxGroup = "sbg-squad-stub"; ResourceGroup = "rg-squad-stub"
+                SubscriptionId = "00000000-0000-0000-0000-000000000000"
+                DiskId = "aaaaaaaa-1111-2222-3333-444444444444"; AcaCliPath = $sbCli
+                IdleTimeoutSeconds = 1800; PollSeconds = 1; WorkerSecrets = @{ GH_TOKEN = $sbSecret }
+            }
+            Start-SquadExecution -Provider $nlProvider -Request $sbRequest 6>$null | Out-Null
+        } catch { $sbNoLimitErr = [string]$_.Exception.Message }
+        if ($sbNoLimitErr -match "squad-sandbox:config") {
+            Add-Pass "A class with no declared concurrency ceiling is a configuration error, not an unbounded budget"
+        } else {
+            Add-Fail "A class with no ceiling was treated as unlimited: $sbNoLimitErr"
+        }
+
+        $env:SQUAD_STUB_ACA_LIST_FIXTURE = "sandbox-list-reaper.json"
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbReap = Invoke-SquadSandboxReaper -Context $sbCredProvider.Context -MaxAgeMinutes 60 6>$null
+        $sbReapCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $sbReapNames = @($sbReap.Candidates)
+        if ($sbReapNames -contains "squad-orphan-old" -and $sbReapNames -notcontains "squad-fresh-one" `
+                -and $sbReapNames -notcontains "not-ours-orphan" -and $sbReapNames -notcontains "squad-unknown-age" `
+                -and @($sbReap.UndecidableAge) -contains "squad-unknown-age" -and $sbReap.DryRun `
+                -and @($sbReapCalls | Where-Object { $_ -like "sandbox delete *" }).Count -eq 0) {
+            Add-Pass "The reaper finds only OUR aged orphans, never touches other tenants' sandboxes or one whose age it cannot determine, and deletes nothing without -Delete"
+        } else {
+            Add-Fail "Reaper selection is wrong (candidates=$($sbReapNames -join ',') undecidable=$($sbReap.UndecidableAge -join ',') dryRun=$($sbReap.DryRun))"
+        }
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbReap2 = Invoke-SquadSandboxReaper -Context $sbCredProvider.Context -MaxAgeMinutes 60 -KeepSessionIds @("orphan-old") -Delete 6>$null
+        $sbReap2Calls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        if (@($sbReap2.Deleted).Count -eq 0 -and @($sbReap2Calls | Where-Object { $_ -like "sandbox delete *" }).Count -eq 0) {
+            Add-Pass "The reaper never deletes a sandbox belonging to a session it was told to keep (a live session is not an orphan)"
+        } else {
+            Add-Fail "The reaper deleted a kept session (deleted=$(@($sbReap2.Deleted) -join ','))"
+        }
+        # ...but it DOES delete a real orphan when told to, otherwise the control
+        # is decorative. Same fixture, no keep list.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbReap3 = Invoke-SquadSandboxReaper -Context $sbCredProvider.Context -MaxAgeMinutes 60 -Delete 6>$null
+        $sbReap3Deletes = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca | Where-Object { $_ -like "sandbox delete *" })
+        if (@($sbReap3.Deleted) -contains "squad-orphan-old" -and $sbReap3Deletes.Count -eq 1 `
+                -and $sbReap3Deletes[0] -like "*name=squad-orphan-old*") {
+            Add-Pass "The reaper deletes the aged orphan (exactly one labelled delete) when -Delete is given"
+        } else {
+            Add-Fail "The reaper did not delete the orphan (deleted=$(@($sbReap3.Deleted) -join ',') calls=$($sbReap3Deletes.Count))"
+        }
+        $env:SQUAD_STUB_ACA_LIST_FIXTURE = ""
+
+        # A label is service-supplied input, not a value this process minted, and
+        # it reaches an argv (`sandbox delete -l name=<label>`) and a log line.
+        # The disk id resolved from this same service is already validated
+        # "whether it came from config or from the service's own listing"; a
+        # label that skipped that check was the one inconsistency left.
+        $sbHostileLabels = @(
+            @{ Fixture = "sandbox-list-hostile-label.json";   What = "path traversal" },
+            @{ Fixture = "sandbox-list-hostile-label-2.json"; What = "an embedded newline" }
+        )
+        $sbLabelBad = @()
+        foreach ($case in $sbHostileLabels) {
+            $env:SQUAD_STUB_ACA_LIST_FIXTURE = $case.Fixture
+            Reset-SquadCliStubLog -Stub $sbStub
+            $sbLabelErr = ""
+            try { Invoke-SquadSandboxReaper -Context $sbCredProvider.Context -MaxAgeMinutes 60 -Delete 6>$null | Out-Null } catch { $sbLabelErr = [string]$_.Exception.Message }
+            $sbLabelDeletes = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca | Where-Object { $_ -like "sandbox delete *" })
+            if ($sbLabelErr -notmatch "squad-sandbox:capability") { $sbLabelBad += "$($case.What) was not refused (err=$sbLabelErr)" }
+            if ($sbLabelDeletes.Count -ne 0) { $sbLabelBad += "$($case.What) still produced $($sbLabelDeletes.Count) delete call(s)" }
+            if ($sbLabelErr -match "other-tenant" -or $sbLabelErr -match "DELETED everything") { $sbLabelBad += "$($case.What) was echoed back into the error message" }
+        }
+        $env:SQUAD_STUB_ACA_LIST_FIXTURE = ""
+        if ($sbLabelBad.Count -eq 0) {
+            Add-Pass "A sandbox label supplied by the SERVICE's own listing is validated exactly like the disk id resolved from it: a traversal or control-character label is refused before any 'sandbox delete' is built, and is never echoed"
+        } else {
+            Add-Fail "Service-supplied labels bypass identifier validation: $($sbLabelBad -join '; ')"
+        }
+
+        # --- 19. failure kinds are separately identifiable -------------------
+        # PRD #6 requires quota exhaustion, auth failure, capability refusal,
+        # readiness and execution failure to be distinguishable, and the ORDER of
+        # the rules is load-bearing: a throttling response is a 429 and several
+        # services return 403 for a quota refusal, so reading "you have hit your
+        # ceiling" as "your credentials are bad" sends an operator to rotate a
+        # perfectly good token -- while the inverse, reading a rotated-out
+        # credential as "a ceiling was hit, retry later", makes an unattended
+        # dispatcher retry a credential fault forever.
+        #
+        # WHY THIS BLOCK LOOKS THE WAY IT DOES. The previous version asserted
+        # only the kind, over fixtures that each matched exactly ONE rule list.
+        # For such an input every ordering agrees, so swapping the quota and auth
+        # blocks left the suite at 200/0/0 -- the label "quota is not misread as
+        # auth" was a claim, not an observation. That is the fifth recurrence of
+        # this defect class in this programme. Two devices stop it recurring:
+        #
+        #   1. AMBIGUOUS fixtures. Each `Also` fixture matches more than one rule
+        #      list, and the ambiguity is PROVEN from the shipping pattern lists
+        #      rather than asserted by a comment. Only such an input can tell two
+        #      orderings apart.
+        #   2. An ADJACENCY audit. Every neighbouring pair of rules in
+        #      $script:SandboxFailureRules must have at least one ambiguous
+        #      fixture spanning it. Adding a rule, or deleting a fixture, without
+        #      a discriminating input is itself a failing check.
+        #
+        # `DecidedBy` (Get-SandboxFailureClassification) is what makes a
+        # precedence assertable at all -- the same treatment classifyGhFailure
+        # in worker/lib/dispatch-lease.js received after Sprint 6's B3.
+        $sbKinds = @(
+            @{ Err = "ERROR: QuotaExceeded: the subscription has exceeded the limit for sandboxes"; Want = "quota" },
+            @{ Err = "ERROR: 429 TooManyRequests"; Want = "quota" },
+            @{ Err = "ERROR: AADSTS700016 unauthorized_client"; Want = "auth" },
+            @{ Err = "ERROR: (AuthorizationFailed) does not have permission"; Want = "auth" },
+            @{ Err = "ERROR: sandbox is still provisioning"; Want = "readiness" },
+            @{ Err = "Error: Network issue - retry policy expired"; Want = "transport" },
+            @{ Err = "ERROR: the command exited with status 2"; Want = "execution" },
+
+            # --- ambiguous: quota vs auth (the reorder mutation) -------------
+            # The discriminating input class the taxonomy exists for, and which
+            # no previous fixture covered: a 403 that is really a quota refusal.
+            @{ Err = "ERROR: 403 Forbidden (QuotaExceeded): the subscription has no remaining sandbox capacity"
+               Want = "quota"; Also = @("auth") },
+
+            # --- ambiguous: auth vs quota by GUID (the substring mutation) ---
+            # Azure decorates every auth failure with GUIDs. With "429" matched
+            # as a bare substring these classified as `quota`, so a rotated-out
+            # credential looked like a ceiling and got retried forever.
+            @{ Err = "ERROR: (AuthorizationFailed) The client does not have authorization to perform action. Correlation ID: 1b8f429c-8f2d-4c1e-9a42-9b7f0e429a11"
+               Want = "auth" },
+            @{ Err = "ERROR: AADSTS700016 unauthorized_client. Trace ID: 5c429abc-1d2e-4f3a-8b6c-0d1e2f3a4b5c"
+               Want = "auth" },
+            @{ Err = "ERROR: 401 Unauthorized (request id 0000429f-aaaa-bbbb-cccc-ddddeeeeffff)"
+               Want = "auth" },
+            @{ Err = "ERROR: sandbox is still provisioning. Request ID: 4291aaaa-bbbb-cccc-dddd-eeeeffff0000"
+               Want = "readiness" },
+
+            # --- ambiguous: auth vs readiness -------------------------------
+            @{ Err = "ERROR: (AuthorizationFailed) the sandbox is still provisioning and the caller is not authorized to wait for it"
+               Want = "auth"; Also = @("readiness") },
+
+            # --- ambiguous: transport vs quota ------------------------------
+            # Transport wins: a reset connection tells us nothing about a ceiling.
+            @{ Err = "ERROR: 429 TooManyRequests (connection reset by peer)"
+               Want = "transport"; Also = @("quota") }
+        )
+
+        # Which rule lists does this text match at all? Computed from the SHIPPING
+        # lists, so "this fixture is ambiguous" is an observation, not a label.
+        function Get-SbMatchingRules {
+            param([string]$Text)
+            $hit = @()
+            foreach ($rule in $script:SandboxFailureRules) {
+                foreach ($pattern in $rule.Patterns) {
+                    if ($Text -match $pattern) { $hit += $rule.Kind; break }
+                }
+            }
+            return $hit
+        }
+
+        $sbKindBad = @()
+        $sbAmbiguousPairs = @{}
+        foreach ($case in $sbKinds) {
+            $short = $case.Err.Substring(0, [math]::Min(34, $case.Err.Length))
+            $cls = Get-SandboxFailureClassification -Result ([pscustomobject]@{ ExitCode = 1; StdOut = @(); StdErr = @($case.Err) })
+            if ($cls.Kind -ne $case.Want) { $sbKindBad += "'$short' -> $($cls.Kind) (wanted $($case.Want))" }
+            # The rule that decided must be the rule that was supposed to.
+            $wantDecider = $(if ($case.Want -eq "execution") { "fallthrough" } else { $case.Want })
+            if ($cls.DecidedBy -ne $wantDecider) { $sbKindBad += "'$short' was decided by '$($cls.DecidedBy)', wanted '$wantDecider'" }
+            if ($case.Want -ne "execution" -and -not $cls.Pattern) { $sbKindBad += "'$short' reported no deciding pattern" }
+
+            $matching = @(Get-SbMatchingRules -Text $case.Err)
+            $also = @()
+            if ($case.ContainsKey("Also")) { $also = @($case.Also | Where-Object { $_ }) }
+            if ($also.Count -gt 0) {
+                # PROVE the ambiguity from the shipping lists. If a pattern edit
+                # makes this fixture match only one list, it stops discriminating
+                # between the two orderings and this check says so.
+                foreach ($other in $also) {
+                    if ($matching -notcontains $other) {
+                        $sbKindBad += "'$short' was declared ambiguous with '$other' but the shipping '$other' patterns do not match it -- it no longer discriminates between the two orderings"
+                    }
+                }
+                if ($matching -notcontains $case.Want) {
+                    $sbKindBad += "'$short' does not match the '$($case.Want)' list at all"
+                }
+                foreach ($other in $also) {
+                    $sbAmbiguousPairs["$($case.Want)|$other"] = $true
+                    $sbAmbiguousPairs["$other|$($case.Want)"] = $true
+                }
+            }
+        }
+        $sbSuccessCls = Get-SandboxFailureClassification -Result ([pscustomobject]@{ ExitCode = 0; StdOut = @(); StdErr = @() })
+        if ($sbSuccessCls.Kind -ne "" -or $sbSuccessCls.DecidedBy -ne "success") { $sbKindBad += "success classified as a failure" }
+        # Our own client give-up is transport whatever it says, because it is not
+        # a service verdict (Invoke-CliSafeWithStdin reports exit 124).
+        $sbTimeoutCls = Get-SandboxFailureClassification -Result ([pscustomobject]@{ ExitCode = 124; StdOut = @(); StdErr = @("timed out after 120s") })
+        if ($sbTimeoutCls.Kind -ne "transport") { $sbKindBad += "a client timeout (exit 124, 'timed out after 120s') classified as '$($sbTimeoutCls.Kind)', not transport" }
+        # ...and by TEXT alone too, so a caller that lost the exit code still gets it right.
+        if ((Get-SandboxFailureKind -Result ([pscustomobject]@{ ExitCode = 1; StdOut = @(); StdErr = @("aca: timed out after 120s") })) -ne "transport") {
+            $sbKindBad += "'timed out after 120s' is not matched as a transport failure by text"
+        }
+        if ($sbKindBad.Count -eq 0) {
+            Add-Pass "Quota, auth, readiness, transport and execution failures are separately identifiable, each names the rule that decided it, and a 403-that-is-really-a-quota-refusal is classified quota while a GUID-bearing auth failure is NOT"
+        } else {
+            Add-Fail "Failure classification is wrong: $($sbKindBad -join '; ')"
+        }
+
+        # The anti-recurrence device: no adjacent pair of rules may be ordered
+        # without a fixture that can tell the two orderings apart.
+        $sbRuleKinds = @($script:SandboxFailureRules | ForEach-Object { $_.Kind })
+        $sbUncovered = @()
+        for ($i = 0; $i -lt ($sbRuleKinds.Count - 1); $i++) {
+            $key = "$($sbRuleKinds[$i])|$($sbRuleKinds[$i + 1])"
+            if (-not $sbAmbiguousPairs.ContainsKey($key)) { $sbUncovered += $key.Replace("|", " before ") }
+        }
+        if ($sbUncovered.Count -eq 0 -and $sbRuleKinds.Count -ge 4) {
+            Add-Pass "Every adjacent pair of classification rules ($($sbRuleKinds -join ' > ')) has a fixture that matches BOTH lists, so swapping any two neighbouring rules is a visible, failing change"
+        } else {
+            Add-Fail "These rule orderings are unobservable -- no fixture matches both lists, so reordering them is silent: $($sbUncovered -join ', ')"
+        }
+
+        # And the ordering itself, stated once: transport, then quota, then auth.
+        if ($sbRuleKinds[0] -eq "transport" -and $sbRuleKinds.IndexOf("quota") -lt $sbRuleKinds.IndexOf("auth")) {
+            Add-Pass "Classification order is transport-first and quota-before-auth (docs/runbook.md: a quota refusal phrased as a 403 must not send an operator to rotate a good token)"
+        } else {
+            Add-Fail "Classification rule order is wrong: $($sbRuleKinds -join ' > ') -- quota must precede auth and transport must be first"
+        }
+
+        # No numeric HTTP code may be matched as a bare substring. This is the
+        # discipline Test-AcaJobExecutionGone has always kept, and dropping it is
+        # what let a GUID decide a credential fault was a quota ceiling.
+        $sbBareCodes = @()
+        foreach ($rule in $script:SandboxFailureRules) {
+            foreach ($pattern in $rule.Patterns) {
+                if ($pattern -match "^\d{3}$") { $sbBareCodes += "$($rule.Kind): '$pattern'" }
+            }
+        }
+        if ($sbBareCodes.Count -eq 0) {
+            Add-Pass "No classification rule matches a bare HTTP status code, so a correlation GUID can never decide a failure kind"
+        } else {
+            Add-Fail "Bare HTTP status codes are matched as substrings and will fire on GUIDs: $($sbBareCodes -join ', ')"
+        }
+        # The tag has to actually reach the caller, not just exist as a function.
+        $env:SQUAD_STUB_ACA_RC = "1"
+        $env:SQUAD_STUB_ACA_ERR = "ERROR: QuotaExceeded - no capacity remains in this region"
+        $env:SQUAD_STUB_ACA_LIST_RC = "0"
+        $sbQuotaErr = ""
+        try { Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbRequest 6>$null | Out-Null } catch { $sbQuotaErr = [string]$_.Exception.Message }
+        $env:SQUAD_STUB_ACA_RC = "0"
+        $env:SQUAD_STUB_ACA_ERR = ""
+        if ($sbQuotaErr -match "\[squad-sandbox:quota\]") {
+            Add-Pass "A quota refusal from the service surfaces to the caller tagged 'quota', not as a generic failure"
+        } else {
+            Add-Fail "A service quota refusal was not tagged: $sbQuotaErr"
+        }
+
+        # --- 20. brokered credentials do not outlive their session -----------
+        # They live on the GROUP, so they survive the sandbox and stay readable
+        # to anyone with group read access (ADR 0001 risk R2).
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbRevokeOutcome = @{}
+        Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbRequest -Outcome $sbRevokeOutcome 6>$null | Out-Null
+        $sbRevokeHandle = $sbRevokeOutcome["Response"].sessionHandle
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbTermResult = Remove-SquadExecution -Provider (New-SandboxTestProvider) -Handle $sbRevokeHandle 6>$null
+        $sbTermCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        if (@($sbTermCalls | Where-Object { $_ -like "sandboxgroup credential delete *cred-stub-0001*" }).Count -eq 1 `
+                -and $sbTermResult.CredentialsUnrevoked -eq 0) {
+            Add-Pass "terminate revokes every brokered credential recorded on the handle (a group-scoped credential must not outlive its session)"
+        } else {
+            Add-Fail "terminate did not revoke the brokered credential ($($sbTermCalls -join ' | '))"
+        }
+        # And a create that fails AFTER brokering must not leave one behind.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_ACA_EGRESS_RC = "1"
+        $env:SQUAD_STUB_ACA_EGRESS_ERR = "ERROR: policy rejected"
+        try { Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbRequest 6>$null | Out-Null } catch { }
+        $env:SQUAD_STUB_ACA_EGRESS_RC = "0"
+        $env:SQUAD_STUB_ACA_EGRESS_ERR = ""
+        $sbFailCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        if (@($sbFailCalls | Where-Object { $_ -like "sandboxgroup credential delete *" }).Count -ge 1 `
+                -and @($sbFailCalls | Where-Object { $_ -like "sandbox delete *" }).Count -ge 1) {
+            Add-Pass "A dispatch that fails after brokering tears down BOTH the sandbox and its credential (no billing leak, no live token)"
+        } else {
+            Add-Fail "A failed dispatch left a credential or a sandbox behind ($($sbFailCalls -join ' | '))"
+        }
+        # A failed revocation must be reported, never silently swallowed.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbRevokeOutcome2 = @{}
+        Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbRequest -Outcome $sbRevokeOutcome2 6>$null | Out-Null
+        $env:SQUAD_STUB_ACA_CREDDEL_RC = "1"
+        $env:SQUAD_STUB_ACA_CREDDEL_ERR = "ERROR: could not delete credential"
+        $sbTerm2 = Remove-SquadExecution -Provider (New-SandboxTestProvider) -Handle $sbRevokeOutcome2["Response"].sessionHandle 6>$null
+        $env:SQUAD_STUB_ACA_CREDDEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CREDDEL_ERR = ""
+        if ($sbTerm2.Terminated -and $sbTerm2.CredentialsUnrevoked -eq 1) {
+            Add-Pass "A credential that could NOT be revoked is reported as still live rather than silently swallowed, and does not block the teardown"
+        } else {
+            Add-Fail "An unrevoked credential was swallowed (terminated=$($sbTerm2.Terminated) unrevoked=$($sbTerm2.CredentialsUnrevoked))"
         }
     } catch {
         Add-Fail "Sandbox provider checks threw: $($_.Exception.Message)"
