@@ -3155,6 +3155,38 @@ if (Test-Path $cliSource) {
 }
 
 # ---------------------------------------------------------------------------
+# 9e. Worker assertions must not depend on WHERE the repo is checked out
+# ---------------------------------------------------------------------------
+# worker/lib/parse-capabilities.js prefixes every error with the manifest path,
+# so `assert_not_contains "$out" '2'` was really asserting something about the
+# developer's home directory: the same commit failed from `~/verifys2` and
+# passed from a digit-free path, with the parser behaving correctly both times
+# (issue #17). A false negative on a security property is worse than no test at
+# all, because it teaches people to distrust the suite.
+#
+# The suite now masks the manifest path it supplied and asserts against the
+# message body. These two checks make going back to raw output a failing check
+# here rather than a surprise on someone else's machine months later.
+Write-Section "Environment-independent worker assertions"
+$parseSuite = Join-Path $RepoRoot "worker\tests\test_parse_capabilities.sh"
+if (-not (Test-Path $parseSuite)) {
+    Add-Fail "worker/tests/test_parse_capabilities.sh is missing"
+} else {
+    $parseText = Get-Content -LiteralPath $parseSuite -Raw
+    $coupled = @(Select-String -LiteralPath $parseSuite -Pattern '^\s*assert_not_contains\s+"\$out"' -AllMatches)
+    if ($coupled.Count -eq 0) {
+        Add-Pass "No absence assertion in test_parse_capabilities.sh runs against raw parser output; each uses the path-masked body, so a checkout path that happens to contain the needle cannot fail the suite (issue #17)"
+    } else {
+        Add-Fail "test_parse_capabilities.sh asserts absence against unmasked parser output at line(s) $(($coupled.LineNumber) -join ', '); the parser prefixes its errors with the manifest path, so those assertions depend on the checkout directory"
+    }
+    if ($parseText -match 'run_parser\(\)' -and $parseText -match '\$\{out//"\$manifest"/') {
+        Add-Pass "test_parse_capabilities.sh masks the manifest path with a LITERAL (quoted) pattern, so a checkout path containing glob metacharacters cannot silently mis-mask and weaken an absence assertion"
+    } else {
+        Add-Fail "test_parse_capabilities.sh no longer masks the manifest path out of parser output; its absence assertions are coupled to the checkout location again"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 10. CLI golden gate is present AND automated
 # ---------------------------------------------------------------------------
 # scripts/tests/verify-cli-golden.ps1 is the only guard that compares the whole
