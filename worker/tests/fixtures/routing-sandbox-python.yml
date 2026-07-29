@@ -1,0 +1,15 @@
+version: 1
+tools:
+  - name: git
+    required: true
+  - name: python3
+    required: true
+    reason: Test suite is Python
+  - name: pip3
+    required: true
+egress:
+  - host: pypi.org
+  - host: files.pythonhosted.org
+image:
+  hint: ghcr.io/example/squad-worker-python:latest
+  reason: Needs a pinned Python 3.12 toolchain
