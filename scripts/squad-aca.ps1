@@ -10,6 +10,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 . (Join-Path $ScriptDir "lib\session-env.ps1")
 . (Join-Path $ScriptDir "lib\sync-safety.ps1")
+. (Join-Path $ScriptDir "lib\aca-logs.ps1")
 $UserConfigDir = Join-Path $HOME ".squad-on-aca"
 $UserConfigPath = Join-Path $UserConfigDir "config.json"
 
@@ -84,7 +85,7 @@ function Get-PromptText {
             continue
         }
         $item = $Rest[$i]
-        if ($item -in @("--repo", "-Repository", "--name", "-SessionName", "--branch", "-OutputBranch", "--sub-squad", "-SubSquad", "--owner", "--description", "--subscription", "--resource-group", "--session-job", "--ralph-job", "--watch-app", "--dashboard-url")) {
+        if ($item -in @("--repo", "-Repository", "--name", "-SessionName", "--branch", "-OutputBranch", "--sub-squad", "-SubSquad", "--owner", "--description", "--subscription", "--resource-group", "--session-job", "--ralph-job", "--watch-app", "--dashboard-url", "--log-analytics-workspace")) {
             $skipNext = $true
             continue
         }
@@ -172,6 +173,7 @@ function Get-AcaConfig {
         watchApp = "ca-squad-aca-watch"
         aspireApp = "ca-squad-aca-aspire"
         aspireLoginUrl = ""
+        logAnalyticsWorkspace = "law-squad-aca"
     }
 
     foreach ($source in @($deployOutputs, $userConfig)) {
@@ -231,6 +233,7 @@ function Sync-AcaConfigFromOutputs {
         watchApp = $outputs.watchApp
         aspireApp = $outputs.aspireApp
         aspireLoginUrl = $outputs.aspireLoginUrl
+        logAnalyticsWorkspace = $outputs.logAnalyticsWorkspace
     }
     Save-AcaConfig ([pscustomobject]$config)
 }
@@ -346,6 +349,7 @@ function Invoke-Configure {
         watchApp = Get-OptionValue $Items @("--watch-app", "-WatchApp") $existing.watchApp
         aspireApp = Get-OptionValue $Items @("--aspire-app", "-AspireApp") $existing.aspireApp
         aspireLoginUrl = Get-OptionValue $Items @("--dashboard-url", "-DashboardUrl") $existing.aspireLoginUrl
+        logAnalyticsWorkspace = Get-OptionValue $Items @("--log-analytics-workspace", "-LogAnalyticsWorkspace") $existing.logAnalyticsWorkspace
     }
     if (-not $config.resourceGroup -or -not $config.sessionJob) {
         throw "Usage: squad-aca configure --resource-group <rg> --session-job <job> [--subscription <id>]"
@@ -468,6 +472,8 @@ function Invoke-Doctor {
         }
     }
 
+    $logPath = Get-AcaLogPathStatus -WorkspaceName $config.logAnalyticsWorkspace
+    $checks += [pscustomobject]@{ Check = "Logs path"; Status = $logPath.Status; Detail = $logPath.Detail }
     $checks += [pscustomobject]@{ Check = "Aspire URL"; Status = if ($config.aspireLoginUrl) { "ok" } else { "missing" }; Detail = if ($config.aspireLoginUrl) { $config.aspireLoginUrl } else { "Run deploy or squad-aca configure --dashboard-url" } }
     $checks | Format-Table -AutoSize
 }
@@ -544,12 +550,24 @@ function Invoke-Logs {
     $session = Get-FirstPositional $Items @("--tail", "-Tail")
     $tail = [int](Get-OptionValue $Items @("--tail", "-Tail") "100")
     $execution = Resolve-SessionExecution -Config $config -Session $session
-    az containerapp job logs show `
-        --name $config.sessionJob `
-        --resource-group $config.resourceGroup `
-        --execution $execution.Execution `
-        --container $config.sessionJob `
-        --tail $tail
+    # Get-AcaExecutionLog inspects every az exit code and throws when both the
+    # containerapp-extension path and the Log Analytics fallback fail, so a run
+    # that produced no logs can never exit 0 (issue #13).
+    $result = Get-AcaExecutionLog `
+        -ResourceGroup $config.resourceGroup `
+        -JobName $config.sessionJob `
+        -ExecutionName $execution.Execution `
+        -ContainerName $config.sessionJob `
+        -Tail $tail `
+        -WorkspaceName $config.logAnalyticsWorkspace
+    if ($result.Source -eq "log-analytics") {
+        Write-Host "[squad-aca] containerapp CLI extension unavailable; read logs from Log Analytics workspace '$($result.Workspace)'."
+    }
+    $lines = @($result.Lines)
+    if ($lines.Count -eq 0) {
+        Write-Warning "No log rows returned for execution '$($execution.Execution)'. Log Analytics ingestion can lag several minutes after a session starts."
+    }
+    foreach ($line in $lines) { Write-Output $line }
 }
 
 function Invoke-Open {
