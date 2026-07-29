@@ -263,6 +263,233 @@ that one `aca` process argv on the client. The provider never repeats them —
 not into the dispatch response, not into an error message, not into a rendered
 argv — but replacing this with credential brokerage is Sprint 7's job.
 
+## Unified dispatch contract and durable leases
+
+Three things dispatch work: the local CLI (`squad-aca run`), Ralph (a cron-driven
+ACA Job running `worker/lib/ralph-dispatch.sh`), and Watch (a hosted container
+app). PRD #6 requires that all three *share one routing decision* and that
+*claim and session state are written before compute is requested*.
+
+### One implementation, two thin callers
+
+The routing decision and the lease lifecycle live in **Node**, under
+`worker/lib/`:
+
+| File | Responsibility |
+| --- | --- |
+| `worker/lib/dispatch-decision.js` | The one routing decision. Wraps the Sprint 2 capability resolver and produces `{sessionId, dispatchSource, leaseKey, routing{…}}`. |
+| `worker/lib/dispatch-lease.js` | The durable lease store, lifecycle, gone-classification and sweeper. |
+| `worker/lib/squad-dispatch.js` | The CLI seam: `decide \| claim \| dispatched \| heartbeat \| complete \| release \| sweep \| list`. |
+
+Bash and PowerShell do **not** re-implement any of it. `ralph-dispatch.sh` and
+`scripts/lib/dispatch-contract.ps1` are shims that shell out to
+`node worker/lib/squad-dispatch.js` and parse its JSON. Node was chosen because
+the capability resolver it wraps is already Node, Ralph already shells to `node`,
+and the worker image already ships it — so the shared core needed no new runtime
+anywhere.
+
+The `routing` object deliberately carries **no dispatcher identity**. Dispatcher
+identity lives one level up, in `dispatchSource`. That means the same input
+produces a byte-identical `routing` object from all three paths, and the test
+suites compare it byte-for-byte rather than field-by-field.
+
+If `node` is missing, dispatch **fails closed**. It never falls back to a
+locally-guessed route: a second, divergent routing rule is exactly the failure
+mode this contract exists to prevent.
+
+### Where lease state lives, and why
+
+Leases are stored **in GitHub**, on a dedicated orphan ref (`squad-aca-leases`)
+in the same repository, one JSON blob per lease at `leases/<lease-key>.json`,
+written through the Contents API.
+
+- GitHub is already the durable system of record for this project (issues,
+  labels, branches, PRs) and Ralph already claims work by labelling an issue.
+  Extending that model adds **no new infrastructure** — no table, no queue, no
+  blob account, no extra RBAC surface.
+- All three dispatchers can already reach it. Ralph runs in ACA with a token,
+  Watch runs in ACA with a token, the local CLI has `gh` — no dispatcher needs a
+  new credential.
+- It survives a laptop reboot. A local file would not, which the PRD rules out.
+- The Contents API gives the two primitives a lease needs without a lock service:
+  **create-once** (`PUT` without a `sha` returns `422` if the blob exists) is the
+  atomic claim, and **compare-and-swap** (`PUT` with the `sha` you read, `409` on
+  stale) is the atomic update.
+- It is off the default branch, so lease churn never pollutes `main`'s history,
+  never triggers CI, and never appears in a PR diff.
+
+Cost: dispatch now requires `contents: write` on the repository. That is a real
+new dependency and is called out in the runbook.
+
+### Lease key = idempotency key
+
+The lease key is `issue-<n>` when the work is tied to a GitHub issue, and
+`session-<sanitized session id>` otherwise. Two dispatchers that pick different
+session names for the same issue therefore converge on **one** lease record.
+
+Converging on one record is necessary but **not** sufficient. Both dispatchers
+still have to be told different things, or both would dispatch. "Ralph ran
+twice" and "Ralph and the CLI both fired" are handled by the claim outcome
+(below), not by the key alone — the key only guarantees they are arguing over
+the same row.
+
+### Lifecycle
+
+```
+claimed ──► dispatched ──► running ──► succeeded | failed | cancelled
+   │            │             ▲
+   │            └─────────────┤ heartbeat (periodic, every
+   │                          │ SQUAD_LEASE_HEARTBEAT_SECONDS)
+   └──► released (retryable)  └──► reclaimed (by the sweeper)
+```
+
+`claimLease` returns one of four outcomes, and only two of them permit compute:
+
+| Outcome | Meaning | Dispatch? |
+| --- | --- | --- |
+| `created` | No prior lease; this dispatcher owns it. | yes |
+| `repaired` | A lease that is provably *not* being worked was adopted — a `released` or `reclaimed` lease, or a `claimed` lease older than the claim window. This is the crash-between-claim-and-compute repair path. | yes |
+| `active` | Someone else holds the work: either a live execution, **or another dispatcher that is inside its own claim-to-compute window right now**. | **no** |
+| `completed` | The work already reached a terminal state. | **no** |
+
+`reclaimed` is terminal for the *sweeper* (it is never swept twice) but is
+explicitly **repairable** for a *claimer*. A sweeper that permanently retired the
+work it reclaimed would turn every transient stall into lost work, which is the
+opposite of reclaiming it.
+
+#### Two TTLs, because a claim and an execution are not the same thing
+
+A `claimed` lease is **not** self-evidently a crashed one. The window between
+writing the lease and requesting compute is not a millisecond: in
+`worker/lib/ralph-dispatch.sh` it spans `mktemp`, an env build that shells out to
+`node` and `az`, and then the job start — seconds. Ralph's cron and an operator's
+`squad-aca ralph run` overlap by design, so two dispatchers landing in that
+window is reachable through supported operation, not a theoretical race.
+
+So `claimed` and `dispatched`/`running` age out on **different** clocks:
+
+| State | TTL | Env override | Why |
+| --- | --- | --- | --- |
+| `claimed` | 300 s | `SQUAD_LEASE_CLAIM_TTL_SECONDS` | Only has to cover one env build plus one API call. Short, so a genuine crash self-heals in minutes. |
+| `dispatched`, `running` | 3600 s | `SQUAD_LEASE_TTL_SECONDS` | Has to cover a whole agent session, refreshed by the worker's periodic heartbeat. |
+
+The claim TTL is clamped to never exceed the session TTL, so lowering
+`SQUAD_LEASE_TTL_SECONDS` cannot accidentally leave claims outliving executions.
+
+**What a losing claimer sees.** It gets `outcome: "active"` together with the
+current owner's lease record (`sessionId`, `state`, `dispatchSource`,
+`updatedAt`) so it can say *who* holds the work. The CAS conflict path collapses
+to the same answer: if two claimers both decide to adopt and one loses the
+`409`, the loser re-reads and returns `active` rather than throwing. Adoption is
+therefore decided by the store, not by who checked first.
+
+Ralph treats `active` differently depending on the owner's state, and the
+distinction matters:
+
+- owner is `dispatched`/`running`/terminal → **label** the issue. Compute exists;
+  the issue should stop appearing as a candidate.
+- owner is still `claimed` → **do not label**, skip and retry next run. If that
+  dispatcher fails to start it will `release` the lease, and a labelled issue
+  would never be offered again. Costing one extra evaluation is strictly better
+  than silently dropping the work.
+
+### Claim before compute
+
+Every path writes the lease before it requests compute:
+
+1. resolve the decision (`decide`),
+2. write the lease (`claim`) — a durable record now exists,
+3. request compute (`az containerapp job start` / `az containerapp update`),
+4. mark `dispatched`; on any failure in step 3, `release` so the next run retries.
+
+Step 4 is deliberately **best-effort**. Once step 3 succeeds the execution is
+live, so a transient fault while recording `dispatched` must neither throw to the
+caller (whose retry would find a `claimed` lease, be told `repaired`, and start a
+second execution) nor `release` (which would hand live work to another
+dispatcher). All three dispatchers warn and move on; the worker's heartbeat
+reconciles the state.
+
+The worker heartbeats **periodically** for the life of the execution — a
+background ticker every `SQUAD_LEASE_HEARTBEAT_SECONDS` (default 300) — and
+writes the terminal state from an `EXIT` trap (`worker/entrypoint.sh`), which
+stops the ticker first. A single beat at start would be indistinguishable from no
+heartbeat at all for any session that outlives the TTL: the sweeper would reclaim
+a lease whose execution is still running, and the work would be re-dispatched
+underneath itself.
+
+The tests assert this ordering **by index** in a single ordered call log that
+both the fake `az` and the fake `gh` append to. A presence check would still pass
+if the order were inverted.
+
+### Sweeper
+
+`squad-aca leases sweep` (and Ralph, at the top of every run) reclaims:
+
+- **orphaned claims** — a lease stuck in `claimed` past the *claim* TTL, i.e. a
+  dispatcher that died between claim and compute;
+- **expired heartbeats** — a `dispatched`/`running` lease whose worker stopped
+  heartbeating.
+
+…and **prunes** terminal leases (`succeeded`, `failed`, `cancelled`, `released`,
+`reclaimed`) that have been untouched for longer than the retention window
+(`SQUAD_LEASE_RETENTION_SECONDS`, default 7 days) via the Contents API `DELETE`.
+
+#### Both growth and cost are bounded, on purpose
+
+Every `run`, `smoke`, `telemetry smoke` and Ralph issue mints a lease. Without a
+delete path the ledger is append-only, and two things break at scale:
+
+- the Contents API directory listing caps at **1000 entries**, past which the
+  ledger silently stops enumerating and the sweeper stops seeing leases it should
+  reclaim;
+- a sweep that reads every key costs `1 + N` API calls, and Ralph sweeps on a
+  five-minute cron — 288 runs/day. At 600 leases that is ~173,000 calls/day,
+  roughly 7,200/hr against a 5,000/hr authenticated REST budget.
+
+The failure mode is severe *because* classification is correct: a `429` surfaces,
+`claimLease` throws, and Ralph skips **every** issue without labelling. Dispatch
+stops entirely, with no operator-visible cause. So:
+
+| Bound | Mechanism | Knob |
+| --- | --- | --- |
+| Ledger size | terminal leases past the retention window are deleted | `SQUAD_LEASE_RETENTION_SECONDS` (7 d) |
+| Per-run API cost | at most `1 + budget` calls, regardless of ledger size | `SQUAD_LEASE_SWEEP_MAX_READS` (50) |
+| Coverage under the cap | the start offset rotates with the clock, so successive sweeps walk the whole ledger instead of re-reading the same prefix | derived, no knob |
+| Listing cap | `truncated: true` is reported and logged, never silently short | — |
+
+Rotation is derived from the clock (`floor(epoch / 300) * budget mod total`)
+rather than a persisted cursor: it costs zero extra API calls and has no blob of
+its own to fail, corrupt, or contend on.
+
+`sweepLeases` reports `{ reclaimed, pruned, skipped, examined, total, budget,
+truncated }`, so a partial pass is always distinguishable from a complete one.
+
+Cleanup follows the same fail-closed rule as
+`scripts/lib/providers/squad-aca-job-provider.ps1`: **already-cleaned,
+already-terminal and externally-deleted are all SUCCESS**, but auth, RBAC,
+throttling and network failures **surface**. Classification uses the same
+deny-list-first shape as `Test-AcaJobExecutionGone` — a message that mentions
+both `401` and `not found` is a failure, not a "gone", and an unrecognised
+failure is a failure.
+
+That ordering is load-bearing and easy to lose, so `classifyGhFailure` reports
+**which rule decided** (`real-failure`, `gone`, `unrecognised`, …) rather than
+just a boolean, and the tests assert the deciding rule. Asserting only the
+boolean cannot catch a swapped loop order: whenever a message matches just one
+list, both orderings agree. The realistic input is a message that matches both —
+GitHub masks a permission denial on a private resource as `HTTP 404: Not Found` —
+so the fake `gh` ships fail modes whose text carries **both** signatures
+(`masked403`, `masked401`, `masked429`, `masked500`) plus an `unrecognised` mode
+that matches neither.
+
+### Observability
+
+`squad-aca sessions` shows the resolved `Route` and the dispatcher `Source` for
+every execution (both are stamped into the execution environment as
+`SQUAD_DISPATCH_ROUTE` / `SQUAD_DISPATCH_SOURCE`). `squad-aca leases` lists the
+ledger itself. `scripts/show-status.ps1` is unchanged: it renders raw Azure
+projections and has no access to the lease ledger.
+
 ## Optional .NET/Aspire integration path
 
 The `aspire/` directory adds an **opt-in** path. It does not replace the ACA

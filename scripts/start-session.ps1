@@ -12,6 +12,10 @@ param(
     [switch]$RunCopilotSmoke,
     [switch]$PushChanges,
     [string]$OutputBranch = "",
+    [string]$DispatchRoute = "",
+    [ValidateSet("", "local-cli", "ralph", "watch", "api")]
+    [string]$DispatchSource = "",
+    [string]$LeaseKey = "",
     [switch]$NoWait
 )
 
@@ -52,6 +56,13 @@ if ($SubSquad) { $sessionEnv["SQUAD_TEAM"] = $SubSquad }
 if ($RunCopilotSmoke) { $sessionEnv["RUN_COPILOT_SMOKE"] = "true" }
 if ($PushChanges) { $sessionEnv["PUSH_CHANGES"] = "true" }
 if ($OutputBranch) { $sessionEnv["OUTPUT_BRANCH"] = $OutputBranch }
+# Sprint 6 (PRD #6): the resolved route, the dispatcher that made the decision,
+# and the lease that was claimed BEFORE this call. Stamping them into the
+# execution is what makes route and source observable in `squad-aca sessions`
+# and lets the worker heartbeat its own lease without being told twice.
+if ($DispatchRoute) { $sessionEnv["SQUAD_DISPATCH_ROUTE"] = $DispatchRoute }
+if ($DispatchSource) { $sessionEnv["SQUAD_DISPATCH_SOURCE"] = $DispatchSource }
+if ($LeaseKey) { $sessionEnv["SQUAD_LEASE_KEY"] = $LeaseKey }
 
 # Build the full, isolated environment for THIS execution only. The shared job
 # template is read (never written), stripped of any session-managed keys, and
