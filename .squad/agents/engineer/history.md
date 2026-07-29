@@ -867,3 +867,91 @@ failed, 0 skipped (was 9 / 690) - new `test_image_evidence.sh` 43, routing
 never checked against reality is the same defect class as a catalog that claims
 tools nobody probed: a declaration with nothing behind it. Both were in this
 change; both are now verified rather than asserted.
+---
+
+## Sprint 8 — sandbox credential delivery (`fix/sandbox-credential-delivery`)
+
+A live end-to-end run reached the agent invocation and died with
+`Error: No authentication information found`. Session state was correct
+(`phase=done`, `exit-code=1`), so the detached-and-poll machinery was fine —
+`/workspace/<session>/.squad-creds` was simply never created.
+
+**Two defects, not one.**
+
+1. **The dispatcher never fed the mechanism.** `New-SessionExecutionProvider`
+   in `scripts/squad-aca.ps1` built the sandbox provider with `Class`, `Config`
+   and `ScriptDir` only. `New-SandboxExecutionProvider` defaults
+   `WorkerSecrets` to `@{}`, so the staging step became a no-op and the
+   launch's `if [ -f ... ]` guard swallowed the absence in silence. A second,
+   quieter instance of the same class: `scripts/lib/squad-aca-provider.ps1`
+   copies provider options by an explicit NAME LIST, so `BrokeredCredentials`
+   was dropped until it was added there too.
+2. **The Sprint 7 delivery mechanism could not work against the real
+   platform.** `aca sandbox exec` does **not** forward stdin — measured live:
+   `"hello" | aca sandbox exec -c 'IFS= read -r X; echo "GOT=[$X]"'` prints
+   `GOT=[]`. Every stdin-staging test passed because they all ran the shipping
+   *strings* against a local shell, never against `aca`. The replacement is
+   `aca sandbox fs write --path <dest> --file <local>`.
+
+**What the platform actually does.** `exec` runs as the unprivileged session
+user; `fs write` uploads as **root, mode 0644**, and the session user cannot
+`chmod` it. So the containing directory is the only control: the provider
+creates the state directory under `umask 077`, has the sandbox report
+`stat -c %a`, and **refuses to upload** unless that is exactly `700`. `rm` of
+the root-owned file still works, because unlink depends on directory write
+permission and the state directory is not sticky — so source-then-remove holds.
+
+**Where tokens come from for a local run.** Git plane: `SQUAD_GITHUB_TOKEN` /
+`GH_TOKEN` / `GITHUB_TOKEN`, then `gh auth token`. Copilot plane: only
+`SQUAD_COPILOT_GITHUB_TOKEN` / `COPILOT_GITHUB_TOKEN`; otherwise the git token
+serves both with a loud note. No token at all is refused **before** the first
+`aca` call, so a credential-less run is never billed. Brokerage is
+**nomination-based** (`BrokeredCredentials` is separate from `WorkerSecrets`):
+"broker whatever is present" would refuse every session whose Copilot token is
+the reused git token, and "broker whatever looks brokerable" would silently skip
+one the operator meant to broker. The caller states intent.
+
+**A third gap the live run exposed.** With credentials arriving, the agent got
+as far as `ProxyResponseError: HTTP 403 … does not appear to originate from
+GitHub`. That is not a credential failure — the class egress templates allowed
+`*.github.com` only, and the Copilot CLI talks to `api.githubcopilot.com`. A
+credential the sandbox cannot use is not delivered, so
+`*.githubcopilot.com` and `*.githubusercontent.com` were added to both approved
+classes. The next run pushed a branch.
+
+**Live proof.** Session `credproof3`, class `sandbox-python-3-12`:
+`exit-code 0`, the Squad agent created, committed and pushed `CREDPROOF.md`
+(commit `21bb3aa` on `e2e/sandbox-canary`). In-sandbox afterwards:
+`/tmp/squad-session` is `drwx------`, `.squad-creds` is absent, and a
+self-match-free `/proc/*/cmdline` sweep reported `ARGVLEAK_COUNT=0`. Every
+probe sandbox was deleted with `--yes` and `aca sandbox list` is empty.
+
+**Mutation results** (274 -> 284 checks):
+
+| Mutation | Detected by |
+| --- | --- |
+| drop `WorkerSecrets` from the sandbox provider options (the original defect) | `A sandbox-routed run staged no credential before launch` |
+| drop `BrokeredCredentials` from the option name list | `Credential brokerage is not wired into sandbox create` |
+| drop the Copilot plane from `$script:SandboxCredentialPlanes` | five checks, incl. `verify-launch-detachment.ps1` `SEEN3=MISSING` and the launch deny-list |
+| both planes share one token | `The Copilot env plane was not staged separately` |
+| remove `COPILOT_GITHUB_TOKEN` from `$script:SandboxSecretEnvNames` | `Secret env name(s) accepted into the launch command: COPILOT_GITHUB_TOKEN` |
+| `Resolve-SessionSandboxCredential` returns silently instead of throwing | `A credential-less sandbox run was not refused up front` |
+| skip `Test-SandboxCredentialToken` for a nominated Copilot credential | `The classic-PAT Copilot case is wrong (acaCalls=1)` |
+| accept any vault mode instead of exactly 700 | `The vault-mode guard is wrong` |
+| leave the local staging file behind | `local credential staging file(s) survived` |
+| upload an empty credential file | `The uploaded credential file content is wrong` |
+| put the token in `sandbox exec` argv | ten failures, incl. the argv guard throwing |
+
+**Lessons recorded.**
+
+- A test that runs the shipping *string* in a local shell proves the string is
+  correct, not that the transport carries it. Sprint 7's credential mechanism
+  passed every such test and delivered nothing. Probe the real platform.
+- `git checkout -- <file>` on **uncommitted** work destroys it. Reverting a
+  mutation this way cost a full rebuild of two files. Commit first, always.
+- A structural option list (`squad-aca-provider.ps1`) silently drops anything
+  not named in it. New provider options need an entry there or they vanish.
+- cmd's `set /p` cannot split a bare-LF payload; `more > file` can. Relevant
+  whenever a Windows stub has to observe a POSIX-shaped stream.
+- A stray `#>` inside comment-based help breaks PowerShell parsing far from the
+  edit. `[System.Management.Automation.Language.Parser]::ParseFile` locates it.

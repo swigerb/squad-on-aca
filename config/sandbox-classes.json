@@ -140,6 +140,8 @@
         "hostRules": [
           { "pattern": "*.github.com", "action": "Allow" },
           { "pattern": "github.com", "action": "Allow" },
+          { "pattern": "*.githubcopilot.com", "action": "Allow" },
+          { "pattern": "*.githubusercontent.com", "action": "Allow" },
           { "pattern": "registry.npmjs.org", "action": "Allow" },
           { "pattern": "*.npmjs.org", "action": "Allow" },
           { "pattern": "*.nodejs.org", "action": "Allow" }
@@ -188,6 +190,8 @@
         "hostRules": [
           { "pattern": "*.github.com", "action": "Allow" },
           { "pattern": "github.com", "action": "Allow" },
+          { "pattern": "*.githubcopilot.com", "action": "Allow" },
+          { "pattern": "*.githubusercontent.com", "action": "Allow" },
           { "pattern": "pypi.org", "action": "Allow" },
           { "pattern": "*.pypi.org", "action": "Allow" },
           { "pattern": "files.pythonhosted.org", "action": "Allow" }

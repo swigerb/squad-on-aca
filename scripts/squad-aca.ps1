@@ -412,6 +412,146 @@ function Get-SessionSandboxCatalogPath {
     return (Join-Path $RepoRoot "config\sandbox-classes.json")
 }
 
+# Where a LOCAL dispatch finds the credentials a sandbox session needs.
+#
+# The ACA Jobs plane never has this problem: scripts/deploy.ps1 writes the tokens
+# into the deployment's own secret store, and scripts/lib/session-env.ps1 passes
+# `secretref:` POINTERS, so the dispatcher never holds a value at all. A sandbox
+# is created ad hoc by whoever ran the CLI, has no deployment behind it, and no
+# secret store of its own -- so the value has to come from this process.
+#
+# Order is deliberate: an explicit SQUAD_* override first (so a session can be
+# given a narrower credential than the developer's own), then the conventional
+# names, then `gh auth token` as the last resort. Brokering `gh` is not a
+# shortcut: it is BY CONSTRUCTION the identity that just wrote the dispatch
+# lease, so a session can never be given push rights its dispatcher lacks.
+$script:SandboxGitTokenSources = @("SQUAD_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+$script:SandboxCopilotTokenSources = @("SQUAD_COPILOT_GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN")
+
+function Get-EnvironmentToken {
+    <#
+    .SYNOPSIS
+        First non-empty environment variable from an ordered candidate list.
+    #>
+    param([string[]]$Names)
+
+    foreach ($name in @($Names)) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($value -and $value.Trim()) {
+            return [pscustomobject]@{ Token = $value.Trim(); Source = $name }
+        }
+    }
+    return $null
+}
+
+function Resolve-SessionSandboxCredential {
+    <#
+    .SYNOPSIS
+        Resolve the credentials a sandbox-routed session needs, or REFUSE before
+        anything is created.
+
+    .DESCRIPTION
+        Sprint 7 built the delivery mechanism; this is what feeds it. Without it
+        a sandbox session provisioned, applied egress, cloned the repository, ran
+        the capability preflight and only THEN died inside `copilot` with
+        "No authentication information found" -- ninety seconds of billed compute
+        for a failure the dispatcher already had every fact needed to predict.
+
+        So every refusal here happens BEFORE the provider is constructed and
+        therefore before `aca` is called even once. Start-LeasedExecution
+        releases the lease when provider construction throws, so an unusable
+        credential costs nothing and is reported in one sentence that names the
+        fix.
+
+        TWO PLANES (PRD #6):
+
+          git/`gh`  -- required. Used for clone, commit, push and PR. Delivered
+                       as GH_TOKEN/GITHUB_TOKEN through the stdin-staged
+                       credential file.
+          Copilot   -- required. Used by the Copilot CLI. Delivered as
+                       COPILOT_GITHUB_TOKEN through the same file.
+
+        A DEDICATED Copilot credential (SQUAD_COPILOT_GITHUB_TOKEN or
+        COPILOT_GITHUB_TOKEN) is additionally nominated for platform brokerage,
+        which accepts ONLY a fine-grained `github_pat_` token for that type. So a
+        dedicated credential is validated against that rule here and a classic
+        `ghp_` / OAuth `gho_` value is REFUSED up front, with a message that
+        names both the problem and the fix -- never as an opaque service error
+        after the token has already crossed the wire.
+
+        With no dedicated Copilot credential the git token serves the Copilot ENV
+        plane and platform brokerage is skipped. That mirrors what
+        scripts/deploy.ps1 already does for the ACA Jobs plane, and it is SAID
+        OUT LOUD rather than assumed: the operator is told the two planes are one
+        token and how to separate them.
+
+    .OUTPUTS
+        PSCustomObject with WorkerSecrets, BrokeredCredentials and Notes.
+    #>
+
+    $git = Get-EnvironmentToken -Names $script:SandboxGitTokenSources
+    if (-not $git) {
+        $ghToken = ""
+        try {
+            $ghToken = ((& gh auth token 2>$null) | Select-Object -First 1)
+            if ($LASTEXITCODE -ne 0) { $ghToken = "" }
+        } catch {
+            $ghToken = ""
+        }
+        if ($ghToken) { $git = [pscustomobject]@{ Token = ([string]$ghToken).Trim(); Source = "gh auth token" } }
+    }
+
+    if (-not $git -or -not $git.Token) {
+        throw ("Refusing to dispatch this session to a sandbox: no GitHub credential is available, so the worker " +
+               "could not clone, push, or open a pull request and would fail with 'No authentication information found' " +
+               "after the sandbox had already been created and billed. Nothing was started. " +
+               "Fix it by running 'gh auth login', or by setting one of $($script:SandboxGitTokenSources -join ', ') " +
+               "in this shell. The ACA Jobs plane is unaffected: it reads the deployment's own secret store.")
+    }
+
+    # The value reaches a POSIX credential file. Anything outside the unreserved
+    # set is either a mangled value or an attempt to break out of the quoting.
+    if ($git.Token -notmatch "^[A-Za-z0-9_\-\.~+/=]+$") {
+        throw ("Refusing to dispatch this session to a sandbox: the GitHub credential from $($git.Source) contains " +
+               "characters outside the unreserved token set, so it was either truncated, wrapped, or is not a token. " +
+               "The value is not echoed. Nothing was started.")
+    }
+
+    $notes = @()
+    $brokered = [ordered]@{}
+
+    $copilot = Get-EnvironmentToken -Names $script:SandboxCopilotTokenSources
+    if ($copilot -and $copilot.Token) {
+        # A dedicated Copilot credential is nominated for PLATFORM brokerage, so
+        # it must satisfy the platform's type rule. Checked here, offline.
+        $issue = Test-SandboxCredentialToken -Type "github-copilot" -Token $copilot.Token
+        if ($issue) {
+            throw ("Refusing to dispatch this session to a sandbox: the Copilot credential from $($copilot.Source) " +
+                   "cannot be brokered because $issue Nothing was started, and the value was never sent. " +
+                   "Either set $($script:SandboxCopilotTokenSources[0]) to a fine-grained PAT (github_pat_...), or " +
+                   "unset COPILOT_GITHUB_TOKEN to let the GitHub credential serve both planes.")
+        }
+        $brokered["github-copilot"] = $copilot.Token
+        $copilotToken = $copilot.Token
+        $notes += "[squad-aca] Credential planes: git from $($git.Source), Copilot from $($copilot.Source) (brokered separately)."
+    } else {
+        $copilotToken = $git.Token
+        $notes += ("[squad-aca] No dedicated Copilot credential, so the GitHub credential from $($git.Source) serves " +
+                   "BOTH planes in this sandbox. Set $($script:SandboxCopilotTokenSources[0]) to a fine-grained PAT " +
+                   "(github_pat_...) to separate them; see docs/runbook.md.")
+    }
+
+    return [pscustomobject]@{
+        WorkerSecrets       = [ordered]@{
+            GH_TOKEN             = $git.Token
+            GITHUB_TOKEN         = $git.Token
+            COPILOT_GITHUB_TOKEN = $copilotToken
+        }
+        BrokeredCredentials = $brokered
+        Notes               = $notes
+    }
+}
+
 function New-SessionExecutionProvider {
     <#
     .SYNOPSIS
@@ -480,10 +620,19 @@ function New-SessionExecutionProvider {
 
     switch ($route.Route) {
         "sandbox" {
+            # THE credential wiring. Resolved and validated HERE, before the
+            # provider exists and therefore before `aca` is called even once, so
+            # an unusable credential never costs a sandbox. Sprint 7 built the
+            # delivery mechanism and this branch did not feed it -- which is why
+            # a live session reached the Copilot invocation with no credential.
+            $credentials = Resolve-SessionSandboxCredential
+            foreach ($note in $credentials.Notes) { Write-Host $note }
             return New-SquadExecutionProvider -Kind "sandbox" -Options @{
-                Class     = $route.SandboxClass
-                Config    = $Config
-                ScriptDir = $ScriptDir
+                Class               = $route.SandboxClass
+                Config              = $Config
+                ScriptDir           = $ScriptDir
+                WorkerSecrets       = $credentials.WorkerSecrets
+                BrokeredCredentials = $credentials.BrokeredCredentials
             }
         }
         "fail-closed" {
@@ -527,6 +676,11 @@ function New-SessionSandboxOperationsProvider {
         Returns $null when the catalog offers no approved class, so a caller can
         decide whether that is fatal (operating a specific sandbox) or simply
         means there is nothing to list.
+
+        DELIBERATELY CREDENTIAL-FREE. Listing, tailing and stopping a sandbox
+        needs no worker credential, so none is resolved: a `squad-aca sessions`
+        on a machine with no `gh` login must still list, and a lifecycle path
+        that resolved credentials would refuse it for no reason.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Config,

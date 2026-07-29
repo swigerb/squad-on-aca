@@ -1403,7 +1403,8 @@ if (-not (Test-Path $providerLib)) {
         "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
         "SQUAD_STUB_ACA_CRED_RC", "SQUAD_STUB_ACA_CRED_ERR", "SQUAD_STUB_ACA_CRED_ID",
         "SQUAD_STUB_ACA_CRED_STDIN", "SQUAD_STUB_ACA_CREDDEL_RC", "SQUAD_STUB_ACA_CREDDEL_ERR",
-        "SQUAD_STUB_ACA_SEED_RC", "SQUAD_STUB_ACA_SEED_STDIN", "SQUAD_STUB_ACA_LIST_FIXTURE",
+        "SQUAD_STUB_ACA_SEED_RC", "SQUAD_STUB_ACA_SEED_STDIN", "SQUAD_STUB_ACA_VAULT_MODE",
+        "SQUAD_STUB_ACA_LIST_FIXTURE",
         "SQUAD_STUB_ACA_LIST_RC", "SQUAD_STUB_ACA_LIST_ERR")
     try {
         $sbStub = New-SquadCliStubEnvironment
@@ -1432,6 +1433,7 @@ if (-not (Test-Path $providerLib)) {
         $env:SQUAD_STUB_ACA_CREDDEL_ERR = ""
         $env:SQUAD_STUB_ACA_SEED_RC = "0"
         $env:SQUAD_STUB_ACA_SEED_STDIN = ""
+        $env:SQUAD_STUB_ACA_VAULT_MODE = "700"
         $env:SQUAD_STUB_ACA_LIST_FIXTURE = ""
         $env:SQUAD_STUB_ACA_LIST_RC = "0"
         $env:SQUAD_STUB_ACA_LIST_ERR = ""
@@ -1469,20 +1471,23 @@ if (-not (Test-Path $providerLib)) {
             param(
                 [string]$DiskId = "aaaaaaaa-1111-2222-3333-444444444444",
                 [string]$DiskLabel = "",
-                [hashtable]$Secrets = $null
+                [hashtable]$Secrets = $null,
+                [hashtable]$Brokered = $null
             )
             if ($null -eq $Secrets) { $Secrets = @{ GH_TOKEN = $sbSecret; COPILOT_GITHUB_TOKEN = $sbCopilotSecret } }
+            if ($null -eq $Brokered) { $Brokered = @{ "github-copilot" = $sbCopilotSecret } }
             return New-SquadExecutionProvider -Kind "sandbox" -Options @{
-                Class              = $sbClass
-                SandboxGroup       = "sbg-squad-stub"
-                ResourceGroup      = "rg-squad-stub"
-                SubscriptionId     = "00000000-0000-0000-0000-000000000000"
-                DiskId             = $DiskId
-                DiskLabel          = $DiskLabel
-                AcaCliPath         = $sbCli
-                IdleTimeoutSeconds = 1800
-                PollSeconds        = 1
-                WorkerSecrets      = $Secrets
+                Class               = $sbClass
+                SandboxGroup        = "sbg-squad-stub"
+                ResourceGroup       = "rg-squad-stub"
+                SubscriptionId      = "00000000-0000-0000-0000-000000000000"
+                DiskId              = $DiskId
+                DiskLabel           = $DiskLabel
+                AcaCliPath          = $sbCli
+                IdleTimeoutSeconds  = 1800
+                PollSeconds         = 1
+                WorkerSecrets       = $Secrets
+                BrokeredCredentials = $Brokered
             }
         }
 
@@ -2022,6 +2027,7 @@ if (-not (Test-Path $providerLib)) {
         Remove-Item $sbCredStdin, $sbSeedStdin -ErrorAction SilentlyContinue
         $env:SQUAD_STUB_ACA_CRED_STDIN = $sbCredStdin
         $env:SQUAD_STUB_ACA_SEED_STDIN = $sbSeedStdin
+        $env:SQUAD_STUB_ACA_VAULT_MODE = "700"
         Reset-SquadCliStubLog -Stub $sbStub
         $sbCredProvider = New-SandboxTestProvider
         $sbCredOutcome = @{}
@@ -2032,17 +2038,86 @@ if (-not (Test-Path $providerLib)) {
         $sbCredCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
         $sbCredAllArgv = ($sbCredCalls -join "`n")
         $sbGotCred = if (Test-Path $sbCredStdin) { (Get-Content -Raw $sbCredStdin).Trim() } else { "" }
-        $sbGotSeed = if (Test-Path $sbSeedStdin) { (Get-Content -Raw $sbSeedStdin).Trim() } else { "" }
+        $sbGotSeedLines = if (Test-Path $sbSeedStdin) { @((Get-Content $sbSeedStdin) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() }
 
         if (-not $sbCredErr -and $sbGotCred -eq $sbCopilotSecret -and $sbCredAllArgv -notmatch [regex]::Escape($sbCopilotSecret)) {
             Add-Pass "The Copilot credential reaches the platform on STDIN and appears in no process argv (received on stdin, absent from all $($sbCredCalls.Count) recorded aca argvs)"
         } else {
             Add-Fail "Copilot credential delivery is wrong (err=$sbCredErr stdinMatched=$($sbGotCred -eq $sbCopilotSecret) inArgv=$($sbCredAllArgv -match [regex]::Escape($sbCopilotSecret)))"
         }
-        if ($sbGotSeed -eq $sbSecret -and $sbCredAllArgv -notmatch [regex]::Escape($sbSecret)) {
-            Add-Pass "The git/gh push token reaches the sandbox on STDIN and appears in no process argv (no native --type exists for it, so it is staged into a umask-077 file)"
+        if ($sbGotSeedLines.Count -ge 1 -and $sbGotSeedLines[0] -eq "export GH_TOKEN='$sbSecret'" `
+                -and $sbCredAllArgv -notmatch [regex]::Escape($sbSecret)) {
+            Add-Pass "The git/gh push token reaches the sandbox as an UPLOADED FILE and appears in no process argv (no native --type exists for it, so it is written into a 0700 state directory)"
         } else {
-            Add-Fail "Git token delivery is wrong (stdinMatched=$($sbGotSeed -eq $sbSecret) inArgv=$($sbCredAllArgv -match [regex]::Escape($sbSecret)))"
+            Add-Fail "Git token delivery is wrong (lines=$($sbGotSeedLines.Count) firstMatched=$($sbGotSeedLines.Count -ge 1 -and $sbGotSeedLines[0] -eq "export GH_TOKEN='$sbSecret'") inArgv=$($sbCredAllArgv -match [regex]::Escape($sbSecret)))"
+        }
+
+        # THE defect this branch exists for. A sandbox session that stages only
+        # the git plane runs Copilot with no credential and dies with
+        # "No authentication information found" AFTER the sandbox was created,
+        # egress applied, and the repository cloned -- ninety seconds of billed
+        # compute for an error the dispatcher already had the information to
+        # prevent. The Copilot plane must arrive too, on its OWN file line, so
+        # a distinct Copilot credential is never written under the git names.
+        $sbCopilotLine = "export COPILOT_GITHUB_TOKEN='$sbCopilotSecret'"
+        if ($sbGotSeedLines.Count -eq 3 -and $sbGotSeedLines[2] -eq $sbCopilotLine) {
+            Add-Pass "The Copilot ENV plane is staged as its own file line, so the worker's Copilot CLI has a credential and it is not the git token"
+        } else {
+            Add-Fail "The Copilot env plane was not staged separately (lines=$($sbGotSeedLines.Count) thirdIsCopilot=$($sbGotSeedLines.Count -ge 3 -and $sbGotSeedLines[2] -eq $sbCopilotLine))"
+        }
+
+        # `aca sandbox fs write` uploads ROOT-OWNED 0644 and the sandbox account
+        # cannot chmod it, so the CONTAINING DIRECTORY is the only access control
+        # available. If the vault exec reports any mode other than 700, the
+        # credential would land world-readable inside the sandbox -- so the
+        # upload must be REFUSED rather than attempted.
+        Reset-SquadCliStubLog -Stub $sbStub
+        Remove-Item $sbSeedStdin -ErrorAction SilentlyContinue
+        $env:SQUAD_STUB_ACA_VAULT_MODE = "755"
+        $sbVaultErr = ""
+        try {
+            Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbRequest 6>$null | Out-Null
+        } catch { $sbVaultErr = [string]$_.Exception.Message }
+        $sbVaultCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $sbVaultWrote = @($sbVaultCalls | Where-Object { $_ -like "sandbox fs write *" }).Count
+        $sbVaultLaunched = @($sbVaultCalls | Where-Object { $_ -like "*squad-launched*" }).Count
+        if ($sbVaultErr -match "not 700" -and $sbVaultWrote -eq 0 -and $sbVaultLaunched -eq 0 -and -not (Test-Path $sbSeedStdin)) {
+            Add-Pass "A credential state directory that is not 0700 REFUSES the upload (no fs write, no launch), because the platform uploads root-owned 0644 and the sandbox account cannot chmod it"
+        } else {
+            Add-Fail "The vault-mode guard is wrong (err=$sbVaultErr writes=$sbVaultWrote launches=$sbVaultLaunched)"
+        }
+        $env:SQUAD_STUB_ACA_VAULT_MODE = "700"
+
+        # The local file the upload reads from holds both plaintext tokens. It
+        # must not survive the call -- including when the call FAILS, which is
+        # exactly when a leftover is most likely.
+        $sbStageDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".squad-on-aca\.credstage"
+        $sbStageLeft = if (Test-Path $sbStageDir) { @(Get-ChildItem -File $sbStageDir).Count } else { 0 }
+        if ($sbStageLeft -eq 0) {
+            Add-Pass "The local staging file that carries both plaintext tokens is deleted after the upload, including after a failed one"
+        } else {
+            Add-Fail "$sbStageLeft local credential staging file(s) survived in $sbStageDir"
+        }
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbCredCalls = @()
+        $sbCredOutcome = @{}
+        try {
+            Start-SquadExecution -Provider (New-SandboxTestProvider) -Request $sbRequest -Outcome $sbCredOutcome 6>$null | Out-Null
+        } catch { }
+        $sbCredCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+
+        # The generator's plane/line correspondence, directly: dropping a plane
+        # with no value must drop its LINE too, or every later plane silently
+        # receives the previous plane's token.
+        $sbGitOnly = Get-SandboxCredentialStaging -WorkerSecrets @{ GH_TOKEN = $sbSecret }
+        $sbBothPlanes = Get-SandboxCredentialStaging -WorkerSecrets @{ GH_TOKEN = $sbSecret; COPILOT_GITHUB_TOKEN = $sbCopilotSecret }
+        $sbNoPlanes = Get-SandboxCredentialStaging -WorkerSecrets @{}
+        if ($sbGitOnly -and @($sbGitOnly.Tokens).Count -eq 1 -and @($sbGitOnly.Planes).Count -eq 1 `
+                -and $sbBothPlanes -and @($sbBothPlanes.Tokens).Count -eq 2 -and @($sbBothPlanes.Planes).Count -eq 2 `
+                -and ($sbBothPlanes.Planes[1] -contains "COPILOT_GITHUB_TOKEN") -and $null -eq $sbNoPlanes) {
+            Add-Pass "A credential plane with no value drops its stdin LINE as well as its names, so no plane can inherit another plane's token"
+        } else {
+            Add-Fail "Credential plane/line correspondence is wrong (gitOnly=$(if ($sbGitOnly) { @($sbGitOnly.Tokens).Count } else { 'null' }) both=$(if ($sbBothPlanes) { @($sbBothPlanes.Tokens).Count } else { 'null' }) none=$(if ($null -eq $sbNoPlanes) { 'null' } else { 'not-null' }))"
         }
 
         # The brokered id must actually be attached to the sandbox, otherwise
@@ -2061,6 +2136,7 @@ if (-not (Test-Path $providerLib)) {
         # token -- must now be free of it and of the env names it travelled in.
         $iLaunch2 = [array]::FindIndex($sbCredCalls, [Predicate[string]] { param($l) $l -like "*squad-launched*" })
         if ($iLaunch2 -ge 0 -and $sbCredCalls[$iLaunch2] -notmatch [regex]::Escape($sbSecret) `
+                -and $sbCredCalls[$iLaunch2] -notmatch [regex]::Escape($sbCopilotSecret) `
                 -and $sbCredCalls[$iLaunch2] -notmatch "GH_TOKEN=" -and $sbCredCalls[$iLaunch2] -notmatch "GITHUB_TOKEN=") {
             Add-Pass "The launch command carries no token and no token-bearing env assignment (Sprint 5's known limitation is closed)"
         } else {
@@ -2069,15 +2145,20 @@ if (-not (Test-Path $providerLib)) {
 
         # Mutation guard: New-SandboxLaunchCommand must REFUSE to build a
         # command that assigns a secret env name, so a future change that
-        # "helpfully" restores GH_TOKEN= cannot pass silently.
-        $sbEnvGuard = ""
-        try {
-            New-SandboxLaunchCommand -Environment ([ordered]@{ GH_TOKEN = "x" }) -StateDir "/squad/state" | Out-Null
-        } catch { $sbEnvGuard = [string]$_.Exception.Message }
-        if ($sbEnvGuard -match "squad-sandbox:capability") {
-            Add-Pass "New-SandboxLaunchCommand refuses to place a secret env name in the launch argv at all"
+        # "helpfully" restores GH_TOKEN= cannot pass silently. COPILOT_GITHUB_TOKEN
+        # is a bearer token too and is on the same deny list.
+        $sbEnvGuardBad = @()
+        foreach ($sbSecretName in @("GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN")) {
+            $sbEnvGuard = ""
+            try {
+                New-SandboxLaunchCommand -Environment ([ordered]@{ $sbSecretName = "x" }) -StateDir "/squad/state" | Out-Null
+            } catch { $sbEnvGuard = [string]$_.Exception.Message }
+            if ($sbEnvGuard -notmatch "squad-sandbox:capability") { $sbEnvGuardBad += $sbSecretName }
+        }
+        if ($sbEnvGuardBad.Count -eq 0) {
+            Add-Pass "New-SandboxLaunchCommand refuses to place ANY credential-bearing env name (git and Copilot planes) in the launch argv"
         } else {
-            Add-Fail "A secret env name was accepted into the launch command (msg=$sbEnvGuard)"
+            Add-Fail "Secret env name(s) accepted into the launch command: $($sbEnvGuardBad -join ', ')"
         }
 
         $env:SQUAD_STUB_ACA_CRED_STDIN = ""
@@ -2112,7 +2193,8 @@ if (-not (Test-Path $providerLib)) {
         Reset-SquadCliStubLog -Stub $sbStub
         $sbClassicErr = ""
         try {
-            $p = New-SandboxTestProvider -Secrets @{ GH_TOKEN = $sbSecret; COPILOT_GITHUB_TOKEN = ("ghp_" + "stubvalue00000000") }
+            $p = New-SandboxTestProvider -Secrets @{ GH_TOKEN = $sbSecret } `
+                -Brokered @{ "github-copilot" = ("ghp_" + "stubvalue00000000") }
             Start-SquadExecution -Provider $p -Request $sbRequest 6>$null | Out-Null
         } catch { $sbClassicErr = [string]$_.Exception.Message }
         $sbClassicCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
@@ -3247,7 +3329,10 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         # THE acceptance criterion issue #25 exists for.
         Set-StubManifest -Body $sandboxManifest
         Reset-SquadCliStubLog -Stub $stub
+        $cliCredFile = Join-Path $stub.Root "cli-cred-upload.txt"
+        Remove-Item $cliCredFile -ErrorAction SilentlyContinue
         $sb = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CredentialFileCapture $cliCredFile `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-sandbox", "do the thing")
         $jobStarts = @($sb.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
         $sbCreate = @($sb.AcaCalls | Where-Object { $_ -like "sandbox create*" }).Count
@@ -3277,6 +3362,116 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
             Add-Pass "The wired sandbox dispatch passes no --identity on any aca call (the group stays identity-free)"
         } else {
             Add-Fail "A wired sandbox dispatch passed --identity: $($identityCalls -join ' | ')"
+        }
+
+        # --- 3b. THE DISPATCHER ACTUALLY FEEDS THE CREDENTIAL MECHANISM ------
+        # Sprint 7 built credential delivery and proved it in isolation, but
+        # New-SessionExecutionProvider never passed WorkerSecrets, so a live
+        # sandbox session cloned the repository, applied egress, ran the
+        # preflight and THEN died on `copilot` with "No authentication
+        # information found". Isolation tests could not see it; only a
+        # CLI-driven dispatch can. Assert the credential UPLOAD exists and lands
+        # BEFORE the launch, so the launch has something to source.
+        $stageIdx = [array]::FindIndex([string[]]$sb.AcaCalls, [Predicate[string]] { param($l) $l -like "sandbox fs write *" })
+        $vaultIdx = [array]::FindIndex([string[]]$sb.AcaCalls, [Predicate[string]] { param($l) $l -like "*squad-credentials-vault*" })
+        $launchIdx = [array]::FindIndex([string[]]$sb.AcaCalls, [Predicate[string]] { param($l) $l -like "*squad-launched*" })
+        if ($stageIdx -ge 0 -and $launchIdx -ge 0 -and $vaultIdx -ge 0 -and $vaultIdx -lt $stageIdx -and $stageIdx -lt $launchIdx) {
+            Add-Pass "A sandbox-routed run prepares a 0700 credential directory at aca-call index $vaultIdx, UPLOADS the credential at index $stageIdx and launches at index $launchIdx (the dispatcher feeds the delivery mechanism, not just the unit test)"
+        } else {
+            Add-Fail "A sandbox-routed run staged no credential before launch (vaultIdx=$vaultIdx stageIdx=$stageIdx launchIdx=$launchIdx aca=$($sb.AcaCalls -join ' | '))"
+        }
+        # And the launch must CONSUME it: sourcing the seed file is the only
+        # way the worker sees a token, since no env assignment is permitted.
+        if ($launchIdx -ge 0 -and $sb.AcaCalls[$launchIdx] -match "\.squad-creds" `
+                -and $sb.AcaCalls -notmatch [regex]::Escape("ghs-stub-git-token-value")) {
+            Add-Pass "The launch sources the staged credential file and no aca argv contains the token"
+        } else {
+            Add-Fail "The launch does not consume the staged credential, or a token reached argv (launchIdx=$launchIdx)"
+        }
+        # ...and the CONTENT that reached the sandbox must be the dispatcher's
+        # real token under the names the worker reads. Asserting only that a
+        # `fs write` happened would pass for an empty file.
+        $cliCredLines = if (Test-Path $cliCredFile) { @((Get-Content $cliCredFile) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() }
+        $cliCredWant = @("export GH_TOKEN='ghs-stub-git-token-value'",
+                         "export GITHUB_TOKEN='ghs-stub-git-token-value'",
+                         "export COPILOT_GITHUB_TOKEN='ghs-stub-git-token-value'")
+        if (($cliCredLines -join "`n") -eq ($cliCredWant -join "`n")) {
+            Add-Pass "The file a sandbox-routed run uploads carries the dispatcher's token under every name the worker reads (git plane and Copilot plane), which is what 'No authentication information found' meant was missing"
+        } else {
+            Add-Fail "The uploaded credential file content is wrong: $($cliCredLines.Count) line(s), first='$(if ($cliCredLines.Count) { ($cliCredLines[0] -replace 'ghs-stub-git-token-value', '<tok>') } else { '' })'"
+        }
+
+        # PRD #6 requires the two planes stay SEPARATE. When a dedicated Copilot
+        # credential is supplied it must be the one that reaches the sandbox --
+        # a resolver that quietly reuses the git token for both planes would
+        # otherwise pass every check above, because they all run with a single
+        # token configured.
+        Reset-SquadCliStubLog -Stub $stub
+        $twoPlaneFile = Join-Path $stub.Root "cli-cred-twoplane.txt"
+        Remove-Item $twoPlaneFile -ErrorAction SilentlyContinue
+        $twoPlaneCopilot = "github" + "_pat_" + "stubcopilotvalue0001"
+        $twoPlane = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -CredentialFileCapture $twoPlaneFile -CopilotToken $twoPlaneCopilot `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-twoplane", "do the thing")
+        $twoPlaneLines = if (Test-Path $twoPlaneFile) { @((Get-Content $twoPlaneFile) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() }
+        $twoPlaneWant = @("export GH_TOKEN='ghs-stub-git-token-value'",
+                          "export GITHUB_TOKEN='ghs-stub-git-token-value'",
+                          "export COPILOT_GITHUB_TOKEN='$twoPlaneCopilot'")
+        $twoPlaneBrokered = @($twoPlane.AcaCalls | Where-Object { $_ -like "sandboxgroup credential create *--type github-copilot*" }).Count
+        if (($twoPlaneLines -join "`n") -eq ($twoPlaneWant -join "`n") -and $twoPlaneBrokered -eq 1 `
+                -and ($twoPlane.AcaCalls -join "`n") -notmatch [regex]::Escape($twoPlaneCopilot)) {
+            Add-Pass "A dedicated Copilot credential reaches the sandbox as ITSELF, not as a copy of the git token, and is also brokered natively without entering any argv (PRD #6: the planes stay separate)"
+        } else {
+            Add-Fail "The Copilot plane collapsed onto the git token or was not brokered (lines=$($twoPlaneLines.Count) brokered=$twoPlaneBrokered exit=$($twoPlane.ExitCode))"
+        }
+
+        # --- 3c. NO USABLE CREDENTIAL => REFUSE BEFORE ANYTHING IS PAID FOR --
+        # A session that starts, provisions a sandbox and dies ninety seconds
+        # later on an error the dispatcher already had the facts to predict is
+        # a bad failure AND a billed one. Refuse up front: zero aca calls.
+        Reset-SquadCliStubLog -Stub $stub
+        $noCred = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -GitToken "" -CopilotToken "" -GhAuthToken "" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-nocred", "do the thing")
+        $noCredJobStarts = @($noCred.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($noCred.ExitCode -ne 0 -and $noCred.AcaCalls.Count -eq 0 -and $noCredJobStarts -eq 0 `
+                -and ($noCred.StdErr -match "gh auth login") -and ($noCred.StdErr -match "GH_TOKEN")) {
+            Add-Pass "A sandbox-routed run with NO usable credential is refused before any aca call, naming 'gh auth login' and the environment variables that would satisfy it (nothing is provisioned, nothing is billed)"
+        } else {
+            Add-Fail "A credential-less sandbox run was not refused up front (exit=$($noCred.ExitCode) acaCalls=$($noCred.AcaCalls.Count) jobStarts=$noCredJobStarts err=$($noCred.StdErr))"
+        }
+
+        # --- 3d. gh auth token IS the local fallback -------------------------
+        # The dispatcher's gh identity is by construction the identity already
+        # writing the dispatch lease, so brokering it needs no new secret store.
+        Reset-SquadCliStubLog -Stub $stub
+        $ghFallback = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -GitToken "" -CopilotToken "" -GhAuthToken "ghs-stub-fallback-token" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-ghfallback", "do the thing")
+        $ghFallbackCreate = @($ghFallback.AcaCalls | Where-Object { $_ -like "sandbox create*" }).Count
+        if ($ghFallback.ExitCode -eq 0 -and $ghFallbackCreate -ge 1 `
+                -and ($ghFallback.AcaCalls -notmatch [regex]::Escape("ghs-stub-fallback-token"))) {
+            Add-Pass "With no credential environment set, the dispatcher brokers its own 'gh auth token' and the session dispatches, with the token still absent from every aca argv"
+        } else {
+            Add-Fail "The gh auth token fallback did not dispatch (exit=$($ghFallback.ExitCode) create=$ghFallbackCreate err=$($ghFallback.StdErr))"
+        }
+
+        # --- 3e. CLASSIC PAT WHERE A FINE-GRAINED PAT IS REQUIRED ------------
+        # The platform rejects ghp_ for the github-copilot credential type. A
+        # dedicated Copilot token that cannot be brokered must say so here,
+        # not surface as an opaque platform error after provisioning.
+        Reset-SquadCliStubLog -Stub $stub
+        $classicPat = "ghp_" + "cliclassicstub000000"
+        $classic = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
+            -GitToken "ghs-stub-git-token-value" -CopilotToken $classicPat -GhAuthToken "" `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-classicpat", "do the thing")
+        $classicOut = "$($classic.StdErr)`n$($classic.StdOut)"
+        if ($classic.ExitCode -ne 0 -and $classic.AcaCalls.Count -eq 0 `
+                -and ($classicOut -match "github_pat_") -and ($classicOut -match "COPILOT_GITHUB_TOKEN") `
+                -and ($classicOut -notmatch "cliclassicstub")) {
+            Add-Pass "A classic ghp_ token supplied as the Copilot credential is refused before any aca call, names the fine-grained form the platform requires, and does not echo the rejected value"
+        } else {
+            Add-Fail "The classic-PAT Copilot case is wrong (exit=$($classic.ExitCode) acaCalls=$($classic.AcaCalls.Count) echoed=$($classicOut -match 'cliclassicstub') out=$classicOut)"
         }
 
         # --- 4. SAME MANIFEST + FLAG OFF => FAIL CLOSED ----------------------

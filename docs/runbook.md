@@ -591,13 +591,76 @@ actually reaches a sandbox, and how:
 | --- | --- | --- |
 | Control plane (your `az`/`aca` login) | **Never** | Stays on the operator's machine. Nothing in the sandbox can mint it. |
 | Runtime Azure (managed identity) | **Absent by design** | The group carries no identity, so in-sandbox token minting fails closed (`unauthorized_client`). See R1 below. |
-| GitHub (git / `gh` push) | Yes | Written to the **stdin** of a staging `aca sandbox exec` into a `0600` file that the launch command sources and deletes. In no argument vector. |
-| Copilot | Yes | The platform's **native credential brokerage**: `aca sandboxgroup credential create --type github-copilot` with the token on **stdin**, then `aca sandbox create --credential <opaque id>`. |
+| GitHub (git / `gh` push) | Yes | **Uploaded as a file** with `aca sandbox fs write` into a `0700` state directory; the launch command sources it and deletes it. In no argument vector. |
+| Copilot | Yes | Same uploaded file (its own `export COPILOT_GITHUB_TOKEN=` line), **or** the platform's native brokerage — `aca sandboxgroup credential create --type github-copilot` with the token on **stdin**, then `aca sandbox create --credential <opaque id>` — when you supply a fine-grained PAT. |
 
 Neither token is ever a CLI argument, an environment variable in the launch
 command, or a value this tool prints. On Linux an argument vector is world-
 readable at `/proc/<pid>/cmdline` for the life of the process, which is why
 "we redact it in our logs" is not sufficient.
+
+#### How credentials actually reach a sandbox session
+
+Four `aca` calls, in this order, before the worker is launched:
+
+1. **Where the tokens come from.** For a local `run`, `squad-aca.ps1` resolves
+   the **git plane** from `SQUAD_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`,
+   and falls back to `gh auth token`. It resolves the **Copilot plane** only
+   from `SQUAD_COPILOT_GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`; if neither is
+   set, the git token serves both planes and the CLI says so on stdout. If no
+   token can be found at all, the run is **refused up front** — before any
+   sandbox exists, so nothing is billed. (ACA Jobs are unaffected: they still
+   receive `secretref:` pointers from the deployment secret store, and the
+   dispatcher never holds those values.)
+2. **Vault.** `aca sandbox exec … -c 'umask 077; mkdir -p <state> && chmod 700
+   <state> && rm -f <state>/.squad-creds && echo squad-credentials-vault-$(stat
+   -c %a <state>)'`. The provider parses that mode and **refuses to upload**
+   unless it is exactly `700` — see the note below.
+3. **Upload.** The tokens are written to a short-lived local file under
+   `~/.squad-on-aca/.credstage/` (ACL-locked to the current user before any byte
+   is written), uploaded with `aca sandbox fs write --path <state>/.squad-creds
+   --file <local>`, and the local file is deleted in a `finally` — including
+   when the upload fails.
+4. **Launch.** The launch command begins `if [ -f <state>/.squad-creds ]; then
+   . <state>/.squad-creds; rm -f <state>/.squad-creds; fi`, so the tokens exist
+   only in the worker's environment. `New-SandboxLaunchCommand` **throws** if
+   any of `GH_TOKEN`, `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN` appears in the
+   environment it is asked to build.
+
+**Why the directory is 0700 and the file is 0644.** `aca sandbox exec` runs as
+the unprivileged session user, but `aca sandbox fs write` uploads as **root**
+with mode `0644`, and the session user cannot `chmod` a root-owned file
+(`Operation not permitted`). The containing directory is therefore the only
+access control available, so the provider verifies it is `0700` and refuses
+rather than placing a token somewhere world-readable. The session user *can*
+still `rm` the file, because unlink depends on directory write permission and
+the state directory is not sticky — which is what makes source-then-remove work.
+
+**`aca sandbox exec` does not forward stdin.** Piping into it delivers an empty
+stream to the remote command (`"hello" | aca sandbox exec -c 'read X; echo
+"[$X]"'` prints `[]`). Any credential design that relies on `exec` stdin will
+fail live with a bare exit 1 and no error output. `fs write` is the supported
+path. Brokerage (`sandboxgroup credential create`) *does* read stdin and is
+unaffected.
+
+#### Diagnosing a credential failure
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `Refusing to dispatch … no GitHub credential` at dispatch time, no sandbox created | Neither `SQUAD_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` nor `gh auth token` produced a token | `gh auth login`, or set `GH_TOKEN` |
+| `Refusing to broker … a classic personal access token` | A `ghp_`/`gho_`/`ghs_` token was nominated for `--type github-copilot` | Mint a fine-grained PAT and set `SQUAD_COPILOT_GITHUB_TOKEN=github_pat_…` |
+| `Refusing to upload credentials … is mode '<x>', not 700` | The state directory was not private | Usually a stale sandbox or a changed image `umask`; delete the sandbox and retry |
+| Worker log: `Error: No authentication information found` | The credential never arrived — check that a `sandbox fs write … .squad-creds` call preceded the launch | This is the Sprint 8 defect; if it reappears, `New-SessionExecutionProvider` has stopped passing `WorkerSecrets` |
+| Worker log: `ProxyResponseError: HTTP 403 … does not appear to originate from GitHub` | The credential is fine; **egress** is blocking the Copilot API | The class egress template must allow `*.githubcopilot.com` and `*.githubusercontent.com` |
+
+Inside a live sandbox, the useful checks are `ls -la /tmp/squad-session`
+(the directory must be `drwx------` and `.squad-creds` must be **gone** after
+launch) and an argv sweep that cannot match itself:
+
+```bash
+P=$(printf "%s_" gho); for f in /proc/[0-9]*/cmdline; do \
+  tr "\0" " " < "$f" | grep -q "$P" && echo "LEAK: $f"; done; echo done
+```
 
 **The classic-token footgun.** `--type github-copilot` accepts only a
 **fine-grained** PAT (`github_pat_`) and rejects a classic `ghp_` token. But

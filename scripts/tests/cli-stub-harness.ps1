@@ -411,12 +411,18 @@ exit /b 0
 if "%~1"=="repo" goto ghrepo
 if "%~1"=="pr" goto ghpr
 if "%~1"=="api" goto ghapi
+if "%~1"=="auth" goto ghauth
 exit /b 0
 :ghrepo
 echo octo/demo
 exit /b 0
 :ghpr
 echo []
+exit /b 0
+:ghauth
+if not "%~2"=="token" exit /b 0
+if "%SQUAD_STUB_GH_AUTH_TOKEN%"=="" exit /b 1
+echo %SQUAD_STUB_GH_AUTH_TOKEN%
 exit /b 0
 :ghapi
 if not "%SQUAD_STUB_GH_API_RC%"=="" if not "%SQUAD_STUB_GH_API_RC%"=="0" exit /b %SQUAD_STUB_GH_API_RC%
@@ -472,9 +478,11 @@ set "A1=%~1"
 set "A2=%~2"
 set "A3=%~3"
 set "CMD="
+set "FSFILE="
 :acaparse
 if "%~1"=="" goto acaparsed
 if "%~1"=="-c" set "CMD=%~2"
+if "%~1"=="--file" set "FSFILE=%~2"
 shift
 goto acaparse
 :acaparsed
@@ -484,9 +492,22 @@ if "%A2%"=="create" goto acacreate
 if "%A2%"=="egress" goto acaegress
 if "%A2%"=="lifecycle" goto acalifecycle
 if "%A2%"=="exec" goto acaexec
+if "%A2%"=="fs" goto acafs
 if "%A2%"=="list" goto acalist
 if "%A2%"=="delete" goto acadelete
 goto acaok
+:acafs
+rem `aca sandbox fs write` uploads a LOCAL FILE. The stub copies its content to
+rem SQUAD_STUB_ACA_SEED_STDIN so a test can assert exactly what the sandbox
+rem would have received -- including one line per credential plane.
+if not "%A3%"=="write" goto acaok
+if "%SQUAD_STUB_ACA_SEED_STDIN%"=="" goto acafsdone
+if "%FSFILE%"=="" goto acafsdone
+if not exist "%FSFILE%" goto acafsdone
+copy /y "%FSFILE%" "%SQUAD_STUB_ACA_SEED_STDIN%" >nul
+:acafsdone
+echo Uploaded.
+exit /b %SQUAD_STUB_ACA_SEED_RC%
 :acasbg
 if "%A2%"=="credential" goto acacred
 if not "%A2%"=="disk" goto acaok
@@ -539,19 +560,18 @@ if exist "%SQUAD_STUB_ACA_TIMEOUT_ONCE%" goto acaexec2
 exit /b 1
 :acaexec2
 setlocal enabledelayedexpansion
-if not "!CMD:squad-credentials-staged=!"=="!CMD!" goto acaseed
+if not "!CMD:squad-credentials-vault=!"=="!CMD!" goto acavault
 if not "!CMD:squad-launched=!"=="!CMD!" goto acalaunch
 if not "!CMD:squad-cancelled=!"=="!CMD!" goto acacancel
 if not "!CMD:echo marker=!"=="!CMD!" goto acapoll
 if not "!CMD:tail -n=!"=="!CMD!" goto acalogs
 endlocal
 goto acaok
-:acaseed
+:acavault
 endlocal
-set "TOK="
-set /p TOK=
-if not "%SQUAD_STUB_ACA_SEED_STDIN%"=="" >"%SQUAD_STUB_ACA_SEED_STDIN%" echo %TOK%
-echo squad-credentials-staged
+rem The real vault exec reports the mode it achieved; the provider refuses to
+rem upload into anything but 700, so the stub must report a real value.
+echo squad-credentials-vault-%SQUAD_STUB_ACA_VAULT_MODE%
 exit /b %SQUAD_STUB_ACA_SEED_RC%
 :acalaunch
 endlocal
@@ -711,6 +731,21 @@ function Invoke-SquadCliCapture {
         Passed through to worker/tests/lib/fake-gh.js, which backs the lease
         store. Same knobs the bash suite uses, so both languages are driven
         against one implementation of GitHub's semantics.
+
+    .PARAMETER GitToken / CopilotToken / GhAuthToken
+        The credential environment a sandbox-routed dispatch resolves from.
+        Pinned by the harness for the same reason the `gh` identity is: whether
+        a developer happens to have GH_TOKEN exported must not decide whether a
+        capture dispatches or refuses. -GitToken defaults to a fixed stub value
+        so the sandbox-plane checks have a usable credential; -CopilotToken
+        defaults to empty (the reuse-with-a-warning path, which is what a real
+        `gh auth login` machine has); -GhAuthToken defaults to empty so the
+        fake `gh auth token` FAILS unless a test explicitly drives that fallback.
+
+    .PARAMETER CredentialFileCapture
+        Path the fake `aca sandbox fs write` copies the uploaded credential file
+        to, so a test can assert exactly what the sandbox would have received.
+        Empty (the default) discards it, which is what every golden capture does.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
@@ -724,7 +759,11 @@ function Invoke-SquadCliCapture {
         [string]$GhFailMode = "",
         [string]$GhFailPath = "",
         [string]$GhPermissions = "",
-        [string]$SandboxFlag = ""
+        [string]$SandboxFlag = "",
+        [string]$GitToken = "ghs-stub-git-token-value",
+        [string]$CopilotToken = "",
+        [string]$GhAuthToken = "",
+        [string]$CredentialFileCapture = ""
     )
 
     $hostExe = (Get-Process -Id $PID).Path
@@ -744,8 +783,14 @@ function Invoke-SquadCliCapture {
                   "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
                   "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
                   "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
+                  "SQUAD_STUB_ACA_SEED_RC", "SQUAD_STUB_ACA_SEED_STDIN", "SQUAD_STUB_ACA_VAULT_MODE",
+                  "SQUAD_STUB_ACA_CRED_RC", "SQUAD_STUB_ACA_CRED_ERR", "SQUAD_STUB_ACA_CRED_ID",
+                  "SQUAD_STUB_ACA_CRED_STDIN", "SQUAD_STUB_ACA_CREDDEL_RC", "SQUAD_STUB_ACA_CREDDEL_ERR",
                   "SQUAD_ACA_ENABLE_SANDBOX", "SQUAD_ACA_SANDBOX_CLI",
                   "SQUAD_STUB_GH_PUSH", "SQUAD_STUB_GH_LOGIN", "SQUAD_STUB_GH_API_RC",
+                  "SQUAD_STUB_GH_AUTH_TOKEN",
+                  "SQUAD_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN",
+                  "SQUAD_COPILOT_GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN",
                   "SQUAD_GH_BIN", "FAKE_GH_STATE", "FAKE_GH_FAIL_MODE", "FAKE_GH_FAIL_PATH",
                   "FAKE_GH_PERMISSIONS", "FAKE_GH_LOGIN", "SQUAD_CALL_LOG",
                   "SQUAD_LEASE_NOW", "SQUAD_LEASE_TTL_SECONDS", "SQUAD_LEASE_BRANCH")
@@ -799,6 +844,22 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
         $env:SQUAD_STUB_ACA_POLL_DIR = ""
         $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
+        $env:SQUAD_STUB_ACA_SEED_RC = "0"
+        # An UNSET stub knob is not a default -- cmd expands it to the literal
+        # `%NAME%`, which is never "0", so the fake `aca` takes its failure
+        # branch and returns nothing. Every knob the fake reads must be pinned.
+        $env:SQUAD_STUB_ACA_CRED_RC = "0"
+        $env:SQUAD_STUB_ACA_CRED_ERR = ""
+        $env:SQUAD_STUB_ACA_CRED_ID = ""
+        $env:SQUAD_STUB_ACA_CRED_STDIN = ""
+        $env:SQUAD_STUB_ACA_CREDDEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CREDDEL_ERR = ""
+        # The provider REFUSES to upload a credential into a state directory that
+        # is not 0700, so the stub reports a real mode. A test that needs the
+        # refusal sets this to something else after the capture environment is
+        # built.
+        if (-not $env:SQUAD_STUB_ACA_VAULT_MODE) { $env:SQUAD_STUB_ACA_VAULT_MODE = "700" }
+        $env:SQUAD_STUB_ACA_SEED_STDIN = $CredentialFileCapture
         # THE golden-portability pin for Sprint 5. A CLI capture must always be
         # taken with the sandbox feature flag OFF, whatever the developer's shell
         # happens to have exported -- that is what makes "flag off is
@@ -828,6 +889,17 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_GH_PUSH = $GhPush
         $env:SQUAD_STUB_GH_LOGIN = $GhLogin
         $env:SQUAD_STUB_GH_API_RC = "$GhApiExitCode"
+        # The sandbox plane resolves its credentials from this environment
+        # (scripts/squad-aca.ps1, Resolve-SessionSandboxCredential). Pinning
+        # every source keeps a capture a property of the stub: an exported
+        # GH_TOKEN on the developer's box can neither rescue a refusal test nor
+        # break a dispatch test.
+        $env:SQUAD_GITHUB_TOKEN = ""
+        $env:GH_TOKEN = $GitToken
+        $env:GITHUB_TOKEN = ""
+        $env:SQUAD_COPILOT_GITHUB_TOKEN = $CopilotToken
+        $env:COPILOT_GITHUB_TOKEN = ""
+        $env:SQUAD_STUB_GH_AUTH_TOKEN = $GhAuthToken
         $env:SQUAD_CALL_LOG = $Stub.CallLog
         $env:SQUAD_LEASE_NOW = "2024-05-01T00:00:00.000Z"
         $env:SQUAD_LEASE_TTL_SECONDS = "3600"

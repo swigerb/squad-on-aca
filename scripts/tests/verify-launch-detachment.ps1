@@ -147,24 +147,35 @@ $launch = New-SandboxLaunchCommand `
 
 $settle = $WorkerSeconds + 2
 
-# The credential-staging half of the probe. Sprint 7 delivers the git/`gh`
-# token on the STDIN of a staging exec, into a umask-077 file that the launch
-# command sources and deletes. Every one of those claims is behavioural, so
-# each is checked by running the shipping strings in a real shell:
+# The credential-staging half of the probe. Sprint 7 delivers the worker's
+# credentials on the STDIN of a staging exec, into a umask-077 file that the
+# launch command sources and deletes. Every one of those claims is behavioural,
+# so each is checked by running the shipping strings in a real shell:
 #
-#   * the token is written on stdin, never as an argument -- proven by the
-#     command containing none of it while the worker still ends up with it;
+#   * the tokens are written on stdin, never as an argument -- proven by the
+#     command containing none of them while the worker still ends up with them;
 #   * the file is 0600 from the instant it exists -- `umask 077` before the
 #     redirection, not a chmod afterwards, which would leave a window;
 #   * the launch sources it and REMOVES it -- so its on-disk lifetime is the
 #     gap between two execs;
-#   * the value survives verbatim -- `IFS= read -r` plus `printf '%s'`, so no
-#     field splitting, no backslash processing, no lost trailing characters.
+#   * the values survive verbatim -- `IFS= read -r` plus `printf '%s'`, so no
+#     field splitting, no backslash processing, no lost trailing characters;
+#   * the two PLANES stay separate -- the shipping default stages the git
+#     credential and the Copilot credential from two different stdin lines, and
+#     the probe feeds two DIFFERENT values so a generator that wrote one plane's
+#     token under the other plane's name is caught rather than masked by using
+#     the same value twice.
 #
-# The token used here is a throwaway literal generated per run; it never
-# leaves the probe's own shell.
+# The tokens used here are throwaway literals generated per run; they never
+# leave the probe's own shell.
 $probeToken = "sq-probe-" + [guid]::NewGuid().ToString("N")
-$seed = New-SandboxCredentialSeedCommand -StateDir $probeDir
+$probeCopilotToken = "sq-copilot-" + [guid]::NewGuid().ToString("N")
+$probeStaging = Get-SandboxCredentialStaging -WorkerSecrets @{
+    GH_TOKEN             = $probeToken
+    COPILOT_GITHUB_TOKEN = $probeCopilotToken
+}
+$vaultCommand = New-SandboxCredentialVaultCommand -StateDir $probeDir
+$credFileName = $script:SandboxCredentialFileName
 $launchWithCreds = New-SandboxLaunchCommand `
     -Environment ([ordered]@{ SQUAD_DETACH_PROBE = "1" }) `
     -StateDir $probeDir `
@@ -197,7 +208,19 @@ if ($guardErr -notmatch "\[squad-sandbox:capability\]") {
 if ($guardErr -match [regex]::Escape($probeToken)) {
     $staticLeaks += "the launch generator's refusal echoed the token value"
 }
-if ($launchWithCreds -match "GH_TOKEN=" -or $launchWithCreds -match "GITHUB_TOKEN=") { $staticLeaks += "the launch command still assigns a token-bearing env var" }
+if ($launchWithCreds -match "GH_TOKEN=" -or $launchWithCreds -match "GITHUB_TOKEN=" -or $launchWithCreds -match "COPILOT_GITHUB_TOKEN=") { $staticLeaks += "the launch command still assigns a token-bearing env var" }
+
+# The Copilot plane is a credential too. If it is not on the launch generator's
+# deny list, a future change can put COPILOT_GITHUB_TOKEN back into argv.
+$copilotGuardErr = ""
+try {
+    New-SandboxLaunchCommand `
+        -Environment ([ordered]@{ SQUAD_DETACH_PROBE = "1"; COPILOT_GITHUB_TOKEN = $probeCopilotToken }) `
+        -StateDir $probeDir -Entrypoint "$probeDir/worker.sh" | Out-Null
+} catch { $copilotGuardErr = [string]$_.Exception.Message }
+if ($copilotGuardErr -notmatch "\[squad-sandbox:capability\]") {
+    $staticLeaks += "the launch generator accepted a credential-bearing env assignment (COPILOT_GITHUB_TOKEN) instead of refusing it (error was: '$copilotGuardErr')"
+}
 
 $script = @"
 set -u
@@ -217,26 +240,40 @@ echo "EXIT_FILE=`$(cat "`$S/exit-code" 2>/dev/null)"
 if [ -f "`$S/done" ]; then echo "MARKER=done"; else echo "MARKER=absent"; fi
 rm -rf "`$S"
 
-# ---- credential staging -------------------------------------------------
-rm -rf "`$S"; mkdir -p "`$S"
-printf '%s\n' '#!/usr/bin/env bash' '{ ps -ww -eo args= 2>/dev/null; cat /proc/*/cmdline 2>/dev/null | tr "\0" " "; } > "$probeDir/argv-snapshot"' 'printf %s "`${GH_TOKEN:-MISSING}" > "$probeDir/seen-token"' 'printf %s "`${GITHUB_TOKEN:-MISSING}" > "$probeDir/seen-token2"' > "`$S/worker.sh"
+# ---- credential delivery ------------------------------------------------
+rm -rf "`$S"
+printf '%s\n' '#!/usr/bin/env bash' '{ ps -ww -eo args= 2>/dev/null; cat /proc/*/cmdline 2>/dev/null | tr "\0" " "; } > "$probeDir/argv-snapshot"' 'printf %s "`${GH_TOKEN:-MISSING}" > "$probeDir/seen-token"' 'printf %s "`${GITHUB_TOKEN:-MISSING}" > "$probeDir/seen-token2"' 'printf %s "`${COPILOT_GITHUB_TOKEN:-MISSING}" > "$probeDir/seen-token3"' > /tmp/squad-probe-worker.sh
+# The SHIPPING vault command, run verbatim. It must create the state directory
+# and report the mode it actually achieved.
+VAULTOUT=`$( $vaultCommand )
+echo "VAULT=`$VAULTOUT"
+mv /tmp/squad-probe-worker.sh "`$S/worker.sh"
 chmod +x "`$S/worker.sh"
-# The token goes in on STDIN. It is in no argument vector of anything below.
-printf '%s\n' '$probeToken' | ( $seed )
+# `aca sandbox fs write` uploads as ROOT with mode 0644 and the session user
+# cannot chmod a root-owned file. Reproduce that exactly -- writing the file
+# 0600 here would test a permission the platform never grants and would hide the
+# fact that the DIRECTORY is the only real control.
+cat > "`$S/$credFileName" <<'SQUADPROBECREDS'
+$($probeStaging.Content.TrimEnd("`n"))
+SQUADPROBECREDS
+chmod 644 "`$S/$credFileName"
 echo "STAGED=`$?"
-if [ -f "`$S/.squad-creds" ]; then echo "CREDFILE=present"; else echo "CREDFILE=absent"; fi
-echo "CREDMODE=`$(stat -c %a "`$S/.squad-creds" 2>/dev/null)"
+if [ -f "`$S/$credFileName" ]; then echo "CREDFILE=present"; else echo "CREDFILE=absent"; fi
+echo "CREDMODE=`$(stat -c %a "`$S/$credFileName" 2>/dev/null)"
+echo "VAULTMODE=`$(stat -c %a "`$S" 2>/dev/null)"
 out2=`$($launchWithCreds)
 echo "OUT2=`$out2"
 sleep 2
 echo "SEEN=`$(cat "`$S/seen-token" 2>/dev/null)"
 echo "SEEN2=`$(cat "`$S/seen-token2" 2>/dev/null)"
-# The worker held the token in its ENVIRONMENT at the instant of this snapshot
-# (SEEN= above proves that). No process may have held it in its ARGV.
+echo "SEEN3=`$(cat "`$S/seen-token3" 2>/dev/null)"
+# The worker held the tokens in its ENVIRONMENT at the instant of this snapshot
+# (SEEN= above proves that). No process may have held either in its ARGV.
 if [ ! -s "`$S/argv-snapshot" ]; then echo "ARGVLEAK=unchecked"
 elif grep -qF '$probeToken' "`$S/argv-snapshot"; then echo "ARGVLEAK=present"
+elif grep -qF '$probeCopilotToken' "`$S/argv-snapshot"; then echo "ARGVLEAK=present"
 else echo "ARGVLEAK=absent"; fi
-if [ -f "`$S/.squad-creds" ]; then echo "CREDFILE_AFTER=present"; else echo "CREDFILE_AFTER=absent"; fi
+if [ -f "`$S/$credFileName" ]; then echo "CREDFILE_AFTER=present"; else echo "CREDFILE_AFTER=absent"; fi
 rm -rf "`$S"
 "@ -replace "`r`n", "`n"
 
@@ -260,15 +297,19 @@ if ($out -notmatch "PHASE_FINAL=done") { $failures += "the detached worker never
 if ($out -notmatch "EXIT_FILE=0") { $failures += "the detached wrapper did not record the worker's exit code" }
 if ($out -notmatch "MARKER=done") { $failures += "the detached wrapper never touched the completion marker" }
 
-# --- credential staging ---------------------------------------------------
+# --- credential delivery --------------------------------------------------
 $failures += $staticLeaks
-if ($out -notmatch "STAGED=0") { $failures += "the staging command did not succeed reading the token from stdin" }
-if ($out -notmatch "CREDFILE=present") { $failures += "the staging command did not create the credential file" }
-if ($out -notmatch "CREDMODE=600") { $failures += "the credential file is not 0600 (umask 077 must apply at creation; a later chmod leaves a readable window)" }
-if ($out -notmatch ("SEEN=" + [regex]::Escape($probeToken))) { $failures += "the worker did not receive the staged token verbatim -- delivery is broken, or the value was mangled by field splitting" }
+if ($out -notmatch "VAULT=squad-credentials-vault-700") { $failures += "the vault command did not create the state directory at mode 700 -- the uploaded credential file is root-owned 0644 and cannot be chmod'ed by the session user, so the DIRECTORY is the only thing keeping it private" }
+if ($out -notmatch "VAULTMODE=700") { $failures += "the state directory holding the credential file is not 0700 on disk" }
+if ($out -notmatch "STAGED=0") { $failures += "the credential file could not be written" }
+if ($out -notmatch "CREDFILE=present") { $failures += "no credential file was staged" }
+if ($out -notmatch ("SEEN=" + [regex]::Escape($probeToken))) { $failures += "the worker did not receive the staged git token verbatim -- delivery is broken, or the value was mangled by field splitting" }
 if ($out -notmatch ("SEEN2=" + [regex]::Escape($probeToken))) { $failures += "GITHUB_TOKEN was not staged alongside GH_TOKEN" }
-if ($out -notmatch "CREDFILE_AFTER=absent") { $failures += "the credential file survived the launch -- it must be removed as soon as it is sourced, so its on-disk lifetime is the gap between two execs" }
-if ($out -match "ARGVLEAK=present") { $failures += "the staged token appeared in a process ARGUMENT VECTOR while the worker ran -- argv is readable by every process in the sandbox, which is the exposure stdin staging exists to avoid" }
+if ($out -notmatch ("SEEN3=" + [regex]::Escape($probeCopilotToken))) { $failures += "the worker did not receive the staged COPILOT_GITHUB_TOKEN -- the Copilot plane is not delivered, which is exactly the 'No authentication information found' failure the sandbox plane hit in live E2E" }
+if ($out -match ("SEEN3=" + [regex]::Escape($probeToken))) { $failures += "the Copilot plane received the GIT plane's token -- the planes are not mapped to their own names" }
+if ($out -match ("SEEN=" + [regex]::Escape($probeCopilotToken))) { $failures += "the git plane received the COPILOT plane's token -- the planes are not mapped to their own names" }
+if ($out -notmatch "CREDFILE_AFTER=absent") { $failures += "the credential file survived the launch -- it must be removed as soon as it is sourced, so its on-disk lifetime is the gap between the upload and the launch" }
+if ($out -match "ARGVLEAK=present") { $failures += "a staged token appeared in a process ARGUMENT VECTOR while the worker ran -- argv is readable by every process in the sandbox, which is the exposure file delivery exists to avoid" }
 if ($out -notmatch "ARGVLEAK=(present|absent)") { $failures += "the argv sweep did not run, so 'the token never reaches an argv' is UNVERIFIED (a check that cannot observe is not a pass)" }
 if ($out -match [regex]::Escape($probeToken) -and $out -notmatch ("SEEN=" + [regex]::Escape($probeToken))) { $failures += "the token appeared in probe output outside the worker's own read-back" }
 
@@ -278,7 +319,7 @@ Write-Host ""
 
 if ($failures.Count -eq 0) {
     Write-Host "PASS: the emitted launch command detaches - the caller's streams reached EOF in ${elapsed}ms while a ${WorkerSeconds}s worker kept running, and the wrapper recorded exit code then completion marker." -ForegroundColor Green
-    Write-Host "PASS: the credential staged on STDIN reached the worker verbatim through a 0600 file that the launch sourced and removed, the launch generator REFUSES a credential-bearing env assignment, and no process held the token in its argv while the worker held it in its environment." -ForegroundColor Green
+    Write-Host "PASS: the credentials delivered as a FILE reached the worker verbatim -- the state directory is 0700 (the only control the platform allows, since 'aca sandbox fs write' uploads root-owned 0644), the launch sourced the file and removed it, the git and Copilot planes each received their OWN value, the launch generator REFUSES a credential-bearing env assignment, and no process held either token in its argv while the worker held them in its environment." -ForegroundColor Green
     exit 0
 }
 
