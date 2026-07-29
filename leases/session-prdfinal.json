@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-prdfinal",
+  "sessionId": "prdfinal",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "sandbox",
+  "executionMode": "sandbox",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-07-29T23:49:50.258Z",
+  "lastHeartbeatAt": "2026-07-29T23:49:50.258Z",
+  "updatedAt": "2026-07-29T23:49:50.258Z",
+  "terminalReason": null,
+  "executionRef": null
+}
