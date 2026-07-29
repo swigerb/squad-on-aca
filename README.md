@@ -19,6 +19,7 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Unattended work | ACA watcher app running `squad watch --execute` |
 | Secure image pulls | ACR plus user-assigned managed identity |
 | Token storage | ACA secrets by default; optional Key Vault references with `-UseKeyVault` |
+| Second execution plane (opt-in preview) | ACA Sandboxes behind `SQUAD_ACA_ENABLE_SANDBOX`, for per-session isolation and default-deny egress. Off by default; ACA Jobs stay the default and the rollback path |
 | CI/CD | GitHub Actions workflow with Azure OIDC login |
 
 ## Quick start
@@ -248,6 +249,86 @@ error when a required tool or credential is missing instead of failing mid-task.
 The manifest never carries shell commands, and the check adds no network, RBAC,
 or egress. See [docs/capability-manifest.md](docs/capability-manifest.md) for the
 manifest contract, built-in allowlists, security posture, and configuration.
+
+The manifest also produces a deterministic routing decision — run on the default
+ACA job, run on an approved sandbox class, or fail closed. ACA Sandboxes are the
+execution plane that decision can route to, and they are described next.
+
+## ACA Sandboxes (opt-in preview)
+
+**Azure Container Apps Sandboxes** are a second execution plane alongside ACA
+Jobs, not a replacement. ACA Jobs remain the unconditional default and the
+rollback path. Sandboxes are a public preview with no SLA, so the plane is off
+by default and stays off until you turn it on for a specific invocation.
+
+### What it does today
+
+Enabling the flag opens the route gate and nothing more. No `squad-aca` command
+yet passes the capability resolution to `New-SessionExecutionProvider`, so every
+dispatch reaches the gate with no decision and routes to `aca-job`. Turning the
+flag on changes nothing observable yet. Wiring the resolution through is later
+work, so do not plan real sessions on this plane.
+
+### How to enable it
+
+```powershell
+$env:SQUAD_ACA_ENABLE_SANDBOX = "1"     # accepted: 1 / true / yes / on / enabled
+squad-aca run "<prompt>"
+```
+
+The flag is an environment variable rather than a config key on purpose: it is
+per-invocation, nothing that syncs config can turn it on, and rolling back needs
+no file edit. `0`, `false`, `no`, and `off` are an explicit kill switch.
+
+### Two independent fail-closed interlocks
+
+Both must be open before a dispatch can reach a sandbox, so clearing either one
+returns every dispatch to ACA Jobs:
+
+1. **The feature flag defaults off.** With it unset, `New-SessionExecutionProvider`
+   returns the ACA Jobs adapter before it reads the class catalog, resolves a
+   route, or looks for the `aca` binary.
+2. **The class catalog ships provisional.** `config/sandbox-classes.json` sets
+   `"provisional": true` with placeholder images, egress rules, and cost
+   ceilings, so the sandbox route fails closed **even with the flag on**
+   (`reason: catalog-provisional`). An administrator must review each class,
+   pin real image references, and set `"provisional": false`.
+
+### Why the plane exists
+
+Sandboxes give a session two properties the ACA Jobs plane does not have:
+
+- **Per-session isolation.** Each session gets its own sandbox rather than a
+  replica of a shared, fixed worker image.
+- **Default-deny, capability-scoped egress.** A class declares
+  `defaultAction: Deny` plus an allowlist, applied before any repository code
+  runs. Feasibility testing measured allowlisted hosts returning `200`,
+  non-allowlisted hosts returning `403`, and raw non-HTTP TCP refused, with an
+  auditable allow/deny trail from `aca sandbox egress decisions`.
+
+### Prerequisites
+
+- **The standalone `aca` CLI.** Sandboxes are not driven by `az`; there is no
+  `az containerapp sandbox` command.
+- **A sandbox group with no managed identity.** Identity on ACA Sandboxes is
+  group-scoped with no per-sandbox opt-out, so a group carrying one would let
+  sandboxed code mint control-plane tokens. The provider verifies the group is
+  identity-free and refuses to create a sandbox if it cannot prove that.
+
+### Where to go next
+
+- [docs/runbook.md](docs/runbook.md#aca-sandboxes-preview-feature-flagged-off) —
+  [prerequisites](docs/runbook.md#prerequisites),
+  [credentials](docs/runbook.md#credentials-four-planes-kept-separate),
+  [concurrency, cost and orphans](docs/runbook.md#concurrency-cost-and-orphans),
+  [rollback](docs/runbook.md#rollback-to-aca-jobs), and the
+  [incident runbook](docs/runbook.md#incident-runbook).
+- [docs/architecture.md](docs/architecture.md#aca-sandboxes-provider-feature-flagged-default-off) —
+  the provider boundary, the route gate, and the security invariants.
+- [docs/rollback.md](docs/rollback.md#2-aca-sandboxes-feature-flagged-preview) —
+  the rollback procedure and its verification checklist.
+- [docs/adr/0001-aca-sandboxes-feasibility.md](docs/adr/0001-aca-sandboxes-feasibility.md) —
+  the feasibility evidence and the decision to adopt the plane as opt-in.
 
 ## Security notes
 
