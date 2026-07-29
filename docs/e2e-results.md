@@ -421,3 +421,148 @@ PASS
 - Live-Azure evidence: **PASS** (L1-L6, L7a scheduled path, L7b manual
   `squad-aca ralph run` CLI path, and L8 review-fix/capability regression pass
   recorded above).
+
+---
+
+# Sprint 0 regression contract (golden record)
+
+This section is the **regression contract** for the PRD [#6](https://github.com/swigerb/squad-on-aca/issues/6)
+sandbox programme. It records the observable behaviour of the ACA Jobs plane
+*before* any sandbox work. Every later sprint must re-run these checks and
+reproduce this output. Anything that differs is a regression, not a feature.
+
+- **Date (UTC):** 2026-07-29
+- **Commit at capture:** `742e20e` (Sprint 0 guardrails merged)
+- **Resource group:** `rg-squad-aca-dev-eastus2` (subscription/tenant GUIDs redacted)
+- **Worker image:** `squad-worker:a388d7e`
+- **Run by:** repository owner
+
+## S0-1 — Static gate
+
+```powershell
+pwsh -NoProfile -File .\scripts\validate.ps1
+```
+
+```text
+=== Summary ===
+  Passed: 35
+  Failed: 0
+
+All validation checks passed.
+VALIDATE_EXIT=0
+```
+
+## S0-2 — Worker suite (Linux)
+
+The suite **cannot** run under Git Bash/Cygwin — the preflight's hardened
+temp-dir guard correctly refuses a predictable temp path. Run under Linux:
+
+```bash
+bash worker/tests/run-tests.sh
+```
+
+```text
+11 assertions run, 0 failed.   # test_git_checkout.sh
+62 assertions run, 0 failed.   # test_parse_capabilities.sh
+40 assertions run, 0 failed.   # test_preflight.sh
+23 assertions run, 0 failed.   # test_ralph_dispatch.sh
+43 assertions run, 0 failed.   # test_run_tests.sh
+Suites: 5 passed, 0 failed, 0 skipped.
+All worker capability tests passed.
+```
+
+**179 assertions across 5 suites.** No later sprint may reduce this.
+
+## S0-3 — `doctor` against live Azure
+
+```text
+Check           Status Detail
+-----           ------ ------
+git             ok     Required for repo and Squad state sync
+gh              ok     Required for GitHub repo/PR/issue access
+az              ok     Required for ACA job control
+squad           ok     Used by init; npx fallback is available
+GitHub repo     ok     swigerb/squad-on-aca
+.squad          ok     Required for existing-repo dispatch
+GitHub auth     ok     gh auth status succeeded
+Azure auth      ok     <subscription redacted>
+ACA session job ok     rg-squad-aca-dev-eastus2/caj-squad-aca-session
+Ralph job       ok     caj-squad-aca-ralph
+Aspire URL      ok     https://ca-squad-aca-aspire.<region-suffix>.azurecontainerapps.io/login?t=<redacted>
+
+DOCTOR_EXIT=0
+```
+
+## S0-4 — `status` and `sessions`
+
+Both exit 0. `status` lists the Aspire and Watch container apps as
+`Succeeded`/`Running`, plus recent session and Ralph executions. `sessions`
+resolves execution → session name, mode, repository, and branch.
+
+Ralph's scheduled trigger was observed firing every 5 minutes with consecutive
+`Succeeded` executions, confirming the autonomous path is live.
+
+## S0-5 — Live dispatch (`smoke`), end to end
+
+```powershell
+pwsh -NoProfile -File .\scripts\squad-aca.ps1 smoke
+```
+
+Started execution `caj-squad-aca-session-guwi8zw`; terminal state:
+
+```json
+{ "name": "caj-squad-aca-session-guwi8zw", "status": "Succeeded",
+  "start": "2026-07-29T02:08:59+00:00", "end": "2026-07-29T02:10:22+00:00" }
+```
+
+Worker trace (via Log Analytics):
+
+```text
+[squad-on-aca] Squad: 0.11.0
+[squad-on-aca] Node: v24.18.0
+[squad-on-aca] Copilot: GitHub Copilot CLI 1.0.69-2.
+[squad-on-aca] Squad deployment mode: squad-per-pod
+[squad-on-aca] GitHub repository: swigerb/squad-on-aca
+Cloning into '/workspace/smoke-.../repo'...
+[squad-on-aca] Mode: smoke
+[capability-preflight] No capability manifest at squad-capabilities.yml; skipping (safe default).
+[squad-on-aca] Copilot flags: --yolo --agent squad --remote --no-auto-update
+Squad v0.11.0 - remote container is operational and responding normally.
+```
+
+This is the **no-manifest path** the PRD requires to remain unchanged: preflight
+skips with a safe default and the ACA Job runs exactly as before.
+
+## S0-6 — `stop`
+
+```text
+"Job Execution: caj-squad-aca-session-guwi8zw, stopped successfully."
+STOP_EXIT=0
+```
+
+## S0-7 — Secret-leak probe
+
+Queried the execution's console logs for `ghp_`, `gho_`, `github_pat_`,
+`SQUAD_PROMPT=`, and `GITHUB_TOKEN=`:
+
+```text
+SECRET-LEAK PROBE: PASS - no tokens or prompt bodies in worker logs
+```
+
+## S0-8 — `logs` — **FAIL (defect found, tracked as [#13](https://github.com/swigerb/squad-on-aca/issues/13))**
+
+`squad-aca logs <execution>` requires the `containerapp` az extension, which
+could not be installed in this environment (the 32-bit Azure CLI's bundled
+Python lacks `_ctypes`). The command emitted an interactive install prompt and
+an `EOFError`, produced no output, and **still exited 0**.
+
+Logs remained retrievable through Log Analytics (`law-squad-aca`), which needs
+no extension. This is an observability defect plus a false-green exit code, not
+data loss. It is the one gap in an otherwise green baseline.
+
+## Baseline verdict
+
+The ACA Jobs plane is **healthy and fit to build on**: 7 of 8 checks pass, and
+the single failure is a logging-path defect with a working fallback and a
+tracked fix. Sandbox work may proceed.
+
