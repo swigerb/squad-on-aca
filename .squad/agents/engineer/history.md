@@ -89,3 +89,74 @@ differs only by the new row.
 `law-squad-aca` workspace in this session — the query shape is the one already
 recorded in issue #13 as verified live, and everything here was proven offline
 with a stubbed CLI.
+## 2026-07-28: Sprint 2 — capability routing decision (issue #6)
+
+Branch `squad/6-s2-capability-resolution`. Routing decision only: computed and
+reported, never acted upon. No sandbox is created, no dispatch changes, no
+execution-path changes.
+
+- **Resolver.** New `worker/lib/resolve-capability-route.js` builds on the
+  existing `parse-capabilities.js` (requires and reuses its parser/validator;
+  that file is untouched) and emits stable JSON — `schemaVersion`, `route`,
+  `reason`, `requiredTools[]`, `requiredCredentials[]`, `egressHosts[]`,
+  `imageHint`, `defaultImageSufficient`, `sandboxClass`, `manifestPresent`,
+  `manifestVersion`, plus hint provenance, unsatisfied-requirement lists,
+  catalog provenance, and a fixed `detail` string. Fixed key order, arrays
+  de-duplicated and sorted by code unit, so it is golden-testable and diffable.
+  Routes: no manifest → `aca-job` (preserved byte-for-byte), satisfied by the
+  default profile → `aca-job`, exceeds it with an approved class → `sandbox`,
+  otherwise → `fail-closed`. Malformed/invalid manifests, unsafe manifest
+  paths, and unusable catalogs all fail closed, never a silent `aca-job`.
+- **Administrator catalog.** New `config/sandbox-classes.json`, control-plane
+  owned and explicitly not repository-controlled. Each class pins id, image
+  reference, resource limits, tools, egress host templates, allowed credential
+  types, and concurrency/cost limits; `defaultWorker` captures the current ACA
+  job profile so "satisfied by the default image" is data, not a hard-coded
+  branch. `egress` mirrors the real ACA Sandboxes policy shape
+  (`Microsoft.App/sandboxGroups`, `2026-02-01-preview`): `defaultAction` +
+  ordered `hostRules[]` of `{pattern, action}` + `trafficInspection`. Ships
+  `provisional: true` with a `$comment` header; every value is placeholder data
+  pending administrator review, and the decision surfaces `catalogProvisional`.
+- **Security invariants.** A manifest can only *request*; everything grantable
+  comes from the catalog. `image.hint` only disambiguates among approved
+  classes and is never used as an image reference — the emitted `imageHint` is
+  always a catalog-owned string or `null`, so a path-traversal-shaped hint
+  resolves to `null` and never reaches the output. Repository egress entries can
+  only narrow within a class template. Output carries names/counts/fixed reason
+  codes only; free-form `reason`/`notes` text never appears. An identifier that
+  is character-safe but implausibly long fails closed without being echoed.
+- **Preflight untouched as the final gate.** `squad-capability-preflight.sh`
+  changed only in two comment/doc-anchor strings (the renamed
+  `#future-per-task-images-and-sandboxes` heading and the corrected product
+  name); no logic, no guard, no exit code changed.
+- **Tests.** New `worker/tests/test_capability_routing.sh` (123 assertions) in
+  the existing style with `lib/assert.sh` + `require_deps node`, golden JSON in
+  `worker/tests/expected/` and manifests in `worker/tests/fixtures/routing-*.yml`.
+  Covers no-manifest, satisfied-by-default, sandbox-matched, no-matching-class,
+  egress-outside-template, malformed, unknown keys, duplicate keys, wrong types,
+  control characters, oversized tool/host/hint identifiers, path-traversal and
+  injection-shaped values (proving nothing leaks), symlink/absolute/escaping
+  manifest paths, catalog faults (missing, unparseable, unsupported schema),
+  egress wildcard semantics including suffix-smuggling, and determinism under
+  reordered/duplicated entries.
+- **CI/docs.** `worker-tests.yml` syntax gate now `node --check`s the resolver
+  and parses the catalog. `docs/capability-manifest.md` gained the routing
+  contract and catalog documentation; `docs/validation.md` gained the golden
+  fixture workflow and the new suite's dependencies; terminology corrected from
+  "SandboxGroups" to Azure Container Apps Sandboxes across docs.
+
+**Evidence** (WSL Ubuntu, Node 24.12.0, `bash worker/tests/run-tests.sh`):
+before 5 suites / 179 assertions (11/62/40/23/43), after 6 suites / 302
+assertions (123/11/62/40/23/43) — the 179 pre-existing assertions are unchanged
+and green, `Suites: 6 passed, 0 failed, 0 skipped.` Mutation-tested the new
+suite: making unapproved classes selectable fails 5 assertions, echoing the raw
+manifest hint fails 3, routing an invalid manifest to `aca-job` fails 32, and
+removing the identifier length bound fails 3.
+
+**Not done:** neither the resolver nor the catalog is copied into the worker
+image, and nothing calls the resolver — deliberate, since Sprint 2 must not
+change the execution path. The resolver mirrors rather than shares the
+preflight's hardened manifest-path resolution, because modifying the shipped
+preflight was out of scope; unifying them is recorded as a follow-up in
+`docs/capability-manifest.md`. The catalog remains `provisional: true` and must
+be reviewed before Sprint 5 acts on any decision.

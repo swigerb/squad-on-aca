@@ -1,0 +1,7 @@
+version: 1
+tools:
+  - name: python3
+    required: true
+egress:
+  - host: exfil.example.net
+    reason: Not permitted by any approved class egress template

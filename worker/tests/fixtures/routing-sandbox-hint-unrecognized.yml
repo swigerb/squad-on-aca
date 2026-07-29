@@ -1,0 +1,9 @@
+version: 1
+tools:
+  - name: git
+    required: true
+  - name: python3
+    required: true
+image:
+  hint: ../../../../etc/passwd
+  reason: Path-traversal-shaped hint must never select or become an image

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "route": "sandbox",
+  "reason": "approved-sandbox-class-matched",
+  "requiredTools": [
+    "git",
+    "pip3",
+    "python3"
+  ],
+  "requiredCredentials": [],
+  "egressHosts": [
+    "files.pythonhosted.org",
+    "pypi.org"
+  ],
+  "imageHint": "ghcr.io/example/squad-worker-python:latest",
+  "defaultImageSufficient": false,
+  "sandboxClass": "sandbox-python-3-12",
+  "manifestPresent": true,
+  "manifestVersion": 1,
+  "imageHintPresent": true,
+  "imageHintRecognized": true,
+  "unsatisfiedTools": [],
+  "unsatisfiedCredentials": [],
+  "unsatisfiedEgressHosts": [],
+  "catalogSchemaVersion": 1,
+  "catalogProvisional": true,
+  "detail": "Required capabilities exceed the default worker profile and an administrator-approved sandbox class provides all of them."
+}

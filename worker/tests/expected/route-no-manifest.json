@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "route": "aca-job",
+  "reason": "no-manifest",
+  "requiredTools": [],
+  "requiredCredentials": [],
+  "egressHosts": [],
+  "imageHint": null,
+  "defaultImageSufficient": true,
+  "sandboxClass": null,
+  "manifestPresent": false,
+  "manifestVersion": null,
+  "imageHintPresent": false,
+  "imageHintRecognized": false,
+  "unsatisfiedTools": [],
+  "unsatisfiedCredentials": [],
+  "unsatisfiedEgressHosts": [],
+  "catalogSchemaVersion": 1,
+  "catalogProvisional": true,
+  "detail": "No capability manifest is present, so the repository is routed to the existing ACA job unchanged."
+}
