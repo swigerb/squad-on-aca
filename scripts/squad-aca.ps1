@@ -10,6 +10,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 . (Join-Path $ScriptDir "lib\session-env.ps1")
 . (Join-Path $ScriptDir "lib\sync-safety.ps1")
+. (Join-Path $ScriptDir "lib\squad-aca-provider.ps1")
 $UserConfigDir = Join-Path $HOME ".squad-on-aca"
 $UserConfigPath = Join-Path $UserConfigDir "config.json"
 
@@ -391,6 +392,26 @@ function Invoke-Init {
     Write-Output "Next: copilot --agent squad-aca"
 }
 
+function New-SessionExecutionProvider {
+    <#
+    .SYNOPSIS
+        Returns the execution provider used for Squad session dispatch.
+
+    .DESCRIPTION
+        Single place where the CLI decides which execution substrate it is
+        talking to. Today it is always the ACA Jobs adapter, so behaviour is
+        unchanged. PRD #6 Sprint 5 adds the route decision here (the Sprint 2
+        capability resolver emits aca-job | sandbox | fail-closed); every call
+        site below already speaks the provider contract and holds only opaque
+        handles, so none of them has to change when that happens.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Config)
+    return New-SquadExecutionProvider -Kind "aca-job" -Options @{
+        Config    = $Config
+        ScriptDir = $ScriptDir
+    }
+}
+
 function Invoke-Run {
     param([string[]]$Items, [string]$FirstPrompt = "")
     $config = Assert-AcaConfigured
@@ -405,18 +426,17 @@ function Invoke-Run {
     if (-not $prompt) { throw "Provide a prompt, e.g. squad-aca `"Build the API and open a PR`"." }
 
     $ref = Sync-LocalSquadState -SyncAll:(Has-Option $Items @("--sync-all"))
-    $start = Join-Path $ScriptDir "start-session.ps1"
-    & $start `
-        -ResourceGroupName $config.resourceGroup `
-        -JobName $config.sessionJob `
+    $request = New-SquadDispatchRequest `
+        -SessionId $session `
+        -DispatchSource "local-cli" `
         -Repository $repo `
         -Ref $ref `
-        -Mode prompt `
-        -SessionName $session `
         -Prompt $prompt `
+        -Mode "prompt" `
         -SubSquad $subSquad `
-        -PushChanges:(-not (Has-Option $Items @("--no-push"))) `
+        -PushChanges (-not (Has-Option $Items @("--no-push"))) `
         -OutputBranch $branch
+    Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Request $request
 }
 
 function Test-Command {
@@ -473,27 +493,17 @@ function Invoke-Doctor {
 }
 
 function Get-SessionExecutions {
+    <#
+    .SYNOPSIS
+        Recent session executions as provider records (opaque Handle + Display).
+
+    .DESCRIPTION
+        Callers use $record.Handle for every lifecycle operation and
+        $record.Display purely for rendering. Nothing here knows the handle is
+        an ACA Job execution name.
+    #>
     param([object]$Config, [int]$Limit = 10)
-    $names = az containerapp job execution list --name $Config.sessionJob --resource-group $Config.resourceGroup --query "[0:$Limit].name" -o json | ConvertFrom-Json
-    $items = @()
-    foreach ($name in $names) {
-        $execution = az containerapp job execution show --name $Config.sessionJob --resource-group $Config.resourceGroup --job-execution-name $name -o json | ConvertFrom-Json
-        $env = @{}
-        foreach ($e in $execution.properties.template.containers[0].env) {
-            if ($e.name) { $env[$e.name] = $e.value }
-        }
-        $items += [pscustomobject]@{
-            Execution = $name
-            Status = $execution.properties.status
-            Session = $env["SESSION_NAME"]
-            Mode = $env["SQUAD_MODE"]
-            Repository = $env["GITHUB_REPOSITORY"]
-            Branch = $env["GITHUB_REF"]
-            Started = $execution.properties.startTime
-            Ended = $execution.properties.endTime
-        }
-    }
-    return $items
+    return Get-SquadExecutionList -Provider (New-SessionExecutionProvider -Config $Config) -Limit $Limit
 }
 
 function Get-FirstPositional {
@@ -523,7 +533,7 @@ function Resolve-SessionExecution {
         throw "No session executions found."
     }
     $items = Get-SessionExecutions -Config $Config -Limit 50
-    $match = $items | Where-Object { $_.Execution -eq $Session -or $_.Session -eq $Session } | Select-Object -First 1
+    $match = $items | Where-Object { $_.Display.Execution -eq $Session -or $_.Display.Session -eq $Session } | Select-Object -First 1
     if (-not $match) {
         throw "Could not find session or execution '$Session'. Run 'squad-aca sessions' to list recent sessions."
     }
@@ -535,7 +545,7 @@ function Invoke-Sessions {
     $config = Assert-AcaConfigured
     $limitText = Get-OptionValue $Items @("--limit", "-Limit") "10"
     $limit = [int]$limitText
-    Get-SessionExecutions -Config $config -Limit $limit | Format-Table -AutoSize
+    Get-SessionExecutions -Config $config -Limit $limit | ForEach-Object { $_.Display } | Format-Table -AutoSize
 }
 
 function Invoke-Logs {
@@ -544,12 +554,10 @@ function Invoke-Logs {
     $session = Get-FirstPositional $Items @("--tail", "-Tail")
     $tail = [int](Get-OptionValue $Items @("--tail", "-Tail") "100")
     $execution = Resolve-SessionExecution -Config $config -Session $session
-    az containerapp job logs show `
-        --name $config.sessionJob `
-        --resource-group $config.resourceGroup `
-        --execution $execution.Execution `
-        --container $config.sessionJob `
-        --tail $tail
+    Get-SquadExecutionLog `
+        -Provider (New-SessionExecutionProvider -Config $config) `
+        -Handle $execution.Handle `
+        -Tail $tail
 }
 
 function Invoke-Open {
@@ -566,8 +574,8 @@ function Invoke-Open {
     }
     $execution = Resolve-SessionExecution -Config $config -Session $session
     $opened = $false
-    if ($execution.Repository -and $execution.Branch) {
-        $prs = gh pr list --repo $execution.Repository --head $execution.Branch --json url --limit 1 2>$null | ConvertFrom-Json
+    if ($execution.Display.Repository -and $execution.Display.Branch) {
+        $prs = gh pr list --repo $execution.Display.Repository --head $execution.Display.Branch --json url --limit 1 2>$null | ConvertFrom-Json
         if ($prs -and $prs[0].url) {
             Start-Process $prs[0].url
             Write-Output $prs[0].url
@@ -604,7 +612,10 @@ function Invoke-Stop {
     $config = Assert-AcaConfigured
     $session = Get-FirstPositional $Items
     $execution = Resolve-SessionExecution -Config $config -Session $session
-    az containerapp job stop --name $config.sessionJob --resource-group $config.resourceGroup --job-execution-name $execution.Execution
+    # cancel, not terminate: `stop` keeps the substrate's own result and output
+    # verbatim, including failures. The idempotent teardown lives on the
+    # provider's terminate operation and is deliberately not wired here.
+    Stop-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Handle $execution.Handle
 }
 
 function Invoke-Watch {
@@ -737,7 +748,12 @@ function Invoke-Telemetry {
     $config = Assert-AcaConfigured
     $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
     if (-not $repo) { throw "No GitHub repo detected. Pass --repo <owner/repo>." }
-    & (Join-Path $ScriptDir "start-session.ps1") -ResourceGroupName $config.resourceGroup -JobName $config.sessionJob -Repository $repo -Mode telemetry-smoke -SessionName "telemetry-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    $request = New-SquadDispatchRequest `
+        -SessionId "telemetry-$(Get-Date -Format 'yyyyMMdd-HHmmss')" `
+        -DispatchSource "local-cli" `
+        -Repository $repo `
+        -Mode "telemetry-smoke"
+    Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Request $request
     if ($config.aspireLoginUrl) { Write-Output "Aspire: $($config.aspireLoginUrl)" }
 }
 
@@ -843,7 +859,13 @@ switch ($Command.ToLowerInvariant()) {
         $config = Assert-AcaConfigured
         $repo = Get-OptionValue $Arguments @("--repo", "-Repository") (Get-CurrentRepo)
         if (-not $repo) { throw "No GitHub repo detected. Pass --repo <owner/repo>." }
-        & (Join-Path $ScriptDir "start-session.ps1") -ResourceGroupName $config.resourceGroup -JobName $config.sessionJob -Repository $repo -Mode smoke -RunCopilotSmoke -SessionName "smoke-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        $request = New-SquadDispatchRequest `
+            -SessionId "smoke-$(Get-Date -Format 'yyyyMMdd-HHmmss')" `
+            -DispatchSource "local-cli" `
+            -Repository $repo `
+            -Mode "smoke" `
+            -RunCopilotSmoke $true
+        Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $config) -Request $request
     }
     "status" {
         $config = Assert-AcaConfigured
