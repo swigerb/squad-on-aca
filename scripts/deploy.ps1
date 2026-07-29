@@ -343,6 +343,7 @@ $outputs = [ordered]@{
     watchApp = $watchName
     defaultRepository = $DefaultRepository
     defaultRef = $DefaultRef
+    logAnalyticsWorkspace = $workspaceName
 }
 
 $outputsPath = Join-Path $repoRoot "deploy.outputs.json"

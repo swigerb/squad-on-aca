@@ -48,6 +48,47 @@ separators), so the PowerShell CI job runs on `windows-latest` rather than
 scope for a tests/CI/docs-only sprint; recorded as a follow-up in
 `docs/validation.md`.
 
+## 2026-07-28: `squad-aca logs` exit-code + Log Analytics fallback (issue #13)
+
+Branch `squad/13-logs-fallback`. Two independent defects, both fixed.
+
+- **False green.** `Invoke-Logs` ended with the `az` call, so `$LASTEXITCODE`
+  was never inspected and a run that produced no logs still exited 0 — the
+  CLI instance of the class of bug that closed PR #9. Log retrieval now lives
+  in `scripts/lib/aca-logs.ps1`, every `az` exit code is checked, and a total
+  failure throws (exit 1).
+- **Extension dependency.** `az containerapp job logs show` is the only
+  control-plane call that needs the `containerapp` CLI extension; `run`,
+  `status`, `sessions`, `stop`, and `doctor` are core `az`. Added a Log
+  Analytics fallback against the workspace `deploy.ps1` already provisions
+  (`law-squad-aca`), so `logs` works wherever `status` works.
+- **Prompt hazard.** All `az` calls run with
+  `AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no` (previous value restored, set or
+  unset), so a missing extension can never block on stdin in CI/Ralph/Watch.
+- **Config.** `deploy.ps1` now emits `logAnalyticsWorkspace`; `Get-AcaConfig`
+  defaults it to `law-squad-aca`; `squad-aca configure
+  --log-analytics-workspace` overrides it. No hardcoded resource names in the
+  log path.
+- **Doctor.** One new row, `Logs path`, reporting `ok` / `fallback` / `failed`.
+- **5.1 trap found while testing.** Windows PowerShell 5.1 does not unroll a
+  JSON array from `ConvertFrom-Json` the way pwsh 7 does, so the fallback
+  returned blank lines under the `.cmd` shim while passing under pwsh. Rows are
+  now flattened explicitly, and `validate.ps1` re-runs the fallback under 5.1
+  so the two hosts cannot diverge again.
+
+**Evidence.** `scripts/validate.ps1`: 35 passed / 0 failed before, 50 passed /
+0 failed after (+1 parse for the new lib, +14 new checks). Worker suite
+unchanged: 5 suites, 179 assertions (11/62/40/23/43), 0 failed, 0 skipped.
+With a stubbed `az` that refuses the extension, `squad-aca logs <execution>`
+printed the old prompt/EOFError text and `LOGS_EXIT=0` before the fix, and
+prints actionable remediation with `LOGS_EXIT=1` after. `help`, `sessions`,
+`stop`, and `status` output is byte-identical before and after; `doctor`
+differs only by the new row.
+
+**Not done:** no live-Azure re-run of the fallback against the real
+`law-squad-aca` workspace in this session — the query shape is the one already
+recorded in issue #13 as verified live, and everything here was proven offline
+with a stubbed CLI.
 ## 2026-07-28: Sprint 2 — capability routing decision (issue #6)
 
 Branch `squad/6-s2-capability-resolution`. Routing decision only: computed and

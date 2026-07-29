@@ -236,6 +236,56 @@ Loop session:
 .\scripts\start-session.ps1 -Repository "<github-owner>/<repo>" -Mode loop -SessionName daily-loop
 ```
 
+## Session logs
+
+```powershell
+squad-aca logs <session-or-execution> --tail 200
+```
+
+`logs` resolves the execution the same way `sessions`, `stop`, and `open` do, then reads console output through the first path that is available:
+
+1. **`az containerapp job logs show`** — used when the `containerapp` Azure CLI extension is installed. This is the nicer path when it exists.
+2. **Log Analytics fallback** — used otherwise. The deployment already provisions the `law-squad-aca` workspace (`deploy.ps1` writes its name to `deploy.outputs.json` as `logAnalyticsWorkspace`). Querying it does require the `log-analytics` az extension; what it avoids is the `containerapp` extension. When this path is used, `logs` prints a one-line note naming the workspace it read.
+
+`az containerapp job logs show` is the **only** command the control plane uses that lives in the `containerapp` CLI extension; `run`, `status`, `sessions`, `stop`, and `doctor` are all core `az`. On hosts where the extension cannot be installed (for example an Azure CLI whose bundled Python lacks `_ctypes`, which breaks the `kubernetes` → `python-dateutil` build chain), only `logs` was affected — and it used to fail silently with exit 0. It now always propagates a non-zero exit code, and it never triggers the interactive "install the extension now?" prompt, which would otherwise block on stdin in CI, Ralph, and Watch contexts.
+
+Check which path is active:
+
+```powershell
+squad-aca doctor
+```
+
+The `Logs path` row reports `ok` (containerapp extension present), `fallback` (Log Analytics will be used), or `failed` (neither path is available).
+
+If both paths fail, `logs` exits non-zero and prints the remediation directly. To fix it:
+
+```powershell
+az extension add --name containerapp     # native path
+az extension add --name log-analytics    # fallback path
+```
+
+If the deployment uses a workspace other than `law-squad-aca`:
+
+```powershell
+squad-aca configure --log-analytics-workspace <workspace-name>
+```
+
+The equivalent manual query, useful when you want raw Log Analytics access:
+
+```powershell
+$wsid = az monitor log-analytics workspace show `
+  --resource-group <rg> --workspace-name law-squad-aca --query customerId -o tsv
+az monitor log-analytics query -w $wsid --analytics-query @"
+ContainerAppConsoleLogs_CL
+| where ContainerGroupName_s startswith '<execution-name>'
+| top 200 by TimeGenerated desc
+| project TimeGenerated, Log_s
+| order by TimeGenerated asc
+"@
+```
+
+Log Analytics ingestion can lag a few minutes after a session starts. An execution with no rows yet produces a warning, not an error.
+
 ## Start a project without a repo
 
 Use `scripts/new-project.ps1` when you have an idea but no GitHub repository yet:
