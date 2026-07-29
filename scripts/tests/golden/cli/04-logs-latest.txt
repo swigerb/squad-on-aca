@@ -10,6 +10,7 @@ extension show --name containerapp --only-show-errors -o none
 containerapp job logs show --name caj-squad-aca-session --resource-group rg-squad-stub --execution caj-squad-aca-session-stub01 --container caj-squad-aca-session --tail 100 --only-show-errors
 ### GH CALLS
 ### SQUAD CALLS
+### ACA CALLS
 ### STDOUT
 STUB-LOG-LINE-1
 STUB-LOG-LINE-2

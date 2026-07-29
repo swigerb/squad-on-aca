@@ -405,17 +405,59 @@ function New-SessionExecutionProvider {
 
     .DESCRIPTION
         Single place where the CLI decides which execution substrate it is
-        talking to. Today it is always the ACA Jobs adapter, so behaviour is
-        unchanged. PRD #6 Sprint 5 adds the route decision here (the Sprint 2
-        capability resolver emits aca-job | sandbox | fail-closed); every call
-        site below already speaks the provider contract and holds only opaque
-        handles, so none of them has to change when that happens.
+        talking to.
+
+        ACA Jobs are the unconditional default. The very first thing this does
+        is check the sandbox feature flag, and with the flag unset it returns the
+        ACA Jobs adapter having touched nothing else -- no catalog read, no route
+        resolution, no `aca` lookup. That is what makes "flag off" byte-identical
+        to a build with no sandbox code in it, and it is what the CLI golden gate
+        and compare-cli-baseline.ps1 verify.
+
+        With the flag ON, the Sprint 2 capability resolution (when the caller has
+        one) is routed through Resolve-SquadExecutionRoute, which can return
+        `sandbox` only for an administrator-approved class in a non-provisional
+        catalog, and returns `fail-closed` rather than quietly downgrading a
+        session whose required capabilities the default worker cannot satisfy.
+
+        NOTHING PASSES -CapabilityResolution YET. Every call site in this file
+        omits it, so the gate is always reached with no decision and the
+        `sandbox` branch is unreachable from the CLI even with the flag on. That
+        is deliberate for a default-off sprint -- the gate and the provider are
+        proven in isolation first -- and wiring the resolution through is later
+        work (PRD #6, Sprint 6+). Do not describe this as the capability
+        decision being acted on end to end; it is not, yet.
     #>
-    param([Parameter(Mandatory = $true)][object]$Config)
-    return New-SquadExecutionProvider -Kind "aca-job" -Options @{
-        Config    = $Config
-        ScriptDir = $ScriptDir
+    param(
+        [Parameter(Mandatory = $true)][object]$Config,
+        [object]$CapabilityResolution = $null
+    )
+
+    $acaJob = {
+        return New-SquadExecutionProvider -Kind "aca-job" -Options @{
+            Config    = $Config
+            ScriptDir = $ScriptDir
+        }
     }
+
+    if (-not (Test-SquadSandboxEnabled -Config $Config)) { return (& $acaJob) }
+
+    $route = Resolve-SquadExecutionRoute -Decision $CapabilityResolution -Config $Config `
+        -CatalogPath (Join-Path $RepoRoot "config\sandbox-classes.json")
+
+    switch ($route.Route) {
+        "sandbox" {
+            return New-SquadExecutionProvider -Kind "sandbox" -Options @{
+                Class     = $route.SandboxClass
+                Config    = $Config
+                ScriptDir = $ScriptDir
+            }
+        }
+        "fail-closed" {
+            throw "Refusing to dispatch this session: capability routing failed closed ($($route.Reason)). Nothing was started. Review the repository's squad-capabilities.yml and config/sandbox-classes.json, or unset SQUAD_ACA_ENABLE_SANDBOX to return to the ACA Jobs path."
+        }
+    }
+    return (& $acaJob)
 }
 
 function Invoke-Run {

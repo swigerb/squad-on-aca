@@ -72,6 +72,7 @@ $RepoRoot = Split-Path -Parent $ScriptDir
 
 $script:Failures = @()
 $script:Passes = @()
+$script:Skips = @()
 
 # $IsWindows only exists in PowerShell 6+; this file also has to run under 5.1.
 $IsWindowsHost = if ($null -ne $PSVersionTable.Platform) { $PSVersionTable.Platform -eq "Win32NT" } else { $true }
@@ -79,6 +80,12 @@ $IsWindowsHost = if ($null -ne $PSVersionTable.Platform) { $PSVersionTable.Platf
 function Write-Section($text) { Write-Host "`n=== $text ===" -ForegroundColor Cyan }
 function Add-Pass($text) { $script:Passes += $text; Write-Host "  [PASS] $text" -ForegroundColor Green }
 function Add-Fail($text) { $script:Failures += $text; Write-Host "  [FAIL] $text" -ForegroundColor Red }
+# A check that could not execute is NEITHER a pass nor a failure. The worker
+# suite established this (worker/tests/lib/deps.sh exits 77 and run-tests.sh
+# reports it as SKIP, never as a pass); a validate.ps1 check with an external
+# dependency has to be equally honest, because a skip that silently counted as
+# a pass is a check that stops existing the moment the dependency goes missing.
+function Add-Skip($text) { $script:Skips += $text; Write-Host "  [SKIP] $text" -ForegroundColor Yellow }
 
 # ---------------------------------------------------------------------------
 # 1. PowerShell parse
@@ -1188,6 +1195,746 @@ if (-not (Test-Path $providerLib)) {
 }
 
 # ---------------------------------------------------------------------------
+# 8c. Sandbox feature flag + route gate (no CLI, no stubs needed)
+# ---------------------------------------------------------------------------
+# The flag is the whole safety story for Sprint 5: with it unset, the sandbox
+# plane must be unreachable even for a dispatch that explicitly asks for it.
+# These checks pin the gate itself; section 8d drives the provider behind it.
+Write-Section "Sandbox feature flag and route gate"
+if (-not (Test-Path $providerLib)) {
+    Add-Fail "scripts/lib/squad-aca-provider.ps1 is missing (sandbox route gate checks)"
+} else {
+    $gateSaved = [Environment]::GetEnvironmentVariable("SQUAD_ACA_ENABLE_SANDBOX", "Process")
+    $gateCatalogDir = Join-Path $RepoRoot "scripts\tests"
+    $approvedCatalog = $null
+    try {
+        Remove-Item "Env:SQUAD_ACA_ENABLE_SANDBOX" -ErrorAction SilentlyContinue
+
+        # An APPROVED, non-provisional catalog. The shipped catalog is
+        # provisional:true (its own header says treat it as report-only), so the
+        # ON-path tests must supply their own -- which is itself the proof that
+        # the provisional gate bites.
+        $approvedCatalog = @'
+{
+  "provisional": false,
+  "classes": [
+    {
+      "id": "sandbox-node-lts",
+      "approved": true,
+      "image": "acrstub.azurecr.io/squad-worker:stub",
+      "resources": { "cpu": 2, "memoryGi": 4 },
+      "egress": {
+        "defaultAction": "Deny",
+        "hostRules": [
+          { "pattern": "*.github.com", "action": "Allow" },
+          { "pattern": "registry.npmjs.org", "action": "Allow" }
+        ],
+        "trafficInspection": "Full"
+      }
+    },
+    { "id": "sandbox-container-build", "approved": false, "resources": { "cpu": 4, "memoryGi": 8 } }
+  ]
+}
+'@ | ConvertFrom-Json
+
+        $sandboxDecision = [pscustomobject]@{ route = "sandbox"; sandboxClass = "sandbox-node-lts"; defaultImageSufficient = $false }
+
+        # --- 1. Default OFF ---------------------------------------------------
+        if (-not (Test-SquadSandboxEnabled)) {
+            Add-Pass "Sandbox feature flag defaults OFF when SQUAD_ACA_ENABLE_SANDBOX is unset"
+        } else {
+            Add-Fail "Sandbox feature flag is ON by default -- ACA Jobs must be the unconditional default"
+        }
+
+        # --- 2. Flag OFF makes the sandbox route unreachable ------------------
+        # Even when the resolver explicitly asked for it AND an approved,
+        # non-provisional catalog is available. This is the check that a
+        # "default the flag to on" mutation has to trip.
+        $offRoute = Resolve-SquadExecutionRoute -Decision $sandboxDecision -Catalog $approvedCatalog
+        if ($offRoute.Route -eq "fail-closed" -and -not $offRoute.FeatureEnabled -and $offRoute.Reason -like "sandbox-feature-disabled*") {
+            Add-Pass "Flag OFF: an explicit 'sandbox' decision is refused, not silently downgraded (route=$($offRoute.Route))"
+        } else {
+            Add-Fail "Flag OFF did not make the sandbox route unreachable (route=$($offRoute.Route) reason=$($offRoute.Reason) enabled=$($offRoute.FeatureEnabled))"
+        }
+
+        # --- 3. Flag OFF: an aca-job decision is still aca-job ----------------
+        $offJob = Resolve-SquadExecutionRoute -Decision ([pscustomobject]@{ route = "aca-job" }) -Catalog $approvedCatalog
+        $offNone = Resolve-SquadExecutionRoute -Decision $null -Catalog $approvedCatalog
+        if ($offJob.Route -eq "aca-job" -and $offNone.Route -eq "aca-job") {
+            Add-Pass "Flag OFF: 'aca-job' and 'no resolution' both route to ACA Jobs (today's path, unchanged)"
+        } else {
+            Add-Fail "Flag OFF changed the default path (aca-job=$($offJob.Route) none=$($offNone.Route))"
+        }
+
+        # --- 4. Kill switch ---------------------------------------------------
+        $env:SQUAD_ACA_ENABLE_SANDBOX = "0"
+        $killed = Test-SquadSandboxEnabled -Config ([pscustomobject]@{ sandboxEnabled = $true })
+        $env:SQUAD_ACA_ENABLE_SANDBOX = "1"
+        $onWithConfigOff = Test-SquadSandboxEnabled -Config ([pscustomobject]@{ sandboxEnabled = $false })
+        Remove-Item "Env:SQUAD_ACA_ENABLE_SANDBOX" -ErrorAction SilentlyContinue
+        if (-not $killed -and $onWithConfigOff) {
+            Add-Pass "An explicit SQUAD_ACA_ENABLE_SANDBOX value decides in both directions (0 overrides an opted-in config)"
+        } else {
+            Add-Fail "SQUAD_ACA_ENABLE_SANDBOX is not authoritative (kill switch honoured=$(-not $killed) explicit-on honoured=$onWithConfigOff)"
+        }
+
+        # --- 5. Flag ON + shipped (provisional) catalog => fail closed --------
+        $env:SQUAD_ACA_ENABLE_SANDBOX = "1"
+        $shippedRoute = Resolve-SquadExecutionRoute -Decision $sandboxDecision `
+            -CatalogPath (Join-Path $RepoRoot "config\sandbox-classes.json")
+        if ($shippedRoute.Route -eq "fail-closed" -and $shippedRoute.Reason -eq "catalog-provisional") {
+            Add-Pass "Flag ON + the shipped provisional catalog fails closed (provisional classes are report-only)"
+        } else {
+            Add-Fail "A provisional catalog did not fail closed (route=$($shippedRoute.Route) reason=$($shippedRoute.Reason))"
+        }
+
+        # --- 6. Flag ON + approved class => sandbox ---------------------------
+        $onRoute = Resolve-SquadExecutionRoute -Decision $sandboxDecision -Catalog $approvedCatalog
+        if ($onRoute.Route -eq "sandbox" -and $onRoute.SandboxClass -and $onRoute.SandboxClass.id -eq "sandbox-node-lts") {
+            Add-Pass "Flag ON + an approved class in a non-provisional catalog routes to the sandbox plane"
+        } else {
+            Add-Fail "Flag ON did not reach the sandbox plane for an approved class (route=$($onRoute.Route) reason=$($onRoute.Reason))"
+        }
+
+        # --- 7. Flag ON but the class is not administrator-approved ----------
+        $unapproved = Resolve-SquadExecutionRoute -Catalog $approvedCatalog `
+            -Decision ([pscustomobject]@{ route = "sandbox"; sandboxClass = "sandbox-container-build"; defaultImageSufficient = $false })
+        $unknown = Resolve-SquadExecutionRoute -Catalog $approvedCatalog `
+            -Decision ([pscustomobject]@{ route = "sandbox"; sandboxClass = "attacker-supplied-image"; defaultImageSufficient = $false })
+        if ($unapproved.Route -eq "fail-closed" -and $unapproved.Reason -eq "class-not-approved" `
+                -and $unknown.Route -eq "fail-closed" -and $unknown.Reason -eq "class-not-in-catalog") {
+            Add-Pass "Only administrator-approved catalog classes are reachable (unapproved and unknown ids both fail closed)"
+        } else {
+            Add-Fail "An unapproved or unknown sandbox class was not refused (unapproved=$($unapproved.Reason) unknown=$($unknown.Reason))"
+        }
+
+        # --- 8. fail-closed stays fail-closed; junk routes fail closed -------
+        $failClosed = Resolve-SquadExecutionRoute -Decision ([pscustomobject]@{ route = "fail-closed" }) -Catalog $approvedCatalog
+        $junk = Resolve-SquadExecutionRoute -Decision ([pscustomobject]@{ route = "something-else" }) -Catalog $approvedCatalog
+        if ($failClosed.Route -eq "fail-closed" -and $junk.Route -eq "fail-closed") {
+            Add-Pass "A 'fail-closed' resolution, and any unrecognised route, refuse to dispatch even with the flag ON"
+        } else {
+            Add-Fail "fail-closed or an unrecognised route did not refuse (failClosed=$($failClosed.Route) junk=$($junk.Route))"
+        }
+    } catch {
+        Add-Fail "Sandbox route gate checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($null -eq $gateSaved) {
+            Remove-Item "Env:SQUAD_ACA_ENABLE_SANDBOX" -ErrorAction SilentlyContinue
+        } else {
+            $env:SQUAD_ACA_ENABLE_SANDBOX = $gateSaved
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 8d. ACA Sandboxes provider against a stubbed `aca`
+# ---------------------------------------------------------------------------
+# Drives New-SandboxExecutionProvider itself, fully offline, through the fake
+# `aca` from scripts/tests/cli-stub-harness.ps1.
+#
+# The two defects these exist for are the ones the live investigation actually
+# hit: `aca sandbox exec` has a hard ~120s client timeout, so a session run as a
+# single synchronous exec dies at two minutes; and that same timeout, read as a
+# failure rather than as INCONCLUSIVE, kills a healthy 60-minute run. Both are
+# invisible to any check that only asserts "the right commands were issued".
+Write-Section "ACA Sandboxes provider (stubbed aca)"
+$sandboxHarness = Join-Path $RepoRoot "scripts\tests\cli-stub-harness.ps1"
+if (-not (Test-Path $providerLib)) {
+    Add-Fail "scripts/lib/squad-aca-provider.ps1 is missing (sandbox provider checks)"
+} elseif (-not (Test-Path $sandboxHarness)) {
+    Add-Fail "scripts/tests/cli-stub-harness.ps1 is missing (sandbox provider checks)"
+} elseif (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] Sandbox provider checks require Windows (.cmd stubs)" -ForegroundColor Yellow
+} else {
+    . $sandboxHarness
+    $sbStub = $null
+    $sbPrevPath = $env:PATH
+    $sbEnvNames = @("SQUAD_STUB_AZ_LOG", "SQUAD_STUB_ACA_LOG", "SQUAD_STUB_FIXTURES",
+        "SQUAD_STUB_SBG_IDENTITY", "SQUAD_STUB_SBG_RC",
+        "SQUAD_STUB_ACA_RC", "SQUAD_STUB_ACA_ERR", "SQUAD_STUB_ACA_EXEC_RC",
+        "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
+        "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
+        "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
+        "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE")
+    try {
+        $sbStub = New-SquadCliStubEnvironment
+        $env:PATH = "$($sbStub.BinDir);$sbPrevPath"
+        $env:SQUAD_STUB_AZ_LOG = $sbStub.AzLog
+        $env:SQUAD_STUB_ACA_LOG = $sbStub.AcaLog
+        $env:SQUAD_STUB_FIXTURES = $sbStub.FixtureDir
+        $env:SQUAD_STUB_SBG_IDENTITY = ""
+        $env:SQUAD_STUB_SBG_RC = "0"
+        $env:SQUAD_STUB_ACA_RC = "0"
+        $env:SQUAD_STUB_ACA_ERR = ""
+        $env:SQUAD_STUB_ACA_EXEC_RC = "0"
+        $env:SQUAD_STUB_ACA_EGRESS_RC = "0"
+        $env:SQUAD_STUB_ACA_EGRESS_ERR = ""
+        $env:SQUAD_STUB_ACA_DELETE_RC = "0"
+        $env:SQUAD_STUB_ACA_DELETE_ERR = ""
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        $env:SQUAD_STUB_ACA_POLL_DIR = ""
+        $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
+
+        $sbCli = Join-Path $sbStub.BinDir "aca.cmd"
+        $resolvedAca = (Get-Command aca -ErrorAction SilentlyContinue)
+        if ($resolvedAca -and $resolvedAca.Source -eq $sbCli) {
+            Add-Pass "Fake 'aca' is first on PATH; sandbox provider checks run fully offline"
+        } else {
+            Add-Fail "Could not stub 'aca' on PATH for the sandbox provider checks (resolved: $($resolvedAca.Source))"
+        }
+
+        $sbClass = @'
+{
+  "id": "sandbox-node-lts",
+  "approved": true,
+  "resources": { "cpu": 2, "memoryGi": 4 },
+  "egress": {
+    "defaultAction": "Deny",
+    "hostRules": [
+      { "pattern": "*.github.com", "action": "Allow" },
+      { "pattern": "registry.npmjs.org", "action": "Allow" }
+    ],
+    "trafficInspection": "Full"
+  }
+}
+'@ | ConvertFrom-Json
+
+        $sbSecret = "ghp-stub-secret-token-value"
+        function New-SandboxTestProvider {
+            param([string]$DiskId = "aaaaaaaa-1111-2222-3333-444444444444", [string]$DiskLabel = "")
+            return New-SquadExecutionProvider -Kind "sandbox" -Options @{
+                Class              = $sbClass
+                SandboxGroup       = "sbg-squad-stub"
+                ResourceGroup      = "rg-squad-stub"
+                SubscriptionId     = "00000000-0000-0000-0000-000000000000"
+                DiskId             = $DiskId
+                DiskLabel          = $DiskLabel
+                AcaCliPath         = $sbCli
+                IdleTimeoutSeconds = 1800
+                PollSeconds        = 1
+                WorkerSecrets      = @{ GH_TOKEN = $sbSecret }
+            }
+        }
+
+        $sbRequest = New-SquadDispatchRequest -SessionId "stub-session" -Repository "octo/demo" `
+            -Prompt "do the thing" -Mode "prompt" -PushChanges $true -OutputBranch "squad/stub-session"
+
+        # --- 1. create: full argv sequence, in order --------------------------
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbProvider = New-SandboxTestProvider
+        $sbOutcome = @{}
+        $sbCreateErr = ""
+        try {
+            Start-SquadExecution -Provider $sbProvider -Request $sbRequest -Outcome $sbOutcome 6>$null | Out-Null
+        } catch {
+            $sbCreateErr = [string]$_.Exception.Message
+        }
+        $sbCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $iCreate  = [array]::FindIndex($sbCalls, [Predicate[string]] { param($l) $l -like "sandbox create *" })
+        $iEgress  = [array]::FindIndex($sbCalls, [Predicate[string]] { param($l) $l -like "sandbox egress set *" })
+        $iLife    = [array]::FindIndex($sbCalls, [Predicate[string]] { param($l) $l -like "sandbox lifecycle set *" })
+        $iLaunch  = [array]::FindIndex($sbCalls, [Predicate[string]] { param($l) $l -like "*squad-launched*" })
+
+        if (-not $sbCreateErr -and $iCreate -ge 0 -and $iEgress -ge 0 -and $iLife -ge 0 -and $iLaunch -ge 0) {
+            Add-Pass "Sandbox create issues create -> egress set -> lifecycle set -> detached exec (4 aca calls)"
+        } else {
+            Add-Fail "Sandbox create did not issue the expected aca sequence (err=$sbCreateErr calls=$($sbCalls -join ' | '))"
+        }
+
+        # THE ordering assertion: egress policy must be applied BEFORE the exec
+        # that runs anything from the repository. A create that applied policy
+        # afterwards would still issue every one of the calls above.
+        if ($iEgress -ge 0 -and $iLaunch -ge 0 -and $iEgress -lt $iLaunch -and $iCreate -lt $iEgress) {
+            Add-Pass "Egress default-deny is applied BEFORE the worker launch (egress #$iEgress precedes launch #$iLaunch)"
+        } else {
+            Add-Fail "Egress policy was not applied before repository code ran (create=$iCreate egress=$iEgress launch=$iLaunch)"
+        }
+
+        if ($iCreate -ge 0 -and $sbCalls[$iCreate] -like "*--disk-id aaaaaaaa-1111-2222-3333-444444444444*" `
+                -and $sbCalls[$iCreate] -like "*--label name=squad-stub-session*" `
+                -and $sbCalls[$iCreate] -like "*--cpu 2000m*" -and $sbCalls[$iCreate] -like "*--memory 4096Mi*") {
+            Add-Pass "Sandbox create uses --disk-id (private disks are not addressable by --disk) and the class's resources"
+        } else {
+            Add-Fail "Sandbox create argv is wrong: $(if ($iCreate -ge 0) { $sbCalls[$iCreate] } else { '<missing>' })"
+        }
+
+        if ($iEgress -ge 0 -and $sbCalls[$iEgress] -like "*--default Deny*" `
+                -and $sbCalls[$iEgress] -like "*--rule *.github.com:Allow*" `
+                -and $sbCalls[$iEgress] -like "*--rule registry.npmjs.org:Allow*" `
+                -and $sbCalls[$iEgress] -like "*--traffic-inspection Full*") {
+            Add-Pass "Egress applies the class's default-deny action, every allowlist rule, and traffic inspection"
+        } else {
+            Add-Fail "Egress argv is wrong: $(if ($iEgress -ge 0) { $sbCalls[$iEgress] } else { '<missing>' })"
+        }
+
+        # Auto-suspend defaults to ENABLED at 600s, which would suspend a live
+        # session; it has to be set explicitly.
+        if ($iLife -ge 0 -and $sbCalls[$iLife] -like "*--auto-suspend enable*" -and $sbCalls[$iLife] -like "*--idle-timeout-seconds 1800*") {
+            Add-Pass "Auto-suspend is pinned explicitly instead of inheriting the 600s default"
+        } else {
+            Add-Fail "Auto-suspend was not pinned: $(if ($iLife -ge 0) { $sbCalls[$iLife] } else { '<missing>' })"
+        }
+
+        # --- 2. the launch is DETACHED (proven by running it in a real shell) -
+        # `aca sandbox exec` returns after ~120s no matter what the command is
+        # doing, so a session held open by one exec dies at two minutes -- and
+        # `create`'s catch tears the healthy sandbox down with it.
+        #
+        # This CANNOT be asserted by substring. In POSIX/bash grammar `&` is a
+        # list terminator that binds LOOSER than `&&`, so
+        #
+        #   prelude && setsid nohup bash -c '...' </dev/null >/dev/null 2>&1 &
+        #
+        # contains every character of a detach while backgrounding the entire
+        # and-list and binding the three redirections to the last simple command
+        # only -- the async subshell keeps the exec's fd 0/1/2 open for the whole
+        # worker run. A substring assertion passes on both shapes; the stub `aca`
+        # never evaluates the `-c` payload in a shell, so nothing else in this
+        # suite can tell them apart either. The only assertion that can is to
+        # execute the emitted command in a real shell and time when the parent's
+        # streams reach EOF.
+        $launchLine = if ($iLaunch -ge 0) { $sbCalls[$iLaunch] } else { "" }
+        # The launch argv is the ONE call that legitimately carries the worker
+        # token, so it must be scrubbed before it can reach a failure message
+        # (and from there a CI log).
+        $safeLaunchLine = Protect-SandboxText -Text $launchLine -Secrets @($sbSecret)
+
+        # (a) the command evaluated below is byte-for-byte the command that ships.
+        $sbShipEnv = New-SandboxWorkerEnvironment -Request $sbRequest -Context $sbProvider.Context
+        $sbShipLaunch = New-SandboxLaunchCommand -Environment $sbShipEnv -StateDir $sbProvider.Context.StateDir
+        if ($launchLine.Contains($sbShipLaunch)) {
+            Add-Pass "The command the detach test evaluates is byte-for-byte the command 'aca sandbox exec -c' was given"
+        } else {
+            Add-Fail "New-SandboxLaunchCommand no longer produces the argv that was actually issued, so the detach test would be testing a different string: $safeLaunchLine"
+        }
+
+        # (b) the behavioural test, delegated to scripts/tests/verify-launch-detachment.ps1
+        #     so the same probe is a standalone CI gate on a real Linux runner
+        #     rather than a check that only ever runs on a developer's WSL box.
+        #     A correct implementation releases the caller while the worker is
+        #     still running; the mis-scoped one blocks for the worker's full
+        #     duration. Exit 77 means the probe DID NOT RUN (deps.sh convention).
+        $sbDetachScript = Join-Path $RepoRoot "scripts\tests\verify-launch-detachment.ps1"
+        if (-not (Test-Path $sbDetachScript)) {
+            Add-Fail "scripts/tests/verify-launch-detachment.ps1 is missing -- nothing else in this suite can tell a detach from a command containing the characters of one"
+        } else {
+            $sbDetachOut = (& (Get-Process -Id $PID).Path -NoProfile -File $sbDetachScript 2>&1 | Out-String)
+            $sbDetachRc = $LASTEXITCODE
+            $sbDetachFlat = ($sbDetachOut -replace "`r?`n", " | ").Trim()
+            if ($sbDetachRc -eq 0) {
+                Add-Pass "The emitted launch command really detaches in a real shell (verify-launch-detachment.ps1): $sbDetachFlat"
+            } elseif ($sbDetachRc -eq 77) {
+                # A dependency we cannot satisfy is a SKIP, never a pass: the
+                # worker suite's convention (worker/tests/lib/deps.sh -> exit 77
+                # -> run-tests.sh reports SKIP) exists so a check cannot quietly
+                # stop existing when its dependency goes missing.
+                Add-Skip "Worker-launch detachment is UNVERIFIED: $sbDetachFlat"
+            } else {
+                Add-Fail "The emitted launch command does NOT detach (verify-launch-detachment.ps1 exit $sbDetachRc): $sbDetachFlat"
+            }
+        }
+
+        if ($launchLine -like "*/usr/local/bin/squad-on-aca*" -and $launchLine -like "*exit-code*" -and $launchLine -like "*touch /tmp/squad-session/done*") {
+            Add-Pass "The detached wrapper records an exit code and touches the completion marker last"
+        } else {
+            Add-Fail "The detached wrapper does not record terminal state: $safeLaunchLine"
+        }
+
+        # --- 3. secrets never reach anything the provider EMITS ---------------
+        # The token is delivered to the worker as an environment assignment in
+        # the launch command, so it is present in that one process argv (PRD #6
+        # Sprint 7 owns credential brokerage and replaces this). What must never
+        # happen is the provider REPEATING it: into the dispatch response, into
+        # an error message, or into the rendered argv it puts in one.
+        $sbResponseText = ($sbOutcome["Response"] | ConvertTo-Json -Depth 8)
+        if ($sbResponseText -notmatch [regex]::Escape($sbSecret)) {
+            Add-Pass "The worker token never appears in the dispatch response"
+        } else {
+            Add-Fail "The worker token leaked into the dispatch response"
+        }
+        $sbSafe = Get-SandboxSafeArgv -Argv @("sandbox", "egress", "set", "--default", "Deny", "--rule", "*.github.com:Allow", "-c", "GH_TOKEN=$sbSecret /usr/local/bin/squad-on-aca", "--token", $sbSecret)
+        if ($sbSafe -notmatch [regex]::Escape($sbSecret) -and $sbSafe -notmatch "github\.com" -and $sbSafe -notmatch "squad-on-aca" -and $sbSafe -like "*--token <redacted>*") {
+            Add-Pass "Safe argv rendering redacts tokens, egress policy values and remote commands"
+        } else {
+            Add-Fail "Safe argv rendering leaked a token, an egress value or a command: $sbSafe"
+        }
+        # And a failure of the launch itself -- the one call whose argv really
+        # does carry the token -- must not quote it back.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_ACA_EXEC_RC = "1"
+        $sbLaunchMsg = ""
+        try { Start-SquadExecution -Provider $sbProvider -Request $sbRequest 6>$null | Out-Null } catch { $sbLaunchMsg = [string]$_.Exception.Message }
+        $env:SQUAD_STUB_ACA_EXEC_RC = "0"
+        if ($sbLaunchMsg -and $sbLaunchMsg -notmatch [regex]::Escape($sbSecret) -and $sbLaunchMsg -notmatch "github\.com") {
+            Add-Pass "A failed worker launch reports the failure without echoing the token-bearing command"
+        } else {
+            Add-Fail "A failed worker launch leaked the token or the egress policy: $sbLaunchMsg"
+        }
+
+        # Protect-SandboxText, DIRECTLY. It is the only control on captured CLI
+        # OUTPUT (Get-SandboxErrorText feeds every thrown error in the provider,
+        # plus `logs` line output and `cancel` host output), and until now it had
+        # no test of its own: the checks above pass on Get-SandboxSafeArgv's
+        # argv-side redaction alone, so the whole function body could be replaced
+        # with `return $Text` and the suite still reported all green.
+        #
+        # The lengths are the ones that occur in practice. They also happen to be
+        # exactly the lengths the defect hid behind: `[string]$secret.Length -lt 8`
+        # is `[string]($secret.Length)`, so PowerShell coerced the right operand
+        # to string and compared LEXICALLY -- "40" -lt "8" is $true -- and only
+        # lengths 8, 9 and 80-99 were ever scrubbed.
+        $sbRedactLengths = @(
+            @{ Len = 27;   What = "the suite's own fixture token" },
+            @{ Len = 36;   What = "a GUID" },
+            @{ Len = 40;   What = "a classic GitHub PAT" },
+            @{ Len = 64;   What = "a hex API key" },
+            @{ Len = 93;   What = "a fine-grained PAT" },
+            @{ Len = 1200; What = "an ACR refresh token / JWT" }
+        )
+        $sbRedactBad = @()
+        foreach ($case in $sbRedactLengths) {
+            $secret = "s" + ("K" * ([int]$case.Len - 1))
+            $out = Protect-SandboxText -Text "aca: request failed, token=$secret was rejected" -Secrets @($secret)
+            if ($out.Contains($secret) -or $out -notlike "*token=<redacted>*") {
+                $sbRedactBad += "$($case.Len) ($($case.What))"
+            }
+        }
+        if ($sbRedactBad.Count -eq 0) {
+            Add-Pass "Protect-SandboxText redacts a secret at every realistic credential length (27/36/40/64/93/1200)"
+        } else {
+            Add-Fail "Protect-SandboxText passed a secret through verbatim at length(s): $($sbRedactBad -join ', ')"
+        }
+
+        # Multiple secrets, repeated occurrences, and the sub-8 floor (too short
+        # to be a credential and too likely to shred ordinary words).
+        $sbLongA = "A" * 40
+        $sbLongB = "B" * 36
+        $sbMulti = Protect-SandboxText -Text "first=$sbLongA second=$sbLongB again=$sbLongA short=abc" -Secrets @($sbLongA, $sbLongB, "abc")
+        if ($sbMulti -eq "first=<redacted> second=<redacted> again=<redacted> short=abc") {
+            Add-Pass "Protect-SandboxText replaces every occurrence of every secret and leaves sub-8 values alone"
+        } else {
+            Add-Fail "Protect-SandboxText mishandled multiple/repeated secrets or the length floor: $sbMulti"
+        }
+
+        # And the path that matters: a CLI echoing the secret back in its OWN
+        # error text must not survive Get-SandboxErrorText into a thrown message.
+        $sbEchoResult = [pscustomobject]@{
+            StdErr = @("ERROR: authentication failed for token $sbSecret (40 chars)")
+            StdOut = @()
+        }
+        $sbEchoText = Get-SandboxErrorText -Result $sbEchoResult -Secrets @($sbSecret)
+        if ($sbEchoText -notmatch [regex]::Escape($sbSecret) -and $sbEchoText -like "*<redacted>*") {
+            Add-Pass "A CLI that echoes the secret back in its own error text is scrubbed before the text reaches an exception"
+        } else {
+            Add-Fail "Get-SandboxErrorText passed a CLI-echoed secret through: $sbEchoText"
+        }
+
+        # --- 4. a long session is driven by POLLING, not by one exec ---------
+        $pollDir = Join-Path $sbStub.Root "pollstate"
+        New-Item -ItemType Directory -Force -Path $pollDir | Out-Null
+        $env:SQUAD_STUB_ACA_POLL_DIR = $pollDir
+        Set-Content -LiteralPath (Join-Path $pollDir "phase.txt") -Value "running" -Encoding ascii -NoNewline
+
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbHandle = $sbOutcome["Response"].sessionHandle
+        $sbRunning = Get-SquadExecutionStatus -Provider $sbProvider -Handle $sbHandle
+        if ($sbRunning.Status -eq "Running" -and -not $sbRunning.Inconclusive) {
+            Add-Pass "A poll of a live session reports Running from the marker/phase file"
+        } else {
+            Add-Fail "A live session did not poll as Running (status=$($sbRunning.Status) inconclusive=$($sbRunning.Inconclusive))"
+        }
+
+        # Terminal state must come from the marker PLUS a recorded exit code.
+        Set-Content -LiteralPath (Join-Path $pollDir "phase.txt") -Value "done" -Encoding ascii -NoNewline
+        Set-Content -LiteralPath (Join-Path $pollDir "done.txt") -Value "x" -Encoding ascii -NoNewline
+        $sbMarkerOnly = Get-SquadExecutionStatus -Provider $sbProvider -Handle $sbHandle
+        Set-Content -LiteralPath (Join-Path $pollDir "exit.txt") -Value "0" -Encoding ascii -NoNewline
+        $sbDone = Get-SquadExecutionStatus -Provider $sbProvider -Handle $sbHandle
+        Set-Content -LiteralPath (Join-Path $pollDir "exit.txt") -Value "1" -Encoding ascii -NoNewline
+        $sbFailed = Get-SquadExecutionStatus -Provider $sbProvider -Handle $sbHandle
+        if ($sbMarkerOnly.Status -ne "Succeeded" -and $sbDone.Status -eq "Succeeded" -and $sbFailed.Status -eq "Failed") {
+            Add-Pass "Terminal state needs the completion marker AND a recorded exit code (marker alone is not Succeeded)"
+        } else {
+            Add-Fail "Terminal state was derived incorrectly (markerOnly=$($sbMarkerOnly.Status) exit0=$($sbDone.Status) exit1=$($sbFailed.Status))"
+        }
+
+        # `wait` to terminal must issue MULTIPLE short execs, never rely on one.
+        Set-Content -LiteralPath (Join-Path $pollDir "phase.txt") -Value "running" -Encoding ascii -NoNewline
+        Remove-Item -LiteralPath (Join-Path $pollDir "done.txt"), (Join-Path $pollDir "exit.txt") -Force -ErrorAction SilentlyContinue
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbWaitThrew = $false
+        try {
+            Wait-SquadExecution -Provider $sbProvider -Handle $sbHandle -TimeoutSeconds 3 -PollSeconds 1 -UntilTerminal | Out-Null
+        } catch {
+            $sbWaitThrew = $true
+        }
+        $sbPolls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca | Where-Object { $_ -like "sandbox exec *" })
+        if ($sbWaitThrew -and $sbPolls.Count -ge 3) {
+            Add-Pass "A long-running session is driven by repeated short polls ($($sbPolls.Count) execs), not by one synchronous exec"
+        } else {
+            Add-Fail "wait did not poll repeatedly (threw=$sbWaitThrew execs=$($sbPolls.Count))"
+        }
+
+        # --- 5. a transport timeout mid-poll is INCONCLUSIVE, and is re-polled -
+        # `Network issue - retry policy expired` is the ~120s client timeout. The
+        # work is almost certainly still running; reporting Failed here would
+        # kill a healthy 60-minute session at the two-minute mark.
+        Set-Content -LiteralPath (Join-Path $pollDir "phase.txt") -Value "running" -Encoding ascii -NoNewline
+        $timeoutMarker = Join-Path $sbStub.Root "timeout-once.txt"
+        Remove-Item -LiteralPath $timeoutMarker -Force -ErrorAction SilentlyContinue
+        $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = $timeoutMarker
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbIncThrew = $false
+        $sbInc = $null
+        try {
+            $sbInc = Get-SquadExecutionStatus -Provider $sbProvider -Handle $sbHandle
+        } catch {
+            $sbIncThrew = $true
+        }
+        if (-not $sbIncThrew -and $sbInc -and $sbInc.Inconclusive -and $sbInc.Status -ne "Failed") {
+            Add-Pass "A transport timeout mid-poll is reported INCONCLUSIVE, never as a failed session"
+        } else {
+            Add-Fail "A transport timeout was not treated as inconclusive (threw=$sbIncThrew status=$($sbInc.Status) inconclusive=$($sbInc.Inconclusive))"
+        }
+
+        # ... and the next poll (the stub's timeout fires only once) recovers.
+        $sbAfter = Get-SquadExecutionStatus -Provider $sbProvider -Handle $sbHandle
+        if (-not $sbAfter.Inconclusive -and $sbAfter.Status -eq "Running") {
+            Add-Pass "Re-polling after an inconclusive transport timeout recovers the real state"
+        } else {
+            Add-Fail "Re-polling after a transport timeout did not recover (status=$($sbAfter.Status) inconclusive=$($sbAfter.Inconclusive))"
+        }
+
+        # `wait` must not return an inconclusive poll as a result either.
+        Remove-Item -LiteralPath $timeoutMarker -Force -ErrorAction SilentlyContinue
+        Set-Content -LiteralPath (Join-Path $pollDir "phase.txt") -Value "done" -Encoding ascii -NoNewline
+        Set-Content -LiteralPath (Join-Path $pollDir "done.txt") -Value "x" -Encoding ascii -NoNewline
+        Set-Content -LiteralPath (Join-Path $pollDir "exit.txt") -Value "0" -Encoding ascii -NoNewline
+        $sbWaitRec = Wait-SquadExecution -Provider $sbProvider -Handle $sbHandle -TimeoutSeconds 10 -PollSeconds 1 -UntilTerminal
+        $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
+        if ($sbWaitRec.Status -eq "Succeeded" -and -not $sbWaitRec.Inconclusive) {
+            Add-Pass "wait rides through an inconclusive poll and returns the real terminal state"
+        } else {
+            Add-Fail "wait did not ride through an inconclusive poll (status=$($sbWaitRec.Status) inconclusive=$($sbWaitRec.Inconclusive))"
+        }
+
+        # --- 6. terminate: idempotent, but only for 'already gone' -----------
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_ACA_DELETE_RC = "0"
+        $sbTerm = Remove-SquadExecution -Provider $sbProvider -Handle $sbHandle
+        $sbDeleteCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca | Where-Object { $_ -like "sandbox delete *" })
+        if ($sbTerm.Terminated -and -not $sbTerm.AlreadyTerminal -and $sbDeleteCalls.Count -eq 1 -and $sbDeleteCalls[0] -like "*-l name=squad-stub-session --yes*") {
+            Add-Pass "Sandbox terminate deletes with one labelled 'aca sandbox delete --yes'"
+        } else {
+            Add-Fail "Sandbox terminate did not delete correctly (terminated=$($sbTerm.Terminated) calls=$($sbDeleteCalls.Count))"
+        }
+
+        $sbGoneCases = @(
+            @{ Rc = "1"; Err = "Error: sandbox with label name=squad-stub-session was not found"; Label = "not found" },
+            @{ Rc = "1"; Err = "Error: ResourceNotFound: the sandbox no longer exists"; Label = "ResourceNotFound" }
+        )
+        $sbGoneOk = $true
+        $sbGoneDetail = @()
+        foreach ($case in $sbGoneCases) {
+            $env:SQUAD_STUB_ACA_DELETE_RC = $case.Rc
+            $env:SQUAD_STUB_ACA_DELETE_ERR = $case.Err
+            $r = $null
+            $threw = $false
+            try { $r = Remove-SquadExecution -Provider $sbProvider -Handle $sbHandle } catch { $threw = $true }
+            if ($threw -or -not $r.Terminated -or -not $r.AlreadyTerminal) {
+                $sbGoneOk = $false
+                $sbGoneDetail += "$($case.Label): threw=$threw terminated=$($r.Terminated) already=$($r.AlreadyTerminal)"
+            }
+        }
+        $env:SQUAD_STUB_ACA_DELETE_RC = "0"
+        $env:SQUAD_STUB_ACA_DELETE_ERR = ""
+        if ($sbGoneOk) {
+            Add-Pass "Sandbox terminate is idempotent: an already-deleted sandbox is success (AlreadyTerminal)"
+        } else {
+            Add-Fail "Sandbox terminate mishandled an already-gone sandbox ($($sbGoneDetail -join '; '))"
+        }
+
+        # The defect this exists for: returning Terminated=$true for EVERY
+        # non-zero exit. A cleanup path told "terminated" stops looking, so an
+        # auth failure, an RBAC denial, throttling or a transport timeout leaks
+        # a running sandbox and bills for it.
+        $sbFailCases = @(
+            @{ Err = "ERROR: AADSTS700082: The refresh token has expired. Please run 'aca login'."; Label = "expired auth" },
+            @{ Err = "Error: 403 CheckAccess: the caller does not have permission on the sandbox group"; Label = "RBAC denial" },
+            @{ Err = "Error: 429 TooManyRequests: rate limit exceeded, retry after 30s"; Label = "throttling" },
+            @{ Err = "Error: Network issue - retry policy expired"; Label = "transport timeout" }
+        )
+        $sbFailOk = $true
+        $sbFailDetail = @()
+        foreach ($case in $sbFailCases) {
+            $env:SQUAD_STUB_ACA_DELETE_RC = "1"
+            $env:SQUAD_STUB_ACA_DELETE_ERR = $case.Err
+            $threw = $false
+            $msg = ""
+            try { Remove-SquadExecution -Provider $sbProvider -Handle $sbHandle | Out-Null } catch { $threw = $true; $msg = [string]$_.Exception.Message }
+            if (-not $threw) {
+                $sbFailOk = $false
+                $sbFailDetail += "$($case.Label): did not throw"
+            }
+        }
+        $env:SQUAD_STUB_ACA_DELETE_RC = "0"
+        $env:SQUAD_STUB_ACA_DELETE_ERR = ""
+        if ($sbFailOk) {
+            Add-Pass "Sandbox terminate THROWS on auth, RBAC, throttling and transport failures (never reported as torn down)"
+        } else {
+            Add-Fail "Sandbox terminate swallowed a real failure ($($sbFailDetail -join '; '))"
+        }
+
+        # --- 6b. cancel classifies failures the same way terminate does -------
+        # cancel is the softer sibling of the same defect: writing a non-zero
+        # exit to the host and returning success tells the caller the session was
+        # stopped when an auth failure, an RBAC denial, throttling or a transport
+        # timeout says nothing about whether the worker is still running -- and
+        # still billing. Same classifier as terminate, not a second mechanism.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        $sbCancelOk = Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null
+        $sbCancelCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca | Where-Object { $_ -like "*squad-cancelled*" })
+        if ($sbCancelOk.Cancelled -and -not $sbCancelOk.AlreadyTerminal -and $sbCancelCalls.Count -eq 1) {
+            Add-Pass "Sandbox cancel stops the worker with one labelled 'aca sandbox exec' and reports success"
+        } else {
+            Add-Fail "Sandbox cancel did not cancel correctly (cancelled=$($sbCancelOk.Cancelled) calls=$($sbCancelCalls.Count))"
+        }
+
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "1"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = "Error: sandbox with label name=squad-stub-session was not found"
+        $sbCancelGone = $null
+        $sbCancelGoneThrew = $false
+        try { $sbCancelGone = Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null } catch { $sbCancelGoneThrew = $true }
+        if (-not $sbCancelGoneThrew -and $sbCancelGone.Cancelled -and $sbCancelGone.AlreadyTerminal) {
+            Add-Pass "Sandbox cancel is idempotent: an already-gone sandbox is success (AlreadyTerminal), not an error"
+        } else {
+            Add-Fail "Sandbox cancel mishandled an already-gone sandbox (threw=$sbCancelGoneThrew cancelled=$($sbCancelGone.Cancelled) already=$($sbCancelGone.AlreadyTerminal))"
+        }
+
+        $sbCancelFailOk = $true
+        $sbCancelFailDetail = @()
+        foreach ($case in $sbFailCases) {
+            $env:SQUAD_STUB_ACA_CANCEL_RC = "1"
+            $env:SQUAD_STUB_ACA_CANCEL_ERR = $case.Err
+            $threw = $false
+            $msg = ""
+            try { Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null | Out-Null } catch { $threw = $true; $msg = [string]$_.Exception.Message }
+            if (-not $threw) {
+                $sbCancelFailOk = $false
+                $sbCancelFailDetail += "$($case.Label): did not throw"
+            } elseif ($msg -match [regex]::Escape($sbSecret)) {
+                $sbCancelFailOk = $false
+                $sbCancelFailDetail += "$($case.Label): leaked the token"
+            }
+        }
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        if ($sbCancelFailOk) {
+            Add-Pass "Sandbox cancel THROWS on auth, RBAC, throttling and transport failures (never reported as cancelled)"
+        } else {
+            Add-Fail "Sandbox cancel swallowed a real failure ($($sbCancelFailDetail -join '; '))"
+        }
+
+        # --- 7. refusal when the sandbox group carries a managed identity ----
+        # Private-registry pulls use an ACR refresh token precisely so the group
+        # needs no identity. An identity on the group is an escalation path out
+        # of the sandbox, so the provider must refuse before creating anything.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_SBG_IDENTITY = "1"
+        $sbIdThrew = $false
+        $sbIdMsg = ""
+        try { Start-SquadExecution -Provider $sbProvider -Request $sbRequest 6>$null | Out-Null } catch { $sbIdThrew = $true; $sbIdMsg = [string]$_.Exception.Message }
+        $sbIdCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $env:SQUAD_STUB_SBG_IDENTITY = ""
+        if ($sbIdThrew -and $sbIdCalls.Count -eq 0 -and $sbIdMsg -match "identity") {
+            Add-Pass "Provider refuses to use a sandbox group that has a managed identity, before creating anything"
+        } else {
+            Add-Fail "A sandbox group with a managed identity was not refused (threw=$sbIdThrew acaCalls=$($sbIdCalls.Count) msg=$sbIdMsg)"
+        }
+
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_SBG_RC = "1"
+        $sbIdFailThrew = $false
+        try { Start-SquadExecution -Provider $sbProvider -Request $sbRequest 6>$null | Out-Null } catch { $sbIdFailThrew = $true }
+        $sbIdFailCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $env:SQUAD_STUB_SBG_RC = "0"
+        if ($sbIdFailThrew -and $sbIdFailCalls.Count -eq 0) {
+            Add-Pass "An identity check that cannot be completed fails closed (unknown is not treated as 'no identity')"
+        } else {
+            Add-Fail "A failed identity check did not fail closed (threw=$sbIdFailThrew acaCalls=$($sbIdFailCalls.Count))"
+        }
+
+        # --- 8. --identity is refused wherever it appears --------------------
+        $sbIdentityArgvRefused = $false
+        try { Assert-SandboxArgvIdentityFree -Argv @("sandboxgroup", "disk", "create", "--identity", "mi-squad") } catch { $sbIdentityArgvRefused = $true }
+        $sbIdentityArgvRefused2 = $false
+        try { Assert-SandboxArgvIdentityFree -Argv @("sandbox", "create", "--system-assigned") } catch { $sbIdentityArgvRefused2 = $true }
+        if ($sbIdentityArgvRefused -and $sbIdentityArgvRefused2) {
+            Add-Pass "Any argv carrying --identity / --system-assigned is refused before the process starts"
+        } else {
+            Add-Fail "An identity-granting flag was not refused (--identity=$sbIdentityArgvRefused --system-assigned=$sbIdentityArgvRefused2)"
+        }
+
+        # --- 9. failure between policy and launch tears the sandbox down -----
+        # Otherwise a sandbox is left running, billed for, and orphaned.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $env:SQUAD_STUB_ACA_EGRESS_RC = "1"
+        $env:SQUAD_STUB_ACA_EGRESS_ERR = "Error: egress policy rejected"
+        $sbEgThrew = $false
+        $sbEgMsg = ""
+        try { Start-SquadExecution -Provider $sbProvider -Request $sbRequest 6>$null | Out-Null } catch { $sbEgThrew = $true; $sbEgMsg = [string]$_.Exception.Message }
+        $sbEgCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $sbEgLaunched = @($sbEgCalls | Where-Object { $_ -like "*squad-launched*" }).Count
+        $sbEgDeleted = @($sbEgCalls | Where-Object { $_ -like "sandbox delete *" }).Count
+        $env:SQUAD_STUB_ACA_EGRESS_RC = "0"
+        $env:SQUAD_STUB_ACA_EGRESS_ERR = ""
+        if ($sbEgThrew -and $sbEgLaunched -eq 0 -and $sbEgDeleted -eq 1) {
+            Add-Pass "If the egress policy cannot be applied, no repository code is launched and the sandbox is torn down"
+        } else {
+            Add-Fail "A failed egress policy did not stop the launch or leaked a sandbox (threw=$sbEgThrew launches=$sbEgLaunched deletes=$sbEgDeleted)"
+        }
+        if ($sbEgMsg -notmatch "github\.com" -and $sbEgMsg -notmatch "npmjs" -and $sbEgMsg -notmatch [regex]::Escape($sbSecret)) {
+            Add-Pass "The egress failure message carries no policy host patterns and no token"
+        } else {
+            Add-Fail "An egress failure message leaked policy values or a token: $sbEgMsg"
+        }
+
+        # --- 10. disk label -> GUID resolution --------------------------------
+        # `--name` on `disk create` becomes a LABEL, so a private disk has to be
+        # resolved to its GUID; `--disk` accepts public images only.
+        Reset-SquadCliStubLog -Stub $sbStub
+        $sbLabelProvider = New-SandboxTestProvider -DiskId "" -DiskLabel "squad-worker-stub"
+        try { Start-SquadExecution -Provider $sbLabelProvider -Request $sbRequest 6>$null | Out-Null } catch { }
+        $sbLabelCalls = @(Get-SquadCliStubCall -Stub $sbStub -Tool aca)
+        $sbListed = @($sbLabelCalls | Where-Object { $_ -like "sandboxgroup disk list*" }).Count
+        $sbUsedGuid = @($sbLabelCalls | Where-Object { $_ -like "sandbox create *--disk-id aaaaaaaa-1111-2222-3333-444444444444*" }).Count
+        if ($sbListed -eq 1 -and $sbUsedGuid -eq 1) {
+            Add-Pass "A disk label is resolved to its GUID via 'sandboxgroup disk list' before create"
+        } else {
+            Add-Fail "Disk label resolution did not happen (lists=$sbListed guidCreates=$sbUsedGuid)"
+        }
+
+        # --- 11. every sandbox is labelled with its session id ---------------
+        $sbLabelled = @($sbCalls | Where-Object { $_ -like "*name=squad-stub-session*" }).Count
+        if ($sbLabelled -ge 4) {
+            Add-Pass "Every sandbox operation is addressed by a session-derived label, so a reaper can find orphans"
+        } else {
+            Add-Fail "Sandbox operations are not consistently session-labelled ($sbLabelled labelled calls)"
+        }
+    } catch {
+        Add-Fail "Sandbox provider checks threw: $($_.Exception.Message)"
+    } finally {
+        $env:PATH = $sbPrevPath
+        foreach ($name in $sbEnvNames) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        if ($sbStub) { Remove-SquadCliStubEnvironment -Stub $sbStub }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 9. CLI behaviour regression (offline, stubbed az/gh)
 # ---------------------------------------------------------------------------
 Write-Section "CLI behaviour regression"
@@ -1561,6 +2308,22 @@ if (-not (Test-Path $goldenScript)) {
         } else {
             Add-Fail "No CI job runs scripts/tests/verify-cli-golden.ps1; the stdout regression guard would be developer-only again"
         }
+
+        # Same principle for the one invariant that needs a real Linux shell.
+        # The windows-latest job can only ever SKIP it (no WSL on GitHub's
+        # Windows runners, and Git Bash has no setsid), so it has to run in the
+        # ubuntu-latest job -- and that job must treat exit 77 as a failure,
+        # because a skip is not a pass.
+        if ($workflowText -match 'verify-launch-detachment\.ps1') {
+            Add-Pass "CI runs scripts/tests/verify-launch-detachment.ps1, so a launch that stops detaching fails a job on a real Linux shell"
+        } else {
+            Add-Fail "No CI job runs scripts/tests/verify-launch-detachment.ps1; worker-launch detachment would be verified only on a developer's WSL box"
+        }
+        if ($workflowText -match '(?s)verify-launch-detachment\.ps1.{0,400}\brc\b.{0,200}\b77\b') {
+            Add-Pass "The CI detachment step treats exit 77 (probe did not run) as a failure, not as a pass"
+        } else {
+            Add-Fail "The CI detachment step does not fail on exit 77; a runner that lost bash would report green while proving nothing"
+        }
     }
 
     # The goldens are only a gate if they verify on a machine other than the one
@@ -1600,6 +2363,11 @@ if (-not (Test-Path $goldenScript)) {
 Write-Section "Summary"
 Write-Host ("  Passed: {0}" -f $script:Passes.Count) -ForegroundColor Green
 Write-Host ("  Failed: {0}" -f $script:Failures.Count) -ForegroundColor ($(if ($script:Failures.Count -gt 0) { 'Red' } else { 'Green' }))
+Write-Host ("  Skipped: {0}" -f $script:Skips.Count) -ForegroundColor ($(if ($script:Skips.Count -gt 0) { 'Yellow' } else { 'Green' }))
+if ($script:Skips.Count -gt 0) {
+    Write-Host "`nSkipped (NOT passes -- the dependency was missing):" -ForegroundColor Yellow
+    $script:Skips | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+}
 if ($script:Failures.Count -gt 0) {
     Write-Host "`nFailures:" -ForegroundColor Red
     $script:Failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }

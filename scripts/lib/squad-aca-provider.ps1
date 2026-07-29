@@ -24,11 +24,11 @@
     Sandboxes specifics. Providers live in scripts/lib/providers/.
 
 .NOTES
-    Extension point for PRD #6 Sprint 5: add
-    scripts/lib/providers/squad-sandbox-provider.ps1 exposing
-    New-SandboxExecutionProvider, dot-source it below, and add a 'sandbox' branch
-    to New-SquadExecutionProvider. No call site in scripts/squad-aca.ps1 should
-    need to change. Sprint 3 intentionally ships no sandbox code and no flag.
+    PRD #6 Sprint 5 added scripts/lib/providers/squad-sandbox-provider.ps1 and a
+    'sandbox' branch in New-SquadExecutionProvider. The sandbox route is gated by
+    Resolve-SquadExecutionRoute + Test-SquadSandboxEnabled: with the feature flag
+    unset, that gate returns 'aca-job' before anything sandbox-shaped is
+    touched, so behaviour is byte-identical to a build with no sandbox code.
 #>
 
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here. This file
@@ -44,6 +44,11 @@ $script:SquadHandlePrefix = "sqx1."
 
 # The provider contract. Every provider MUST supply exactly these operations.
 $script:SquadProviderOperations = @("create", "wait", "status", "logs", "cancel", "terminate")
+
+# The sandbox feature flag. ACA Jobs are the unconditional default; the sandbox
+# route is reachable ONLY when this is explicitly set to an affirmative value.
+$script:SquadSandboxFlagName = "SQUAD_ACA_ENABLE_SANDBOX"
+$script:SquadSandboxFlagTrue = @("1", "true", "yes", "on", "enabled")
 
 # Provider-neutral execution states (subset of the PRD #6 lifecycle that a
 # provider can report for a single execution).
@@ -332,6 +337,207 @@ function Assert-SquadExecutionProvider {
     return $Provider
 }
 
+# ---------------------------------------------------------------------------
+# Sandbox feature flag and route gate
+# ---------------------------------------------------------------------------
+
+function Test-SquadSandboxEnabled {
+    <#
+    .SYNOPSIS
+        Is the ACA Sandboxes execution plane switched on?
+
+    .DESCRIPTION
+        DEFAULT OFF, and off in every ambiguous case. ACA Sandboxes are public
+        preview with no SLA (ADR 0001), so ACA Jobs stay the unconditional
+        default and the rollback path: unset the flag and the control plane is
+        byte-identical to a build that has no sandbox code in it at all.
+
+        The flag is an environment variable rather than a config-file key on
+        purpose. It is per-invocation, so rollback is immediate and needs no
+        file edit, and it cannot be turned on by a repository or by anything
+        that syncs config.
+
+        A Config object may also carry `sandboxEnabled = $true`. Nothing writes
+        that today; it exists so an operator-managed deployment can opt in
+        without exporting a variable, and it is still subject to the explicit
+        environment kill switch below.
+
+    .OUTPUTS
+        [bool]
+    #>
+    param([object]$Config = $null)
+
+    $raw = [Environment]::GetEnvironmentVariable($script:SquadSandboxFlagName, "Process")
+    if ($null -ne $raw) {
+        $value = ([string]$raw).Trim().ToLowerInvariant()
+        if ($value) {
+            # An explicit value always decides, in both directions. That is what
+            # makes SQUAD_ACA_ENABLE_SANDBOX=0 a kill switch.
+            return ($script:SquadSandboxFlagTrue -contains $value)
+        }
+    }
+
+    if ($Config -and ($Config.PSObject.Properties.Name -contains "sandboxEnabled")) {
+        return ($Config.sandboxEnabled -eq $true)
+    }
+    return $false
+}
+
+function Get-SquadSandboxCatalog {
+    <#
+    .SYNOPSIS
+        Load the administrator-owned sandbox class catalog.
+
+    .DESCRIPTION
+        config/sandbox-classes.json is owned by this repository's control plane,
+        never by a repository being worked on. A missing or unparseable catalog
+        returns $null, and every caller treats that as fail-closed.
+    #>
+    param([string]$CatalogPath = "")
+
+    if (-not $CatalogPath) {
+        $CatalogPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "config\sandbox-classes.json"
+    }
+    if (-not (Test-Path $CatalogPath)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $CatalogPath -Raw
+        if (-not $raw) { return $null }
+        return ($raw | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+function Get-SquadSandboxClass {
+    <#
+    .SYNOPSIS
+        Resolve an approved sandbox class by id, or fail closed.
+
+    .DESCRIPTION
+        The ONLY way a class reaches the Sandboxes provider. Three gates, all of
+        which must pass:
+
+          1. the catalog loads,
+          2. the catalog is not `provisional` -- it ships provisional:true with
+             placeholder images, egress rules and cost ceilings, and its own
+             header says consumers must treat that as report-only, so acting on
+             it would run repository code under egress rules nobody reviewed,
+          3. the class exists and is `approved: true`.
+
+        A repository's `image.hint` never reaches here: the Sprint 2 resolver
+        only ever emits a catalog-owned class id.
+
+    .OUTPUTS
+        PSCustomObject with Class (null when refused) and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$ClassId,
+        [string]$CatalogPath = "",
+        [object]$Catalog = $null
+    )
+
+    if (-not $Catalog) { $Catalog = Get-SquadSandboxCatalog -CatalogPath $CatalogPath }
+    if (-not $Catalog) {
+        return [pscustomobject]@{ Class = $null; Reason = "catalog-unavailable" }
+    }
+    if ($Catalog.provisional -ne $false) {
+        return [pscustomobject]@{ Class = $null; Reason = "catalog-provisional" }
+    }
+    if (-not $ClassId) {
+        return [pscustomobject]@{ Class = $null; Reason = "no-sandbox-class" }
+    }
+    foreach ($class in @($Catalog.classes)) {
+        if ([string]$class.id -ne [string]$ClassId) { continue }
+        if ($class.approved -ne $true) {
+            return [pscustomobject]@{ Class = $null; Reason = "class-not-approved" }
+        }
+        return [pscustomobject]@{ Class = $class; Reason = "approved-sandbox-class" }
+    }
+    return [pscustomobject]@{ Class = $null; Reason = "class-not-in-catalog" }
+}
+
+function Resolve-SquadExecutionRoute {
+    <#
+    .SYNOPSIS
+        Decide which execution plane a dispatch actually goes to.
+
+    .DESCRIPTION
+        The Sprint 2 resolver computes a route (`aca-job` | `sandbox` |
+        `fail-closed`). This is where that decision is finally ACTED ON, and it
+        is the single place the feature flag is enforced.
+
+        Rules, in order:
+
+          * No decision at all -> `aca-job`. Today's path, unchanged.
+          * `fail-closed` -> `fail-closed`, flag or no flag. The resolver already
+            decided the requirements cannot be met safely.
+          * `sandbox` with the flag OFF -> `aca-job` ONLY if the default worker
+            profile satisfies the manifest, otherwise `fail-closed`. Falling back
+            to the default image while required capabilities are unsatisfied is
+            exactly the "silently run unsafely" outcome PRD #6 forbids -- and a
+            `sandbox` route means the resolver already found the default
+            insufficient, so in practice this fails closed.
+          * `sandbox` with the flag ON -> `sandbox`, but only once
+            Get-SquadSandboxClass has confirmed an approved class in a
+            non-provisional catalog. Anything else fails closed.
+          * Anything unrecognised -> `fail-closed`.
+
+    .OUTPUTS
+        PSCustomObject: Route, Reason, SandboxClass (the catalog object or
+        $null), SandboxClassId, FeatureEnabled.
+    #>
+    param(
+        [object]$Decision = $null,
+        [object]$Config = $null,
+        [string]$CatalogPath = "",
+        [object]$Catalog = $null
+    )
+
+    $enabled = Test-SquadSandboxEnabled -Config $Config
+
+    function New-RouteResult {
+        param([string]$Route, [string]$Reason, [object]$Class = $null, [string]$ClassId = "")
+        return [pscustomobject]@{
+            Route          = $Route
+            Reason         = $Reason
+            SandboxClass   = $Class
+            SandboxClassId = $ClassId
+            FeatureEnabled = $enabled
+        }
+    }
+
+    if (-not $Decision) {
+        return (New-RouteResult -Route "aca-job" -Reason "no-capability-resolution")
+    }
+
+    $route = ""
+    if ($Decision.PSObject.Properties.Name -contains "route") { $route = [string]$Decision.route }
+    $classId = ""
+    if ($Decision.PSObject.Properties.Name -contains "sandboxClass" -and $Decision.sandboxClass) {
+        $classId = [string]$Decision.sandboxClass
+    }
+    $defaultSufficient = ($Decision.PSObject.Properties.Name -contains "defaultImageSufficient") -and ($Decision.defaultImageSufficient -eq $true)
+
+    switch ($route) {
+        "aca-job" { return (New-RouteResult -Route "aca-job" -Reason "capability-resolution-aca-job") }
+        "fail-closed" { return (New-RouteResult -Route "fail-closed" -Reason "capability-resolution-fail-closed") }
+        "sandbox" {
+            if (-not $enabled) {
+                if ($defaultSufficient) {
+                    return (New-RouteResult -Route "aca-job" -Reason "sandbox-feature-disabled")
+                }
+                return (New-RouteResult -Route "fail-closed" -Reason "sandbox-feature-disabled-and-default-insufficient" -ClassId $classId)
+            }
+            $resolved = Get-SquadSandboxClass -ClassId $classId -CatalogPath $CatalogPath -Catalog $Catalog
+            if (-not $resolved.Class) {
+                return (New-RouteResult -Route "fail-closed" -Reason $resolved.Reason -ClassId $classId)
+            }
+            return (New-RouteResult -Route "sandbox" -Reason "approved-sandbox-class" -Class $resolved.Class -ClassId $classId)
+        }
+    }
+    return (New-RouteResult -Route "fail-closed" -Reason "unrecognised-route")
+}
+
 function New-SquadExecutionProvider {
     <#
     .SYNOPSIS
@@ -339,21 +545,26 @@ function New-SquadExecutionProvider {
 
     .PARAMETER Kind
         'aca-job' - the production adapter over ACA Jobs (preserves today's
-                    behaviour exactly).
+                    behaviour exactly). The unconditional default.
+        'sandbox' - the ACA Sandboxes adapter. Reachable only when the sandbox
+                    feature flag is explicitly enabled AND an approved,
+                    non-provisional class was resolved; see
+                    Resolve-SquadExecutionRoute.
         'fake'    - filesystem-backed, offline, deterministic. Used by the
                     provider contract tests so the seam can be exercised with no
                     network and no Azure.
 
-        Sprint 5 adds 'sandbox' here.
-
     .PARAMETER Options
         Provider-specific construction options (hashtable). For 'aca-job':
-        Config (the resolved ACA config object) and ScriptDir. For 'fake':
+        Config (the resolved ACA config object) and ScriptDir. For 'sandbox':
+        Class (an approved catalog class) plus Config / SandboxGroup /
+        ResourceGroup / SubscriptionId / DiskId / DiskLabel / AcaCliPath /
+        IdleTimeoutSeconds / PollSeconds / WorkerSecrets. For 'fake':
         StateRoot.
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet("aca-job", "fake")]
+        [ValidateSet("aca-job", "sandbox", "fake")]
         [string]$Kind,
         [System.Collections.IDictionary]$Options = @{}
     )
@@ -363,6 +574,15 @@ function New-SquadExecutionProvider {
             $provider = New-AcaJobExecutionProvider `
                 -Config $Options["Config"] `
                 -ScriptDir $Options["ScriptDir"]
+        }
+        "sandbox" {
+            $sandboxArgs = @{ Class = $Options["Class"] }
+            foreach ($name in @("Config", "SandboxGroup", "ResourceGroup", "SubscriptionId",
+                                "DiskId", "DiskLabel", "AcaCliPath", "IdleTimeoutSeconds",
+                                "PollSeconds", "WorkerSecrets", "ScriptDir")) {
+                if ($Options.Contains($name) -and $null -ne $Options[$name]) { $sandboxArgs[$name] = $Options[$name] }
+            }
+            $provider = New-SandboxExecutionProvider @sandboxArgs
         }
         "fake" {
             $provider = New-FakeExecutionProvider -StateRoot $Options["StateRoot"]
@@ -461,17 +681,25 @@ function Wait-SquadExecution {
     <#
     .SYNOPSIS
         wait: block until the execution is ready (running) or terminal.
+
+    .PARAMETER UntilTerminal
+        Wait all the way to a terminal state rather than returning as soon as the
+        execution is running. Providers that cannot distinguish the two ignore
+        it; the Sandboxes provider uses it to poll a detached session to
+        completion.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Provider,
         [Parameter(Mandatory = $true)][string]$Handle,
         [int]$TimeoutSeconds = 300,
-        [int]$PollSeconds = 5
+        [int]$PollSeconds = 5,
+        [switch]$UntilTerminal
     )
     return Invoke-SquadProviderOperation -Provider $Provider -Operation "wait" -Arguments @{
         Handle         = $Handle
         TimeoutSeconds = $TimeoutSeconds
         PollSeconds    = $PollSeconds
+        UntilTerminal  = [bool]$UntilTerminal
     }
 }
 
@@ -560,4 +788,5 @@ function Remove-SquadExecution {
 # scoping surprises (dot-sourcing inside a function would scope the adapter's
 # functions to that function).
 . (Join-Path $PSScriptRoot "providers\squad-aca-job-provider.ps1")
+. (Join-Path $PSScriptRoot "providers\squad-sandbox-provider.ps1")
 . (Join-Path $PSScriptRoot "providers\squad-fake-provider.ps1")

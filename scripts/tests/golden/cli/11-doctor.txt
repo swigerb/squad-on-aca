@@ -11,6 +11,7 @@ extension show --name containerapp --only-show-errors -o none
 repo view --json nameWithOwner --jq .nameWithOwner
 auth status
 ### SQUAD CALLS
+### ACA CALLS
 ### STDOUT
 
 Check           Status  Detail

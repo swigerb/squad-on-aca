@@ -50,9 +50,10 @@ that starts, watches, or stops a session goes through a **provider seam**:
 scripts/squad-aca.ps1            control plane / CLI
         │  dispatch request  (provider-neutral, PRD #6 shape)
         ▼
-scripts/lib/squad-aca-provider.ps1        the contract
+scripts/lib/squad-aca-provider.ps1        the contract + the route gate
         │  create / wait / status / logs / cancel / terminate
-        ├── scripts/lib/providers/squad-aca-job-provider.ps1   (production: ACA Jobs)
+        ├── scripts/lib/providers/squad-aca-job-provider.ps1   (production: ACA Jobs, the default)
+        ├── scripts/lib/providers/squad-sandbox-provider.ps1   (ACA Sandboxes, feature-flagged OFF)
         └── scripts/lib/providers/squad-fake-provider.ps1      (offline tests)
 ```
 
@@ -126,9 +127,141 @@ through an execution provider would add risk without helping a future substrate.
 
 ### Extension point
 
-`New-SquadExecutionProvider -Kind` accepts `aca-job` and `fake` today. A
-Sandboxes provider plugs in there without touching CLI plumbing. Sandboxes are
-**not** implemented yet.
+`New-SquadExecutionProvider -Kind` accepts `aca-job`, `sandbox` and `fake`. A
+further substrate plugs in there without touching CLI plumbing.
+
+## ACA Sandboxes provider (feature-flagged, default OFF)
+
+`scripts/lib/providers/squad-sandbox-provider.ps1` implements the same six
+operations over **Azure Container Apps Sandboxes** (ARM `Microsoft.App/sandboxGroups`,
+api-version `2026-02-01-preview`). ACA Jobs remain the unconditional default and
+the rollback path; see `docs/runbook.md` for how to switch the flag on and off.
+
+Every preview-specific detail lives inside that one file. Sandboxes are driven by
+a standalone **`aca` binary**, not by an `az` extension — there is no
+`az containerapp sandbox` command — and only the sandbox *group* is
+ARM-reachable, so the group's managed-identity check is the one `az` call the
+provider makes. `aca` is resolved through an overridable path
+(`-AcaCliPath`, then `SQUAD_ACA_SANDBOX_CLI`, then `PATH`, then
+`~/.aca/bin/aca.exe`) so the offline tests can stub it exactly like `az` and `gh`.
+
+### The route gate
+
+`Resolve-SquadExecutionRoute` is the single place the Sprint 2 capability
+decision (`aca-job` | `sandbox` | `fail-closed`) is acted on, and the single
+place the feature flag is enforced:
+
+| Decision | Flag OFF | Flag ON |
+| --- | --- | --- |
+| *(none)* | `aca-job` | `aca-job` |
+| `aca-job` | `aca-job` | `aca-job` |
+| `sandbox` | `aca-job` **only if** the default worker satisfies the manifest, otherwise `fail-closed` | `sandbox`, but only for an **approved** class in a **non-provisional** catalog; anything else `fail-closed` |
+| `fail-closed` | `fail-closed` | `fail-closed` |
+| anything else | `fail-closed` | `fail-closed` |
+
+A `sandbox` decision means the resolver already found the default image
+insufficient, so with the flag off it fails closed rather than silently running
+a session whose required capabilities cannot be met. Only administrator-approved
+classes from `config/sandbox-classes.json` are reachable; a repository's
+`image.hint` can at most *select among* them.
+
+`New-SessionExecutionProvider` in `scripts/squad-aca.ps1` checks the flag
+**first** and returns the ACA Jobs adapter immediately when it is off, without
+reading the catalog, resolving a route, or looking for `aca`. That is what makes
+"flag off" byte-identical to a build with no sandbox code in it, and it is what
+`scripts/tests/verify-cli-golden.ps1` and `scripts/tests/compare-cli-baseline.ps1`
+verify.
+
+**The gate exists; it is not yet fed.** No `New-SessionExecutionProvider` call
+site in `scripts/squad-aca.ps1` passes `-CapabilityResolution`, so every CLI
+dispatch reaches the gate with *no* decision — the `(none)` row above — and the
+`sandbox` branch is unreachable from the CLI **even with the flag on**. That is
+the correct state for a default-off sprint: the routing table and the provider
+are testable in isolation before anything can select them. Handing the Sprint 2
+resolution to the gate is later work (PRD #6, Sprint 6+); until then, describing
+this as "the capability decision is now acted on" overstates what ships.
+
+### Session execution model: detached + poll
+
+`aca sandbox exec` has a hard **~120 s client transport timeout**, constant
+regardless of how long the remote command runs, after which it fails with
+`Network issue — retry policy expired`. The sandbox itself is unharmed. Squad
+sessions run 10–60 minutes, so **a session is never a single synchronous exec**.
+
+`create` performs, in this order — and the order is a security control, not a
+style choice:
+
+1. assert the target sandbox group has **no managed identity** (fail closed if
+   the check cannot be completed);
+2. `aca sandbox create --disk-id <GUID> --label name=squad-<session> --cpu … --memory …`
+   (`--disk` accepts public images only, so a private disk must be addressed by
+   the GUID resolved from `aca sandboxgroup disk list -o json`);
+3. `aca sandbox egress set … --default Deny --rule <pattern>:<action> … --traffic-inspection …`
+   — **before** any repository code exists in the sandbox;
+4. `aca sandbox lifecycle set … --auto-suspend enable --idle-timeout-seconds …`
+   (auto-suspend otherwise defaults to enabled at 600 s and would suspend a live
+   session);
+5. `aca sandbox exec -l name=… -c "prelude && { setsid nohup bash -c '…' </dev/null >/dev/null 2>&1 & } && …"`
+   — the **detached** worker launch, and the first repository code to run.
+
+The brace group in step 5 is load-bearing. In POSIX/bash grammar `&` is a list
+terminator that binds *looser* than `&&`, so writing
+
+```text
+prelude && setsid nohup bash -c '…' </dev/null >/dev/null 2>&1 &
+```
+
+backgrounds the **entire** `&&`-list and binds the three redirections to the last
+simple command only — the async subshell keeps the exec's own fd 0/1/2 open for
+the whole worker run, the launching exec blocks to its ~120 s timeout, and
+`create`'s teardown then destroys a perfectly healthy session two minutes in.
+`{ … & }` scopes the `&` to the redirected `setsid` alone, so the prelude runs
+synchronously (and gates the launch), `phase=running` cannot race an asynchronous
+`mkdir`, and the exec returns immediately. `validate.ps1` proves this by running
+the emitted command in a real shell rather than by matching its text.
+
+Any failure between steps 3 and 5 tears the sandbox down and rethrows the
+original error, so repository code can never run in a sandbox whose egress policy
+was not applied, and a policy-less sandbox is never left billing.
+
+The detached wrapper records terminal state so a poll never has to infer it: the
+worker runs (its own run includes the `git push`, so results are in GitHub before
+the session is terminal — invariant 9), then its exit code is written, then the
+phase, then the completion marker is touched **last**.
+
+`status` is a short exec that reads that state; `wait` is a poll loop of those
+short execs. Terminal state comes from the **completion marker plus a recorded
+exit code** — a marker with no exit code is `Unknown`, not `Succeeded` — and never
+from an exec's own exit status, which reports the transport rather than the
+session. A transport failure is reported **inconclusive** and re-polled, never as
+a failed session.
+
+### Security invariants enforced by this provider
+
+* `--identity`, `--system-assigned` and `--mi-user-assigned` are rejected on any
+  argv before the process starts, and the target group is asserted
+  identity-free. Private-registry pulls use an ACR refresh token
+  (`--username 00000000-0000-0000-0000-000000000000 --token …`), which is exactly
+  what removes the need for an identity.
+* Default-deny egress plus the class's allowlist is applied before any repository
+  code runs.
+* Tokens, egress policy values (`--default`, `--rule`, `--traffic-inspection`)
+  and remote command text are redacted from every rendered argv, and known secret
+  values are scrubbed out of captured output, so they cannot reach an error
+  message or a log.
+* `terminate` is idempotent — already-deleted is success — but auth, RBAC,
+  throttling, network and transport failures throw, because none of them says
+  anything about whether the sandbox still exists. It reuses
+  `Test-AcaJobExecutionGone`, the same fail-closed classifier the ACA Job adapter
+  uses, rather than inventing a second mechanism.
+* Every sandbox is labelled `name=squad-<session id>` so a reaper can find
+  orphans.
+
+**Known limitation (PRD #6 Sprint 7 owns it).** Worker credentials are currently
+delivered as environment assignments inside the launch command, so they appear in
+that one `aca` process argv on the client. The provider never repeats them —
+not into the dispatch response, not into an error message, not into a rendered
+argv — but replacing this with credential brokerage is Sprint 7's job.
 
 ## Unified dispatch contract and durable leases
 

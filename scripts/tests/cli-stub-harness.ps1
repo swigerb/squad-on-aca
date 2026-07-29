@@ -45,9 +45,40 @@
                              `containerapp job execution show` reports
                              Provisioning, later calls report Running
       SQUAD_STUB_EXEC_STUCK  "1" => every `execution show` reports Provisioning
+      SQUAD_STUB_SBG_IDENTITY "1" => `az resource show` reports a managed
+                             identity on the sandbox group (invariant 4 refusal)
 
-    Used by scripts/validate.ps1 ("ACA Job adapter" and "CLI behaviour
-    regression" sections).
+    The fake `aca` (Sprint 5, ACA Sandboxes provider) reads these. It records
+    every invocation to SQUAD_STUB_ACA_LOG exactly like the other shims, so a
+    test can assert the argv sequence and its ORDER -- which is how "egress was
+    applied before the worker was launched" becomes an assertion rather than a
+    hope:
+
+      SQUAD_STUB_ACA_RC        exit code for every `aca` call (default 0)
+      SQUAD_STUB_ACA_ERR       stderr line every failing `aca` call emits
+      SQUAD_STUB_ACA_EGRESS_RC exit code for `sandbox egress set` only
+      SQUAD_STUB_ACA_DELETE_RC exit code for `sandbox delete` only
+      SQUAD_STUB_ACA_DELETE_ERR stderr for `sandbox delete` only
+      SQUAD_STUB_ACA_CANCEL_RC exit code for a cancel `sandbox exec` only
+      SQUAD_STUB_ACA_CANCEL_ERR stderr for a cancel `sandbox exec` only. Cancel
+                               needs its own pair because its failure
+                               classification (auth / RBAC / throttling /
+                               transport vs "already gone") is the same
+                               classification terminate makes, and it has to be
+                               driven independently of the launch exec's rc.
+      SQUAD_STUB_ACA_POLL_DIR  directory holding the simulated sandbox state.
+                               A poll (`sandbox exec` whose command reads the
+                               state dir) reports phase/exit/marker from
+                               phase.txt / exit.txt / done.txt in there, so a
+                               test drives a long session by editing files.
+      SQUAD_STUB_ACA_TIMEOUT_ONCE marker file; the FIRST `sandbox exec` fails
+                               with the real client-timeout text
+                               ("Network issue - retry policy expired"), later
+                               ones succeed. Proves a transport timeout is
+                               treated as inconclusive and re-polled.
+
+    Used by scripts/validate.ps1 ("ACA Job adapter", "Sandbox provider" and
+    "CLI behaviour regression" sections).
 #>
 
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here. This file
@@ -82,15 +113,11 @@ function New-SquadCliStubEnvironment {
     $azLog = Join-Path $Root "az-calls.log"
     $ghLog = Join-Path $Root "gh-calls.log"
     $squadLog = Join-Path $Root "squad-calls.log"
-    # Shared, ordered, cross-tool call log. `az` and the lease store both append
-    # to it, so a test can assert that the lease write precedes the compute
-    # request BY INDEX. It is deliberately NOT part of the golden capture: the
-    # goldens cover observable CLI output, this covers ordering.
-    $callLog = Join-Path $Root "dispatch-calls.log"
+    $acaLog = Join-Path $Root "aca-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $ghLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $squadLog -Value "" -NoNewline -Encoding ascii
-    Set-Content -LiteralPath $callLog -Value "" -NoNewline -Encoding ascii
+    Set-Content -LiteralPath $acaLog -Value "" -NoNewline -Encoding ascii
 
     # --- Synthetic deployment config (never the developer's real one) --------
     $config = [ordered]@{
@@ -191,6 +218,36 @@ function New-SquadCliStubEnvironment {
 { "name": "Stub Subscription", "id": "00000000-0000-0000-0000-000000000000" }
 '@
 
+    # --- Fixtures returned by the fake `aca` (Sprint 5, ACA Sandboxes) -------
+    # A sandbox group with NO managed identity. This is the shape the provider
+    # must see before it will run anything (PRD #6 invariant 4): private-registry
+    # pulls use an ACR refresh token, never an identity the sandbox could reuse.
+    Set-Content -LiteralPath (Join-Path $fixtureDir "sbg-identity-none.json") -Encoding ascii -Value @'
+null
+'@
+
+    # The refusal case: a group that DOES carry an identity.
+    Set-Content -LiteralPath (Join-Path $fixtureDir "sbg-identity-present.json") -Encoding ascii -Value @'
+{ "type": "SystemAssigned", "principalId": "11111111-1111-1111-1111-111111111111" }
+'@
+
+    # `--name` on `aca sandboxgroup disk create` becomes a LABEL, not a
+    # resolvable name, so a private disk has to be addressed by GUID resolved
+    # from this listing.
+    Set-Content -LiteralPath (Join-Path $fixtureDir "disk-list.json") -Encoding ascii -Value @'
+[
+  { "id": "aaaaaaaa-1111-2222-3333-444444444444", "name": "squad-worker-stub" },
+  { "id": "bbbbbbbb-5555-6666-7777-888888888888", "name": "other-disk" }
+]
+'@
+
+    Set-Content -LiteralPath (Join-Path $fixtureDir "sandbox-list.json") -Encoding ascii -Value @'
+[
+  { "labels": { "name": "squad-stub-session" }, "status": "Running" },
+  { "labels": { "name": "not-ours" }, "status": "Running" }
+]
+'@
+
     # --- Fake `az` ----------------------------------------------------------
     # Flat goto-based dispatch (no nested parenthesised blocks) so cmd.exe
     # parsing stays predictable for arguments containing [], {} and =.
@@ -256,10 +313,16 @@ if not "%SQUAD_CALL_LOG%"=="" >>"%SQUAD_CALL_LOG%" echo az job-start
 echo STUB-START-ACK
 exit /b %SQUAD_STUB_START_RC%
 :sqnotca
+if "%A1%"=="resource" goto sqresource
 if not "%A1%"=="account" goto sqok
 if not "%A2%"=="show" goto sqok
 type "%SQUAD_STUB_FIXTURES%\account-show.json"
 goto sqok
+:sqresource
+if not "%A2%"=="show" goto sqok
+if "%SQUAD_STUB_SBG_IDENTITY%"=="1" type "%SQUAD_STUB_FIXTURES%\sbg-identity-present.json"
+if not "%SQUAD_STUB_SBG_IDENTITY%"=="1" type "%SQUAD_STUB_FIXTURES%\sbg-identity-none.json"
+exit /b %SQUAD_STUB_SBG_RC%
 :sqok
 exit /b 0
 '@
@@ -294,6 +357,101 @@ echo STUB-SQUAD-ACK
 exit /b 0
 '@
 
+    # --- Fake `aca` (Sprint 5, ACA Sandboxes) -------------------------------
+    # ACA Sandboxes are driven by a standalone `aca` binary, not by an `az`
+    # extension, so this is a separate shim with its own log. The log is what
+    # turns "egress is applied before any repository code runs" into an
+    # assertion: a test reads the recorded argv sequence and compares INDEXES.
+    #
+    # Same flat goto dispatch as the fake `az`, for the same reason -- the
+    # `-c` argument carries a whole shell command full of &, > and | and must
+    # arrive intact. Delayed expansion is switched on only where the command
+    # text has to be inspected.
+    Set-Content -LiteralPath (Join-Path $binDir "aca.cmd") -Encoding ascii -Value @'
+@echo off
+>>"%SQUAD_STUB_ACA_LOG%" echo %*
+set "A1=%~1"
+set "A2=%~2"
+set "A3=%~3"
+set "CMD="
+:acaparse
+if "%~1"=="" goto acaparsed
+if "%~1"=="-c" set "CMD=%~2"
+shift
+goto acaparse
+:acaparsed
+if "%A1%"=="sandboxgroup" goto acasbg
+if not "%A1%"=="sandbox" goto acaok
+if "%A2%"=="create" goto acacreate
+if "%A2%"=="egress" goto acaegress
+if "%A2%"=="lifecycle" goto acalifecycle
+if "%A2%"=="exec" goto acaexec
+if "%A2%"=="list" goto acalist
+if "%A2%"=="delete" goto acadelete
+goto acaok
+:acasbg
+if not "%A2%"=="disk" goto acaok
+if not "%A3%"=="list" goto acaok
+type "%SQUAD_STUB_FIXTURES%\disk-list.json"
+exit /b %SQUAD_STUB_ACA_RC%
+:acacreate
+echo STUB-SANDBOX-CREATED
+if not "%SQUAD_STUB_ACA_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_ERR%
+exit /b %SQUAD_STUB_ACA_RC%
+:acaegress
+if not "%SQUAD_STUB_ACA_EGRESS_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_EGRESS_ERR%
+exit /b %SQUAD_STUB_ACA_EGRESS_RC%
+:acalifecycle
+exit /b %SQUAD_STUB_ACA_RC%
+:acalist
+type "%SQUAD_STUB_FIXTURES%\sandbox-list.json"
+exit /b %SQUAD_STUB_ACA_RC%
+:acadelete
+if not "%SQUAD_STUB_ACA_DELETE_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_DELETE_ERR%
+exit /b %SQUAD_STUB_ACA_DELETE_RC%
+:acaexec
+if "%SQUAD_STUB_ACA_TIMEOUT_ONCE%"=="" goto acaexec2
+if exist "%SQUAD_STUB_ACA_TIMEOUT_ONCE%" goto acaexec2
+>"%SQUAD_STUB_ACA_TIMEOUT_ONCE%" echo seen
+>&2 echo Error: Network issue - retry policy expired
+exit /b 1
+:acaexec2
+setlocal enabledelayedexpansion
+if not "!CMD:squad-launched=!"=="!CMD!" goto acalaunch
+if not "!CMD:squad-cancelled=!"=="!CMD!" goto acacancel
+if not "!CMD:echo marker=!"=="!CMD!" goto acapoll
+if not "!CMD:tail -n=!"=="!CMD!" goto acalogs
+endlocal
+goto acaok
+:acalaunch
+endlocal
+echo squad-launched
+exit /b %SQUAD_STUB_ACA_EXEC_RC%
+:acacancel
+endlocal
+echo squad-cancelled
+if not "%SQUAD_STUB_ACA_CANCEL_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_CANCEL_ERR%
+exit /b %SQUAD_STUB_ACA_CANCEL_RC%
+:acalogs
+endlocal
+if exist "%SQUAD_STUB_ACA_POLL_DIR%\session-log.txt" type "%SQUAD_STUB_ACA_POLL_DIR%\session-log.txt"
+exit /b %SQUAD_STUB_ACA_EXEC_RC%
+:acapoll
+endlocal
+set "P=unknown"
+set "E=none"
+set "M=absent"
+if exist "%SQUAD_STUB_ACA_POLL_DIR%\phase.txt" set /p P=<"%SQUAD_STUB_ACA_POLL_DIR%\phase.txt"
+if exist "%SQUAD_STUB_ACA_POLL_DIR%\exit.txt" set /p E=<"%SQUAD_STUB_ACA_POLL_DIR%\exit.txt"
+if exist "%SQUAD_STUB_ACA_POLL_DIR%\done.txt" set "M=done"
+echo phase=%P%
+echo exit=%E%
+echo marker=%M%
+exit /b %SQUAD_STUB_ACA_EXEC_RC%
+:acaok
+exit /b 0
+'@
+
     return [pscustomobject]@{
         Root       = $Root
         BinDir     = $binDir
@@ -303,9 +461,7 @@ exit /b 0
         AzLog      = $azLog
         GhLog      = $ghLog
         SquadLog   = $squadLog
-        LeaseDir   = $leaseDir
-        CallLog    = $callLog
-        FakeGhPath = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "worker\tests\lib\fake-gh.js")
+        AcaLog     = $acaLog
     }
 }
 
@@ -349,27 +505,35 @@ function Initialize-SquadCliStubRepository {
 function Reset-SquadCliStubLog {
     <#
     .SYNOPSIS
-        Truncates the recorded az/gh/squad invocation logs between cases.
+        Truncates the recorded az/gh/squad/aca invocation logs between cases.
     #>
     param([Parameter(Mandatory = $true)][object]$Stub)
     Set-Content -LiteralPath $Stub.AzLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $Stub.GhLog -Value "" -NoNewline -Encoding ascii
     if ($Stub.SquadLog) { Set-Content -LiteralPath $Stub.SquadLog -Value "" -NoNewline -Encoding ascii }
+    if ($Stub.AcaLog) { Set-Content -LiteralPath $Stub.AcaLog -Value "" -NoNewline -Encoding ascii }
 }
 
 function Get-SquadCliStubCall {
     <#
     .SYNOPSIS
-        Returns the recorded command lines for the fake az (default), gh or
-        squad.
+        Returns the recorded command lines for the fake az (default), gh, squad
+        or aca.
+
+    .DESCRIPTION
+        The `aca` log is ordered, and that order is the point: a caller can
+        assert that the egress call was recorded BEFORE the exec that launched
+        the worker, which is the only way to test "policy is applied before any
+        repository code runs" rather than merely "policy is applied".
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
-        [ValidateSet("az", "gh", "squad")][string]$Tool = "az"
+        [ValidateSet("az", "gh", "squad", "aca")][string]$Tool = "az"
     )
     $path = switch ($Tool) {
         "gh"    { $Stub.GhLog }
         "squad" { $Stub.SquadLog }
+        "aca"   { $Stub.AcaLog }
         default { $Stub.AzLog }
     }
     if (-not $path -or -not (Test-Path $path)) { return @() }
@@ -408,11 +572,17 @@ function Invoke-SquadCliCapture {
     $envNames = @("PATH", "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE",
                   "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT",
                   "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
+                  "SQUAD_STUB_ACA_LOG",
                   "SQUAD_STUB_FIXTURES",
                   "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC",
                   "SQUAD_STUB_STOP_ERR", "SQUAD_STUB_EXEC_SEQ", "SQUAD_STUB_EXEC_STUCK",
-                  "SQUAD_GH_BIN", "FAKE_GH_STATE", "FAKE_GH_FAIL_MODE", "SQUAD_CALL_LOG",
-                  "SQUAD_LEASE_NOW", "SQUAD_LEASE_TTL_SECONDS", "SQUAD_LEASE_BRANCH")
+                  "SQUAD_STUB_SBG_IDENTITY", "SQUAD_STUB_SBG_RC",
+                  "SQUAD_STUB_ACA_RC", "SQUAD_STUB_ACA_ERR",
+                  "SQUAD_STUB_ACA_EXEC_RC", "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
+                  "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
+                  "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
+                  "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
+                  "SQUAD_ACA_ENABLE_SANDBOX", "SQUAD_ACA_SANDBOX_CLI")
     $saved = @{}
     foreach ($name in $envNames) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
@@ -444,20 +614,32 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_STOP_ERR = ""
         $env:SQUAD_STUB_EXEC_SEQ = ""
         $env:SQUAD_STUB_EXEC_STUCK = ""
-        # --- Dispatch leases (Sprint 6) -------------------------------------
-        # Every dispatch now writes a durable lease through `gh` before compute
-        # is requested. The lease store spawns `gh` itself, so it is pointed at
-        # the SAME offline fake the worker suite uses -- one implementation of
-        # GitHub's semantics for both languages. The clock and TTL are pinned so
-        # a capture can never depend on how long the run took, and the ledger is
-        # a throwaway directory inside the stub root.
-        $env:SQUAD_GH_BIN = $Stub.FakeGhPath
-        $env:FAKE_GH_STATE = $Stub.LeaseDir
-        $env:FAKE_GH_FAIL_MODE = ""
-        $env:SQUAD_CALL_LOG = $Stub.CallLog
-        $env:SQUAD_LEASE_NOW = "2024-05-01T00:00:00.000Z"
-        $env:SQUAD_LEASE_TTL_SECONDS = "3600"
-        $env:SQUAD_LEASE_BRANCH = "squad-aca-leases"
+        $env:SQUAD_STUB_SBG_IDENTITY = ""
+        $env:SQUAD_STUB_SBG_RC = "0"
+        # The `aca` shim is on PATH for every capture so that any command which
+        # ever starts shelling out to it shows up as a capture diff -- and the
+        # captures RECORD its calls in an `### ACA CALLS` section, which is what
+        # makes that claim true rather than aspirational. It must be quiet and
+        # default-configured, exactly like the `az` shim.
+        $env:SQUAD_STUB_ACA_LOG = $Stub.AcaLog
+        $env:SQUAD_STUB_ACA_RC = "0"
+        $env:SQUAD_STUB_ACA_ERR = ""
+        $env:SQUAD_STUB_ACA_EXEC_RC = "0"
+        $env:SQUAD_STUB_ACA_EGRESS_RC = "0"
+        $env:SQUAD_STUB_ACA_EGRESS_ERR = ""
+        $env:SQUAD_STUB_ACA_DELETE_RC = "0"
+        $env:SQUAD_STUB_ACA_DELETE_ERR = ""
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        $env:SQUAD_STUB_ACA_POLL_DIR = ""
+        $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
+        # THE golden-portability pin for Sprint 5. A CLI capture must always be
+        # taken with the sandbox feature flag OFF, whatever the developer's shell
+        # happens to have exported -- that is what makes "flag off is
+        # byte-identical to main" a property the golden gate actually tests
+        # rather than an accident of the machine it ran on.
+        $env:SQUAD_ACA_ENABLE_SANDBOX = ""
+        $env:SQUAD_ACA_SANDBOX_CLI = ""
 
         $argList = @("-NoProfile", "-NonInteractive", "-File", $ScriptPath) + $CliArguments
         $proc = Start-Process -FilePath $hostExe -ArgumentList $argList `
@@ -483,6 +665,7 @@ function Invoke-SquadCliCapture {
         AzCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
         GhCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool gh)
         SquadCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool squad)
+        AcaCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool aca)
     }
 }
 
