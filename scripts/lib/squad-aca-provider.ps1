@@ -559,8 +559,8 @@ function New-SquadExecutionProvider {
         Config (the resolved ACA config object) and ScriptDir. For 'sandbox':
         Class (an approved catalog class) plus Config / SandboxGroup /
         ResourceGroup / SubscriptionId / DiskId / DiskLabel / AcaCliPath /
-        IdleTimeoutSeconds / PollSeconds / WorkerSecrets. For 'fake':
-        StateRoot.
+        IdleTimeoutSeconds / PollSeconds / WorkerSecrets / BrokeredCredentials.
+        For 'fake': StateRoot.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -579,7 +579,7 @@ function New-SquadExecutionProvider {
             $sandboxArgs = @{ Class = $Options["Class"] }
             foreach ($name in @("Config", "SandboxGroup", "ResourceGroup", "SubscriptionId",
                                 "DiskId", "DiskLabel", "AcaCliPath", "IdleTimeoutSeconds",
-                                "PollSeconds", "WorkerSecrets", "ScriptDir")) {
+                                "PollSeconds", "WorkerSecrets", "BrokeredCredentials", "ScriptDir")) {
                 if ($Options.Contains($name) -and $null -ne $Options[$name]) { $sandboxArgs[$name] = $Options[$name] }
             }
             $provider = New-SandboxExecutionProvider @sandboxArgs

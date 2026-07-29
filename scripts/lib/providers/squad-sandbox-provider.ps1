@@ -206,7 +206,7 @@ $script:SandboxFailureRules = @(
 # credentials, the egress policy (readable egress rules are risk R2 in ADR 0001),
 # and the exec command line (which carries session environment).
 $script:SandboxRedactedFlags = @(
-    "--token", "--password", "--secret",
+    "--token", "--password", "--secret", "--file",
     "--rule", "--default", "--traffic-inspection",
     "-c", "--command"
 )
@@ -247,11 +247,33 @@ $script:SandboxCredentialTypes = [ordered]@{
 # life of the session.
 $script:SandboxCredentialFileName = ".squad-creds"
 
-# Worker environment variables that carry a credential. These are delivered
-# through the credential file, never as an `env NAME=value` assignment in the
-# launch command -- an assignment is argv, and argv is world-readable inside the
-# sandbox.
-$script:SandboxSecretEnvNames = @("GH_TOKEN", "GITHUB_TOKEN")
+# Worker environment variables that carry a credential, grouped into the PLANES
+# PRD #6 requires. Each plane resolves ONE token and exports it under its own
+# names, so a dedicated Copilot credential is never written under the git names
+# and vice versa. Every plane is delivered through the credential file, never as
+# an `env NAME=value` assignment in the launch command -- an assignment is argv,
+# and argv is world-readable inside the sandbox.
+$script:SandboxCredentialPlanes = @(
+    [pscustomobject]@{
+        Id      = "git"
+        Sources = @("GH_TOKEN", "GITHUB_TOKEN")
+        Names   = @("GH_TOKEN", "GITHUB_TOKEN")
+    },
+    [pscustomobject]@{
+        Id      = "copilot"
+        Sources = @("COPILOT_GITHUB_TOKEN")
+        Names   = @("COPILOT_GITHUB_TOKEN")
+    }
+)
+
+# Every name any plane exports. This is the deny-list New-SandboxLaunchCommand
+# refuses: a credential-bearing name must never become an `env NAME=value`
+# assignment. COPILOT_GITHUB_TOKEN is in it for the same reason GH_TOKEN is --
+# it is a bearer token, and argv inside the sandbox is readable by every process
+# in it.
+$script:SandboxSecretEnvNames = @(
+    @($script:SandboxCredentialPlanes | ForEach-Object { $_.Names }) | Select-Object -Unique
+)
 
 # Token character allowlist. Every credential this provider handles is an opaque
 # bearer string from a small alphabet; anything outside it is either an attack
@@ -683,18 +705,31 @@ function Invoke-SandboxCliWithSecretStdin {
           * the secret is never an element of $Argv,
           * the secret is registered for scrubbing, so a CLI that echoes it back
             in its own error text still cannot reach a thrown message.
+
+        -SecretValues carries the individual token values. It exists for two
+        reasons. First, a multi-value payload joined for stdin is unfailable as a
+        containment needle -- no argv element could ever contain a newline-joined
+        blob -- so the sweep must test each token. Second, credential delivery is
+        now a FILE UPLOAD (`aca sandbox fs write`) rather than a stdin feed,
+        because `aca sandbox exec` gives the remote command an empty stdin; that
+        call has no stdin secret at all, and -SecretValues is what still holds it
+        to the same argv guarantee.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Context,
         [Parameter(Mandatory = $true)][string[]]$Argv,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Secret
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Secret,
+        [string[]]$SecretValues = @()
     )
 
     Assert-SandboxArgvIdentityFree -Argv $Argv
     Assert-SandboxArgvNoReadback -Argv $Argv
+    $needles = @(@($SecretValues) + @($Secret) | Where-Object { $_ } | Select-Object -Unique)
     foreach ($arg in @($Argv)) {
-        if ($Secret -and ([string]$arg).Contains($Secret)) {
-            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to run 'aca': a credential was found in the argument vector, which is world-readable at /proc/<pid>/cmdline. It must be delivered on stdin.")
+        foreach ($needle in $needles) {
+            if (([string]$arg).Contains($needle)) {
+                throw (New-SandboxFailure -Kind "capability" -Message "Refusing to run 'aca': a credential was found in the argument vector, which is world-readable at /proc/<pid>/cmdline. It must be delivered on stdin.")
+            }
         }
     }
     $result = Invoke-CliSafeWithStdin -FilePath $Context.AcaPath -Arguments $Argv -StandardInput $Secret
@@ -1169,52 +1204,205 @@ function Remove-SandboxBrokeredCredential {
     return [pscustomobject]@{ Revoked = $false; Reason = "exit $($result.ExitCode)" }
 }
 
-function New-SandboxCredentialSeedCommand {
+function New-SandboxCredentialVaultCommand {
     <#
     .SYNOPSIS
-        The exec that receives the git/`gh` token on STDIN and stages it inside
-        the sandbox.
+        The exec that prepares the private directory the credential file is
+        uploaded into.
 
     .DESCRIPTION
-        The platform brokers `github-copilot` and `anthropic-claude` natively.
-        It exposes no type for a plain git push token, so that plane cannot use
-        `--credential` -- but it must still stay out of every argument vector,
-        because argv inside the sandbox is readable by every process in it.
+        WHY A DIRECTORY AND NOT A FILE MODE. `aca sandbox fs write` uploads as
+        root with mode 0644 and the sandbox user (uid 1001 `squad`, which is what
+        `sandbox exec` runs as) cannot chmod a root-owned file -- `chmod` returns
+        "Operation not permitted". The confidentiality of the staged credential
+        therefore rests on the DIRECTORY, which this exec creates as `squad` under
+        `umask 077`, giving 0700: no other unprivileged account in the sandbox can
+        traverse it, so the file's own 0644 is unreachable.
 
-        Shape, and why each piece is there:
+        `chmod 700` is issued as well as the umask because `mkdir -p` on an
+        already-existing directory leaves its mode alone, and a state directory
+        created earlier by something else would otherwise keep a wider mode.
 
-          umask 077          the file is created 0600 from the outset; a chmod
-                             after the fact leaves a window where it is not.
-          IFS= read -r       preserves the value exactly: no field splitting, no
-                             backslash processing, no trailing-whitespace loss.
-          printf '%s'        never interprets the value (unlike `echo -e`).
-          '...'             the value is single-quoted INSIDE the file, so a
-                             sourcing shell treats it as a literal. Tokens are
-                             validated against $script:SandboxTokenPattern first,
-                             which excludes `'`, so this quoting cannot be
-                             escaped from.
-          unset             the variable does not survive into the environment
-                             of anything this exec later spawns.
+        The directory is emptied of any previous credential file first, so a
+        failed earlier attempt can never leave a stale token that the launch
+        would source.
 
-        The launch command sources this file and deletes it immediately, so its
-        on-disk lifetime is the gap between two execs.
+        Verification is part of the command, not an assumption: it prints the
+        octal mode it actually achieved, and the caller refuses to upload into
+        anything but 700.
+    #>
+    param([string]$StateDir = $script:SandboxStateDir)
+
+    return "umask 077; mkdir -p $StateDir && chmod 700 $StateDir && rm -f $StateDir/$($script:SandboxCredentialFileName) && " +
+           "echo squad-credentials-vault-`$(stat -c %a $StateDir)"
+}
+
+function New-SandboxCredentialFileContent {
+    <#
+    .SYNOPSIS
+        The exact bytes of the credential file that is uploaded into the sandbox.
+
+    .DESCRIPTION
+        A POSIX shell fragment the launch command sources and then deletes, so
+        its on-disk lifetime is the gap between the upload and the first line of
+        the launch.
+
+        ONE PLANE PER TOKEN. A plane exports its own token under its own names,
+        so a dedicated Copilot credential is never written under the git names.
+        Planes and tokens are supplied by Get-SandboxCredentialStaging, which
+        produces them together precisely so they cannot drift apart.
+
+        Each value is SINGLE-QUOTED, so a sourcing shell treats it as a literal
+        with no expansion, and every token has already been validated against
+        $script:SandboxTokenPattern -- which excludes `'` -- so the quoting
+        cannot be escaped from.
+
+        LF line endings unconditionally: this file is read by `sh` inside a Linux
+        sandbox, and a CR would become part of the token value.
+
+    .PARAMETER Planes
+        One entry per token, each a string[] of environment variable names that
+        receive that token.
+
+    .PARAMETER Tokens
+        The token for each plane, in the same order.
     #>
     param(
-        [string]$StateDir = $script:SandboxStateDir,
-        [string[]]$Names = $script:SandboxSecretEnvNames
+        [object[]]$Planes = @(),
+        [string[]]$Tokens = @()
     )
 
-    $writes = @()
-    foreach ($name in @($Names)) {
-        if ($name -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
-            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage a credential: '$name' is not a valid environment variable name.")
-        }
-        $writes += "printf 'export $name=%s\n' ""'`$__squad_tok'"" >> $StateDir/$($script:SandboxCredentialFileName)"
+    if (@($Planes).Count -ne @($Tokens).Count) {
+        throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage credentials: $(@($Planes).Count) plane(s) but $(@($Tokens).Count) token(s). Each plane must carry exactly one token, or a plane would receive another plane's value.")
     }
 
-    return "umask 077; mkdir -p $StateDir && rm -f $StateDir/$($script:SandboxCredentialFileName) && " +
-           "IFS= read -r __squad_tok && " + ($writes -join " && ") +
-           " && unset __squad_tok && echo squad-credentials-staged"
+    $lines = @()
+    for ($i = 0; $i -lt @($Planes).Count; $i++) {
+        $planeNames = @($Planes[$i])
+        if ($planeNames.Count -eq 0) {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage credentials: plane $i exports no environment variable, so its token would be resolved and then silently dropped.")
+        }
+        if ($Tokens[$i] -notmatch $script:SandboxTokenPattern) {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage credentials: a token contains characters outside the unreserved set, which could break out of the quoting in the credential file. The value is not echoed.")
+        }
+        foreach ($name in $planeNames) {
+            if ($name -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
+                throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage credentials: '$name' is not a valid environment variable name.")
+            }
+            $lines += "export $name='$($Tokens[$i])'"
+        }
+    }
+
+    return (($lines -join "`n") + "`n")
+}
+
+function New-SandboxLocalCredentialFile {
+    <#
+    .SYNOPSIS
+        Write the credential file to a private local path so `aca sandbox fs
+        write` can upload it, with the token in NO argument vector.
+
+    .DESCRIPTION
+        `aca sandbox exec` hands the remote command an EMPTY stdin -- verified
+        against the live service: `"x" | aca sandbox exec -c 'read -r X; echo
+        [$X]'` prints `[]`. So a credential cannot be piped into the sandbox, and
+        the only two remaining ways to get one in are the command string (argv,
+        world-readable at /proc/<pid>/cmdline inside the sandbox) and a file
+        upload. This is the file upload.
+
+        The local file is the whole exposure, so it is minimised deliberately:
+
+          * it lives under the user's own ~/.squad-on-aca, never a shared temp
+            directory, so on a multi-user host no other account has a path to it;
+          * on Windows its ACL is replaced with a single entry for the current
+            user, with inheritance disabled, so a permissive parent ACL cannot
+            widen it;
+          * on Unix it is chmod 600 before the content is written;
+          * the caller deletes it in a `finally`, so a failed upload does not
+            leave it behind.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Content)
+
+    $root = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".squad-on-aca"
+    $dir = Join-Path $root ".credstage"
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $path = Join-Path $dir ("cred-" + [guid]::NewGuid().ToString("N"))
+
+    # Create empty and lock it down BEFORE the token is written, so the content
+    # never exists on disk under a wider mode.
+    [System.IO.File]::WriteAllBytes($path, [byte[]]@())
+    if ($IsWindows -or $env:OS -eq "Windows_NT") {
+        $acl = Get-Acl -Path $path
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, "FullControl", "Allow"))) | Out-Null
+        Set-Acl -Path $path -AclObject $acl
+    } else {
+        & chmod 600 $path 2>$null | Out-Null
+    }
+
+    # LF endings and no BOM: this file is sourced by `sh` inside a Linux sandbox.
+    [System.IO.File]::WriteAllText($path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
+function Get-SandboxCredentialStaging {
+    <#
+    .SYNOPSIS
+        Resolve which credential planes are stageable from a worker secret set,
+        and the exact stdin payload that feeds them.
+
+    .DESCRIPTION
+        Planes and tokens are produced TOGETHER and dropped TOGETHER. That is the
+        whole point: the seed command emits one `read` per plane, so a plane that
+        keeps its line but loses its value silently hands the next plane's token
+        to the wrong environment variable. Returning both from one walk makes the
+        correspondence structural rather than a convention two call sites have to
+        remember.
+
+        Every token is validated against $script:SandboxTokenPattern here, before
+        it is written anywhere, and a rejection never echoes the value.
+
+    .OUTPUTS
+        Hashtable with Planes (string[][]), PlaneIds, Tokens and Content (the
+        exact bytes of the credential file), or $null when no plane has a value
+        -- in which case the caller must skip credential delivery entirely
+        rather than upload an empty file the launch would source for nothing.
+    #>
+    param(
+        [System.Collections.IDictionary]$WorkerSecrets = @{}
+    )
+
+    $planes = @()
+    $planeIds = @()
+    $tokens = @()
+
+    foreach ($plane in $script:SandboxCredentialPlanes) {
+        $token = ""
+        foreach ($source in $plane.Sources) {
+            if ($WorkerSecrets.Contains($source) -and $WorkerSecrets[$source]) {
+                $token = [string]$WorkerSecrets[$source]
+                break
+            }
+        }
+        if (-not $token) { continue }
+        if ($token -notmatch $script:SandboxTokenPattern) {
+            throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage the '$($plane.Id)' credential: the value contains characters outside the unreserved token set, so it was either truncated, wrapped, or is not a token. The value is not echoed.")
+        }
+        $planes += , [string[]]$plane.Names
+        $planeIds += $plane.Id
+        $tokens += $token
+    }
+
+    if ($tokens.Count -eq 0) { return $null }
+
+    return @{
+        Planes   = $planes
+        PlaneIds = $planeIds
+        Tokens   = $tokens
+        Content  = (New-SandboxCredentialFileContent -Planes $planes -Tokens $tokens)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1819,6 +2007,19 @@ function New-SandboxExecutionProvider {
 
     .PARAMETER AcaCliPath
         Overrides `aca` resolution so tests can stub the binary.
+
+    .PARAMETER WorkerSecrets
+        Credential values the WORKER needs in its environment, keyed by
+        environment variable name. Delivered through the stdin-staged credential
+        file. This is what the Copilot CLI and `git` actually read.
+
+    .PARAMETER BrokeredCredentials
+        Credentials NOMINATED for platform brokerage, keyed by `aca` credential
+        type. Deliberately separate from -WorkerSecrets rather than sniffed out
+        of it: "broker whatever looks brokerable" would silently skip a
+        credential the operator meant to broker, and "broker everything present"
+        would refuse every session whose Copilot plane is merely the reused git
+        token. The caller states intent; nothing here guesses.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Class,
@@ -1832,6 +2033,7 @@ function New-SandboxExecutionProvider {
         [int]$IdleTimeoutSeconds = 0,
         [int]$PollSeconds = 0,
         [System.Collections.IDictionary]$WorkerSecrets = @{},
+        [System.Collections.IDictionary]$BrokeredCredentials = @{},
         [string]$ScriptDir = ""
     )
 
@@ -1860,22 +2062,27 @@ function New-SandboxExecutionProvider {
     foreach ($key in @($WorkerSecrets.Keys)) {
         if ($WorkerSecrets[$key]) { $secrets += [string]$WorkerSecrets[$key] }
     }
+    foreach ($key in @($BrokeredCredentials.Keys)) {
+        if ($BrokeredCredentials[$key]) { $secrets += [string]$BrokeredCredentials[$key] }
+    }
+    $secrets = @($secrets | Select-Object -Unique)
 
     $context = [pscustomobject]@{
-        AcaPath            = (Resolve-SandboxCliPath -Override $AcaCliPath)
-        Config             = $Config
-        Class              = $Class
-        SandboxGroup       = $SandboxGroup
-        ResourceGroup      = $ResourceGroup
-        SubscriptionId     = $SubscriptionId
-        DiskId             = $DiskId
-        DiskLabel          = $DiskLabel
-        IdleTimeoutSeconds = $IdleTimeoutSeconds
-        PollSeconds        = $PollSeconds
-        WorkerSecrets      = $WorkerSecrets
-        Secrets            = $secrets
-        ScriptDir          = $ScriptDir
-        StateDir           = $script:SandboxStateDir
+        AcaPath             = (Resolve-SandboxCliPath -Override $AcaCliPath)
+        Config              = $Config
+        Class               = $Class
+        SandboxGroup        = $SandboxGroup
+        ResourceGroup       = $ResourceGroup
+        SubscriptionId      = $SubscriptionId
+        DiskId              = $DiskId
+        DiskLabel           = $DiskLabel
+        IdleTimeoutSeconds  = $IdleTimeoutSeconds
+        PollSeconds         = $PollSeconds
+        WorkerSecrets       = $WorkerSecrets
+        BrokeredCredentials = $BrokeredCredentials
+        Secrets             = $secrets
+        ScriptDir           = $ScriptDir
+        StateDir            = $script:SandboxStateDir
     }
 
     $operations = [ordered]@{}
@@ -1888,7 +2095,8 @@ function New-SandboxExecutionProvider {
     #   4. create the sandbox, referencing the credentials by opaque id
     #   5. apply default-deny egress           (invariant 3)
     #   6. pin auto-suspend
-    #   7. stage the git credential on stdin   (never argv)
+    #   7. stage the worker credentials by file upload (never argv, never stdin:
+    #      `aca sandbox exec` gives the remote command an empty stdin)
     #   8. launch the worker DETACHED          <- the first repository code to run
     # Any failure after step 3 revokes the brokered credentials and tears the
     # sandbox down, so repository code can never run in a sandbox whose egress
@@ -1936,16 +2144,18 @@ function New-SandboxExecutionProvider {
         $memory = [int]([math]::Max(1, [double]$class.resources.memoryGi))
 
         # --- credential brokerage (PRD #6 Sprint 7) --------------------------
-        # The Copilot plane is a platform primitive: the token goes in on stdin,
-        # an opaque id comes back, and the sandbox references the id. The token
-        # never appears in an argument vector on either side of the boundary.
+        # Only credentials the caller NOMINATED are brokered. The token goes in
+        # on stdin, an opaque id comes back, and the sandbox references the id.
+        # The token never appears in an argument vector on either side of the
+        # boundary. A worker secret is NOT automatically a brokered credential:
+        # when the git token is reused for the Copilot env plane it is a classic
+        # or OAuth token, which the platform rejects for `github-copilot`, and
+        # brokering it would refuse a session that works perfectly well.
         $credentialIds = @()
-        $copilot = ""
-        if ($Context.WorkerSecrets -and $Context.WorkerSecrets.Contains("COPILOT_GITHUB_TOKEN")) {
-            $copilot = [string]$Context.WorkerSecrets["COPILOT_GITHUB_TOKEN"]
-        }
-        if ($copilot) {
-            $credentialIds += (New-SandboxBrokeredCredential -Context $Context -Type "github-copilot" -Token $copilot)
+        foreach ($type in @($Context.BrokeredCredentials.Keys)) {
+            $token = [string]$Context.BrokeredCredentials[$type]
+            if (-not $token) { continue }
+            $credentialIds += (New-SandboxBrokeredCredential -Context $Context -Type $type -Token $token)
         }
 
         $createArgv = @(
@@ -2002,30 +2212,52 @@ function New-SandboxExecutionProvider {
                 throw (New-SandboxFailure -Kind $kind -Message "Could not set the auto-suspend policy on sandbox '$name' ($($lifecycle.SafeArgv), exit $($lifecycle.ExitCode)): $(Get-SandboxErrorText -Result $lifecycle -Secrets $Context.Secrets). Auto-suspend defaults to 600s, which would suspend a running session.")
             }
 
-            # --- stage the git/`gh` credential on STDIN ----------------------
-            # The platform brokers no type for a plain push token, so it is
-            # delivered on the stdin of this exec into a umask-077 file that the
-            # launch command sources and deletes. It is in no argv on either
-            # side of the boundary.
-            $gitToken = ""
-            foreach ($candidate in @("GH_TOKEN", "GITHUB_TOKEN")) {
-                if ($Context.WorkerSecrets -and $Context.WorkerSecrets.Contains($candidate) -and $Context.WorkerSecrets[$candidate]) {
-                    $gitToken = [string]$Context.WorkerSecrets[$candidate]
-                    break
-                }
-            }
-            if ($gitToken) {
-                if ($gitToken -notmatch $script:SandboxTokenPattern) {
-                    throw (New-SandboxFailure -Kind "capability" -Message "Refusing to stage the git credential: it contains characters outside the unreserved set, which could break out of the quoting in the staged credential file. The value is not echoed.")
-                }
-                $seed = New-SandboxCredentialSeedCommand -StateDir $Context.StateDir
-                $staged = Invoke-SandboxCliWithSecretStdin -Context $Context -Secret $gitToken -Argv @(
-                    "sandbox", "exec", "-l", "name=$name", "-c", $seed
+            # --- deliver the worker credential PLANES ------------------------
+            # `aca sandbox exec` hands the remote command an EMPTY stdin (proved
+            # against the live service), so a credential cannot be piped in. The
+            # only ways left are the command string -- which is argv, readable at
+            # /proc/<pid>/cmdline by every process in the sandbox -- and a file
+            # upload. So: create a 0700 vault directory as the sandbox user, then
+            # upload the credential file into it by LOCAL PATH. The token is in
+            # no argument vector on either side of the boundary.
+            $staging = Get-SandboxCredentialStaging -WorkerSecrets $Context.WorkerSecrets
+            if ($staging) {
+                $vault = Invoke-SandboxCli -Context $Context -Argv @(
+                    "sandbox", "exec", "-l", "name=$name", "-c", (New-SandboxCredentialVaultCommand -StateDir $Context.StateDir)
                 )
+                if ($vault.ExitCode -ne 0) {
+                    $kind = Get-SandboxFailureKind -Result $vault
+                    if (-not $kind) { $kind = "execution" }
+                    throw (New-SandboxFailure -Kind $kind -Message "Could not prepare the credential directory in sandbox '$name' ($($vault.SafeArgv), exit $($vault.ExitCode)): $(Get-SandboxErrorText -Result $vault -Secrets $Context.Secrets)")
+                }
+                # `fs write` uploads as root 0644 and the sandbox user cannot
+                # chmod a root-owned file, so the 0700 directory IS the control.
+                # Verify it rather than assume it: uploading a token into a
+                # world-traversable directory is exactly the disclosure this
+                # whole path exists to prevent.
+                $vaultMode = ""
+                if (($vault.StdOut -join "`n") -match "squad-credentials-vault-(\d+)") { $vaultMode = $Matches[1] }
+                if ($vaultMode -ne "700") {
+                    throw (New-SandboxFailure -Kind "capability" -Message "Refusing to upload credentials into sandbox '$name': $($Context.StateDir) is mode '$(if ($vaultMode) { $vaultMode } else { 'unknown' })', not 700. The uploaded file is owned by root and cannot be chmod'ed by the session user, so the directory is the only thing protecting it.")
+                }
+
+                $localCredentialPath = ""
+                try {
+                    $localCredentialPath = New-SandboxLocalCredentialFile -Content $staging.Content
+                    $staged = Invoke-SandboxCliWithSecretStdin -Context $Context -Secret "" -SecretValues $staging.Tokens -Argv @(
+                        "sandbox", "fs", "write", "-l", "name=$name",
+                        "--path", "$($Context.StateDir)/$($script:SandboxCredentialFileName)",
+                        "--file", $localCredentialPath
+                    )
+                } finally {
+                    if ($localCredentialPath -and (Test-Path $localCredentialPath)) {
+                        Remove-Item -Force -ErrorAction SilentlyContinue $localCredentialPath
+                    }
+                }
                 if ($staged.ExitCode -ne 0) {
                     $kind = Get-SandboxFailureKind -Result $staged
                     if (-not $kind) { $kind = "execution" }
-                    throw (New-SandboxFailure -Kind $kind -Message "Could not stage the git credential in sandbox '$name' ($($staged.SafeArgv), exit $($staged.ExitCode)): $(Get-SandboxErrorText -Result $staged -Secrets $Context.Secrets)")
+                    throw (New-SandboxFailure -Kind $kind -Message "Could not stage the worker credentials ($($staging.PlaneIds -join ', ')) in sandbox '$name' ($($staged.SafeArgv), exit $($staged.ExitCode)): $(Get-SandboxErrorText -Result $staged -Secrets $Context.Secrets)")
                 }
             }
 
