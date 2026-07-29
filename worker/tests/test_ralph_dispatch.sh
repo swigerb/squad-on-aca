@@ -11,6 +11,9 @@ TEST_TMP_ROOT="${TEST_DIR}/.tmp-ralph"
 
 # shellcheck source=lib/assert.sh
 source "${TEST_DIR}/lib/assert.sh"
+# shellcheck source=lib/deps.sh
+source "${TEST_DIR}/lib/deps.sh"
+require_deps node mktemp date
 
 echo "== ralph-dispatch.sh =="
 rm -rf "$TEST_TMP_ROOT"

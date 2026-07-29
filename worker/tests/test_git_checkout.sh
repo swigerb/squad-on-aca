@@ -15,6 +15,9 @@ TEST_TMP_ROOT="${TEST_DIR}/.tmp-git-checkout"
 
 # shellcheck source=lib/assert.sh
 source "${TEST_DIR}/lib/assert.sh"
+# shellcheck source=lib/deps.sh
+source "${TEST_DIR}/lib/deps.sh"
+require_deps git
 
 echo "== git-checkout.sh =="
 rm -rf "$TEST_TMP_ROOT"
