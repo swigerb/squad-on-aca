@@ -3,9 +3,15 @@ FROM node:24-bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive \
     CI=true \
     COPILOT_AUTO_UPDATE=false \
-    COPILOT_ALLOW_ALL=true \
     SQUAD_MODE=smoke \
     WORKDIR=/workspace
+
+# COPILOT_ALLOW_ALL is deliberately NOT set (issue #26, PRD #6). It is the
+# environment form of `--allow-all-tools`, and baking it into the image meant
+# blanket tool approval applied even to a session whose flags said otherwise --
+# a control that could not be turned off from the outside. Tool permissions are
+# now resolved per session by worker/lib/agent-policy.js and passed explicitly,
+# so what a session is allowed to do is decided in one reviewable place.
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg openssh-client \
@@ -26,8 +32,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --chown=squad:squad entrypoint.sh /usr/local/bin/squad-on-aca
-COPY --chown=squad:squad lib/squad-capability-preflight.sh lib/parse-capabilities.js lib/resolve-capability-route.js lib/dispatch-decision.js lib/dispatch-lease.js lib/squad-dispatch.js lib/ralph-dispatch.sh lib/git-checkout.sh /usr/local/lib/squad-on-aca/
-RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh \
+COPY --chown=squad:squad lib/squad-capability-preflight.sh lib/parse-capabilities.js lib/resolve-capability-route.js lib/dispatch-decision.js lib/dispatch-lease.js lib/squad-dispatch.js lib/ralph-dispatch.sh lib/git-checkout.sh lib/agent-policy.js lib/squad-policy.sh /usr/local/lib/squad-on-aca/
+RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh \
     && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh
 
 USER squad

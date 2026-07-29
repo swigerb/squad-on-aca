@@ -528,3 +528,157 @@ itself has to be part of the return value, or the choice cannot be tested. The
 same applies to B1: converging on one lease record was asserted, but "and
 exactly one of them is told to dispatch" never was, and the one test that
 should have covered it had a line inserted in the middle of the race.
+
+## Issue #26: tool approval parity - `--yolo` removed from both planes, and the honest boundary around what a flag can enforce
+
+**The defect.** `worker/entrypoint.sh` ran every session with `--yolo` on an
+image that also set `COPILOT_ALLOW_ALL=true`, and `deploy.ps1` injected the same
+flag string through the job template. `--yolo` is `--allow-all-tools
+--allow-all-paths --allow-all-urls`, so a remote session could write anywhere on
+the filesystem while the same agent on a developer's machine was confined to its
+working directory. Remote execution applied *weaker* policy than local - the
+escalation PRD #6 explicitly forbids - and none of the eight sprints had touched
+it. It affected both planes, so "the sandbox is isolated" was never an answer.
+
+**The investigation came before the design, and changed it.** The pinned
+`@github/copilot@1.0.69-2` was installed into a scratch tree and interrogated
+directly rather than trusted: `--deny-tool` accepts two-word subcommand patterns
+and denials outrank `--allow-all-tools`; a real probe confirmed `shell(git
+config)` is refused with *"Permission to run this tool was denied due to the
+following rules"*; a write outside the working directory is refused once
+`--allow-all-paths` is gone; `--allow-all-urls` turned out to gate neither the
+shell tool nor web-fetch, so it is simply not passed. The finding that mattered
+was negative: there is **no `--deny-path`**, and `write` is all-or-nothing. A
+control paper had assumed "restrict writes to `.squad/policies` via flags" would
+be possible. It is not expressible at all, so governance had to move to the
+filesystem or be decoration.
+
+The second constraint was found the same way: `@bradygaster/squad-cli@0.11.0`
+splits `--copilot-flags` with `.trim().split(/\s+/)` in nine `dist/` modules, so
+a multi-word deny pattern cannot survive `squad watch` / `squad loop`. Rather
+than quietly emit a weaker set on that path, the resolver publishes two surfaces
+and the session log names every rule the handoff cannot carry. That gap belongs
+to the Squad runtime and is written down as such.
+
+**What was built.** One pure resolver (`worker/lib/agent-policy.js`) decides a
+tier from `SQUAD_MODE` + `SQUAD_DISPATCH_SOURCE`; one bash layer
+(`worker/lib/squad-policy.sh`) applies it. Both planes reach both through the
+single entrypoint, so parity is structural rather than asserted. Unattended runs
+lose the irreversible infrastructure verbs outright rather than being
+approval-gated, because Ralph is a five-minute cron and there is nobody to
+approve anything. Governance paths are made read-only *and* fingerprinted into a
+0700 directory outside the checkout, re-verified before the push and at the end
+of every agent-running mode; every failure path exits 78 and nothing is pushed.
+
+**Two things I had to correct in my own work.** The resolver originally treated
+an absent `SQUAD_DISPATCH_SOURCE` as attended - fail-open, and exactly the shape
+this change exists to remove; it is now autonomous, which in turn exposed that
+`New-SandboxWorkerEnvironment` never carried the dispatch source at all, so a
+Ralph-dispatched sandbox session would have resolved to the *attended* tier while
+the identical ACA Jobs session resolved to *autonomous*. That is escalation by
+choosing a substrate, sitting in the repository the whole time, and the parity
+check that found it drives the real env builders rather than hand-written maps.
+
+**The mutation that failed to be detected, kept in the report.** Removing the
+manifest's `absent` markers changed nothing: the baseline-vs-current diff already
+detects a path appearing or disappearing. My own comment had claimed otherwise.
+The claim was wrong, so the comment was corrected and the markers reclassified as
+manifest completeness rather than a control - an undetectable "control" is a
+liability, and the honest move was to stop calling it one instead of inventing an
+assertion to protect it.
+
+**Verification.** `validate.ps1` 213 -> **240 passed / 0 failed / 0 skipped**;
+worker suite **7 -> 9 suites, 426 -> 623 assertions, 0 failed / 0 skipped**;
+`verify-cli-golden.ps1` 22/22 and `compare-cli-baseline.ps1` byte-identical
+22/22 - **no golden changed**; `verify-launch-detachment.ps1` PASS. Sixteen
+mutations were run; fifteen produced a specific named failure and the sixteenth
+is reported above as undetected with the reason.
+
+**Lesson recorded.** Investigate the enforcement point before designing the
+control. Two of the three shapes the issue proposed were unimplementable as
+written, and only reading the pinned binary's own help - and then running it -
+revealed which. The related habit: when a mutation you expected to be caught
+isn't, the first hypothesis should be that the control does less than its comment
+claims, not that the test is weak.
+
+## Issue #26 follow-up: narrowing the governance lock so an agent can still record what it did
+
+**What I flagged, and what the owner decided.** Locking `.squad/agents` wholesale
+meant an autonomous ACA run could no longer append to
+`.squad/agents/<name>/history.md`. I surfaced that as a deliberate behaviour
+change rather than quietly exempting it. The owner's decision: narrow the lock.
+The reasoning is worth keeping, because the exception will look like an oversight
+to whoever reads it next. `history.md` is an **append-only work log**, not
+policy. It records what an agent *did*; it grants an agent nothing. Locking it
+prevents **no** privilege escalation - it only destroys the audit trail PRD #6
+asks for, on exactly the unattended paths (Ralph, Watch) where nobody else is
+around to write the record. A charter is the opposite: it states what an agent is
+*permitted to do*. That distinction - *log of what happened* versus *statement of
+what is allowed* - is where the boundary now sits.
+
+**What is excluded.** Exactly `^\.squad/agents/[^/]+/history\.md$`, anchored at
+both ends. Not `.squad/agents/**`. `charter.md` beside it,
+`.squad/agents/history.md`, `a/b/history.md` and `history.md.bak` all stay
+locked, and each of those is a named assertion rather than a claim.
+
+**The part I nearly got wrong: the directory.** `history.md` sits inside a
+directory whose other contents are locked, so the real question was not "can the
+run append?" but "does unlocking the file unlock the directory?". It must not, or
+"history is writable" becomes "the agents directory is writable" and an agent can
+add or delete files beside a charter it cannot edit. The answer is ordering, not
+exclusion: hardening runs `chmod -R a-w` over `.squad/agents` **first** and only
+then restores `u+w` on the matching files. `chmod` on a file needs ownership, not
+write on its parent, so the file opens and the directory does not. Expressing it
+the other way round - excluding the path from the recursive `chmod` - could not
+have produced that shape, because the directory would have had to be writable for
+the file to be creatable. Create, delete, new-agent-directory and charter-write
+are each asserted against a real hardened filesystem.
+
+**The detector: I did not drop history from the manifest.** A path excluded from
+both the lock and the integrity check is a foothold. History stays in the
+baseline under a different rule - `append-only <path> <sha256> <bytes>` instead of
+`file <path> <sha256>` - and verification re-hashes the first `<bytes>` bytes. An
+append passes and is **reported with its byte delta**; a truncation, a rewrite
+(even a longer one, which a size-only check would wave through), a deletion, or a
+history file that did not exist at hardening time all fail the session at 78.
+
+**I chose to add the append-only check rather than call it over-engineering.**
+The argument for skipping it is that a work log is low-value. The argument
+against - which won - is that the *stated reason* for unlocking the file is that
+it is the audit trail, and an audit trail an agent can rewrite is not one; the
+exclusion would otherwise have bought an attacker a silent, freely writable file
+inside the governance tree. It costs one `head -c | sha256sum` per file, and it is
+directly testable, which is the bar. The committed form gets the same check, so
+an agent cannot commit a truncated history and hide it by restoring the working
+tree. What I did **not** add is any validation of *what* gets appended: that needs
+a schema this log does not have, and a control that only appears to check is
+worse than none.
+
+**Accepted consequence, documented rather than hidden.** A `history.md` that did
+not exist when the session started cannot be created by the run - that is a new
+governance file. Three agents in this repository (`devrel`, `lead`, `reviewer`)
+have no history file; theirs must be seeded in the PR that adds them.
+
+**Mutation.** Widening the pattern to `^\.squad/agents/.+$` failed 9 governance-
+guard assertions, 5 agent-policy assertions and 2 validate checks. The one that
+matters names the real defect behaviourally: *"an autonomous run CANNOT write
+.squad/agents/<name>/charter.md - a charter is what an agent is permitted to do
+(expected: 'original ...', actual: 'TAMPERED')"* - a real write to a real charter
+on a real hardened filesystem, not a grep.
+
+**Verification.** `validate.ps1` 240 -> **247 passed / 0 failed / 0 skipped**;
+worker suite **9 suites, 623 -> 668 assertions, 0 failed / 0 skipped**
+(governance guard 70 -> 104, agent policy 127 -> 138); `verify-cli-golden.ps1`
+22/22 and `compare-cli-baseline.ps1` byte-identical 22/22 - **no golden
+changed**; `verify-launch-detachment.ps1` PASS. Tier resolution, exit-78
+fail-closed behaviour, the blanket-allow rejection, the `SQUAD_DISPATCH_SOURCE`
+parity fix and the baseline-outside-checkout abort are all untouched.
+
+**Lesson recorded.** "Lock the governance directory" was the right instinct and
+the wrong granularity. The useful question is not *is this path under governance?*
+but *does writing here change what the agent is allowed to do, or only the record
+of what it did?* - and when the answer is the second, locking it costs
+auditability and buys nothing. The follow-on discipline: an exception to a
+security control must be narrower than the control, must stay inside the
+detective layer, and must be documented with its reasoning, or the next reader
+will "fix" it back.

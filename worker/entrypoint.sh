@@ -52,7 +52,12 @@ log "GitHub repository: ${GITHUB_REPOSITORY}"
 log "Session: ${SESSION_NAME}"
 log "Squad deployment mode: ${SQUAD_DEPLOYMENT_MODE}"
 log "Squad pod ID: ${SQUAD_POD_ID}"
-log "Mode: ${SQUAD_MODE:-smoke}"
+# The mode the rest of this script dispatches on. Exported so the shared policy
+# resolver sees exactly the mode that runs, rather than having to guess a default
+# for an unset variable — guessing an attended default is the fail-open shape
+# this change removes (issue #26).
+export SQUAD_MODE="${SQUAD_MODE:-smoke}"
+log "Mode: ${SQUAD_MODE}"
 log "Squad OTLP endpoint: ${ASPIRE_OTLP_GRPC_ENDPOINT}"
 log "Copilot OTLP endpoint: ${ASPIRE_OTLP_HTTP_ENDPOINT}"
 
@@ -111,16 +116,51 @@ if [[ -n "${SQUAD_TEAM:-}" ]]; then
   squad subsquads activate "$SQUAD_TEAM" || true
 fi
 
-if [[ -z "${SQUAD_COPILOT_FLAGS:-}" ]]; then
-  if [[ "${ENABLE_GITHUB_REMOTE:-true}" == "true" ]]; then
-    COPILOT_FLAGS="--yolo --agent squad --remote --no-auto-update"
-  else
-    COPILOT_FLAGS="--yolo --agent squad --no-remote --no-auto-update"
-  fi
-else
-  COPILOT_FLAGS="$SQUAD_COPILOT_FLAGS"
+# --- Agent policy (issue #26, PRD #6) ----------------------------------------
+# Isolation is not authorization. Until now every session ran Copilot with
+# `--yolo` (== --allow-all-tools --allow-all-paths --allow-all-urls) on top of a
+# Dockerfile that set COPILOT_ALLOW_ALL=true, so REMOTE execution applied WEAKER
+# policy than a developer's own machine -- the escalation PRD #6 forbids.
+#
+# Policy is now resolved by one shared module (worker/lib/agent-policy.js) that
+# both execution planes reach through this single entrypoint, and enforced by
+# worker/lib/squad-policy.sh. Nothing here falls back to a permissive default:
+# if the policy cannot be resolved or applied, the session aborts.
+#
+# Ordering matters. Hardening runs AFTER `squad init` and SubSquad activation --
+# session bootstrap legitimately creates the very governance files the agent
+# must not then rewrite -- and BEFORE anything that runs an agent.
+SQUAD_POLICY_LIB="${SQUAD_POLICY_LIB:-/usr/local/lib/squad-on-aca/squad-policy.sh}"
+if [[ ! -f "$SQUAD_POLICY_LIB" ]]; then
+  log "Agent policy library not found at ${SQUAD_POLICY_LIB}."
+  log "A session whose policy cannot be applied must not run with blanket allow; refusing to start."
+  exit 78
 fi
-log "Copilot flags: ${COPILOT_FLAGS}"
+# shellcheck source=lib/squad-policy.sh
+source "$SQUAD_POLICY_LIB"
+
+squad_policy_resolve
+squad_policy_harden "$REPO_DIR"
+
+COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
+SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
+
+# Verified once per session, before anything is published. Called at the top of
+# commit_and_push_if_needed so a governance rewrite can never reach the remote,
+# and at the end of every mode that runs an agent so a non-pushing session still
+# fails rather than reporting success.
+SQUAD_POLICY_VERIFIED=0
+squad_policy_checkpoint() {
+  if [[ "$SQUAD_POLICY_VERIFIED" -eq 1 ]]; then
+    return 0
+  fi
+  SQUAD_POLICY_VERIFIED=1
+  if ! squad_policy_verify "$REPO_DIR"; then
+    log "Session FAILED: a governance path was modified by this run. Nothing has been pushed."
+    exit 78
+  fi
+  return 0
+}
 
 # --- Lease heartbeat (Sprint 6, PRD #6) --------------------------------------
 # A session started by any dispatcher carries SQUAD_LEASE_KEY. Report liveness
@@ -180,6 +220,10 @@ if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
 fi
 
 commit_and_push_if_needed() {
+  # Governance integrity is checked BEFORE anything leaves the container. A
+  # session that rewrote a protected path fails here and publishes nothing.
+  squad_policy_checkpoint
+
   if [[ "${PUSH_CHANGES:-false}" != "true" ]]; then
     return 0
   fi
@@ -202,6 +246,7 @@ commit_and_push_if_needed() {
 case "${SQUAD_MODE:-smoke}" in
   smoke)
     log "Running smoke checks."
+    squad_policy_announce direct
     gh repo view "$GITHUB_REPOSITORY" --json nameWithOwner,defaultBranchRef >/tmp/repo.json
     cat /tmp/repo.json
     squad status || true
@@ -209,10 +254,11 @@ case "${SQUAD_MODE:-smoke}" in
       OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-        copilot -p "You are validating a remote Squad container. Reply with a one-sentence status only." $COPILOT_FLAGS --silent
+        copilot -p "You are validating a remote Squad container. Reply with a one-sentence status only." "${COPILOT_ARGV[@]}" --silent
     else
       log "Skipping Copilot prompt smoke. Set RUN_COPILOT_SMOKE=true to exercise Copilot."
     fi
+    squad_policy_checkpoint
     ;;
   telemetry-smoke)
     log "Running OpenTelemetry smoke signal."
@@ -294,14 +340,16 @@ await sdk.shutdown().catch(error => console.error('OpenTelemetry SDK shutdown fa
 NODE
     node telemetry-smoke.mjs
     log "OpenTelemetry smoke signal emitted."
+    squad_policy_checkpoint
     ;;
   prompt)
     require SQUAD_PROMPT
     log "Running one-shot Squad prompt."
+    squad_policy_announce direct
     OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
       COPILOT_OTEL_ENABLED=true \
       COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-      copilot -p "$SQUAD_PROMPT" $COPILOT_FLAGS
+      copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
     commit_and_push_if_needed
     ;;
   new-project)
@@ -310,10 +358,11 @@ NODE
     export OUTPUT_BRANCH="${OUTPUT_BRANCH:-squad/bootstrap-${SESSION_NAME}}"
     export PR_TITLE="${PR_TITLE:-Bootstrap project with Squad on ACA}"
     log "Running new-project bootstrap Squad prompt."
+    squad_policy_announce direct
     OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
       COPILOT_OTEL_ENABLED=true \
       COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-      copilot -p "$SQUAD_PROMPT" $COPILOT_FLAGS
+      copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
     commit_and_push_if_needed
     ;;
   loop)
@@ -324,9 +373,11 @@ NODE
       sed -i 's/configured: false/configured: true/' loop.md
     fi
     log "Starting Squad loop."
+    squad_policy_announce squad
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
-    squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --copilot-flags "$COPILOT_FLAGS"
+    squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --copilot-flags "$SQUAD_COPILOT_FLAG_STRING"
+    squad_policy_checkpoint
     ;;
   ralph)
     log "Starting scheduled Ralph dispatcher."
@@ -381,6 +432,7 @@ NODE
 
     if [[ "${#issue_rows[@]}" -eq 0 ]]; then
       log "Ralph found no undispatched actionable issues."
+      squad_policy_checkpoint
       exit 0
     fi
 
@@ -432,9 +484,11 @@ NODE
     # ONLY after a confirmed start. A failure on one issue is logged and skipped
     # so the rest of the batch still runs. See worker/lib/ralph-dispatch.sh.
     run_ralph_dispatch
+    squad_policy_checkpoint
     ;;
   watch|triage)
     log "Starting Squad watch."
+    squad_policy_announce squad
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
     squad watch \
@@ -442,9 +496,10 @@ NODE
       --interval "${WATCH_INTERVAL_MINUTES:-5}" \
       --timeout "${WATCH_TIMEOUT_MINUTES:-45}" \
       --max-concurrent "${WATCH_MAX_CONCURRENT:-1}" \
-      --copilot-flags "$COPILOT_FLAGS" \
+      --copilot-flags "$SQUAD_COPILOT_FLAG_STRING" \
       --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
       --verbose
+    squad_policy_checkpoint
     ;;
   shell)
     log "Starting requested shell command."

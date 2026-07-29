@@ -228,7 +228,19 @@ $commonEnv = @(
     "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers",
     "SQUAD_DEPLOYMENT_MODE=squad-per-pod",
     "ENABLE_GITHUB_REMOTE=true",
-    "SQUAD_COPILOT_FLAGS=--yolo --agent squad --remote --no-auto-update",
+    # Explicitly CLEARED, not just omitted (issue #26, PRD #6). This used to be
+    # `--yolo --agent squad --remote --no-auto-update`, so every deployed job ran
+    # with --allow-all-tools + --allow-all-paths + --allow-all-urls, and anyone
+    # who could set one environment variable on a dispatch could keep it that
+    # way. `az containerapp job update --set-env-vars` MERGES, so dropping the
+    # line would leave the old `--yolo` value on an existing deployment forever;
+    # setting it empty is what actually removes it on redeploy.
+    #
+    # Flags are now composed per session by worker/lib/agent-policy.js from
+    # SQUAD_MODE and SQUAD_DISPATCH_SOURCE. The variable is still read as
+    # OPERATOR EXTRAS (model, log level, reasoning effort); a permission-widening
+    # flag in it now aborts the session instead of applying.
+    "SQUAD_COPILOT_FLAGS=",
     "AZURE_SUBSCRIPTION_ID=$SubscriptionId",
     "AZURE_RESOURCE_GROUP=$ResourceGroupName",
     "AZURE_CLIENT_ID=$identityClientId",
