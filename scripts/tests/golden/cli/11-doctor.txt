@@ -29,6 +29,5 @@ Ralph job       ok      caj-squad-aca-ralph
 Logs path       ok      containerapp extension present; logs uses 'az containerapp job logs show'
 Aspire URL      ok      https://aspire.stub.invalid/login
 
-
 ### STDERR
 

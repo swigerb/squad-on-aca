@@ -255,6 +255,42 @@ lease_count="$(node "$SQUAD_DISPATCH_CLI" list --repository "$GITHUB_REPOSITORY"
 assert_eq "1" "$lease_count" "crash repair: exactly one lease record exists for issue #32"
 
 # ---------------------------------------------------------------------------
+# 9b. CONCURRENT dispatchers. Ralph's cron and an operator's `squad-aca ralph
+#     run` overlap by design (the cron fires every five minutes and the manual
+#     command is always available). If the other dispatcher is still inside its
+#     own claim-to-compute window -- which spans mktemp, an env build that
+#     shells to node and az, and the job start itself, i.e. SECONDS, not
+#     milliseconds -- Ralph must NOT treat that live claim as a crashed one.
+#
+#     Two things are asserted, and the second is the subtle one:
+#       * no second execution starts (the actual double-dispatch bug), and
+#       * the issue is NOT labeled. Labeling here would retire an issue that
+#         the OTHER dispatcher may still fail and release, silently dropping
+#         the work. A contended claim is "come back next run", not "done".
+# ---------------------------------------------------------------------------
+reset_state
+# Another dispatcher claims first and is still mid-flight (clock unmoved).
+node "$SQUAD_DISPATCH_CLI" decide --session-id issue-35-other --dispatch-source local-cli \
+  --repository "$GITHUB_REPOSITORY" --issue 35 \
+  | node "$SQUAD_DISPATCH_CLI" claim --repository "$GITHUB_REPOSITORY" >/dev/null 2>&1
+out="$(ralph_dispatch_issue 35 "Contended" "https://example/35" 2>&1)"
+rc=$?
+assert_eq "0" "$rc" "contended claim: Ralph reports success (the work is owned, not failed)"
+assert_eq "0" "$(grep -c '^start$' "$AZ_START_LOG")" "contended claim: NO second execution starts while the other dispatcher holds a live claim"
+assert_eq "0" "$(grep -c '^35$' "$GH_LABEL_LOG")" "contended claim: issue #35 is NOT labeled, so it stays retryable if the owner never dispatches"
+assert_contains "$out" "skipping" "contended claim: logs that it skipped rather than dispatched"
+
+# ...and once that window elapses without the owner reaching compute, the claim
+# IS adoptable, so a genuine crash still self-heals rather than wedging.
+export SQUAD_LEASE_NOW="2024-05-01T00:30:00.000Z"
+out="$(ralph_dispatch_issue 35 "Contended" "https://example/35" 2>&1)"
+rc=$?
+export SQUAD_LEASE_NOW="2024-05-01T00:00:00.000Z"
+assert_eq "0" "$rc" "abandoned claim: the retry after the claim window dispatches"
+assert_eq "1" "$(grep -c '^start$' "$AZ_START_LOG")" "abandoned claim: compute starts exactly once in total across both runs"
+assert_eq "1" "$(grep -c '^35$' "$GH_LABEL_LOG")" "abandoned claim: issue #35 labeled exactly once in total"
+
+# ---------------------------------------------------------------------------
 # 10. The sweeper reclaims a stale lease and is idempotent when run twice.
 # ---------------------------------------------------------------------------
 reset_state

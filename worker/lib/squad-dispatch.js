@@ -86,6 +86,19 @@ function readStdin() {
   }
 }
 
+function warnIfTruncated(result) {
+  // The Contents API caps a directory listing at 1,000 entries with no
+  // continuation token. Past that the ledger is only partly visible, so the
+  // sweeper cannot see leases it should reclaim. Say so on stderr (stdout stays
+  // parseable) as well as in the `truncated` field.
+  if (!result || !result.truncated) return;
+  process.stderr.write(
+    'squad-dispatch: the lease ledger hit the Contents API directory listing cap, so this ' +
+      'result covers only part of it. Prune the ledger (leases sweep) or shorten ' +
+      'SQUAD_LEASE_RETENTION_SECONDS.\n'
+  );
+}
+
 function requireDecisionFromStdin() {
   const text = readStdin();
   if (!text.trim()) {
@@ -229,12 +242,14 @@ function run() {
       case 'sweep': {
         const repository = requireRepository(flags, null);
         const result = lease.sweepLeases(repository);
+        warnIfTruncated(result);
         emit(result, pretty);
         return;
       }
       case 'list': {
         const repository = requireRepository(flags, null);
         const result = lease.listLeases(repository);
+        warnIfTruncated(result);
         emit(result, pretty);
         return;
       }

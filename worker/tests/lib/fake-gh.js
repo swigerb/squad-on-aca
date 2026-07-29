@@ -26,9 +26,13 @@
  *   SQUAD_CALL_LOG    shared, ordered, cross-tool call log. The fake `az`
  *                     appends to the same file, so a test can assert that the
  *                     lease write happens BEFORE the compute request by INDEX.
- *   FAKE_GH_FAIL_MODE auth | throttle | network — makes every `api` call fail
- *                     the way a real credential/permission/rate-limit fault
- *                     does, so cleanup paths can be proven to surface it.
+ *   FAKE_GH_FAIL_MODE auth | forbidden | throttle | network — makes every `api`
+ *                     call fail the way a real credential/permission/rate-limit
+ *                     fault does, so cleanup paths can be proven to surface it.
+ *                     masked403 | masked401 | masked429 | masked500 carry BOTH a
+ *                     real-failure signature and a "gone" token, which is what
+ *                     makes the deny-list-FIRST ordering testable at all.
+ *                     unrecognised carries neither, and must fail closed.
  *   FAKE_GH_FAIL_PATH substring; only api calls whose path contains it fail.
  */
 
@@ -85,7 +89,27 @@ const FAILURES = {
   auth: 'gh: Bad credentials (HTTP 401)',
   forbidden: 'gh: Resource not accessible by integration (HTTP 403)',
   throttle: 'gh: API rate limit exceeded (HTTP 429)',
-  network: 'gh: Post "https://api.github.com": dial tcp: lookup api.github.com: no such host'
+  network: 'gh: Post "https://api.github.com": dial tcp: lookup api.github.com: no such host',
+
+  // --- DENY-LIST-FIRST PROBES ------------------------------------------------
+  // Each of these texts contains BOTH a real-failure signature AND a token from
+  // the "gone" list, so classification is decided by the ORDER of the two loops
+  // in dispatch-lease.js rather than by which list happens to match at all.
+  //
+  // Without them the deny-list is never the deciding factor and the ordering is
+  // untestable: deleting REAL_FAILURE_PATTERNS entirely, or moving it after
+  // GONE_PATTERNS, both left the whole suite green. That is the Sprint 3 B1 /
+  // Sprint 5 `cancel` defect, now on its fourth appearance.
+  //
+  // `masked403` is also the most likely real-world input: GitHub masks a
+  // permission denial on a private resource as HTTP 404 / "Not Found".
+  masked403: 'gh: HTTP 403: Resource not accessible by integration (Not Found)',
+  masked401: 'gh: Bad credentials (HTTP 401) - Not Found',
+  masked429: 'gh: HTTP 429: API rate limit exceeded (the resource does not exist)',
+  masked500: 'gh: HTTP 502: Bad gateway - Not Found',
+
+  // Neither list matches. The documented rule is that this fails CLOSED.
+  unrecognised: 'gh: the remote end did something nobody wrote down'
 };
 
 function handleApi(args) {
@@ -212,7 +236,14 @@ function handleApi(args) {
     if (method === 'DELETE') {
       const file = contentFile(branch, filePath);
       if (!fs.existsSync(file)) die('gh: Not Found (HTTP 404)');
+      // The real Contents API requires the blob's current sha on a delete and
+      // rejects a stale one, exactly as it does for PUT. Reproducing that is the
+      // only way the prune path's compare-and-swap behaviour can be tested.
+      const current = sha1(fs.readFileSync(file, 'utf8'));
+      if (!body.sha) die('gh: Invalid request. "sha" wasn\'t supplied. (HTTP 422)');
+      if (body.sha !== current) die('gh: is at <sha> but expected <other> (HTTP 409)');
       fs.unlinkSync(file);
+      appendLog(process.env.SQUAD_CALL_LOG, `gh lease-delete ${path.posix.basename(filePath)}`);
       process.stdout.write('{}\n');
       return;
     }

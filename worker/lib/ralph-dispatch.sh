@@ -90,10 +90,19 @@ squad_dispatch_decide() {
 
 squad_lease_claim() {
   # Writes the lease BEFORE compute is requested. Reads the decision on stdin.
-  # Prints the claim outcome (created | repaired | active | completed) on stdout.
-  local repository="$1" claim_json
+  # Prints "<outcome> <lease state>" on stdout, tab-separated.
+  #
+  # The lease STATE is printed alongside the outcome because `active` no longer
+  # implies compute is running: it also covers "another dispatcher is inside its
+  # claim -> compute window right now". Labeling an issue in that case would
+  # retire it even if the other dispatcher then failed to start and released the
+  # lease. The caller needs both values to tell those apart; neither is a routing
+  # rule, so reading them here does not put a second decision in bash.
+  local repository="$1" claim_json outcome state
   claim_json="$(node "$(squad_dispatch_cli)" claim --repository "$repository")" || return 1
-  printf '%s' "$claim_json" | squad_json_field outcome
+  outcome="$(printf '%s' "$claim_json" | squad_json_field outcome)"
+  state="$(printf '%s' "$claim_json" | squad_json_field lease.state)"
+  printf '%s\t%s' "$outcome" "$state"
 }
 
 squad_lease_op() {
@@ -205,7 +214,7 @@ ralph_dispatch_issue() {
   #   RALPH_DISPATCH_LABEL, RALPH_SESSION_JOB_ENV_JSON, RALPH_SESSION_JOB_IMAGE,
   #   RALPH_SESSION_JOB_CPU, RALPH_SESSION_JOB_MEMORY, RALPH_SESSION_JOB_CONTAINER
   local issue_number="$1" issue_title="$2" issue_url="$3"
-  local session_name prompt env_file decision claim_outcome route lease_key
+  local session_name prompt env_file decision claim_result claim_outcome claim_state route lease_key
   local -a start_env
 
   session_name="issue-${issue_number}-$(date +%Y%m%d%H%M%S)"
@@ -231,15 +240,25 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
 
   # CLAIM BEFORE COMPUTE. The lease is durable and keyed on the issue, so a
   # crash anywhere below repairs on the next run instead of double-dispatching.
-  if ! claim_outcome="$(printf '%s' "$decision" | squad_lease_claim "$GITHUB_REPOSITORY" 2>/dev/null)"; then
+  if ! claim_result="$(printf '%s' "$decision" | squad_lease_claim "$GITHUB_REPOSITORY" 2>/dev/null)"; then
     log "Ralph: could not claim a lease for issue #${issue_number}; skipping without labeling."
     return 1
   fi
+  IFS=$'\t' read -r claim_outcome claim_state <<< "$claim_result"
   case "$claim_outcome" in
     active|completed)
-      # Another dispatcher already owns (or finished) this work. Do NOT start a
-      # second execution; just reconcile the label so the issue stops appearing
-      # as a candidate. This is the crash-between-claim-and-label repair path.
+      if [[ "$claim_state" == "claimed" ]]; then
+        # Another dispatcher holds a LIVE CLAIM and has not yet requested
+        # compute. Do NOT start a second execution, and do NOT label: if that
+        # dispatcher fails to start it will release the lease, and a labeled
+        # issue would never be offered again. Leaving it unlabeled costs one
+        # extra evaluation next run and cannot lose the work.
+        log "Ralph: issue #${issue_number} is being claimed by another dispatcher right now; skipping without labeling."
+        return 0
+      fi
+      # Compute is already running, or the work already finished. Reconcile the
+      # label so the issue stops appearing as a candidate. This is the
+      # crash-between-claim-and-label repair path.
       gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$RALPH_DISPATCH_LABEL" >/dev/null 2>&1 || true
       log "Ralph: issue #${issue_number} already has a live lease (${claim_outcome}); not dispatching again."
       return 0
@@ -334,13 +353,19 @@ run_ralph_dispatch() {
   # `issue_rows` (tab-separated: number, title, url) plus the config globals
   # documented on ralph_dispatch_issue. A failure on one issue is counted and
   # logged; the loop always continues to the next issue.
-  local row issue_number issue_title issue_url
+  local row issue_number issue_title issue_url sweep_json
   local dispatched=0 failed=0
 
-  # Reclaim leases whose heartbeat has aged out before dispatching. Sweeping is
-  # idempotent and never fatal: a sweep failure must not block new work.
-  if ! squad_lease_op sweep "${GITHUB_REPOSITORY:-}" >/dev/null 2>&1; then
+  # Reclaim leases whose heartbeat has aged out, and prune the ledger, before
+  # dispatching. Sweeping is idempotent and never fatal: a sweep failure must not
+  # block new work. It is also BOUNDED -- it reads at most a fixed number of
+  # records per run -- so it cannot grow into the API budget that dispatch itself
+  # depends on.
+  if ! sweep_json="$(squad_lease_op sweep "${GITHUB_REPOSITORY:-}" 2>/dev/null)"; then
     log "Ralph: stale-lease sweep did not complete; continuing with dispatch."
+  elif [[ "$(printf '%s' "$sweep_json" | squad_json_field truncated)" == "true" ]]; then
+    # Silently sweeping a partial ledger would leave leases unreclaimed forever.
+    log "Ralph: the lease ledger exceeded the Contents API directory listing cap; only part of it was swept."
   fi
 
   for row in "${issue_rows[@]}"; do

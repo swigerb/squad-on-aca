@@ -524,7 +524,12 @@ function Start-LeasedExecution {
         -IssueNumber $IssueNumber
 
     $claim = New-SquadDispatchLease -Decision $decision -Repository $repo
-    if ($claim.outcome -eq "active" -or $claim.outcome -eq "completed") {
+    # Fail-closed on the outcome vocabulary: ONLY `created` and `repaired` mean
+    # "you own this work". Anything else -- including any outcome added later --
+    # must not dispatch. `active` now also covers "another dispatcher is inside
+    # its claim -> compute window right now", which is exactly the case that used
+    # to hand two dispatchers the same lease.
+    if ($claim.outcome -ne "created" -and $claim.outcome -ne "repaired") {
         Write-Warning ("Not dispatching '$($Request.sessionId)': lease '$($decision.leaseKey)' is already " +
             "$($claim.lease.state) (claimed by $($claim.lease.dispatchSource) at $($claim.lease.startedAt)). " +
             "Run 'squad-aca leases' to inspect it.")
@@ -540,7 +545,18 @@ function Start-LeasedExecution {
         throw
     }
 
-    Set-SquadDispatchLeaseState -Operation "dispatched" -Repository $repo -LeaseKey ([string]$decision.leaseKey) | Out-Null
+    # Compute is LIVE from here on, so this call is inside the try for the same
+    # reason Ralph guards its equivalent with `|| true`. A transient fault must
+    # not throw to the user AFTER the execution started: the user would retry,
+    # the retry would find a `claimed` lease, and a second execution would start.
+    # It must also NOT release -- that would hand live work to another dispatcher.
+    # The worker's periodic heartbeat moves the lease to `running` regardless.
+    try {
+        Set-SquadDispatchLeaseState -Operation "dispatched" -Repository $repo -LeaseKey ([string]$decision.leaseKey) | Out-Null
+    } catch {
+        Write-Warning ("Started '$($Request.sessionId)' but could not record the lease as dispatched: $($_.Exception.Message) " +
+            "The execution is running; the lease is reconciled by the worker heartbeat.")
+    }
 }
 
 function Invoke-Leases {
@@ -571,12 +587,19 @@ function Invoke-Leases {
                     Started = $_.startedAt
                     Heartbeat = $_.lastHeartbeatAt
                 }
-            } | Format-Table -AutoSize
+            } | Format-Table -AutoSize | Out-String -Width 200
         }
         "sweep" {
             $result = Invoke-SquadLeaseSweep -Repository $repo
-            Write-Output "Examined $($result.examined) lease(s); reclaimed $(@($result.reclaimed).Count)."
+            Write-Output "Examined $($result.examined) of $($result.total) lease(s); reclaimed $(@($result.reclaimed).Count); pruned $(@($result.pruned).Count)."
             foreach ($item in @($result.reclaimed)) { Write-Output "  reclaimed $($item.key) ($($item.reason))" }
+            foreach ($item in @($result.pruned)) { Write-Output "  pruned $($item.key) ($($item.state), past the retention window)" }
+            if ($result.total -gt $result.examined) {
+                Write-Output "  $($result.total - $result.examined) lease(s) were not examined this run (per-run read budget $($result.budget)); the next sweep continues from where this one stopped."
+            }
+            if ($result.truncated) {
+                Write-Warning "The lease ledger exceeded the Contents API directory listing cap, so this sweep saw only part of it."
+            }
         }
         default { throw "Usage: squad-aca leases [list|sweep] [--repo <owner/repo>]" }
     }
@@ -634,7 +657,14 @@ function Invoke-Doctor {
     $logPath = Get-AcaLogPathStatus -WorkspaceName $config.logAnalyticsWorkspace
     $checks += [pscustomobject]@{ Check = "Logs path"; Status = $logPath.Status; Detail = $logPath.Detail }
     $checks += [pscustomobject]@{ Check = "Aspire URL"; Status = if ($config.aspireLoginUrl) { "ok" } else { "missing" }; Detail = if ($config.aspireLoginUrl) { $config.aspireLoginUrl } else { "Run deploy or squad-aca configure --dashboard-url" } }
-    $checks | Format-Table -AutoSize
+    # Same width rule as `sessions`: Detail carries free-form text (an Aspire
+    # login URL, a resource-group/job pair) that runs well past a narrow
+    # console, and Format-Table drops trailing columns that do not fit.
+    $checks |
+        Format-Table -AutoSize |
+        Out-String -Width 200 |
+        ForEach-Object { $_.TrimEnd() } |
+        Write-Output
 }
 
 function Get-SessionExecutions {
@@ -805,8 +835,10 @@ function Invoke-Watch {
             $session = "watch"
             $decision = Get-SquadDispatchDecision -SessionId $session -DispatchSource "watch" -Repository $repo
             $claim = New-SquadDispatchLease -Decision $decision -Repository $repo
-            if ($claim.outcome -eq "active") {
-                Write-Warning ("Watch already holds lease '$($decision.leaseKey)' (started $($claim.lease.startedAt)). " +
+            # Same fail-closed rule as Start-LeasedExecution: only `created` and
+            # `repaired` mean this process owns the watcher.
+            if ($claim.outcome -ne "created" -and $claim.outcome -ne "repaired") {
+                Write-Warning ("Watch already holds lease '$($decision.leaseKey)' (state $($claim.lease.state), started $($claim.lease.startedAt)). " +
                     "Run 'squad-aca leases' to inspect it, or 'squad-aca watch stop' first.")
                 return
             }
@@ -816,7 +848,14 @@ function Invoke-Watch {
                 Set-SquadDispatchLeaseState -Operation "release" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -Reason "watch-start-failed" | Out-Null
                 throw
             }
-            Set-SquadDispatchLeaseState -Operation "dispatched" -Repository $repo -LeaseKey ([string]$decision.leaseKey) | Out-Null
+            # The watcher is live: recording `dispatched` must not throw to the
+            # user (a retry would then race its own live watcher) and must not
+            # release. See the identical guard in Start-LeasedExecution.
+            try {
+                Set-SquadDispatchLeaseState -Operation "dispatched" -Repository $repo -LeaseKey ([string]$decision.leaseKey) | Out-Null
+            } catch {
+                Write-Warning ("Started the watcher but could not record the lease as dispatched: $($_.Exception.Message)")
+            }
         }
         "stop" {
             $repo = Get-OptionValue $Items @("--repo", "-Repository") (Get-CurrentRepo)
