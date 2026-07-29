@@ -1596,6 +1596,15 @@ function New-SandboxWorkerEnvironment {
         GIT_CLONE_DEPTH   = [string]$Request.repository.cloneDepth
         RUN_COPILOT_SMOKE = $(if ($prefs.runCopilotSmoke) { "true" } else { "false" })
         SQUAD_EXECUTION_MODE = "sandbox"
+        # WHO started this run, carried onto the sandbox plane for the same
+        # reason it is carried onto the ACA Jobs plane: worker/lib/agent-policy.js
+        # picks the attended or autonomous tool tier from SQUAD_MODE plus this
+        # value (issue #26, PRD #6). Leaving it out here would mean a Ralph-
+        # dispatched session resolved to the AUTONOMOUS tier on ACA Jobs and the
+        # ATTENDED one in the sandbox -- privilege escalation by choosing a
+        # substrate, which is precisely what the PRD forbids. It is a routing
+        # fact, not a credential, so nothing secret is added by including it.
+        SQUAD_DISPATCH_SOURCE = [string]$Request.dispatchSource
     }
     if ($Request.repository.ref) { $vars["GITHUB_REF"] = [string]$Request.repository.ref }
     if ($prefs.subSquad) { $vars["SQUAD_SUB_SQUAD"] = [string]$prefs.subSquad }

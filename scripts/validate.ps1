@@ -113,7 +113,10 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\entrypoint.sh"),
     (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"),
     (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh"),
-    (Join-Path $RepoRoot "worker\lib\git-checkout.sh")
+    (Join-Path $RepoRoot "worker\lib\git-checkout.sh"),
+    (Join-Path $RepoRoot "worker\lib\squad-policy.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_agent_policy.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
@@ -3688,6 +3691,352 @@ if (-not (Test-Path $goldenScript)) {
         } else {
             Add-Fail "'squad' is no longer stubbed onto PATH; 'doctor' reports ok/optional depending on the host and re-pads every row of its table"
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Agent tool policy (issue #26, PRD #6)
+# ---------------------------------------------------------------------------
+# "Isolation is not authorization." Until this change every session ran Copilot
+# with `--yolo` on an image that also set COPILOT_ALLOW_ALL=true, so REMOTE
+# execution applied WEAKER policy than a developer's own machine. These checks
+# exist so that regressing to that state fails a build rather than being noticed
+# in an incident.
+Write-Section "Agent tool policy"
+
+$policyResolver = Join-Path $RepoRoot "worker\lib\agent-policy.js"
+$policyLib      = Join-Path $RepoRoot "worker\lib\squad-policy.sh"
+$entrypointPath = Join-Path $RepoRoot "worker\entrypoint.sh"
+$workerDockerfile = Join-Path $RepoRoot "worker\Dockerfile"
+
+if (-not (Test-Path $policyResolver)) { Add-Fail "worker/lib/agent-policy.js is missing; there is no shared policy resolver and each plane would decide for itself" }
+if (-not (Test-Path $policyLib))      { Add-Fail "worker/lib/squad-policy.sh is missing; nothing applies the resolved policy" }
+
+# --- 1. The blanket-allow switches are gone from every shipping path ---------
+# Deliberately NOT a whole-repo grep: docs and this file must be able to name
+# `--yolo` when explaining what was removed. The check is on the files that
+# actually compose a command or an image.
+$blanketTargets = @(
+    @{ Path = $entrypointPath;   Name = "worker/entrypoint.sh" },
+    @{ Path = $workerDockerfile; Name = "worker/Dockerfile" },
+    @{ Path = (Join-Path $RepoRoot "scripts\deploy.ps1"); Name = "scripts/deploy.ps1" }
+)
+foreach ($t in $blanketTargets) {
+    if (-not (Test-Path $t.Path)) { Add-Fail "$($t.Name) is missing"; continue }
+    # Strip comment lines first: the point is what the file DOES, and every one
+    # of these files explains the removal in prose that names the flag.
+    $lines = Get-Content -LiteralPath $t.Path
+    $code = @($lines | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    if ($code -match '--yolo|--allow-all(?!-tools)|COPILOT_ALLOW_ALL\s*=\s*true') {
+        Add-Fail "$($t.Name) still applies a blanket-allow switch (--yolo / --allow-all / COPILOT_ALLOW_ALL=true); remote execution would again be more permissive than local"
+    } else {
+        Add-Pass "$($t.Name) applies no blanket-allow switch"
+    }
+}
+
+# `--yolo` used to be injected through the job template, which is the one place
+# an operator could restore it without touching code. Omitting the line is not
+# enough -- `az containerapp job update --set-env-vars` merges, so a previously
+# deployed job would keep the old value forever. It must be explicitly cleared.
+$deployText = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\deploy.ps1") -Raw
+if ($deployText -match '"SQUAD_COPILOT_FLAGS="') {
+    Add-Pass "deploy.ps1 explicitly CLEARS SQUAD_COPILOT_FLAGS, so redeploying removes a previously baked-in --yolo (set-env-vars merges; omitting the line would not)"
+} else {
+    Add-Fail "deploy.ps1 does not clear SQUAD_COPILOT_FLAGS; an existing deployment would keep its old '--yolo ...' value through every redeploy"
+}
+
+# --- 2. The entrypoint uses the policy, and uses it safely -------------------
+if (-not (Test-Path $entrypointPath)) {
+    Add-Fail "worker/entrypoint.sh is missing"
+} else {
+    $entryText = Get-Content -LiteralPath $entrypointPath -Raw
+
+    # Every `copilot` invocation must expand the ARRAY. An unquoted string
+    # expansion word-splits `shell(git config)` into two arguments, which both
+    # destroys the rule and changes what the next token means -- and it would
+    # still look correct in a diff.
+    $copilotCalls = @(Get-Content -LiteralPath $entrypointPath | Where-Object { $_ -match '^\s*copilot\s+-p' })
+    $badCalls = @($copilotCalls | Where-Object { $_ -notmatch '"\$\{COPILOT_ARGV\[@\]\}"' })
+    if ($copilotCalls.Count -gt 0 -and $badCalls.Count -eq 0) {
+        Add-Pass "All $($copilotCalls.Count) direct 'copilot -p' invocations expand `"`${COPILOT_ARGV[@]}`", so a multi-word deny pattern stays one argument"
+    } else {
+        Add-Fail "A 'copilot -p' invocation does not expand the policy argv array (found $($badCalls.Count) of $($copilotCalls.Count)); word-splitting would silently drop every multi-word deny rule"
+    }
+
+    # The policy must be applied before anything runs an agent, and a missing
+    # library must abort rather than fall through to an unpoliced session.
+    if ($entryText -match '(?s)if \[\[ ! -f "\$SQUAD_POLICY_LIB" \]\].{0,400}exit 78') {
+        Add-Pass "A missing policy library aborts the session (exit 78) instead of running unpoliced"
+    } else {
+        Add-Fail "worker/entrypoint.sh does not abort when the policy library is absent; the session would run with no tool policy at all"
+    }
+
+    # The governance verdict must gate the push. A check that runs after the
+    # push protects nothing.
+    if ($entryText -match '(?s)commit_and_push_if_needed\(\)\s*\{\s*(#[^\n]*\n\s*)*squad_policy_checkpoint') {
+        Add-Pass "commit_and_push_if_needed verifies governance integrity BEFORE it can push, so a rewrite never reaches the remote"
+    } else {
+        Add-Fail "commit_and_push_if_needed does not verify governance integrity first; a governance rewrite could be pushed before anything noticed"
+    }
+
+    # Every mode that runs an agent must reach a checkpoint, or a non-pushing
+    # session would report success after rewriting a policy file.
+    $agentModes = @('smoke', 'prompt', 'loop', 'ralph', 'watch|triage', 'new-project', 'telemetry-smoke')
+    $checkpointCount = ([regex]::Matches($entryText, 'squad_policy_checkpoint')).Count
+    if ($checkpointCount -ge ($agentModes.Count + 1)) {
+        Add-Pass "The governance checkpoint is reached from every agent-running mode and from the push path ($checkpointCount call sites)"
+    } else {
+        Add-Fail "Only $checkpointCount squad_policy_checkpoint call sites; at least $($agentModes.Count + 1) are needed for every agent-running mode plus the push path"
+    }
+}
+
+# --- 3. The Dockerfile actually ships the policy files -----------------------
+# A resolver that is not in the image is a resolver that aborts every session.
+if (-not (Test-Path $workerDockerfile)) {
+    Add-Fail "worker/Dockerfile is missing"
+} else {
+    $dockerText = Get-Content -LiteralPath $workerDockerfile -Raw
+    foreach ($f in @('lib/agent-policy.js', 'lib/squad-policy.sh')) {
+        if ($dockerText -match [regex]::Escape($f)) {
+            Add-Pass "worker/Dockerfile ships $f into the image"
+        } else {
+            Add-Fail "worker/Dockerfile does not ship $f; every session would abort at policy resolution"
+        }
+    }
+    if ($dockerText -match 'sed -i[^\n]*\\r[^\n]*squad-policy\.sh') {
+        Add-Pass "worker/Dockerfile CRLF-strips squad-policy.sh like every other shipped shell script"
+    } else {
+        Add-Fail "worker/Dockerfile does not CRLF-strip squad-policy.sh; a Windows checkout would produce an unsourceable policy library"
+    }
+}
+
+# --- 4. Local / remote parity, driven through the REAL env builders ----------
+# This is the PRD requirement itself: "Local and sandbox execution must apply the
+# same policy semantics so changing execution substrate cannot escalate
+# privilege." Asserting it on hand-written env maps would prove nothing about the
+# product, so both maps are produced by the functions each plane actually uses,
+# then fed to the same resolver.
+$nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+if (-not $nodeCmd) {
+    Add-Skip "Cross-plane policy parity is UNVERIFIED: node is not on PATH"
+} elseif (-not (Test-Path $policyResolver)) {
+    Add-Fail "Cross-plane policy parity cannot be checked: worker/lib/agent-policy.js is missing"
+} else {
+    function Get-PolicyJsonFor {
+        param([hashtable]$EnvMap)
+        $prev = @{}
+        foreach ($k in @('SQUAD_MODE', 'SQUAD_DISPATCH_SOURCE', 'SQUAD_EXECUTION_MODE', 'SQUAD_COPILOT_FLAGS', 'ENABLE_GITHUB_REMOTE')) {
+            $prev[$k] = [Environment]::GetEnvironmentVariable($k)
+            [Environment]::SetEnvironmentVariable($k, $null)
+        }
+        foreach ($k in $EnvMap.Keys) { [Environment]::SetEnvironmentVariable($k, [string]$EnvMap[$k]) }
+        try { $out = (& node $policyResolver json 2>&1 | Out-String) } finally {
+            foreach ($k in $prev.Keys) { [Environment]::SetEnvironmentVariable($k, $prev[$k]) }
+        }
+        return $out
+    }
+
+    # The dispatch source the ACA Jobs plane stamps must also reach the sandbox
+    # plane's worker environment, or a Ralph-dispatched session would get the
+    # strict tier remotely and the permissive one in a sandbox.
+    $sandboxProviderText = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\lib\providers\squad-sandbox-provider.ps1") -Raw
+    if ($sandboxProviderText -match 'SQUAD_DISPATCH_SOURCE\s*=\s*\[string\]\$Request\.dispatchSource') {
+        Add-Pass "The sandbox worker environment carries SQUAD_DISPATCH_SOURCE, so who started a run is known on both planes"
+    } else {
+        Add-Fail "New-SandboxWorkerEnvironment does not carry SQUAD_DISPATCH_SOURCE; a ralph-dispatched sandbox session would resolve to the ATTENDED tier -- escalation by choosing a substrate"
+    }
+
+    $parityMismatch = @()
+    foreach ($case in @(
+        @{ Mode = 'prompt'; Source = 'local-cli' },
+        @{ Mode = 'prompt'; Source = 'ralph' },
+        @{ Mode = 'ralph';  Source = 'ralph' },
+        @{ Mode = 'watch';  Source = 'watch' },
+        @{ Mode = 'loop';   Source = 'watch' },
+        @{ Mode = 'smoke';  Source = 'local-cli' }
+    )) {
+        $acaJson = Get-PolicyJsonFor @{ SQUAD_MODE = $case.Mode; SQUAD_DISPATCH_SOURCE = $case.Source; SQUAD_EXECUTION_MODE = '' }
+        $sbxJson = Get-PolicyJsonFor @{ SQUAD_MODE = $case.Mode; SQUAD_DISPATCH_SOURCE = $case.Source; SQUAD_EXECUTION_MODE = 'sandbox' }
+        # executionPlane is reported, not acted on; everything else must match.
+        $a = $acaJson -replace '"executionPlane":\s*"[^"]*"', '"executionPlane": "X"'
+        $b = $sbxJson -replace '"executionPlane":\s*"[^"]*"', '"executionPlane": "X"'
+        if ($a -ne $b) { $parityMismatch += "$($case.Mode)/$($case.Source)" }
+    }
+    if ($parityMismatch.Count -eq 0) {
+        Add-Pass "ACA Jobs and sandbox execution resolve to an identical policy for all 6 mode/source pairs; changing substrate cannot escalate privilege"
+    } else {
+        Add-Fail "Policy differs between the ACA Jobs and sandbox planes for: $($parityMismatch -join ', ') -- changing execution substrate escalates privilege"
+    }
+
+    # An unattended dispatch must get the strict tier, and it must actually be
+    # stricter -- equal tiers would pass a naive "tiers exist" check.
+    $attJson = Get-PolicyJsonFor @{ SQUAD_MODE = 'prompt'; SQUAD_DISPATCH_SOURCE = 'local-cli' }
+    $autJson = Get-PolicyJsonFor @{ SQUAD_MODE = 'ralph';  SQUAD_DISPATCH_SOURCE = 'ralph' }
+    $att = $attJson | ConvertFrom-Json
+    $aut = $autJson | ConvertFrom-Json
+    if ($att.tier -eq 'attended' -and $aut.tier -eq 'autonomous') {
+        Add-Pass "An attended dispatch resolves to the 'attended' tier and an unattended one to 'autonomous'"
+    } else {
+        Add-Fail "Tier selection is wrong: attended dispatch -> '$($att.tier)', unattended dispatch -> '$($aut.tier)'"
+    }
+    $extraDenied = @($aut.denyTools | Where-Object { $att.denyTools -notcontains $_ })
+    $lostDenied = @($att.denyTools | Where-Object { $aut.denyTools -notcontains $_ })
+    if ($extraDenied.Count -gt 0 -and $lostDenied.Count -eq 0) {
+        Add-Pass "The autonomous tier is strictly stricter: it denies $($extraDenied.Count) additional tools and drops none of the attended denials"
+    } else {
+        Add-Fail "The autonomous tier is not strictly stricter than the attended one (extra denials: $($extraDenied.Count), denials lost: $($lostDenied.Count))"
+    }
+
+    # Fail closed: an attempt to widen permission through the environment must
+    # abort with EX_CONFIG, not be silently ignored and not be applied.
+    $prevFlags = [Environment]::GetEnvironmentVariable('SQUAD_COPILOT_FLAGS')
+    foreach ($bad in @('--yolo', '--allow-all', '--allow-all-paths', '--add-dir /etc')) {
+        [Environment]::SetEnvironmentVariable('SQUAD_MODE', 'ralph')
+        [Environment]::SetEnvironmentVariable('SQUAD_DISPATCH_SOURCE', 'ralph')
+        [Environment]::SetEnvironmentVariable('SQUAD_COPILOT_FLAGS', $bad)
+        $null = (& node $policyResolver flags 2>&1)
+        $rc = $LASTEXITCODE
+        if ($rc -eq 78) {
+            Add-Pass "SQUAD_COPILOT_FLAGS='$bad' aborts policy resolution (exit 78) rather than widening the session"
+        } else {
+            Add-Fail "SQUAD_COPILOT_FLAGS='$bad' did not abort (exit $rc); permission could be widened from the job template"
+        }
+    }
+    [Environment]::SetEnvironmentVariable('SQUAD_COPILOT_FLAGS', $prevFlags)
+    [Environment]::SetEnvironmentVariable('SQUAD_MODE', $null)
+    [Environment]::SetEnvironmentVariable('SQUAD_DISPATCH_SOURCE', $null)
+}
+
+# --- 5. The new suites are wired into CI ------------------------------------
+# A test nobody runs is documentation.
+$workerWorkflow = Join-Path $RepoRoot ".github\workflows\worker-tests.yml"
+if (-not (Test-Path $workerWorkflow)) {
+    Add-Fail ".github/workflows/worker-tests.yml is missing; the policy suites have no automated runner"
+} else {
+    $wfText = Get-Content -LiteralPath $workerWorkflow -Raw
+    if ($wfText -match 'worker/tests/run-tests\.sh') {
+        Add-Pass "CI runs worker/tests/run-tests.sh, which auto-discovers the agent-policy and governance-guard suites"
+    } else {
+        Add-Fail "No CI job runs worker/tests/run-tests.sh; the policy enforcement suites would be developer-only"
+    }
+}
+foreach ($suite in @('worker\tests\test_agent_policy.sh', 'worker\tests\test_governance_guard.sh')) {
+    if (Test-Path (Join-Path $RepoRoot $suite)) {
+        Add-Pass "$($suite -replace '\\','/') exists"
+    } else {
+        Add-Fail "$($suite -replace '\\','/') is missing; the policy controls have no behavioural coverage"
+    }
+}
+
+# --- 6. Governance paths cover what the PRD names ---------------------------
+if ($nodeCmd -and (Test-Path $policyResolver)) {
+    $govOut = (& node $policyResolver governance-paths 2>&1) -join "`n"
+    $required = @('.squad/policies', '.squad/agents', '.squad/identity', '.squad/config.json', '.squad/routing.md')
+    $missingGov = @($required | Where-Object { $govOut -notmatch [regex]::Escape($_) })
+    if ($missingGov.Count -eq 0) {
+        Add-Pass "Every governance path PRD #6 names is protected (.squad/policies, .squad/agents, .squad/identity, .squad/config.json, .squad/routing.md)"
+    } else {
+        Add-Fail "Governance protection is missing PRD #6 paths: $($missingGov -join ', ')"
+    }
+    if ($govOut -match 'audit') {
+        Add-Pass "Audit/approval state is included in the protected set"
+    } else {
+        Add-Fail "No audit state is protected; PRD #6 names approval/audit state explicitly"
+    }
+}
+
+# --- 7. The append-only exclusion is narrow, and is still detected -----------
+# `.squad/agents/<name>/history.md` is excluded from the WRITE LOCK because it is
+# an append-only work log, not policy: locking it prevented no escalation and
+# destroyed the audit trail PRD #6 asks for. The exclusion is only safe while it
+# stays anchored at both ends and stays inside the integrity check, so both
+# properties are asserted here against the REAL resolver rather than described.
+if ($nodeCmd -and (Test-Path $policyResolver)) {
+    function Get-GovernanceClass {
+        param([string]$Path)
+        return ((& node $policyResolver classify-governance-path $Path 2>&1) -join '').Trim()
+    }
+
+    # The thing the narrowing exists to allow.
+    if ((Get-GovernanceClass '.squad/agents/security/history.md') -eq 'append-only') {
+        Add-Pass "An agent history file is classified append-only, so an autonomous run can record what it did"
+    } else {
+        Add-Fail "An agent history file is not classified append-only; autonomous runs cannot write .squad/agents/<name>/history.md and the audit trail is lost"
+    }
+
+    # The thing it must NOT allow. A charter states what an agent is permitted to
+    # do; an agent that can rewrite its charter has rewritten its authorisation.
+    $mustStayLocked = @(
+        @{ Path = '.squad/agents/security/charter.md';     Why = 'a charter defines what an agent is permitted to do' },
+        @{ Path = '.squad/agents/security/history.md.bak'; Why = 'a lookalike filename must not inherit the exclusion' },
+        @{ Path = '.squad/agents/history.md';              Why = 'the exclusion is anchored to <name>/history.md, not anything named history.md under .squad/agents' },
+        @{ Path = '.squad/agents/a/b/history.md';          Why = 'exactly one path segment may stand for the agent name' },
+        @{ Path = '.squad/policies/history.md';            Why = 'the exclusion is scoped to .squad/agents' },
+        @{ Path = '.squad/identity/identity.md';           Why = 'identity is governance' },
+        @{ Path = '.squad/config.json';                    Why = 'config is governance' },
+        @{ Path = '.squad/routing.md';                     Why = 'routing is governance' },
+        @{ Path = '.squad/memory/audit.jsonl';             Why = 'audit state is governance' }
+    )
+    $leaked = @($mustStayLocked | Where-Object { (Get-GovernanceClass $_.Path) -ne 'locked' })
+    if ($leaked.Count -eq 0) {
+        Add-Pass "The append-only exclusion is anchored: all $($mustStayLocked.Count) neighbouring governance paths -- charter.md included -- stay locked"
+    } else {
+        Add-Fail "The append-only exclusion is too wide; these should be locked but are not: $(($leaked | ForEach-Object { "$($_.Path) ($($_.Why))" }) -join '; ')"
+    }
+
+    # Widening the pattern to `.squad/agents/**` is the specific regression this
+    # guards against, so assert it on the pattern itself as well as on the
+    # classification -- a pattern that stopped anchoring the filename would fail
+    # here even if someone also loosened the cases above.
+    $patterns = @((& node $policyResolver mutable-governance-patterns 2>&1) | Where-Object { $_ -match '\S' })
+    $unanchored = @($patterns | Where-Object { $_ -notmatch 'history' -or $_ -notmatch '\$$' -or $_ -notmatch '\^' })
+    if ($patterns.Count -ge 1 -and $unanchored.Count -eq 0) {
+        Add-Pass "Every append-only pattern is fully anchored and filename-specific ($($patterns -join ', '))"
+    } else {
+        Add-Fail "An append-only pattern is unanchored or not filename-specific: $($unanchored -join ', '); a wildcard here re-opens charter.md"
+    }
+}
+
+# --- 8. Excluded from the LOCK is not excluded from the DETECTOR -------------
+# A path that neither layer covers is a foothold: whoever can write there writes
+# invisibly. These are structural checks on the enforcement library, because the
+# behavioural proof lives in worker/tests/test_governance_guard.sh (which cannot
+# run on Windows).
+if (Test-Path $policyLib) {
+    $libText = Get-Content -LiteralPath $policyLib -Raw
+
+    if ($libText -match [regex]::Escape("printf 'append-only %s %s %s")) {
+        Add-Pass "The manifest records excluded paths under an 'append-only' rule rather than dropping them, so an operator can still see what changed and by how much"
+    } else {
+        Add-Fail "The manifest does not record append-only entries; an excluded path would be invisible to both the lock and the integrity check"
+    }
+
+    # The prefix hash IS the append-only control. Without it the entry is a
+    # comment: the file could be truncated or rewritten and still 'match'.
+    if ($libText -match 'squad_policy_prefix_sha' -and $libText -match 'head -c "\$bytes"') {
+        Add-Pass "Append-only is enforced by re-hashing the baseline byte prefix, so a truncation or a rewrite of existing history fails the session"
+    } else {
+        Add-Fail "There is no prefix-hash check; 'append-only' would be an unenforced label and an agent could rewrite its own work log"
+    }
+
+    # ORDERING IS THE CONTROL. The recursive lock must run first and the file
+    # unlock second: `chmod` on a file needs ownership, not parent write, so
+    # this ordering is what keeps the DIRECTORY locked against create/delete
+    # while the file inside it is writable. Reversed, or expressed as an
+    # exclusion from the recursive chmod, the directory would have to be
+    # writable and the exclusion would open the whole agent directory.
+    $lockIdx   = $libText.IndexOf('chmod -R a-w')
+    $unlockIdx = $libText.IndexOf('SQUAD_POLICY_UNLOCKED_FILES=()')
+    if ($lockIdx -ge 0 -and $unlockIdx -gt $lockIdx) {
+        Add-Pass "Hardening locks every governance path recursively FIRST and re-opens only the append-only files afterwards, so their directories still refuse create and delete"
+    } else {
+        Add-Fail "The append-only files are unlocked before or instead of the recursive lock; the containing agent directory would become writable and new files could be added beside a locked charter"
+    }
+
+    if ($libText -match 'git diff --name-only "\$base_commit" HEAD') {
+        Add-Pass "The committed form of an append-only path is prefix-checked too, so a truncation cannot be committed and then hidden by restoring the working tree"
+    } else {
+        Add-Fail "The commit detector does not check the committed form of append-only paths; a history rewrite could be committed, hidden in the working tree, and pushed"
     }
 }
 
