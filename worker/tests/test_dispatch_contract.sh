@@ -45,6 +45,8 @@ reset_state() {
   export FAKE_GH_STATE SQUAD_CALL_LOG
   unset FAKE_GH_FAIL_MODE
   unset FAKE_GH_FAIL_PATH
+  unset FAKE_GH_PERMISSIONS
+  unset FAKE_GH_LOGIN
   unset SQUAD_LEASE_CLAIM_TTL_SECONDS
   unset SQUAD_LEASE_RETENTION_SECONDS
   unset SQUAD_LEASE_SWEEP_MAX_READS
@@ -308,6 +310,79 @@ unset FAKE_GH_FAIL_MODE FAKE_GH_FAIL_PATH
 assert_eq "1" "$scoped_rc" "scoped fault: a masked 403 on ONE lease fails the sweep instead of being read as 'gone'"
 assert_contains "$scoped_out" "HTTP 403" "scoped fault: the sweep surfaces the underlying permission denial"
 assert_not_contains "$scoped_out" '"outcome":"swept"' "scoped fault: no sweep result is emitted"
+
+# ---------------------------------------------------------------------------
+# 10b-push. Issue #22: a 404 on a WRITE is DIAGNOSED, never reclassified.
+#
+#     GitHub answers a write to a repository the caller may only READ with
+#     `404 Not Found`, never `403 Forbidden`. A live E2E run lost an afternoon to
+#     that: of two authenticated `gh` accounts the ACTIVE one was read-only, and
+#     the lease claim reported nothing but "Not Found".
+#
+#     The two halves are asserted together on purpose. The classification must
+#     NOT move -- the store still fails closed, exits 1, and writes no lease --
+#     while the message now names the identity, the permission, and the fix.
+#     Reporting the 404 as "gone" instead would silently skip the claim and
+#     start compute with no durable lease; that is the defect class this
+#     programme has rejected five times, and it is far worse than a confusing
+#     message.
+# ---------------------------------------------------------------------------
+assert_eq "gone" "$(classify_decided_by 'gh: Not Found (HTTP 404) {"message":"Not Found","status":"404"}')" \
+  "diagnosis is not reclassification: the exact issue #22 404 text is still decided by the gone list, exactly as before"
+
+reset_state
+export FAKE_GH_FAIL_MODE="notfound404"
+export FAKE_GH_FAIL_PATH="git/commits"
+export FAKE_GH_PERMISSIONS="nopush"
+export FAKE_GH_LOGIN="read-only-bot"
+denied_out="$(node "$CLI" decide --session-id issue-61-a --dispatch-source ralph --repository octo/demo --issue 61 \
+  | node "$CLI" claim --repository octo/demo 2>&1)"
+denied_rc=$?
+unset FAKE_GH_FAIL_MODE FAKE_GH_FAIL_PATH FAKE_GH_PERMISSIONS FAKE_GH_LOGIN
+assert_eq "1" "$denied_rc" "404 on write: still a hard failure -- the classification is unchanged"
+assert_contains "$denied_out" "create the 'squad-aca-leases' base commit" "404 on write: still names the operation that failed"
+assert_contains "$denied_out" "HTTP 404" "404 on write: still quotes the raw gh output"
+assert_contains "$denied_out" "(read-only-bot) has push=false on octo/demo" "404 on write: names the identity and the permission it lacks"
+assert_contains "$denied_out" "GitHub reports a write denial on a readable repository as 404 Not Found" "404 on write: explains why the status code is misleading"
+assert_contains "$denied_out" "gh auth status" "404 on write: tells the operator how to fix it"
+assert_not_contains "$denied_out" '"outcome"' "404 on write: no lease outcome is emitted, so nothing looks claimed"
+
+# A 404 from an identity that CAN push says nothing about permissions, so the
+# diagnosis must stay silent rather than inventing an accusation.
+reset_state
+export FAKE_GH_FAIL_MODE="notfound404"
+export FAKE_GH_FAIL_PATH="git/commits"
+writable_out="$(node "$CLI" decide --session-id issue-62-a --dispatch-source ralph --repository octo/demo --issue 62 \
+  | node "$CLI" claim --repository octo/demo 2>&1)"
+writable_rc=$?
+unset FAKE_GH_FAIL_MODE FAKE_GH_FAIL_PATH
+assert_eq "1" "$writable_rc" "404 on write with push access: still a hard failure"
+assert_not_contains "$writable_out" "push=false" "404 on write with push access: no permission accusation is invented"
+
+# The probe is a diagnostic, not a dependency: if it cannot answer, the ORIGINAL
+# failure must survive intact. Masking one error with another would be worse
+# than the problem being fixed.
+reset_state
+export FAKE_GH_FAIL_MODE="notfound404"
+export FAKE_GH_FAIL_PATH="git/commits"
+export FAKE_GH_PERMISSIONS="fail"
+fallback_out="$(node "$CLI" decide --session-id issue-63-a --dispatch-source ralph --repository octo/demo --issue 63 \
+  | node "$CLI" claim --repository octo/demo 2>&1)"
+fallback_rc=$?
+unset FAKE_GH_FAIL_MODE FAKE_GH_FAIL_PATH FAKE_GH_PERMISSIONS
+assert_eq "1" "$fallback_rc" "probe failure: the write failure is still reported as a failure"
+assert_contains "$fallback_out" "'gh' exited 1 and the failure is not 'already gone or already terminal'" "probe failure: falls back to the original message"
+assert_contains "$fallback_out" "HTTP 404" "probe failure: the raw gh output survives"
+assert_not_contains "$fallback_out" "push=false" "probe failure: no permission claim is made on evidence that was never obtained"
+assert_not_contains "$fallback_out" "Bad credentials" "probe failure: the probe's own error never replaces the real one"
+
+# The probe must not run on the SUCCESS path -- a per-claim permission read
+# would double the API cost of every dispatch.
+reset_state
+node "$CLI" decide --session-id issue-64-a --dispatch-source ralph --repository octo/demo --issue 64 \
+  | node "$CLI" claim --repository octo/demo >/dev/null
+probe_calls="$(grep -c '^gh api GET repos/octo/demo$' "$SQUAD_CALL_LOG" || true)"
+assert_eq "0" "$probe_calls" "success path: a healthy claim makes no permission probe at all"
 
 # ---------------------------------------------------------------------------
 # 10c. LEDGER GROWTH IS BOUNDED. Nothing used to delete a lease record: every

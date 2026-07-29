@@ -771,6 +771,66 @@ terminal state.
 failures are surfaced deliberately and never reported as a clean sweep. A
 failing sweep almost always means the token lost `contents: write`.
 
+### `404 Not Found` on a lease write, and the multi-account hazard
+
+If a dispatch fails like this:
+
+```
+Cannot claim a dispatch lease: the shared dispatch core exited 1.
+squad-dispatch: Lease store could not create the 'squad-aca-leases' base commit:
+'gh' exited 1 and the failure is not 'already gone or already terminal'.
+gh: Not Found (HTTP 404) {"message":"Not Found", ... "status":"404"}
+```
+
+the repository almost certainly exists and you can almost certainly read it.
+**GitHub reports a write denial on a repository you can only read as
+`404 Not Found`, not `403 Forbidden`** — it will not confirm that a resource you
+cannot write to is there. So a bare 404 on a lease write means *this identity
+cannot write here* far more often than it means *this thing is missing*.
+
+The usual cause is that **more than one GitHub account is authenticated and `gh`
+is using the active one**, which may not be the account that owns the
+repository. `gh` picks the active account for every call; nothing warns you that
+it is the wrong one.
+
+Since the fix for [#22](https://github.com/swigerb/squad-on-aca/issues/22), a 404
+on a lease write is followed by one permission probe and the message says so
+directly:
+
+```
+... The authenticated gh identity (read-only-bot) has push=false on owner/repo.
+GitHub reports a write denial on a readable repository as 404 Not Found.
+Run 'gh auth status' and select an account with write access.
+```
+
+The probe runs only on an already-failing path, and if the probe itself fails
+the original message is reported unchanged.
+
+**Check it directly:**
+
+```powershell
+gh auth status                                   # which account is ACTIVE?
+gh api user --jq .login                          # who is gh actually acting as?
+gh api repos/OWNER/REPO --jq .permissions        # {"admin":..,"push":..,"pull":..}
+```
+
+`push: false` is the answer. Switch account and re-run:
+
+```powershell
+gh auth switch --user <account-with-write-access>
+```
+
+**`squad-aca doctor` checks this for you.** It reports two separate rows:
+
+| Row | Means |
+| --- | --- |
+| `GitHub auth` | `gh auth status` succeeded — *some* account is signed in |
+| `GitHub push` | the **active** identity's `push` permission on this repository |
+
+`GitHub auth ok` on its own does not mean dispatch will work; `GitHub push` is
+the row that answers that. It reports `unknown` rather than guessing when the
+permission cannot be read.
+
 ## Security notes
 
 - Use a separate GitHub token for GitHub API work and Copilot headless auth when your policy requires separation.

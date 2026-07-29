@@ -3098,6 +3098,94 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
     }
 }
 
+# --- Issue #22: a 404 on a lease write must be DIAGNOSED, not just quoted -----
+# GitHub answers a write to a repository the caller may only READ with
+# `404 Not Found`, never `403 Forbidden`, so "this identity cannot write here"
+# is invisible in the raw message. A live E2E run lost an afternoon to it. The
+# classification is deliberately NOT changed: these checks pin that the failure
+# is still a failure AND that the operator is now told why.
+if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment
+        Initialize-SquadCliStubRepository -Stub $stub | Out-Null
+
+        $denied = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript `
+            -CliArguments @("smoke", "--repo", "octo/demo") `
+            -GhFailMode "notfound404" -GhFailPath "git/commits" `
+            -GhPermissions "nopush" -GhLogin "read-only-bot"
+        $deniedText = "$($denied.StdErr)`n$($denied.StdOut)"
+        if ($denied.ExitCode -ne 0 -and
+            $deniedText -match "has push=false on octo/demo" -and
+            $deniedText -match "404 Not Found" -and
+            $deniedText -match "read-only-bot") {
+            Add-Pass "A lease write that fails with 404 names the gh identity and its missing push permission, and still exits $($denied.ExitCode) (the failure is diagnosed, not reclassified)"
+        } else {
+            Add-Fail "A 404 lease write no longer explains the push-permission cause (exit=$($denied.ExitCode)): $deniedText"
+        }
+        # The compute request must never happen: a diagnostic may not turn a
+        # failed claim into a dispatch.
+        if (@($denied.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count -eq 0) {
+            Add-Pass "A failed lease claim still starts no execution, so the improved diagnostic did not weaken claim-before-compute"
+        } else {
+            Add-Fail "A failed lease claim started an execution; the 404 diagnosis changed the classification"
+        }
+
+        # The probe is a diagnostic, not a dependency. When it cannot answer,
+        # the ORIGINAL failure must survive unchanged.
+        $stubFallback = New-SquadCliStubEnvironment
+        try {
+            Initialize-SquadCliStubRepository -Stub $stubFallback | Out-Null
+            $fallback = Invoke-SquadCliCapture -Stub $stubFallback -ScriptPath $cliScript `
+                -CliArguments @("smoke", "--repo", "octo/demo") `
+                -GhFailMode "notfound404" -GhFailPath "git/commits" -GhPermissions "fail"
+            $fallbackText = "$($fallback.StdErr)`n$($fallback.StdOut)"
+            if ($fallback.ExitCode -ne 0 -and
+                $fallbackText -match "already gone or already terminal" -and
+                $fallbackText -notmatch "push=false") {
+                Add-Pass "When the permission probe itself fails, the original lease error is reported unchanged instead of being masked by the probe's error"
+            } else {
+                Add-Fail "The permission probe masked the real lease failure (exit=$($fallback.ExitCode)): $fallbackText"
+            }
+        } finally {
+            Remove-SquadCliStubEnvironment -Stub $stubFallback
+        }
+
+        # doctor must verify push, not merely that `gh auth status` exited 0:
+        # reporting "GitHub auth ok" for a read-only identity is what let this
+        # reach a live run.
+        $doctorOk = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorOk.StdOut -match "GitHub push\s+ok\s+octo-stub has push access to octo/demo") {
+            Add-Pass "squad-aca doctor reports which gh identity is active and that it can push"
+        } else {
+            Add-Fail "squad-aca doctor no longer reports GitHub push access: $($doctorOk.StdOut)"
+        }
+
+        $doctorDenied = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor") `
+            -GhPush "false" -GhLogin "read-only-bot"
+        if ($doctorDenied.StdOut -match "GitHub push\s+failed" -and
+            $doctorDenied.StdOut -match "read-only-bot has push=false" -and
+            $doctorDenied.StdOut -match "GitHub auth\s+ok") {
+            Add-Pass "squad-aca doctor fails the push row for a read-only identity even though 'gh auth status' succeeds, which is the gap that let issue #22 reach a live run"
+        } else {
+            Add-Fail "squad-aca doctor still reports a read-only identity as healthy: $($doctorDenied.StdOut)"
+        }
+
+        $doctorUnknown = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor") `
+            -GhApiExitCode 1
+        if ($doctorUnknown.StdOut -match "GitHub push\s+unknown") {
+            Add-Pass "squad-aca doctor reports push access as 'unknown' when the permission read fails, rather than guessing either way"
+        } else {
+            Add-Fail "squad-aca doctor does not fail safe when the permission read fails: $($doctorUnknown.StdOut)"
+        }
+    } catch {
+        Add-Fail "GitHub push-permission diagnosis checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
 # --- Operational invariants around the lease that only source can prove -----
 # These three are cheap to state and expensive to lose. Each is a defect the
 # reviewer found by reading, and each would otherwise be re-introducible with a

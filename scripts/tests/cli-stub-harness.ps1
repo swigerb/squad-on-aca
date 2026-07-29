@@ -382,17 +382,37 @@ exit /b 0
 '@
 
     # --- Fake `gh` ----------------------------------------------------------
+    # `api` is answered here as well as by fake-gh.js: the lease store spawns
+    # `gh` through SQUAD_GH_BIN, but `doctor` calls `gh` straight off PATH to
+    # check whether the ACTIVE identity can WRITE to the repository (issue #22).
+    # SQUAD_STUB_GH_PUSH / SQUAD_STUB_GH_LOGIN / SQUAD_STUB_GH_API_RC let a test
+    # drive the read-only-account case and the probe-failed case without a
+    # second harness.
     Set-Content -LiteralPath (Join-Path $binDir "gh.cmd") -Encoding ascii -Value @'
 @echo off
 >>"%SQUAD_STUB_GH_LOG%" echo %*
 if "%~1"=="repo" goto ghrepo
 if "%~1"=="pr" goto ghpr
+if "%~1"=="api" goto ghapi
 exit /b 0
 :ghrepo
 echo octo/demo
 exit /b 0
 :ghpr
 echo []
+exit /b 0
+:ghapi
+if not "%SQUAD_STUB_GH_API_RC%"=="" if not "%SQUAD_STUB_GH_API_RC%"=="0" exit /b %SQUAD_STUB_GH_API_RC%
+if "%~2"=="user" goto ghuser
+if "%SQUAD_STUB_GH_PUSH%"=="false" goto ghnopush
+echo {"admin":true,"pull":true,"push":true}
+exit /b 0
+:ghnopush
+echo {"admin":false,"pull":true,"push":false}
+exit /b 0
+:ghuser
+if "%SQUAD_STUB_GH_LOGIN%"=="" echo octo-stub
+if not "%SQUAD_STUB_GH_LOGIN%"=="" echo %SQUAD_STUB_GH_LOGIN%
 exit /b 0
 '@
 
@@ -652,13 +672,33 @@ function Invoke-SquadCliCapture {
     .PARAMETER StopExitCode
         Exit code the fake `az containerapp job stop` returns. Used to prove the
         CLI propagates an Azure failure instead of swallowing it.
+
+    .PARAMETER GhPush
+        What the fake `gh api repos/<owner>/<name> --jq .permissions` reports for
+        `push`. "false" drives the issue #22 case: an identity that can read the
+        repository but not write to it.
+
+    .PARAMETER GhApiExitCode
+        Exit code the fake `gh api` returns. Non-zero drives the probe-failed
+        fallback, where a diagnostic must not replace the real error.
+
+    .PARAMETER GhFailMode / GhFailPath / GhPermissions / GhLogin
+        Passed through to worker/tests/lib/fake-gh.js, which backs the lease
+        store. Same knobs the bash suite uses, so both languages are driven
+        against one implementation of GitHub's semantics.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [string[]]$CliArguments = @(),
         [int]$StopExitCode = 0,
-        [int]$StartExitCode = 0
+        [int]$StartExitCode = 0,
+        [string]$GhPush = "true",
+        [string]$GhLogin = "octo-stub",
+        [int]$GhApiExitCode = 0,
+        [string]$GhFailMode = "",
+        [string]$GhFailPath = "",
+        [string]$GhPermissions = ""
     )
 
     $hostExe = (Get-Process -Id $PID).Path
@@ -679,7 +719,9 @@ function Invoke-SquadCliCapture {
                   "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
                   "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
                   "SQUAD_ACA_ENABLE_SANDBOX", "SQUAD_ACA_SANDBOX_CLI",
-                  "SQUAD_GH_BIN", "FAKE_GH_STATE", "FAKE_GH_FAIL_MODE", "SQUAD_CALL_LOG",
+                  "SQUAD_STUB_GH_PUSH", "SQUAD_STUB_GH_LOGIN", "SQUAD_STUB_GH_API_RC",
+                  "SQUAD_GH_BIN", "FAKE_GH_STATE", "FAKE_GH_FAIL_MODE", "FAKE_GH_FAIL_PATH",
+                  "FAKE_GH_PERMISSIONS", "FAKE_GH_LOGIN", "SQUAD_CALL_LOG",
                   "SQUAD_LEASE_NOW", "SQUAD_LEASE_TTL_SECONDS", "SQUAD_LEASE_BRANCH")
     $saved = @{}
     foreach ($name in $envNames) {
@@ -747,7 +789,17 @@ function Invoke-SquadCliCapture {
         # a throwaway directory inside the stub root.
         $env:SQUAD_GH_BIN = $Stub.FakeGhPath
         $env:FAKE_GH_STATE = $Stub.LeaseDir
-        $env:FAKE_GH_FAIL_MODE = ""
+        $env:FAKE_GH_FAIL_MODE = $GhFailMode
+        $env:FAKE_GH_FAIL_PATH = $GhFailPath
+        $env:FAKE_GH_PERMISSIONS = $GhPermissions
+        $env:FAKE_GH_LOGIN = $GhLogin
+        # `doctor` asks `gh` on PATH whether the ACTIVE identity can write here
+        # (issue #22). Pinned so the answer is a property of the stub, not of the
+        # developer's GitHub account, which is what keeps the doctor golden
+        # portable.
+        $env:SQUAD_STUB_GH_PUSH = $GhPush
+        $env:SQUAD_STUB_GH_LOGIN = $GhLogin
+        $env:SQUAD_STUB_GH_API_RC = "$GhApiExitCode"
         $env:SQUAD_CALL_LOG = $Stub.CallLog
         $env:SQUAD_LEASE_NOW = "2024-05-01T00:00:00.000Z"
         $env:SQUAD_LEASE_TTL_SECONDS = "3600"
