@@ -144,4 +144,5 @@ boundary and sees plaintext request bodies. See
 - [rollback.md — ACA Sandboxes](rollback.md#2-aca-sandboxes-feature-flagged-preview):
   the rollback procedure and its verification checklist.
 - [adr/0001-aca-sandboxes-feasibility.md](adr/0001-aca-sandboxes-feasibility.md):
-  the feasibility evidence and the decision to adopt the plane as opt-in.
+  why this plane exists, the live evidence behind the decision, and the
+  constraints it places on anyone changing it.

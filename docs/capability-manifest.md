@@ -541,23 +541,31 @@ images) could let a task's declared `image.hint` or `tools[]` list drive
 manually rebuilding and repointing jobs.
 
 The selection *decision* now exists — see
-[Capability routing](#capability-routing) — but nothing acts on it. Still to
-come:
+[Capability routing](#capability-routing) — and dispatch acts on it. What
+landed:
 
-- **Packaging.** `worker/lib/resolve-capability-route.js` and
-  `config/sandbox-classes.json` are repository artifacts today; neither is
-  copied into the worker image yet, because nothing in the execution path calls
-  the resolver.
-- **A provider seam.** The decision needs a consumer that can create and tear
-  down a sandbox, with the ACA job remaining the default provider.
-- **Acting on the decision.** Dispatch must honour `route`, and `fail-closed`
-  must actually stop a session rather than only being reported.
+- **A provider seam.** The decision has a consumer that creates and tears down a
+  sandbox, with the ACA job remaining the default provider.
+- **Acting on the decision.** `squad-aca run` resolves the manifest before
+  requesting compute and dispatches to the plane the decision names.
+  `fail-closed` stops a session rather than only being reported — a repository
+  that needs a non-default capability is refused when the sandbox plane is off,
+  never quietly downgraded.
+- **Catalog review.** The catalog is reviewed (`provisional: false`), every
+  approved class is pinned to an immutable `sha256` digest, and each class's
+  declared tools are backed by digest-keyed evidence — so a class cannot claim a
+  tool its image does not provide.
+
+Still outstanding:
+
+- **Packaging.** `worker/lib/resolve-capability-route.js` is copied into the
+  worker image, but `config/sandbox-classes.json` is not: resolution for a
+  dispatch runs control-plane side, against the repository working tree, before
+  any compute is requested.
 - **One manifest-path implementation.** The resolver mirrors the preflight's
-  hardened manifest-path resolution rather than sharing it, because this phase
-  deliberately did not modify the shipped `squad-capability-preflight.sh`. The
-  two should be unified when the provider seam lands.
-- **Catalog review.** The catalog is `provisional: true` and must be reviewed
-  before anything treats it as authority.
+  hardened manifest-path resolution rather than sharing it, because the phase
+  that introduced it deliberately did not modify the shipped
+  `squad-capability-preflight.sh`. The two should be unified.
 
 Whatever consumes the decision, the in-worker preflight stays the final safety
 check: routing chooses *where* to run, and preflight still verifies the

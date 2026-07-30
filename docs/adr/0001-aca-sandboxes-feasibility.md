@@ -1,10 +1,17 @@
-# ADR 0001 — Azure Container Apps Sandboxes feasibility
+# ADR 0001 — Adopt Azure Container Apps Sandboxes as an opt-in execution plane
 
-- **Status:** Accepted — **GO**
-- **Date:** 2026-07-28
+- **Status:** Accepted — **implemented**
+- **Date:** 2026-07-28 (decision) · 2026-07-29 (implemented)
 - **Deciders:** Squad (lead, engineer, security), repository owner
 - **Context:** PRD [#6](https://github.com/swigerb/squad-on-aca/issues/6) — adding an opt-in, capability-aware execution plane alongside ACA Jobs
 - **Supersedes:** the Sprint 0 ADR proposed in PR [#9](https://github.com/swigerb/squad-on-aca/pull/9) (closed), which recorded 4 of 5 gates as `UNKNOWN`
+
+> This ADR is a historical record of a decision and the evidence behind it. The
+> plane is now built, wired, and verified end to end — a Squad agent ran inside a
+> sandbox and pushed a commit to GitHub. For how to **use** it, see
+> [docs/sandboxes.md](../sandboxes.md); for how to **operate** it, see
+> [docs/runbook.md](../runbook.md). This document explains *why* the plane exists
+> and what constrains it, and is not maintained as usage documentation.
 
 ## Context
 
@@ -152,21 +159,63 @@ Binding constraints for later sprints:
 
 ## Risks carried forward
 
-| ID | Risk | Rating | Mitigation |
-|---|---|---|---|
-| R1 | Group-scoped MI reachable from inside a sandbox | HIGH | Dedicated identity-free group; CI asserts `identity` absent |
-| R2 | Egress rule values readable with group read access | HIGH | Scope RBAC to orchestrator; never log egress policy dumps |
-| R3 | `trafficInspection: Full` terminates TLS | MEDIUM | Document proxy as in-trust-boundary; verify issuer |
-| R4 | Auto-suspend may fire during long runs | MEDIUM | Set explicit idle timeout; verify with a long-run probe |
-| R5 | No Terraform/.NET SDK; data-plane REST undocumented | MEDIUM | Pin `aca` binary by version + checksum |
-| R7 | Leaked sandboxes on abnormal exit | LOW-MED | Label-based reaper, auto-delete policy, push-before-teardown |
-| R8 | Preview instability, no SLA | MEDIUM | Feature flag; ACA Jobs remain default and rollback |
+Ratings are as assessed at decision time. The **Status** column records what
+implementation actually did about each one.
 
-## Open questions deferred
+| ID | Risk | Rating | Mitigation | Status |
+|---|---|---|---|---|
+| R1 | Group-scoped MI reachable from inside a sandbox | HIGH | Dedicated identity-free group | **Mitigated** — the provider verifies the group is identity-free and refuses to create a sandbox if it cannot prove it |
+| R2 | Egress rule values readable with group read access | HIGH | Scope RBAC to orchestrator; never log egress policy dumps | **Accepted** — inherent to the platform; RBAC on the group is the boundary |
+| R3 | `trafficInspection: Full` terminates TLS | MEDIUM | Document proxy as in-trust-boundary | **Accepted** — mandatory for default-deny, documented |
+| R4 | Auto-suspend may fire during long runs | MEDIUM | Set explicit idle timeout | **Mitigated** — set deliberately rather than inheriting the 600 s default; the ~120 s `exec` timeout proved the larger constraint |
+| R5 | No Terraform/.NET SDK; data-plane REST undocumented | MEDIUM | Pin `aca` binary | **Open** — still CLI-driven; the provider keeps preview specifics behind its boundary |
+| R7 | Leaked sandboxes on abnormal exit | LOW-MED | Label-based reaper, push-before-teardown | **Mitigated** — and note `aca sandbox delete` **prompts without `--yes`**, which silently left billing sandboxes running until it was caught |
+| R8 | Preview instability, no SLA | MEDIUM | Feature flag; ACA Jobs remain default | **Open by design** — the plane stays opt-in |
 
-- Cold-start and allocation latency with the real (large) `squad-worker` image.
-- Whether a long `exec` can be interrupted by auto-suspend, and whether the
-  worker must therefore be launched detached with status polling.
-- Private ACR pull without attaching a group identity (fallback: publish the
-  image to a public registry).
-- Snapshot retention, cost after preview, and per-subscription quotas.
+## Open questions, as resolved during implementation
+
+Each of these was open when the decision was taken and was answered by building
+the plane. They are recorded here because the answers shaped the design.
+
+- **Cold-start and allocation latency with the real `squad-worker` image.**
+  The 3.1 GB image pulls from private ACR and boots without special handling. A
+  digest-pinned disk is created once per class and reused, so image pull is not
+  on the per-session path.
+
+- **Whether a long `exec` can be interrupted, and whether the worker must be
+  launched detached.** Yes, and yes. `aca sandbox exec` has a hard **~120 s
+  client timeout** — constant regardless of command duration; a `sleep 60` still
+  failed at 122 s. Squad sessions run 10–60 minutes, so a synchronous exec would
+  have failed every run while the work continued invisibly. The worker is
+  launched detached and driven by polling a marker file, and a transport timeout
+  is treated as **inconclusive**, never as failure.
+
+- **Private ACR pull without attaching a group identity.** Solved, and the
+  public-registry fallback was not needed. `--username 00000000-0000-0000-0000-000000000000`
+  with a short-lived ACR token pulls the image with **no managed identity
+  anywhere**, which is what preserves invariant 4.
+
+- **Snapshot retention, cost after preview, and per-subscription quotas.**
+  Still open, and now operational rather than architectural. Cost containment is
+  handled by explicit lifecycle policy (auto-suspend is set deliberately rather
+  than inheriting the 600 s default), a per-deployment and per-repository
+  concurrency ceiling, and a label-based reaper. See
+  [docs/runbook.md](../runbook.md).
+
+## Discovered after the decision
+
+Two findings that a live run exposed and that future maintainers should know:
+
+- **`aca sandbox exec` does not forward stdin.** Measured:
+  `"hello" | aca sandbox exec -c 'IFS= read -r X; echo "GOT=[$X]"'` returns
+  `GOT=[]`. Credentials therefore travel by `aca sandbox fs write`, which uploads
+  **root-owned 0644** — so the directory mode is the only available control, and
+  the upload is refused unless the state directory is exactly `0700`.
+
+- **A class must not claim tools its pinned image lacks.** The first catalog
+  pinned two classes to the same image while declaring tools it did not provide.
+  The in-worker preflight caught it and refused to run, which is the intended
+  defence in depth, but the catalog should not have been able to lie. Claims are
+  now backed by **digest-keyed evidence**: the evidence filename derives from the
+  pinned digest, so re-pinning without re-verifying fails offline, and missing
+  evidence is a failure rather than a skip.

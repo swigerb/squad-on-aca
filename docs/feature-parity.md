@@ -66,17 +66,20 @@ closed.
 instead of an ACA Job. This has no `squad-on-aks` counterpart, so it is listed
 here rather than in the parity table. It is an **opt-in preview**, off by
 default behind `SQUAD_ACA_ENABLE_SANDBOX`, and gated a second time by the
-`"provisional": true` marker in `config/sandbox-classes.json`. ACA Jobs remain
-the unconditional default and the rollback path.
+`provisional` marker in `config/sandbox-classes.json`. ACA Jobs remain the
+unconditional default and the rollback path.
 
 The plane adds per-session isolation and default-deny, capability-scoped egress
 — neither of which the ACA Jobs plane provides. On ACA Jobs, `egress[]` entries
 in a manifest stay advisory, and GitHub and Azure access stay a long-lived token
 pair plus one shared user-assigned managed identity.
 
-Enabling the flag currently opens the route gate and nothing more: no
-`squad-aca` command yet passes the capability resolution to
-`New-SessionExecutionProvider`, so every dispatch still runs on ACA Jobs. See
-the [README](../README.md#aca-sandboxes-opt-in-preview),
+With the flag on, `squad-aca run` resolves the repository's
+`squad-capabilities.yml` before requesting compute and dispatches to whichever
+plane the decision names. A repository with no manifest, or one the default
+worker image already satisfies, is unaffected. A repository that genuinely needs
+a non-default capability is **refused** when the flag is off, rather than being
+quietly run on the default worker. See
+[sandboxes.md](sandboxes.md),
 [runbook.md](runbook.md#aca-sandboxes-preview-feature-flagged-off), and
 [rollback.md](rollback.md#2-aca-sandboxes-feature-flagged-preview).
