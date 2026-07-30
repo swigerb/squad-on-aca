@@ -18,8 +18,11 @@
                               (bin/, obj/, node_modules/) and binary files are
                               skipped.
       4. .NET scaffold check- validates the optional aspire/ integration scaffold
-                              structure (solution + AppHost project + README) and
-                              optionally runs `dotnet build` with -RunDotnet.
+                              structure (solution + AppHost + agent contract
+                              library), asserts the contract library has zero
+                              package references, and runs `dotnet build` and
+                              `dotnet test` whenever a dotnet SDK is on PATH
+                              (-RunDotnet makes a missing SDK a failure).
       5. Env key parity     - session-managed env keys must match between the
                               PowerShell and worker dispatch paths.
       6. Sync guard         - regression tests for the public-repo secret guard.
@@ -54,8 +57,10 @@
     and as the E2E "sprint gate" documented in docs/validation.md.
 
 .PARAMETER RunDotnet
-    Also run `dotnet restore`/`dotnet build` on the optional aspire scaffold.
-    Off by default because preview package restore can be brittle offline.
+    Strict mode for the .NET gate. `dotnet build` and `dotnet test` on the aspire
+    solution ALWAYS run when a dotnet SDK is on PATH; a machine without one gets a
+    counted SKIP. Passing -RunDotnet turns that SKIP into a failure, which is what
+    CI uses so a missing SDK cannot quietly become a green run.
 
 .PARAMETER SkipBash
     Skip the `bash -n` worker entrypoint check (for environments without bash).
@@ -218,6 +223,10 @@ if (-not (Test-Path $aspireDir)) {
         "Squad.Aca.sln",
         "Squad.Aca.AppHost\Squad.Aca.AppHost.csproj",
         "Squad.Aca.AppHost\AppHost.cs",
+        "Squad.Aca.Agents\Squad.Aca.Agents.csproj",
+        "Squad.Aca.Agents\AgentAbstraction.cs",
+        "Squad.Aca.Agents\AcaSquadAgent.cs",
+        "Squad.Aca.Agents.Tests\Squad.Aca.Agents.Tests.csproj",
         "README.md"
     )
     foreach ($rel in $expected) {
@@ -237,23 +246,60 @@ if (-not (Test-Path $aspireDir)) {
         }
     }
 
-    if ($RunDotnet) {
-        $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-        if (-not $dotnet) {
-            Add-Fail "-RunDotnet specified but dotnet is not on PATH"
+    # The agent contract library must stay free of package references. That is
+    # what keeps a Sprint 2 preview restore failure from taking the contract --
+    # and every consumer of it -- down with it. A comment saying so is not a
+    # constraint; this is.
+    $agentsCsproj = Join-Path $aspireDir "Squad.Aca.Agents\Squad.Aca.Agents.csproj"
+    if (Test-Path $agentsCsproj) {
+        $agentsXml = [xml](Get-Content -LiteralPath $agentsCsproj -Raw)
+        $pkgRefs = @($agentsXml.SelectNodes("//PackageReference"))
+        if ($pkgRefs.Count -eq 0) {
+            Add-Pass "Squad.Aca.Agents has zero package references (no preview dependency)"
         } else {
-            Write-Host "  Running dotnet build (may restore preview packages)..."
-            Push-Location $aspireDir
-            try {
-                & $dotnet.Source build "Squad.Aca.sln" -nologo --verbosity quiet
-                if ($LASTEXITCODE -eq 0) { Add-Pass "dotnet build succeeded" }
-                else { Add-Fail "dotnet build failed (exit $LASTEXITCODE) - see docs/validation.md for preview-package guidance" }
-            } finally {
-                Pop-Location
-            }
+            $names = ($pkgRefs | ForEach-Object { $_.Include }) -join ", "
+            Add-Fail "Squad.Aca.Agents must have zero package references but has: $names"
         }
     } else {
-        Write-Host "  [SKIP] dotnet build (pass -RunDotnet to enable)"
+        Add-Fail "aspire/Squad.Aca.Agents/Squad.Aca.Agents.csproj missing"
+    }
+
+    # .NET build AND test run whenever a dotnet SDK is present -- NOT behind
+    # -RunDotnet. A test that only runs when someone remembers a flag is close to
+    # no test at all, and these tests are the gate for the agent contract. They
+    # are also fully offline (every one fakes ISquadCliInvoker), so there is no
+    # brittleness argument for hiding them.
+    #
+    # A machine with no SDK gets a counted, visible SKIP -- never a silent pass --
+    # mirroring worker/tests/lib/deps.sh's exit-77 convention. -RunDotnet is now
+    # STRICT mode: it turns a missing SDK into a failure, which is what CI uses.
+    $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+    if (-not $dotnet) {
+        if ($RunDotnet) {
+            Add-Fail "-RunDotnet specified but dotnet is not on PATH"
+        } else {
+            Add-Skip "dotnet build/test (no dotnet SDK on PATH)"
+        }
+    } else {
+        Push-Location $aspireDir
+        try {
+            Write-Host "  Running dotnet build..."
+            & $dotnet.Source build "Squad.Aca.sln" -nologo --verbosity quiet
+            $buildExit = $LASTEXITCODE
+            if ($buildExit -eq 0) { Add-Pass "dotnet build succeeded" }
+            else { Add-Fail "dotnet build failed (exit $buildExit) - see docs/validation.md for preview-package guidance" }
+
+            if ($buildExit -eq 0) {
+                Write-Host "  Running dotnet test..."
+                & $dotnet.Source test "Squad.Aca.sln" -nologo --no-build --verbosity quiet
+                if ($LASTEXITCODE -eq 0) { Add-Pass "dotnet test succeeded" }
+                else { Add-Fail "dotnet test failed (exit $LASTEXITCODE)" }
+            } else {
+                Add-Skip "dotnet test (build failed, so the result would be meaningless)"
+            }
+        } finally {
+            Pop-Location
+        }
     }
 }
 

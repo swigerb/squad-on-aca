@@ -1,0 +1,37 @@
+### CASE 25-status-json: squad-aca status --json
+### EXITCODE: 0
+### AZ CALLS
+account set --subscription 00000000-0000-0000-0000-000000000000
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
+containerapp list --resource-group rg-squad-stub --query [].{name:name,provisioningState:properties.provisioningState,runningStatus:properties.runningStatus,fqdn:properties.configuration.ingress.fqdn} -o json
+containerapp job execution list --name caj-squad-aca-session --resource-group rg-squad-stub --query [0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime} -o json
+containerapp job execution list --name caj-squad-aca-ralph --resource-group rg-squad-stub --query [0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime} -o json
+containerapp show --name ca-squad-aca-aspire --resource-group rg-squad-stub --query properties.configuration.ingress.fqdn -o tsv
+### GH CALLS
+### SQUAD CALLS
+### ACA CALLS
+### STDOUT
+{
+  "schema": "squad-aca/status@1",
+  "resourceGroup": "rg-squad-stub",
+  "sessionJob": "caj-squad-aca-session",
+  "ralphJob": "caj-squad-aca-ralph",
+  "watchApp": "ca-squad-aca-watch",
+  "aspireApp": "ca-squad-aca-aspire",
+  "dashboardUrl": null,
+  "containerApps": [],
+  "containerAppsError": null,
+  "sessionExecutions": [
+    "caj-squad-aca-session-stub01",
+    "caj-squad-aca-session-stub02"
+  ],
+  "sessionExecutionsError": null,
+  "ralphExecutions": [
+    "caj-squad-aca-session-stub01",
+    "caj-squad-aca-session-stub02"
+  ],
+  "ralphExecutionsError": null
+}
+
+### STDERR
+

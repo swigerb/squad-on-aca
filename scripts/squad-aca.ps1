@@ -552,6 +552,187 @@ function Resolve-SessionSandboxCredential {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Machine-readable output (`--json`)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. `squad-aca` renders for humans, and 22 golden captures pin
+# that rendering byte for byte. A .NET caller -- the Microsoft Agent Framework
+# adapter in aspire/Squad.Aca.Agents -- needs a STABLE machine contract, and
+# parsing the human tables would both be fragile and make the goldens
+# load-bearing for something they were never meant to describe.
+#
+# So `--json` is strictly ADDITIVE and strictly OPT-IN. No existing invocation
+# emits any of this, which is what keeps all 22 goldens byte-identical; the new
+# `--json` invocations get goldens of their own.
+#
+# Three rules the shapes below obey:
+#
+#   1. STABLE KEY ORDER, and every key is always present. A field the substrate
+#      cannot supply is emitted as null rather than omitted, so a consumer's
+#      deserialiser never has to distinguish "absent" from "unknown".
+#   2. NO TOKENS, EVER. Nothing here reads a credential, and the only strings
+#      that reach the document are session identifiers, the opaque execution
+#      handle, and the fixed route/reason vocabulary the control plane already
+#      publishes.
+#   3. NO RAW MANIFEST VALUES. The capability manifest is repository content;
+#      only the resolver's DECISION (route, reason, sandbox class id) crosses
+#      this boundary.
+#
+# The vocabulary is deliberately borrowed rather than invented:
+#   route / reason / sandboxClassId  <- Resolve-SquadExecutionRoute
+#   executionMode / sessionHandle / status / statusPollRef / fallbackReason
+#                                    <- New-SquadDispatchResponse (PRD #6)
+$script:SquadJsonRunSchema      = "squad-aca/run@1"
+$script:SquadJsonSessionsSchema = "squad-aca/sessions@1"
+
+# Route reasons that describe the ORDINARY outcome, not a deviation. Anything
+# else is reported as a fallbackReason, because it explains why the session did
+# not land where the manifest asked.
+$script:SquadJsonPlainRouteReasons = @(
+    "no-capability-resolution",
+    "capability-resolution-aca-job",
+    "approved-sandbox-class"
+)
+
+function Write-SquadJsonDocument {
+    <#
+    .SYNOPSIS
+        Emits one JSON document on stdout.
+
+    .DESCRIPTION
+        -Depth is pinned so a nested record is never truncated to
+        "System.Object[]", and -Compress is deliberately NOT used: the goldens
+        for the `--json` cases are reviewed by humans too.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Document)
+    Write-Output ($Document | ConvertTo-Json -Depth 10)
+}
+
+function Get-SquadJsonFallbackReason {
+    <#
+    .SYNOPSIS
+        The route reason, but only when it explains a DEVIATION.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Reason)
+    if (-not $Reason) { return $null }
+    if ($script:SquadJsonPlainRouteReasons -contains $Reason) { return $null }
+    return $Reason
+}
+
+function New-SquadRunJsonDocument {
+    <#
+    .SYNOPSIS
+        The `squad-aca run --json` contract.
+
+    .DESCRIPTION
+        `executionHandle` is null for an ACA Job dispatch and that is a truthful
+        property of the substrate, not an omission: ACA names an execution
+        asynchronously, so there is nothing to hand back at dispatch time.
+        `statusPollRef` is therefore the field a caller addresses `stop` and
+        `sessions --session` with -- the handle when there is one, the session
+        id when there is not. A caller passes it back verbatim and never parses
+        it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$SessionName,
+        [AllowEmptyString()][string]$Repository = "",
+        [AllowEmptyString()][string]$Ref = "",
+        [AllowEmptyString()][string]$OutputBranch = "",
+        [AllowNull()][object]$Route = $null,
+        [AllowNull()][object]$RouteReason = $null,
+        [AllowNull()][object]$ExecutionMode = $null,
+        [AllowNull()][object]$ExecutionHandle = $null,
+        [AllowNull()][object]$SandboxClass = $null,
+        [AllowNull()][object]$FallbackReason = $null,
+        [bool]$Dispatched = $false,
+        [Parameter(Mandatory = $true)][string]$Status
+    )
+
+    $pollRef = $null
+    if ($ExecutionHandle) { $pollRef = [string]$ExecutionHandle }
+    elseif ($Dispatched -and $SessionName) { $pollRef = [string]$SessionName }
+
+    return [pscustomobject]([ordered]@{
+        schema          = $script:SquadJsonRunSchema
+        sessionName     = $SessionName
+        repository      = $Repository
+        ref             = $Ref
+        outputBranch    = $OutputBranch
+        route           = $Route
+        routeReason     = $RouteReason
+        executionMode   = $ExecutionMode
+        executionHandle = $ExecutionHandle
+        statusPollRef   = $pollRef
+        sandboxClass    = $SandboxClass
+        fallbackReason  = $FallbackReason
+        dispatched      = $Dispatched
+        status          = $Status
+    })
+}
+
+function ConvertTo-SquadSessionJson {
+    <#
+    .SYNOPSIS
+        One provider execution record as the `sessions --json` element shape.
+
+    .DESCRIPTION
+        The two substrates describe an execution with different Display columns
+        (ACA Jobs: Execution/Repository/Branch/Mode/Source/Started/Ended;
+        Sandboxes: Sandbox/Class/Phase/ExitCode/Inconclusive). Rendering picks
+        one table per shape; a machine contract cannot, so this projects BOTH
+        into one key set with nulls where a substrate has no answer.
+
+        `executionMode` comes from the HANDLE's provider id, not from the
+        display, because the handle is the only authoritative statement of which
+        substrate owns this execution.
+    #>
+    param([Parameter(Mandatory = $true)][object]$Record)
+
+    $display = $Record.Display
+    $names = @()
+    if ($display) { $names = @($display.PSObject.Properties.Name) }
+
+    $mode = ""
+    try { $mode = [string](ConvertFrom-SquadExecutionHandle -Handle $Record.Handle).ProviderId } catch { $mode = "" }
+
+    $doc = [ordered]@{
+        sessionName     = ""
+        executionName   = ""
+        executionHandle = [string]$Record.Handle
+        executionMode   = $mode
+        route           = $mode
+        status          = [string]$Record.Status
+        sandboxClass    = $null
+        repository      = $null
+        branch          = $null
+        mode            = $null
+        source          = $null
+        startedAt       = $null
+        endedAt         = $null
+        phase           = $null
+        exitCode        = $null
+        inconclusive    = $null
+    }
+
+    if ($names -contains "Session") { $doc["sessionName"] = [string]$display.Session }
+    if ($names -contains "Sandbox") { $doc["executionName"] = [string]$display.Sandbox }
+    elseif ($names -contains "Execution") { $doc["executionName"] = [string]$display.Execution }
+    if ($names -contains "Route" -and $display.Route) { $doc["route"] = [string]$display.Route }
+    if ($names -contains "Class") { $doc["sandboxClass"] = [string]$display.Class }
+    if ($names -contains "Repository") { $doc["repository"] = $display.Repository }
+    if ($names -contains "Branch") { $doc["branch"] = $display.Branch }
+    if ($names -contains "Mode") { $doc["mode"] = $display.Mode }
+    if ($names -contains "Source") { $doc["source"] = $display.Source }
+    if ($names -contains "Started") { $doc["startedAt"] = $display.Started }
+    if ($names -contains "Ended") { $doc["endedAt"] = $display.Ended }
+    if ($names -contains "Phase") { $doc["phase"] = $display.Phase }
+    if ($names -contains "ExitCode") { $doc["exitCode"] = $display.ExitCode }
+    if ($names -contains "Inconclusive") { $doc["inconclusive"] = [bool]$display.Inconclusive }
+
+    return [pscustomobject]$doc
+}
+
 function New-SessionExecutionProvider {
     <#
     .SYNOPSIS
@@ -588,10 +769,20 @@ function New-SessionExecutionProvider {
         because the lifecycle call sites (`sessions`, `logs`, `stop`) must NOT
         re-resolve: they recover the substrate from the opaque execution handle
         they already hold, via New-SessionExecutionProviderForHandle.
+
+    .PARAMETER RouteOutcome
+        Optional hashtable (a reference type, exactly like Start-SquadExecution's
+        -Outcome). When supplied it receives ['Route'] -- the
+        Resolve-SquadExecutionRoute result -- INCLUDING on the fail-closed path,
+        which is set before the throw so a `--json` caller can report the reason
+        rather than only a stack trace. Nothing here re-derives a route to fill
+        it: it is the same object the switch below acts on, so the reported route
+        cannot drift from the executed one.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Config,
-        [object]$CapabilityResolution = $null
+        [object]$CapabilityResolution = $null,
+        [System.Collections.IDictionary]$RouteOutcome = $null
     )
 
     $acaJob = {
@@ -617,6 +808,7 @@ function New-SessionExecutionProvider {
     # is byte-identical to what it has always been.
     $route = Resolve-SquadExecutionRoute -Decision $CapabilityResolution -Config $Config `
         -CatalogPath (Get-SessionSandboxCatalogPath)
+    if ($null -ne $RouteOutcome) { $RouteOutcome["Route"] = $route }
 
     switch ($route.Route) {
         "sandbox" {
@@ -859,7 +1051,8 @@ function Invoke-Run {
         -SubSquad $subSquad `
         -PushChanges (-not (Has-Option $Items @("--no-push"))) `
         -OutputBranch $branch
-    Start-LeasedExecution -Config $config -Request $request -ManifestSource $manifestSource
+    Start-LeasedExecution -Config $config -Request $request -ManifestSource $manifestSource `
+        -Json:(Has-Option $Items @("--json"))
 }
 
 function Start-LeasedExecution {
@@ -896,15 +1089,37 @@ function Start-LeasedExecution {
         Path) means there is no readable working tree for this repository, which
         resolves exactly like a repository with no manifest: the default ACA Jobs
         route. That is reported, not assumed silently.
+
+    .PARAMETER Json
+        Emit the machine-readable dispatch document (squad-aca/run@1) on stdout
+        instead of the substrate's own dispatch output. OPT-IN and additive: with
+        it unset this function behaves exactly as it always has, which is what
+        keeps the 22 CLI goldens byte-identical.
+
+        Two things change under -Json, both deliberately:
+
+          * The substrate's pass-through dispatch output is REDIRECTED TO STDERR,
+            not suppressed. stdout has to carry exactly one JSON document for a
+            machine to parse it, and swallowing `az containerapp job start`'s
+            output is the regression that sank PR #9 -- so it is moved, in full,
+            never dropped.
+          * A refusal (a fail-closed route) still exits non-zero, but ALSO emits
+            the document, carrying route `fail-closed` and the resolver's reason.
+            An adapter that only saw the exit code would know a dispatch failed
+            but not that the repository's capabilities cannot be met.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Config,
         [Parameter(Mandatory = $true)][object]$Request,
         [string]$IssueNumber = "",
-        [object]$ManifestSource = $null
+        [object]$ManifestSource = $null,
+        [switch]$Json
     )
 
     $repo = [string]$Request.repository.fullName
+    $sessionId = [string]$Request.sessionId
+    $ref = [string]$Request.repository.ref
+    $outputBranch = [string]$Request.git.outputBranch
     $repoDir = ""
     if ($ManifestSource -and $ManifestSource.Path) { $repoDir = [string]$ManifestSource.Path }
 
@@ -935,6 +1150,16 @@ function Start-LeasedExecution {
         Write-Warning ("Not dispatching '$($Request.sessionId)': lease '$($decision.leaseKey)' is already " +
             "$($claim.lease.state) (claimed by $($claim.lease.dispatchSource) at $($claim.lease.startedAt)). " +
             "Run 'squad-aca leases' to inspect it.")
+        if ($Json) {
+            # No provider was constructed, so there is no resolved route to
+            # report -- and inventing one here would answer a routing question
+            # nobody asked. dispatched:false is the whole statement, and it is
+            # what an adapter refuses on.
+            Write-SquadJsonDocument (New-SquadRunJsonDocument `
+                -SessionName $sessionId -Repository $repo -Ref $ref -OutputBranch $outputBranch `
+                -FallbackReason ("lease-" + [string]$claim.lease.state) `
+                -Dispatched $false -Status "not-dispatched")
+        }
         return
     }
 
@@ -952,11 +1177,74 @@ function Start-LeasedExecution {
         $capability = $decision.routing.capability
     }
 
+    $routeOutcome = @{}
+    $outcome = @{}
     try {
-        Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $Config -CapabilityResolution $capability) -Request $Request
+        if ($Json) {
+            # 6>&1 folds the information stream (Write-Host) into the success
+            # stream so BOTH the sandbox provider's progress notes and the ACA
+            # Jobs adapter's `az` pass-through are captured. They are then
+            # re-emitted on stderr: moved, never dropped. Warnings and errors are
+            # untouched and already go to stderr.
+            $emitted = @(& {
+                $provider = New-SessionExecutionProvider -Config $Config -CapabilityResolution $capability -RouteOutcome $routeOutcome
+                Start-SquadExecution -Provider $provider -Request $Request -Outcome $outcome
+            } 6>&1)
+            foreach ($line in $emitted) { [Console]::Error.WriteLine([string]$line) }
+        } else {
+            Start-SquadExecution -Provider (New-SessionExecutionProvider -Config $Config -CapabilityResolution $capability) -Request $Request
+        }
     } catch {
         Set-SquadDispatchLeaseState -Operation "release" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -Reason "dispatch-failed" | Out-Null
+        if ($Json) {
+            $failedRoute = $routeOutcome["Route"]
+            $failedReason = $null
+            $failedRouteName = $null
+            $failedClassId = $null
+            if ($failedRoute) {
+                $failedRouteName = [string]$failedRoute.Route
+                $failedReason = [string]$failedRoute.Reason
+                if ($failedRoute.SandboxClassId) { $failedClassId = [string]$failedRoute.SandboxClassId }
+            }
+            $failedStatus = "failed"
+            if ($failedRouteName) { $failedStatus = $failedRouteName }
+            Write-SquadJsonDocument (New-SquadRunJsonDocument `
+                -SessionName $sessionId -Repository $repo -Ref $ref -OutputBranch $outputBranch `
+                -Route $failedRouteName -RouteReason $failedReason -SandboxClass $failedClassId `
+                -FallbackReason (Get-SquadJsonFallbackReason $failedReason) `
+                -Dispatched $false -Status $failedStatus)
+            [Console]::Error.WriteLine([string]$_.Exception.Message)
+            exit 1
+        }
         throw
+    }
+
+    if ($Json) {
+        $route = $routeOutcome["Route"]
+        $response = $outcome["Response"]
+        $reason = $null
+        $routeName = $null
+        if ($route) {
+            $routeName = [string]$route.Route
+            $reason = [string]$route.Reason
+        }
+        $classId = $null
+        if ($response -and $response.sandboxClass) { $classId = [string]$response.sandboxClass }
+        elseif ($route -and $route.SandboxClassId) { $classId = [string]$route.SandboxClassId }
+        $handle = $null
+        if ($response -and $response.sessionHandle) { $handle = [string]$response.sessionHandle }
+        $execMode = $null
+        $status = "Requested"
+        if ($response) {
+            $execMode = [string]$response.executionMode
+            $status = [string]$response.status
+        }
+        Write-SquadJsonDocument (New-SquadRunJsonDocument `
+            -SessionName $sessionId -Repository $repo -Ref $ref -OutputBranch $outputBranch `
+            -Route $routeName -RouteReason $reason `
+            -ExecutionMode $execMode -ExecutionHandle $handle -SandboxClass $classId `
+            -FallbackReason (Get-SquadJsonFallbackReason $reason) `
+            -Dispatched $true -Status $status)
     }
 
     # Compute is LIVE from here on, so this call is inside the try for the same
@@ -1193,7 +1481,22 @@ function Get-FirstPositional {
 }
 
 function Resolve-SessionExecution {
+    <#
+    .DESCRIPTION
+        A caller may address an execution by session name, by substrate
+        execution/sandbox name, or by the OPAQUE HANDLE the `--json` contract
+        hands back. The handle branch is first and deliberately does not list
+        anything: a handle already names the provider that minted it, so
+        resolving it means decoding it, not searching for it. That is also what
+        keeps `stop <handle>` from re-answering today's routing question about
+        yesterday's session.
+    #>
     param([object]$Config, [string]$Session)
+    if ($Session -and (Test-SquadExecutionHandleString -Handle $Session)) {
+        return Get-SquadExecutionStatus `
+            -Provider (New-SessionExecutionProviderForHandle -Config $Config -Handle $Session) `
+            -Handle $Session
+    }
     if (-not $Session) {
         $latest = Get-SessionExecutions -Config $Config -Limit 1
         if ($latest) { return $latest[0] }
@@ -1217,7 +1520,33 @@ function Invoke-Sessions {
     $config = Assert-AcaConfigured
     $limitText = Get-OptionValue $Items @("--limit", "-Limit") "10"
     $limit = [int]$limitText
+    $json = Has-Option $Items @("--json")
+    $session = Get-OptionValue $Items @("--session", "-Session")
+
+    # --session addresses ONE execution. With a handle it is a direct, provider-
+    # scoped status call (Resolve-SessionExecution decodes rather than searches),
+    # which is what an agent adapter polls with. It is only meaningful alongside
+    # --json today; the human table is unchanged and unreachable from here.
+    if ($session) {
+        if (-not $json) { throw "Usage: squad-aca sessions --session <handle-or-name> --json" }
+        $record = Resolve-SessionExecution -Config $config -Session $session
+        Write-SquadJsonDocument ([pscustomobject]([ordered]@{
+            schema   = $script:SquadJsonSessionsSchema
+            sessions = @((ConvertTo-SquadSessionJson -Record $record))
+        }))
+        return
+    }
+
     $records = @(Get-SessionExecutions -Config $config -Limit $limit)
+
+    if ($json) {
+        Write-SquadJsonDocument ([pscustomobject]([ordered]@{
+            schema   = $script:SquadJsonSessionsSchema
+            sessions = @($records | ForEach-Object { ConvertTo-SquadSessionJson -Record $_ })
+        }))
+        return
+    }
+
     # Out-String -Width pins the render width instead of inheriting the host's
     # console width. Sprint 6 appends Route and Source, which pushes the table
     # past the default 120 columns -- and Format-Table silently DROPS trailing
@@ -1628,7 +1957,7 @@ switch ($Command.ToLowerInvariant()) {
     }
     "status" {
         $config = Assert-AcaConfigured
-        & (Join-Path $ScriptDir "show-status.ps1") -ResourceGroupName $config.resourceGroup -JobName $config.sessionJob -RalphJobName $config.ralphJob -WatchAppName $config.watchApp
+        & (Join-Path $ScriptDir "show-status.ps1") -ResourceGroupName $config.resourceGroup -JobName $config.sessionJob -RalphJobName $config.ralphJob -WatchAppName $config.watchApp -Json:(Has-Option $Arguments @("--json"))
     }
     "dashboard" {
         $config = Assert-AcaConfigured
