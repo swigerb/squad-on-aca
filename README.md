@@ -20,6 +20,9 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Secure image pulls | ACR plus user-assigned managed identity |
 | Token storage | ACA secrets by default; optional Key Vault references with `-UseKeyVault` |
 | Second execution plane (opt-in preview) | ACA Sandboxes behind `SQUAD_ACA_ENABLE_SANDBOX`, for per-session isolation and default-deny egress. Off by default; ACA Jobs stay the default and the rollback path |
+| Agent tool policy | Every session resolves an `attended` or `autonomous` tier before any agent starts; unattended runs lose destructive infrastructure verbs. `--yolo` is never emitted |
+| Governance-path protection | `.squad/` policy, identity, and audit state is made read-only and hash-verified for the session; a violation fails the run and pushes nothing |
+| Duplicate-dispatch protection | A durable lease is claimed before compute is requested, shared by the CLI, Ralph, and the watcher (`squad-aca leases`) |
 | CI/CD | GitHub Actions workflow with Azure OIDC login |
 
 ## Quick start
@@ -222,7 +225,9 @@ See [aspire/README.md](aspire/README.md) and [docs/architecture.md](docs/archite
 Run the static validation gate before pushing:
 
 ```powershell
-.\scripts\validate.ps1            # PS parse, worker bash -n, secret scan, scaffold check
+.\scripts\validate.ps1            # 285 offline checks: PowerShell parse, worker bash -n,
+                                  # secret scan, provider contract, sandbox security
+                                  # controls, CLI golden gate, image evidence, scaffold
 .\scripts\validate.ps1 -RunDotnet # also build the optional aspire scaffold
 ```
 
@@ -230,11 +235,13 @@ See [docs/validation.md](docs/validation.md) for the full sprint/E2E checklist a
 security validation steps (OTLP auth, exposure, RBAC, secret scans, token
 separation, rotation, public sync guard, image pinning).
 
-The worker's capability-aware preflight has its own dependency-free test suite.
-When `bash` and `node` are available, run it directly:
+The worker's own logic has a dependency-free test suite — 10 suites covering the
+capability parser and routing decision, the preflight contract, agent tool policy,
+the governance guard, image evidence, and transactional dispatch. When `bash` and
+`node` are available, run it directly:
 
 ```bash
-bash worker/tests/run-tests.sh   # parser + preflight unit/integration tests
+bash worker/tests/run-tests.sh   # 739 assertions
 node --check worker/lib/parse-capabilities.js
 ```
 
@@ -254,99 +261,38 @@ The manifest also produces a deterministic routing decision — run on the defau
 ACA job, run on an approved sandbox class, or fail closed. ACA Sandboxes are the
 execution plane that decision can route to, and they are described next.
 
-## ACA Sandboxes (opt-in preview)
+## ACA Sandboxes
 
-**Azure Container Apps Sandboxes** are a second execution plane alongside ACA
-Jobs, not a replacement. ACA Jobs remain the unconditional default and the
-rollback path. Sandboxes are a public preview with no SLA, so the plane is off
-by default and stays off until you turn it on for a specific invocation.
+**Azure Container Apps Sandboxes** are an opt-in second execution plane that
+gives a session per-session isolation and default-deny egress. ACA Jobs remain
+the unconditional default and the rollback path; the plane is off unless you
+turn it on for a specific invocation.
 
-### What it does today
+Quickstart — five steps, in order:
 
-Enabling the flag makes the plane reachable. `squad-aca run` reads the
-repository's `squad-capabilities.yml` from your working tree **before** it
-requests any compute, resolves it through the same Node routing core Ralph and
-Watch use, and dispatches to whichever plane the decision names. A repository
-whose manifest an approved sandbox class satisfies runs in a sandbox with
-default-deny egress applied before any repository code; `sessions`, `logs`, and
-`stop` then address that session on the plane it actually runs on, recovered
-from its execution handle rather than re-resolved.
+1. **Install the standalone `aca` CLI.** Sandboxes are not driven by `az`; there
+   is no `az containerapp sandbox` command.
+2. **Create an identity-free sandbox group and a disk**, where the disk is built
+   from the pinned image of the approved class your repository will select
+   (`config/sandbox-classes.json`). One disk serves every class, so build it from
+   the one you need. See [docs/runbook.md](docs/runbook.md#prerequisites) for the
+   exact commands.
+3. **Add `sandboxGroup` and `sandboxDiskId`** to `~/.squad-on-aca/config.json`.
+4. **Commit a `squad-capabilities.yml`** to the repository declaring a capability
+   the default worker image does not provide — for example a required `python3`.
+   Without one, the correct answer is ACA Jobs and nothing routes to a sandbox.
+5. **Enable the flag and dispatch from that repository's working tree:**
 
-ACA Jobs remain the default and the rollback path. A repository with no
-manifest, or one the default worker image already satisfies, is unaffected —
-byte for byte.
+   ```powershell
+   $env:SQUAD_ACA_ENABLE_SANDBOX = "1"     # accepted: 1 / true / yes / on / enabled
+   squad-aca run "<prompt>"
+   ```
 
-With the flag **off**, a repository that genuinely needs a non-default
-capability is **refused**, not quietly run on the default worker. That is
-deliberate: silently downgrading is the one outcome worse than not starting.
+With the flag off, a repository that genuinely needs a non-default capability is
+**refused**, not quietly run on the default worker.
 
-### How to enable it
-
-```powershell
-$env:SQUAD_ACA_ENABLE_SANDBOX = "1"     # accepted: 1 / true / yes / on / enabled
-squad-aca run "<prompt>"
-```
-
-The flag is an environment variable rather than a config key on purpose: it is
-per-invocation, nothing that syncs config can turn it on, and rolling back needs
-no file edit. `0`, `false`, `no`, and `off` are an explicit kill switch.
-
-Your deployment also needs a sandbox group and a disk in
-`~/.squad-on-aca/config.json` (`sandboxGroup`, `sandboxDiskId`). Without them
-nothing can reach the plane, which is a third, accidental-but-real interlock.
-
-### Two independent fail-closed interlocks
-
-Both must be open before a dispatch can reach a sandbox, so closing either one
-returns every *satisfiable* dispatch to ACA Jobs:
-
-1. **The feature flag defaults off.** With it unset, the route gate resolves
-   `aca-job` for a repository the default worker image can serve, and
-   `fail-closed` for one it cannot. Nothing reads the class catalog or looks for
-   the `aca` binary.
-2. **The class catalog must be reviewed.** `config/sandbox-classes.json` carries
-   `"provisional": false` only because an administrator reviewed every approved
-   class and pinned it to an immutable `sha256` digest — an approved class
-   without one is a catalog fault, not a warning. Setting `"provisional": true`
-   fails every sandbox route closed again (`reason: catalog-provisional`), and
-   the shipped catalog keeps one deliberately unapproved class as proof the
-   approved-only filter still bites.
-
-### Why the plane exists
-
-Sandboxes give a session two properties the ACA Jobs plane does not have:
-
-- **Per-session isolation.** Each session gets its own sandbox rather than a
-  replica of a shared, fixed worker image.
-- **Default-deny, capability-scoped egress.** A class declares
-  `defaultAction: Deny` plus an allowlist, applied before any repository code
-  runs. Feasibility testing measured allowlisted hosts returning `200`,
-  non-allowlisted hosts returning `403`, and raw non-HTTP TCP refused, with an
-  auditable allow/deny trail from `aca sandbox egress decisions`.
-
-### Prerequisites
-
-- **The standalone `aca` CLI.** Sandboxes are not driven by `az`; there is no
-  `az containerapp sandbox` command.
-- **A sandbox group with no managed identity.** Identity on ACA Sandboxes is
-  group-scoped with no per-sandbox opt-out, so a group carrying one would let
-  sandboxed code mint control-plane tokens. The provider verifies the group is
-  identity-free and refuses to create a sandbox if it cannot prove that.
-
-### Where to go next
-
-- [docs/runbook.md](docs/runbook.md#aca-sandboxes-preview-feature-flagged-off) —
-  [prerequisites](docs/runbook.md#prerequisites),
-  [credentials](docs/runbook.md#credentials-four-planes-kept-separate),
-  [concurrency, cost and orphans](docs/runbook.md#concurrency-cost-and-orphans),
-  [rollback](docs/runbook.md#rollback-to-aca-jobs), and the
-  [incident runbook](docs/runbook.md#incident-runbook).
-- [docs/architecture.md](docs/architecture.md#aca-sandboxes-provider-feature-flagged-default-off) —
-  the provider boundary, the route gate, and the security invariants.
-- [docs/rollback.md](docs/rollback.md#2-aca-sandboxes-feature-flagged-preview) —
-  the rollback procedure and its verification checklist.
-- [docs/adr/0001-aca-sandboxes-feasibility.md](docs/adr/0001-aca-sandboxes-feasibility.md) —
-  the feasibility evidence and the decision to adopt the plane as opt-in.
+See [docs/sandboxes.md](docs/sandboxes.md) for what the plane does, the
+fail-closed interlocks, the prerequisites in full, and the operational links.
 
 ## Security notes
 
@@ -354,9 +300,15 @@ Sandboxes give a session two properties the ACA Jobs plane does not have:
   resource group so Ralph can start session job executions. This is broader than
   strictly required and is documented as an existing risk with a custom-role
   hardening path in [docs/validation.md](docs/validation.md#rbac--identity-scope).
+- Remote sessions no longer run Copilot with `--yolo`. Every session resolves an
+  `attended` or `autonomous` tool-policy tier, is confined to the checkout, and
+  runs with governance paths under `.squad/` locked and hash-verified. A
+  permission-widening flag smuggled in through `SQUAD_COPILOT_FLAGS` aborts the
+  session with exit 78 rather than being silently dropped. See
+  [docs/runbook.md](docs/runbook.md#agent-tool-policy).
 - OTLP auth is preserved: **BrowserToken** for the UI and **ApiKey** for OTLP,
   never `Unsecured`. OTLP ports stay internal to the ACA environment.
 - `squad-aca sync --sync-all` runs a public repo secret guard that blocks obvious
   secret files and inline tokens before staging.
 
-See [docs/runbook.md](docs/runbook.md), [docs/rollback.md](docs/rollback.md), [docs/architecture.md](docs/architecture.md), and [docs/feature-parity.md](docs/feature-parity.md).
+See [docs/runbook.md](docs/runbook.md), [docs/sandboxes.md](docs/sandboxes.md), [docs/rollback.md](docs/rollback.md), [docs/architecture.md](docs/architecture.md), and [docs/feature-parity.md](docs/feature-parity.md).
