@@ -290,3 +290,76 @@ Three things changed:
 2. A final step fails the run when the lease said `start` but no execution name
    was produced.
 3. `validate.ps1` fails if the workflow ever reads `.claimed` again.
+## Operating it
+
+### Redeploying destroys the trigger's grant
+
+`deploy.ps1` deletes and recreates the session job whenever the image changes,
+and **a role assignment scoped to a resource dies with that resource**. The
+Actions identity therefore loses its grant on every image-changing deploy, and
+the next triggered run fails at Azure login:
+
+```
+##[error]No subscriptions found for ***.
+```
+
+That reads like an OIDC fault. It is an RBAC one, and it was observed live
+rather than theorised. `deploy.ps1` now reconciles the grant after recreating
+the job, keeping the tight per-job scope rather than widening it to the resource
+group. Pass `-GitHubActionsIdentityName` if the identity is not
+`uai-<prefix>-gha`; a deployment with no such identity skips the step, because
+the Actions trigger is optional.
+
+### Stale leases
+
+A lease is claimed **before** compute is requested, so a dispatcher that dies in
+between leaves a lease held by a session that does not exist. The issue is then
+blocked: every future trigger sees `active` and correctly stands down, forever.
+
+`squad-lease-sweep.yml` runs hourly and calls the **shared**
+`squad-dispatch.js sweep`, so it applies the same staleness rules the CLI, Ralph
+and Watch already agree on.
+
+Hourly, not every five minutes, on purpose. A lease heartbeats while its session
+lives, so a genuinely stale lease is stale for a long time — and this repository
+has already had one self-inflicted rate-limit outage from an unbounded sweep.
+
+To release one by hand:
+
+```bash
+node worker/lib/squad-dispatch.js list --repository <owner>/<repo>
+node worker/lib/squad-dispatch.js release --repository <owner>/<repo> \
+  --lease-key issue-<n> --session-id <session>
+```
+
+### Rate limits
+
+Installation tokens get 5,000 requests/hour, which is ample for event-driven
+work and **fatal for O(n) polling**. Secondary limits bite sooner: **80
+content-creation requests per minute and 500 per hour**, which a comment-happy
+agent reaches. The sweep prints the remaining core budget each run so drift
+towards the ceiling is visible before it is an outage.
+
+### Cost
+
+| Component | Cost |
+|---|---|
+| GitHub Actions minutes | Free on public repositories, metered on private ones. Each dispatch uses roughly a minute of runner time — the workflow starts a job and exits. |
+| ACA session job | The real cost, and unchanged by this path: it is the same execution the local CLI and Ralph start. |
+| The hourly sweep | About 10 seconds of runner time per run. |
+
+The trigger does **not** hold a runner while the session runs, so a 45-minute
+agent session costs 45 minutes of ACA and about one minute of Actions.
+
+### Incremental pushes
+
+`squad_push_checkpoint` pushes whatever exists at a safe boundary, so a
+credential that expires mid-run costs one increment instead of the whole run.
+
+It is **off by default** (`SQUAD_INCREMENTAL_PUSH=true` to enable), and that is a
+judgement rather than caution. This worker runs the agent as a **single**
+`copilot -p` invocation, so there is no natural quiet point: checkpointing during
+that call means running `git add -A` and `git commit` while the agent is still
+editing files and may be running its own git commands. On a session whose whole
+value is the final pull request, a corrupted intermediate commit is worse than
+losing one increment. Enable it for sessions that have safe boundaries.

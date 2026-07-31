@@ -87,3 +87,54 @@ squad_push_branch() {
     squad_push_log "  ACA Sandboxes can be refreshed mid-session; ACA Jobs cannot (see docs/sandboxes.md, 'Refresh channel matrix'). Under Jobs, shorten the run or mint the token immediately before dispatch."
     return "$SQUAD_EXIT_CREDENTIAL"
 }
+
+# Push whatever exists RIGHT NOW to the session branch, best effort.
+#
+# The branch is the durable artifact. A credential that expires mid-run costs
+# the last increment instead of the whole run only if something has been pushed
+# before the end -- otherwise "the work is lost, not delayed" (issue #32).
+#
+# DEFAULT OFF, and that is a deliberate judgement rather than caution.
+#
+# This worker runs the agent as a SINGLE `copilot -p` invocation, so there is no
+# natural quiet point between phases. Checkpointing during that call means
+# running `git add -A` and `git commit` while the agent is still editing files
+# and may be running its own git commands. That races its index and can commit a
+# half-finished state. On a session whose whole value is the final pull request,
+# a corrupted intermediate commit is a worse outcome than losing one increment.
+#
+# It is therefore opt-in via SQUAD_INCREMENTAL_PUSH=true, for callers who know
+# their session has safe checkpoint boundaries -- a loop or a multi-phase
+# pipeline -- rather than being switched on for everyone by default.
+#
+# Deliberately BEST EFFORT and deliberately quiet about failure: an intermediate
+# push that cannot happen must never end a session that is still working. It
+# returns 0 always, and says what it did.
+squad_push_checkpoint() {
+    local branch="$1" label="${2:-checkpoint}"
+    local rc=0
+
+    if [[ "${PUSH_CHANGES:-false}" != "true" ]]; then
+        return 0
+    fi
+    if [[ "${SQUAD_INCREMENTAL_PUSH:-false}" != "true" ]]; then
+        return 0
+    fi
+
+    # Nothing staged and nothing modified means there is nothing to checkpoint.
+    if git diff --quiet && git diff --cached --quiet; then
+        return 0
+    fi
+
+    git checkout -B "$branch" >/dev/null 2>&1 || return 0
+    git add -A >/dev/null 2>&1 || return 0
+    git commit -m "${COMMIT_MESSAGE:-Remote Squad session}: ${label}" >/dev/null 2>&1 || return 0
+
+    git push --set-upstream origin "$branch" >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )); then
+        squad_push_log "Checkpoint pushed to ${branch} (${label}). If the credential expires later, this much survives."
+    else
+        squad_push_log "Checkpoint push to ${branch} failed (exit ${rc}); continuing. The session is not over, and the final push decides its outcome."
+    fi
+    return 0
+}

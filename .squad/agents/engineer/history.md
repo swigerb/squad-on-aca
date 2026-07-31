@@ -1476,3 +1476,26 @@ measured TTL of exactly 3600 seconds, so it is not.
   line-start rule covers the mention form exactly as it covers the command.
 - With no bot login configured the mention form is INERT rather than matching an
   arbitrary "@" prefix - there is no identity to mention.
+
+## Issue #32 S4 - hardening
+
+- **A resource-scoped role assignment dies with the resource.** deploy.ps1
+  deletes and recreates the session job on an image change, silently destroying
+  the Actions identity's grant. The next triggered run fails at Azure login with
+  "No subscriptions found" - which reads like OIDC and is RBAC. Observed live.
+  deploy.ps1 now reconciles it, keeping the per-job scope rather than widening
+  to the resource group.
+- **A gate that greps for a string anywhere is decorative.** The first version
+  of the deploy check passed after the role was changed to Reader, because the
+  role NAME still appeared in the query line. Three mutations were needed before
+  every clause was load-bearing: the --role value, the principal, and the scope
+  query. Mutating once is not enough when a check has multiple clauses.
+- **Incremental push is OFF by default, deliberately.** This worker runs the
+  agent as one copilot invocation, so a mid-run "git add -A; git commit" races
+  the agent's own index and can capture a half-finished state. On a session whose
+  value is the final PR, a corrupted intermediate commit is worse than losing one
+  increment. Correctness is not always more safety.
+- **A lease claimed before compute is a lease that can outlive its session.**
+  Several were orphaned by hand this sprint and each needed a human with a CLI.
+  Swept hourly - not every five minutes, because a lease heartbeats while alive
+  and this repo has already had a rate-limit outage from an unbounded sweep.
