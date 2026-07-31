@@ -1025,4 +1025,124 @@ $ aca sandbox list --group sbg-squad-aca -g rg-squad-aca-dev-eastus2
 
 The class disk `02560016-d170-486d-a99b-aed763296b6c` was left in place and
 still lists as `Ready`.
-
+
+---
+
+# Sprint 2 (issue #32) — GitHub Actions trigger, live end-to-end
+
+Issue [#44](https://github.com/swigerb/squad-on-aca/issues/44) is the E2E
+verification trigger for the [#32](https://github.com/swigerb/squad-on-aca/issues/32)
+control-plane move: **GitHub Action fires on an event → authenticates to Azure
+via OIDC → claims the shared lease → starts the ACA dispatcher job**, with the
+laptop-run `squad-aca.ps1` CLI removed from the trigger path. Applying the
+`squad` label to an issue drives `squad-dispatch.yml`; the same shared decision
+core (`worker/lib/squad-dispatch.js`) that Ralph and Watch use decides,
+claims the lease, and starts the execution, so a proof against `squad-dispatch.yml`
+proves the whole family.
+
+## S2-1 — First live attempt — **FAIL (defect found, fixed in #46)**
+
+Workflow run [30662711996](https://github.com/swigerb/squad-on-aca/actions/runs/30662711996).
+Azure OIDC login succeeded, but the lease-claim step failed with a 403
+(`Resource not accessible by integration`): `squad-dispatch.yml`'s dispatch job
+only granted `contents: read`, while the shared lease is written via the
+GitHub Contents API against the `squad-aca-leases` ref, which needs
+`contents: write`. Fixed in #46 (merged as commit `faa6a3a` on `main`):
+least-privilege layout is now a read-only `resolve` job plus a job-scoped
+`id-token: write`, `contents: write`, `issues: write` on `dispatch`.
+
+## S2-2 — Re-run after the permissions fix — **PASS**
+
+Workflow run [30664755108](https://github.com/swigerb/squad-on-aca/actions/runs/30664755108),
+`issues` trigger on `main` after #46 landed:
+
+```text
+resolve:  verdict: {"dispatch":true,"reason":"label-applied","issueNumber":44,"label":"squad","sessionName":"issue-44-30664755108"}
+dispatch: Azure login succeeds by using OIDC (subject claim - repo:swigerb/squad-on-aca:ref:refs/heads/main)
+dispatch: {"outcome":"repaired", ..., "state":"claimed", ...}
+dispatch: claim outcome 'repaired' -> {"action":"start","reason":"lease-repaired"}
+dispatch: Started ACA execution: caj-squad-aca-session-oa5bg21
+dispatch: Confirmed: ACA execution caj-squad-aca-session-oa5bg21 is running the work.
+```
+
+No more 403 — the lease claim succeeds and produces a real ACA execution.
+
+## S2-3 — Reproducibility pass — **PASS**
+
+Two further independent re-runs confirmed the path is reproducible on `main`,
+not a one-off:
+
+- Run [30666116948](https://github.com/swigerb/squad-on-aca/actions/runs/30666116948):
+  lease claim `repaired` → `action":"start"`, `Started ACA execution:
+  caj-squad-aca-session-d1xrmpn`, guard step confirmed.
+- An intervening run (30665958645) failed Azure OIDC with a transient
+  `No subscriptions found`; the very next re-run succeeded cleanly, so the
+  failure was environmental, not a regression in the OIDC/lease/start path.
+- Run [30667555415](https://github.com/swigerb/squad-on-aca/actions/runs/30667555415)
+  (the run that produced this session, `issue-44-30667555415`, and this PR):
+
+  ```text
+  resolve:  verdict: {"dispatch":true,"reason":"label-applied","issueNumber":44,"label":"squad","sessionName":"issue-44-30667555415"}
+  dispatch: Azure CLI login succeeds by using OIDC.
+  dispatch: {"outcome":"repaired","lease":{"leaseKey":"issue-44","sessionId":"issue-44-30667555415","route":"aca-job","state":"claimed",...}}
+  dispatch: claim outcome 'repaired' -> {"action":"start","reason":"lease-repaired"}
+  dispatch: Started ACA execution: caj-squad-aca-session-nwxyb1h
+  dispatch: Confirmed: ACA execution caj-squad-aca-session-nwxyb1h is running the work.
+  ```
+
+  This session — the one that authored this documentation and its PR — **is**
+  that ACA execution: the loop closes from a label event, through OIDC and the
+  shared lease, to a running agent that pushes real changes back to GitHub,
+  with no laptop in the path.
+
+## Result
+
+- Azure OIDC federation from `squad-dispatch.yml`: **PASS**, reproducible
+  across four independent workflow runs.
+- Shared lease claim (`contents: write` scoped to the `dispatch` job only):
+  **PASS** after #46; the pre-fix 403 is a closed defect, not an open risk.
+- ACA session job start from the Actions trigger, with the full merged
+  environment (managed secret refs included, per #48's env-merge fix):
+  **PASS**, and self-evidenced by this session's own existence.
+- Sprint 2's goal — the control plane fires from Azure, not a developer's
+  laptop — is met and reproducible on `main`. No further code change is
+  required to close #32 Sprint 2; #44 tracked the verification only.
+
+### Correction: a started execution is not a finished session
+
+The runs above prove the **trigger**. They do not, on their own, prove the
+session, and two of those executions did in fact **fail** after starting. Both
+failures were dispatch defects, and the distinction matters because "Started ACA
+execution" is the last line the workflow ever sees.
+
+| Execution | Trigger | Session | Cause |
+|---|---|---|---|
+| `caj-squad-aca-session-oa5bg21` | PASS | **Failed** | `--env-vars` REPLACES the container environment rather than merging it, so every secret-backed variable was dropped. The session pulled the image, cloned the repository, and died with `Error: No authentication information found`. Fixed in #48. |
+| `caj-squad-aca-session-d1xrmpn` | PASS | **Failed** | `ralph_build_session_env` deliberately skips managed keys when copying the template, so the caller must supply `OV_GITHUB_TOKEN=secretref:...` itself. Measured: 18 template entries in, 15 out — exactly the three secret-backed ones missing. Fixed in #49. |
+| `caj-squad-aca-session-nwxyb1h` | PASS | **Succeeded** | — |
+
+Both were caught by the token preflight added in #42, at roughly two minutes,
+rather than at the push after a full agent run:
+
+```text
+[token-preflight] Credential wiring OK: one absolute-path helper for https://github.com, no URL rewrite, token file 0600.
+[token-preflight] The credential is accepted by the GitHub API.
+[token-preflight] The credential does NOT have push access to swigerb/squad-on-aca (permissions.push=false).
+[token-preflight]   This session intends to PUSH; the push would fail after the whole agent run.
+```
+
+The last of those was not a dispatch defect at all: `deploy.ps1` falls back to
+`gh auth token`, which on this machine returns a **read-only** account's token.
+The preflight named the real problem instead of letting the session run for an
+hour and fail at the push.
+
+One honest gap remains, and the preflight says so itself:
+
+```text
+[token-preflight] Token expiry is UNKNOWN (no SQUAD_TOKEN_EXPIRES_AT and no expiry header); remaining lifetime was NOT checked.
+[token-preflight] Token preflight passed (usability verified, lifetime unverified).
+```
+
+The session job still runs on a long-lived PAT, so the one-hour lifetime check
+has nothing to check. Minting a GitHub App installation token at dispatch time
+and passing `SQUAD_TOKEN_EXPIRES_AT` is tracked separately.
