@@ -8,12 +8,13 @@ This directory is an **optional** integration path for Squad on ACA. It is
 ## Why this exists
 
 The primary architecture keeps `squad-aca` as a thin ACA remote-runner / control
-plane. This scaffold adds a separate, opt-in path that layers cleanly on top:
+plane. These projects add a separate, opt-in path that layers cleanly on top:
 
 | Layer | Responsibility | Where |
 | --- | --- | --- |
 | **Aspire** | Models resources (the Aspire Dashboard OTLP sink + the `squad-worker` container) as code | `Squad.Aca.AppHost` |
-| **Agent Framework** | Exposes the Squad session as an agent abstraction | `Squad.Aca.Agents` (contract + control-plane implementation, no preview dep) |
+| **Agent contract** | Dispatches a Squad session from .NET over `squad-aca --json` | `Squad.Aca.Agents` (net9.0, zero package references) |
+| **Agent Framework** | Exposes that contract as a MAF `AIAgent` | `Squad.Aca.Agents.MAF` (the only `Microsoft.Agents.AI` reference) |
 | **ACA** | Remains the production execution substrate | `../scripts/deploy.ps1` |
 | **Squad** | Remains the orchestration system inside the worker | `../worker` |
 
@@ -61,7 +62,7 @@ aspire/
 
 ```
 MAF pipeline
-  └─ AIAgent                (sprint 2, isolated, may take a preview dependency)
+  └─ AIAgent                (Squad.Aca.Agents.MAF, the only Microsoft.Agents.AI reference)
        └─ ISquadAgent       (this library, net9.0, zero package references)
             └─ squad-aca --json  ->  ACA Job | ACA Sandbox
 ```
@@ -69,13 +70,13 @@ MAF pipeline
 Three properties are deliberate and enforced:
 
 - **Zero package references.** `scripts/validate.ps1` fails the build if a
-  `<PackageReference>` appears in `Squad.Aca.Agents.csproj`. A preview restore
-  failure in the sprint-2 adapter must not be able to take the contract — and
+  `<PackageReference>` appears in `Squad.Aca.Agents.csproj`. A restore failure
+  in the Agent Framework adapter must not be able to take the contract — and
   everything that depends on it — down with it.
 - **`net9.0`.** The AppHost is `net9.0`, so a `net10.0` contract could not be
   referenced from it without an unrelated Aspire bump; `Microsoft.Agents.AI`
-  targets `net8.0`+, so a sprint-2 adapter on `net8.0`/`9.0`/`10.0` can reference
-  this without an SDK bump either.
+  targets `net8.0`+, so the adapter on `net8.0`/`9.0`/`10.0` can reference this
+  without an SDK bump either.
 - **`--json`, not output parsing.** `AcaSquadAgent` talks to the control plane
   through `squad-aca run|status|sessions --json`. The human-readable output is
   pinned byte-for-byte by 22 golden captures whose purpose is to catch
@@ -153,9 +154,9 @@ The tests are fully offline: every one fakes `ISquadCliInvoker`, so none of them
 starts PowerShell, contacts Azure, or opens a socket. `scripts/validate.ps1` runs
 both commands automatically whenever a dotnet SDK is on PATH.
 
-If restore fails in a locked-down environment, the project and `AppHost.cs`
-remain valid, reviewable scaffolding. See
-[`../docs/validation.md`](../docs/validation.md) for guidance.
+If restore fails in a locked-down environment, the projects still parse and
+review as source; the static structure checks in `scripts/validate.ps1` continue
+to run. See [`../docs/validation.md`](../docs/validation.md) for guidance.
 
 ## Run (local telemetry smoke)
 
@@ -186,5 +187,5 @@ dotnet run
   configuration/user-secrets/environment at run time and generated when absent.
 - Put local tokens only in `appsettings.Development.json` (gitignored) or use
   `dotnet user-secrets`.
-- This scaffold mirrors the OTLP auth posture of `scripts/deploy.ps1`; do not
+- The AppHost mirrors the OTLP auth posture of `scripts/deploy.ps1`; do not
   weaken it to `Unsecured`.

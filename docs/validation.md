@@ -7,7 +7,7 @@ deployment). Use this guide as the per-sprint gate and before any push.
 ## Quick start
 
 ```powershell
-# Static validation: PowerShell parse, worker bash -n, secret scan, .NET scaffold.
+# Static validation: PowerShell parse, worker bash -n, secret scan, .NET projects.
 # `dotnet build` and `dotnet test` on aspire/Squad.Aca.sln run automatically
 # whenever a dotnet SDK is on PATH; without one they report a counted SKIP.
 .\scripts\validate.ps1
@@ -30,7 +30,7 @@ pre-push hook.
 | Session-managed env parity | Compares the session-managed env key lists in `scripts/lib/session-env.ps1` and `worker/lib/ralph-dispatch.sh` | Fails on drift so both dispatch paths strip the same keys and session isolation cannot regress |
 | Sync guard enumeration | Asserts `Test-SyncSafety` (`scripts/lib/sync-safety.ps1`) uses repository-rooted, byte-safe NUL-delimited `git diff`/`git ls-files` enumeration with ordinal path de-duplication, then runs the real guard against a throwaway repo with nested, ignored, non-ASCII, and newline-parser regression cases | Proves every file `git add -A` would stage is scanned before `--sync-all`, including nested untracked files and quoted/escaped paths, while git-ignored files stay excluded |
 | Logs fallback + exit code | Drives `Get-AcaExecutionLog` (`scripts/lib/aca-logs.ps1`) against a fake `az` placed first on `PATH`: extension present, extension absent, extension call failing, Log Analytics query failing, both paths unavailable, and a child-process exit-code assertion. Also re-runs the Log Analytics path under Windows PowerShell 5.1, the host the `squad-aca` shim uses | Regression guard for issue #13: `logs` must never exit 0 after a failed fetch, must never trigger the interactive extension-install prompt, and must fall back to Log Analytics when the `containerapp` extension is unavailable |
-| .NET scaffold | Verifies `aspire/` structure and `.csproj` XML, asserts `Squad.Aca.Agents` has **zero** package references, and runs `dotnet build` + `dotnet test` when an SDK is present | Ensures the optional integration path stays coherent, and keeps the agent contract free of the preview dependency that is sprint 2's isolated problem |
+| .NET agent libraries | Verifies `aspire/` structure and `.csproj` XML, asserts `Squad.Aca.Agents` has **zero** package references and that `Microsoft.Agents.AI` is pinned exactly in `Squad.Aca.Agents.MAF` alone, and runs `dotnet build` + `dotnet test` when an SDK is present | Ensures the optional integration path stays coherent, and keeps the agent contract free of the Agent Framework dependency so a restore failure in the adapter cannot take the contract down with it |
 | Execution provider contract | Exercises `scripts/lib/squad-aca-provider.ps1` offline against the filesystem-backed fake provider: create/wait/status/logs/cancel/terminate state transitions, idempotent `terminate` (repeat and after external deletion), double `cancel`, handle opacity, and rejection of unknown, malformed, and foreign-provider handles | Proves the provider seam behaves per PRD #6 with no Azure subscription, so a future Sandboxes provider can be developed and tested offline |
 | ACA Job adapter | Drives the **production** adapter (`scripts/lib/providers/squad-aca-job-provider.ps1`) against the fake `az` from `scripts/tests/cli-stub-harness.ps1`: `terminate` on a live execution, on an already-terminal/not-found one, under an auth failure, under RBAC/throttling/network/wrong-subscription/unrecognised failures, and with no `az` on `PATH`; plus `wait` polling `Provisioning -> Running` and timing out on an execution that never becomes ready | The fake provider proves the seam, not the adapter that ships. `terminate` used to return `Terminated = $true` for *every* non-zero `az` exit and label it `AlreadyTerminal`, so an auth failure read as a successful teardown; these checks fail if that returns |
 | ACA Sandboxes provider | Drives `scripts/lib/providers/squad-sandbox-provider.ps1` against a stub `aca`, and — the assertions a stub cannot make — evaluates the **actually emitted** launch and credential-staging commands in a real `bash` under WSL: timing when the caller's streams reach EOF against a still-running worker, and proving a token written to **stdin** reaches the worker verbatim through a `0600` file that the launch sources and removes. Also covers `Protect-SandboxText` directly at realistic credential lengths, and `cancel`'s failure classification | A detach is a shell-grammar property, not a substring: `&` binds looser than `&&`, so a command containing every character of a detach can still hold the exec open until its ~120 s timeout. Credential delivery is the same class of claim: only a real shell can distinguish "the token is not in the argv because it is on stdin" from "the token is not in the argv because it is not delivered at all" |
@@ -512,26 +512,27 @@ These map to the Security review items. Each has a concrete way to verify it.
   `scripts/deploy.ps1`, `:9.4` in the optional AppHost). For production, pin the
   dashboard to a specific tag/digest.
 
-## Optional .NET/Aspire scaffold validation
+## Optional .NET/Aspire validation
 
 ```powershell
 cd aspire
 dotnet build .\Squad.Aca.sln          # restore + compile
-dotnet test  .\Squad.Aca.sln          # agent contract tests (offline)
+dotnet test  .\Squad.Aca.sln          # agent contract + MAF adapter tests (offline)
 ```
 
 `Squad.Aca.Agents.Tests` is fully offline by construction: the only seam to the
 outside world is `ISquadCliInvoker`, and every test supplies a fake, so no test
-starts PowerShell, contacts Azure, or opens a socket. There is therefore no
+starts PowerShell, contacts Azure, or opens a socket. `Squad.Aca.Agents.MAF.Tests`
+is offline for the same reason — a scripted `ISquadAgent` and a virtual polling
+clock, so a 90-minute timeout is exercised in milliseconds. There is therefore no
 credential or network reason to gate these tests behind a flag, and
 `validate.ps1` runs them whenever a dotnet SDK is present.
 
-If restore is not feasible (offline, restricted feeds, or preview packages are
-unavailable), that is expected and acceptable: the scaffold is optional. The
-project files and `AppHost.cs` remain valid, reviewable scaffolding, and the
-static structure check in `validate.ps1` still passes. Document the restore
-failure reason in your sprint notes and keep the scaffold explicit rather than
-vendoring preview packages.
+If restore is not feasible (offline or restricted feeds), that is expected and
+acceptable: the path is optional. The project files still parse and review as
+source, and the static structure check in `validate.ps1` still passes. Document
+the restore failure reason in your sprint notes and keep the dependency explicit
+rather than vendoring packages.
 
 ## Rollback and recovery
 

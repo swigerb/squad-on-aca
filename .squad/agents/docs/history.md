@@ -117,3 +117,146 @@ unchanged. `scripts/validate.ps1` has no markdown link check, so link
 verification was done out of band as described above. No secrets, tokens, or
 real subscription/tenant GUIDs added; examples use `<prompt>` and the existing
 placeholder style.
+
+## 2026-07-31: Agent-integration docs, ADR 0002, and an accuracy sweep (#33 S4)
+
+Sprint 4 (final) of issue #33. Sprints 1-3 shipped a real .NET agent contract, a
+MAF adapter, a runnable sample, 114 offline tests, and live evidence on both
+execution planes. The docs still described that path as a scaffold with a preview
+dependency. Closed that gap on `docs/33-s4-agent-docs`.
+
+**README: 314 -> 353 lines (+39).** New `## Agent integration (Microsoft Agent
+Framework)` section, 29 lines, placed after `## ACA Sandboxes` so the three
+sibling concepts (capability routing, the second execution plane, the agent
+caller) read in order. Followed the `## ACA Sandboxes` precedent set in #31
+deliberately: a short what-it-is, a minimal quickstart (DI registration resolving
+the **base `AIAgent`**, plus the sample-host command line), the two facts a
+reader must not miss, and links onward. Everything else lives in `docs/`. Added
+one `## What you get` row, "Callable as an agent (opt-in)", in the existing row
+style.
+
+**Structure: restructured the two existing pages rather than adding a third.**
+`docs/agent-contract.md` (S1) and `docs/maf-adapter.md` (S2) are not
+half-overlapping - they are layered: one is the `squad-aca --json` wire contract,
+the other is the .NET/MAF layer over it. A third page could only have been an
+index, which adds a hop and three places for the same sentence to drift. Instead
+`maf-adapter.md` became the landing page: it gained an orientation opener naming
+its two companions and a **Status at a glance** table (nine rows: what is
+verified live, the `RunToCompletion` default, `DispatchOnly` opt-in, the null
+`executionHandle`, `fallbackReason` semantics, and the broken sandbox cancel).
+`agent-contract.md` gained a one-line "start at maf-adapter.md" pointer so a
+reader landing on the wire reference is not stranded. No prose was duplicated
+between them.
+
+**Two claims the docs did not previously make.** Sandbox cancellation is broken
+([#36](https://github.com/swigerb/squad-on-aca/issues/36)) - the existing caveat
+described the symptom but never cited the issue, and the status table now states
+it as a row rather than a footnote. And a new `## Lifecycle and cost` section:
+**a terminal session is not a stopped bill.** Both live sandboxes were still
+`Running` after their sessions reached terminal state; `cancel` leaves them up so
+logs stay readable, teardown is `terminate`'s job, and no MAF surface performs
+it. That was in the S3 evidence and in nobody's documentation.
+
+**ADR 0002 - `docs/adr/0002-squad-on-aca-as-a-maf-agent.md`**, matching the
+0001 house format (status/date/deciders/context header, the "historical record"
+callout, Context / Decision / Consequences / Open questions / Evidence). Records:
+Option B taken and Option A deferred; *why* A is deferred (the documented
+`SquadAgent` sets `OnPermissionRequest = PermissionHandler.ApproveAll`, a blanket
+allow and exactly what `--yolo` did before #26 removed it, with no permission
+seam on `SquadAgentOptions` because `ConfigureCopilotClient` reaches
+`CopilotClientOptions`, not `SessionConfig` - the `CliArgs` escape is plausible
+and unverified, and the acceptance test is behavioural, not an argument); a
+correction that `Microsoft.Agents.AI` was assumed preview and is GA at 1.16.0,
+with the quarantine kept anyway because a stable package is not a frozen one and
+`ContinuationToken` is still `[Experimental("MEAI001")]`; eight binding
+consequences; and the four upstream questions from #33.
+
+**Stale claims found and fixed.**
+
+- `README.md` - `.\scripts\validate.ps1` documented as **285** offline checks; it
+  is **307**. The `-RunDotnet` comment said "also build the optional aspire
+  scaffold", but that switch turns a missing SDK into a failure rather than a
+  skip - the build and tests already run whenever an SDK is present.
+- `README.md` - "Agent Framework exposes the Squad session as an agent
+  abstraction (a compile-safe seam; **preview packages are not referenced by
+  default**)". Both halves untrue: it is a shipped adapter, and the package is
+  GA and referenced.
+- `README.md` - "the `aspire/` **scaffold**" in the prerequisites.
+- `aspire/README.md` - predates all of S1-S3. Its layer table gave
+  `Squad.Aca.Agents` the "Agent Framework" role and said "no preview dep";
+  split into an **Agent contract** row and an **Agent Framework** row naming
+  `Squad.Aca.Agents.MAF`. Its diagram annotated the `AIAgent` as "(sprint 2,
+  isolated, **may take a preview dependency**)". Two more forward-looking
+  references to "the sprint-2 adapter" and one to "a preview restore failure".
+  And "the project and `AppHost.cs` remain valid, reviewable **scaffolding**",
+  which is no longer what is in that directory. Its `## Package references`
+  section was already correct about GA and was left alone.
+- `docs/architecture.md` - "a Microsoft Agent Framework `AIAgent` adapter - which
+  does take **a preview dependency**". Also the `When to use which` table sent
+  "Expose a Squad session as an Agent Framework agent" to `Squad.Aca.Agents` and
+  `agent-contract.md`, which is the wrong project and the wrong page: that is
+  `Squad.Aca.Agents.MAF` / `maf-adapter.md`. And the layer table's agent row did
+  not mention the MAF project at all.
+- `docs/validation.md` - the `.NET scaffold` check row said it "keeps the agent
+  contract free of the preview dependency that is **sprint 2's isolated
+  problem**"; sprint 2 shipped. The `## Optional .NET/Aspire scaffold
+  validation` section still allowed for "preview packages are unavailable" and
+  called the projects "reviewable scaffolding", and described only
+  `Squad.Aca.Agents.Tests` - `Squad.Aca.Agents.MAF.Tests` is equally offline and
+  was unmentioned.
+- `docs/rollback.md` section 1 - scoped to "the .NET/Aspire **AppHost**" while
+  its `git checkout -- aspire/` reverts two shipped libraries, an adapter, three
+  test projects, and a sample. Named what is actually in scope and dropped
+  "scaffold".
+
+**Checked and deliberately not changed.**
+
+- `docs/feature-parity.md` - re-read in full. Nothing in it is untrue after
+  S1-S3: it makes no claim about the .NET path, and the `## Capability-aware
+  execution` and `## ACA Sandboxes execution plane` sections corrected in #31 are
+  still accurate. I did not add an agent section. The sandbox precedent would
+  have justified one, but the brief was to fix what is wrong, not to pad, and
+  nothing here is wrong.
+- `docs/e2e-results.md:55` says `=== .NET/Aspire scaffold ===`. That is a
+  verbatim capture of what `scripts/validate.ps1` prints (`Write-Section
+  ".NET/Aspire scaffold"`, line 217). Editing a recorded console transcript to
+  match today's vocabulary would falsify the evidence; the script is code and
+  this sprint changes none.
+- `docs/runbook.md`, `docs/architecture.md`, `docs/sandboxes.md` beyond outright
+  errors, per the sprint constraints. The architecture fixes above are all
+  factual corrections, not rewrites.
+- README's "739 assertions" and "22 golden captures" for the human-output
+  goldens: both still correct. There are 26 golden files, but `23`-`26` pin the
+  JSON documents, so "22" is right wherever the human output is what is being
+  described - I briefly "corrected" it in `aspire/README.md` and reverted, since
+  that sentence is about the human-readable output.
+
+**Links.** Every relative link and anchor verified by generating GitHub heading
+slugs from the target files, not by eye - the technique that caught a broken
+anchor in #31. **108 relative links across 15 files, all resolve.** The checker
+was mutation-tested first (a fabricated `docs/nope.md` and a fabricated
+`maf-adapter.md#no-such-heading` were both reported) so that "all resolve" means
+something; it skips fenced code blocks when harvesting headings, and was deleted
+afterwards.
+
+New or changed targets: from `README.md` - `docs/maf-adapter.md`,
+`docs/agent-contract.md`, `docs/adr/0002-squad-on-aca-as-a-maf-agent.md`, and the
+in-page `#agent-integration-microsoft-agent-framework`. From
+`docs/maf-adapter.md` - `agent-contract.md`,
+`adr/0002-squad-on-aca-as-a-maf-agent.md`, `e2e-results.md`,
+`runbook.md#concurrency-cost-and-orphans`, and the in-page
+`#the-long-run-problem` and `#lifecycle-and-cost`. From `docs/agent-contract.md`
+- `maf-adapter.md`. From `docs/architecture.md` - `maf-adapter.md` twice, one of
+which replaced a link to `agent-contract.md` that pointed at the wrong layer.
+From the new ADR - `../maf-adapter.md`, `../agent-contract.md`,
+`../e2e-results.md`. No inbound anchor anywhere in the repo pointed into
+`maf-adapter.md` or `agent-contract.md`, so retitling and reordering broke
+nothing; the one heading I renamed
+(`## Optional .NET/Aspire scaffold validation` -> `## Optional .NET/Aspire
+validation`) was confirmed to have zero inbound references before renaming.
+
+**Evidence.** Documentation only - no code, test, config, or CI file changed.
+`scripts/validate.ps1`: **307 passed / 0 failed / 0 skipped**, identical to the
+baseline captured before any edit. No secrets, tokens, or real
+subscription/tenant GUIDs; the README quickstart uses the existing
+`<github-owner>/<repo>` placeholder style.
