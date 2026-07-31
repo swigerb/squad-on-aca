@@ -1426,3 +1426,18 @@ measured TTL of exactly 3600 seconds, so it is not.
 - **The lease store WRITES to the repository**, so a dispatcher needs
   `contents: write`. With `contents: read` the claim fails 403 immediately
   after a successful Azure login, which reads like an Azure fault and is not.
+
+## Issue #32 - ACA --env-vars REPLACES the container environment
+
+- Passing only per-execution overrides drops every secret-backed variable in the
+  job template. The session pulls the image, clones the repo, and dies with
+  `Error: No authentication information found` - which reads like a Copilot
+  problem and is a dispatch problem.
+- The failure is LATE and misattributed. Everything up to the clone succeeds.
+- Ralph already solved this with `ralph_build_session_env` (merges values and
+  `secretref:` entries, 54 assertions). Reusing it beat writing a second
+  merger that would drift. Reading the existing dispatcher first has now caught
+  three separate traps in this sprint.
+- A live green workflow proved the TRIGGER, not the SESSION. Confirming the ACA
+  execution exists is necessary but still not sufficient; its exit status is the
+  next assertion, and it was Failed.
