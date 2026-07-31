@@ -119,15 +119,27 @@ jobs:
 
           claim="$(printf '%s' "$decision" | node worker/lib/squad-dispatch.js claim --repository "${GITHUB_REPOSITORY}")"
           echo "$claim" | jq -c '.'
-          claimed="$(printf '%s' "$claim" | jq -r '.claimed // false')"
-          echo "claimed=${claimed}" >>"$GITHUB_OUTPUT"
+
+          # The claim response carries an `outcome`, NOT a `claimed` boolean.
+          # Testing a field that does not exist yields "false" on every run,
+          # skips the start step, and reports the whole workflow green having
+          # dispatched nothing -- which is exactly what happened on the first
+          # live run. The vocabulary is mapped in a tested module rather than in
+          # a jq expression no test can reach.
+          outcome="$(printf '%s' "$claim" | jq -r '.outcome // ""')"
+          verdict="$(node worker/lib/actions-event.js --claim-outcome "$outcome")"
+          echo "claim outcome '${outcome}' -> ${verdict}"
+          action="$(printf '%s' "$verdict" | jq -r '.action')"
+
+          echo "action=${action}" >>"$GITHUB_OUTPUT"
           echo "leaseKey=$(printf '%s' "$decision" | jq -r '.leaseKey')" >>"$GITHUB_OUTPUT"
-          if [ "$claimed" != "true" ]; then
-            echo "Another dispatcher already holds this lease. Standing down -- this is correct behaviour, not a failure."
+
+          if [ "$action" = "stand-down" ]; then
+            echo "Standing down: $(printf '%s' "$verdict" | jq -r '.reason'). This is correct behaviour, not a failure."
           fi
 
       - name: Start the ACA session job
-        if: steps.lease.outputs.claimed == 'true'
+        if: steps.lease.outputs.action == 'start'
         id: start
         env:
           SESSION: ${{ needs.resolve.outputs.session }}
@@ -183,7 +195,7 @@ jobs:
           echo "The control plane is now Azure. This workflow's job is done."
 
       - name: Mark the issue as dispatched
-        if: steps.lease.outputs.claimed == 'true' && steps.start.outputs.exec != ''
+        if: steps.lease.outputs.action == 'start' && steps.start.outputs.exec != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE: ${{ needs.resolve.outputs.issue }}
@@ -199,3 +211,19 @@ jobs:
             gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "$DISPATCH_LABEL" \
               || echo "Could not apply ${DISPATCH_LABEL}; Ralph may re-dispatch this issue."
           fi
+      - name: A claimed lease MUST have produced an execution
+        if: steps.lease.outputs.action == 'start'
+        env:
+          EXEC: ${{ steps.start.outputs.exec }}
+        run: |
+          set -euo pipefail
+          # The last line of defence against the failure this workflow already
+          # shipped once: a run that claims a lease, starts nothing, and reports
+          # green. If the lease said START, an execution name must exist. This
+          # step turns "quietly did nothing" into a red X.
+          if [ -z "${EXEC}" ]; then
+            echo "The lease was claimed for this issue but NO ACA execution was started."
+            echo "The lease is now held by a session that does not exist, so the issue is blocked until it is swept."
+            exit 1
+          fi
+          echo "Confirmed: ACA execution ${EXEC} is running the work."

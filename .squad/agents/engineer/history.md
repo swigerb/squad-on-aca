@@ -1405,3 +1405,24 @@ measured TTL of exactly 3600 seconds, so it is not.
 - **The federated path was written but never run.** Zero repository secrets,
   zero workflow runs, zero federated credentials. A workflow file is not
   evidence; a green run is.
+
+## Issue #32 - the green run that did nothing
+
+- **A workflow gated on a field that does not exist reports SUCCESS forever.**
+  The claim response carries `outcome`; the workflow tested `.claimed`.
+  `jq -r '.claimed // false'` yields "false" for a missing field, so the start
+  step was skipped by its own `if:` and the run went green having dispatched
+  nothing - while HOLDING a lease for a session that never existed.
+- **It survived a live end-to-end test.** Every printed line was correct: the
+  event resolved, OIDC succeeded, the lease was really created. Only the absence
+  of a new ACA execution exposed it. "The workflow passed" is not evidence that
+  the workflow did anything.
+- **jq in YAML is logic no test can reach**, exactly like the push logic in
+  entrypoint.sh. The lease vocabulary now lives in a tested module.
+- **A default of "do nothing" is how this class of defect hides.** An
+  unrecognised outcome must be an ERROR, not a polite stand-down.
+- **Assert the effect, not just the decision.** The run now fails if the lease
+  said start and no execution name exists.
+- **The lease store WRITES to the repository**, so a dispatcher needs
+  `contents: write`. With `contents: read` the claim fails 403 immediately
+  after a successful Azure login, which reads like an Azure fault and is not.

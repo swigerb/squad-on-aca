@@ -207,6 +207,50 @@ function buildSessionName(kind, issueNumber, payload) {
   return parts.filter(Boolean).join('-').slice(0, 60).replace(/-$/, '');
 }
 
+/**
+ * Map a lease-claim OUTCOME onto what the trigger should do next.
+ *
+ * This exists because the workflow originally tested `.claimed`, a field the
+ * claim response has never had. `jq '.claimed // false'` therefore evaluated to
+ * "false" on every run, the start step was skipped by its `if:`, and the
+ * workflow reported SUCCESS having dispatched nothing. A green run that did
+ * nothing is the worst possible failure mode, and it survived a live end-to-end
+ * test because everything it printed looked right.
+ *
+ * Putting the mapping here rather than in YAML is the point: a `jq` expression
+ * inside a workflow is reachable by no test, exactly like the push logic that
+ * had to be lifted out of entrypoint.sh in sprint 1.
+ *
+ * The real outcomes come from dispatch-lease.js:
+ *   created         a new lease was written        -> START
+ *   repaired        a crashed lease was reclaimed  -> START
+ *   active          someone else holds it          -> STAND DOWN (not an error)
+ *   already-terminal the work is finished          -> STAND DOWN
+ *   refused         routing could not be resolved  -> ERROR
+ *   gone            the lease vanished             -> ERROR
+ *
+ * @returns {{action: 'start'|'stand-down'|'error', reason: string}}
+ */
+function classifyClaim(outcome) {
+  switch (String(outcome || '')) {
+    case 'created':
+      return { action: 'start', reason: 'lease-created' };
+    case 'repaired':
+      return { action: 'start', reason: 'lease-repaired' };
+    case 'active':
+      return { action: 'stand-down', reason: 'another-dispatcher-holds-the-lease' };
+    case 'already-terminal':
+      return { action: 'stand-down', reason: 'work-already-finished' };
+    case 'refused':
+      return { action: 'error', reason: 'routing-refused' };
+    default:
+      // An UNRECOGNISED outcome is an error, never a silent stand-down. A
+      // default of "do nothing" is how the original defect stayed invisible:
+      // the unknown case looked exactly like a polite decision not to run.
+      return { action: 'error', reason: 'unrecognised-claim-outcome' };
+  }
+}
+
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -221,6 +265,16 @@ function parseArgs(argv) {
 
 function main(argv) {
   const args = parseArgs(argv);
+
+  // `--claim-outcome` is a separate verb so the workflow never has to encode
+  // the lease vocabulary in a jq expression again. Exit 75 (EX_TEMPFAIL) on an
+  // error verdict so the workflow step fails rather than continuing quietly.
+  if (args.claimOutcome !== undefined) {
+    const c = classifyClaim(args.claimOutcome);
+    process.stdout.write(JSON.stringify(c) + '\n');
+    return c.action === 'error' ? 75 : 0;
+  }
+
   if (!args.eventPath) {
     process.stderr.write('actions-event: --event-path is required\n');
     return 64;
@@ -249,6 +303,7 @@ if (require.main === module) {
 
 module.exports = {
   resolveEvent,
+  classifyClaim,
   extractCommand,
   sanitizeName,
   buildSessionName,
