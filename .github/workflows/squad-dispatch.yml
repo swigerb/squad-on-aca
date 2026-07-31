@@ -180,6 +180,21 @@ jobs:
             prompt="Work GitHub issue #${ISSUE} in ${GITHUB_REPOSITORY}. Read the issue, implement it, and open a pull request."
           fi
 
+          # Attribution has to reach the AGENT, not just the worker.
+          #
+          # OV_COMMIT_MESSAGE below only applies when the WORKER commits leftover
+          # changes in commit_and_push_if_needed. Measured on a live run: the
+          # agent committed its own work and opened its own pull request, so the
+          # worker's message -- and its Co-authored-by trailer -- was never used.
+          # Telling the agent who asked is the only lever that survives the agent
+          # doing the whole job itself.
+          if [ -n "${REQUESTER}" ]; then
+            prompt="$(printf '%s\n\n%s\n%s' \
+              "${prompt}" \
+              "This work was requested by @${REQUESTER} on issue #${ISSUE}." \
+              "Add the trailer 'Co-authored-by: ${REQUESTER} <${REQUESTER}@users.noreply.github.com>' to every commit you make, and mention who asked in the pull request body.")"
+          fi
+
           # `--env-vars` REPLACES the container's environment; it does not merge.
           # Passing only the overrides silently drops every secret-backed
           # variable in the template -- GITHUB_TOKEN and COPILOT_GITHUB_TOKEN
