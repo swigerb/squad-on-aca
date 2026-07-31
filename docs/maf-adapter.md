@@ -22,7 +22,7 @@ the run-by-run evidence is in [`docs/e2e-results.md`](e2e-results.md).
 | Dispatch to an approved sandbox class | **Verified** — `sandbox-python-3-12`, `Succeeded` in 43.8 s |
 | `fail-closed` reaches the caller with its reason intact | **Verified** — exit 3, nothing started |
 | Cancellation stops the session — **ACA Jobs** | **Verified** — Azure independently reported `Stopped` |
-| Cancellation stops the session — **sandbox** | **Broken.** The stop reports success and the worker keeps running: [#36](https://github.com/swigerb/squad-on-aca/issues/36) |
+| Cancellation stops the session — **sandbox** | **Verified** — the worker and its children were confirmed gone inside the guest 11 ms after the cancel, markers `cancelled`/`143` ([#36](https://github.com/swigerb/squad-on-aca/issues/36) fixed) |
 | Long-run default | `RunToCompletion`. `DispatchOnly` is opt-in — see [The long-run problem](#the-long-run-problem) |
 | `executionHandle` on a fresh ACA Job dispatch | **`null`**, by design. `statusPollRef` carries the session id instead |
 | `fallbackReason` | Non-`null` **only** when the route deviated from what was asked for |
@@ -233,18 +233,22 @@ the diagnostic sink.
 
 A cancelled *dispatch* stops nothing, because there is no handle yet.
 
-> **Live caveat — the sandbox plane does not honour this yet
-> ([#36](https://github.com/swigerb/squad-on-aca/issues/36)).** Verified against
-> real Azure on 2026-07-31: on the **ACA Jobs** plane a cancelled MAF call really
-> does stop the session (`az containerapp job execution list` independently
-> reported `Stopped`). On the **sandbox** plane the control plane reports a
-> successful cancel while the worker keeps running — `procps` is absent from the
-> pinned class image, so the provider's `pkill` exits 127 into a discarded
-> stderr and the surrounding command still exits 0. The adapter's half of the
-> contract is correct; the layer beneath it is not. Evidence and root cause:
-> [`docs/e2e-results.md` S3-5](e2e-results.md). Until #36 is fixed, treat a
-> successful cancel on the sandbox plane as unproven and confirm the session
-> yourself.
+> **Live status — both planes honour this
+> ([#36](https://github.com/swigerb/squad-on-aca/issues/36) is fixed).** Verified
+> against real Azure on 2026-07-31: on the **ACA Jobs** plane a cancelled MAF call
+> really does stop the session (`az containerapp job execution list` independently
+> reported `Stopped`). The **sandbox** plane used to report a successful cancel
+> while the worker kept running — `procps` is absent from the pinned class image,
+> so the provider's `pkill` exited 127 into a discarded stderr and the surrounding
+> command still exited 0. That command has been replaced: the launch records the
+> worker's own pid, the cancel signals the whole process group with the `kill`
+> **builtin** (no `procps`), confirms death by scanning `/proc`, writes the
+> `cancelled`/`143` markers only afterwards, and reports a machine-readable
+> `squad-cancel-status=<token>` that the provider believes in preference to the
+> exit code. Re-verified live on 2026-08-04: worker and child confirmed gone
+> inside the guest, `phase=cancelled`, `exit-code=143`, unchanged 20 s later.
+> Evidence: [`docs/e2e-results.md` S3-5](e2e-results.md). A cancel that cannot
+> prove the worker stopped now **fails** rather than reporting success.
 
 ## Lifecycle and cost
 
@@ -252,7 +256,8 @@ A **terminal session is not a stopped bill.** Both live sandboxes were still
 `Running` after their sessions reached a terminal state, and that is deliberate:
 `cancel` leaves the sandbox up so its logs stay readable. Teardown is a separate
 operation — `terminate` — and it goes through the ACA control plane rather than
-through a shell inside the guest, so it is unaffected by #36.
+through a shell inside the guest, which is also the escape hatch when a cancel
+reports that it could not confirm the worker stopped.
 
 Nothing in the MAF surface tears a sandbox down. `RunAsync` returning
 `Succeeded`, a cancellation, and a `SquadAgentRunTimeoutException` all leave the

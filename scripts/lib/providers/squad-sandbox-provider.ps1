@@ -98,6 +98,41 @@ $script:SandboxStateDir = "/tmp/squad-session"
 # Entry point of the squad-worker image. The unmodified image boots as a sandbox.
 $script:SandboxWorkerEntrypoint = "/usr/local/bin/squad-on-aca"
 
+# The launch wrapper records its OWN pid here, as its first act, so a later
+# cancel has something to signal that does not depend on `pkill`/`pgrep`/`ps`.
+# None of those three is in the pinned class image (issue #36), and the version
+# that assumed otherwise reported a successful cancel while the worker ran on
+# for another 51 seconds and then overwrote the cancellation markers.
+#
+# `$$` inside `bash -c` is the wrapper's own pid, and the launch runs it under
+# `setsid`, which makes it a SESSION LEADER -- so its process group id equals
+# that pid and one `kill -TERM -<pid>` reaches the wrapper, the entrypoint and
+# every Copilot child in one call. `kill` is a bash BUILTIN, so it needs no
+# package at all. `$!` from the parent is deliberately NOT used: setsid(1) forks
+# only when it is already a process-group leader, so `$!` is not reliably the
+# process that ends up running the worker.
+$script:SandboxWorkerPidFileName = "worker.pid"
+
+# Cancel escalation budget, in whole seconds. TERM first, then KILL, each
+# followed by a bounded verification wait. `sleep` takes integers everywhere, and
+# the total (plus the signal round-trips) must stay far inside the ~120s `aca
+# sandbox exec` client timeout or the cancel becomes transport-inconclusive and
+# tells the caller nothing.
+$script:SandboxCancelTermGraceSeconds = 10
+$script:SandboxCancelKillGraceSeconds = 5
+
+# The machine-readable outcomes the remote cancel script emits as
+# `squad-cancel-status=<token>`. THE point of the token: the shell chain that
+# shipped before ended in `echo`, so its exit status could not be non-zero and
+# the provider could not tell a kill from a missing binary. A cancel is now
+# believed ONLY when the sandbox itself says which of these happened, and the
+# absence of a token is a failure rather than a pass.
+$script:SandboxCancelSuccessStatuses = @(
+    "killed",           # the process group was signalled and is confirmed gone
+    "already-dead",     # the recorded pid was not running; nothing to signal
+    "already-terminal"  # the session had already finished; markers left alone
+)
+
 # Auto-suspend defaults to ENABLED at 600s. That is short enough to suspend a
 # real session between polls, so it is always set explicitly and the poll
 # interval is kept well under it.
@@ -1844,16 +1879,21 @@ function New-SandboxLaunchCommand {
 
         The wrapper records terminal state so a poll never has to infer it:
 
+          pid recorded to <state>/worker.pid (FIRST, before anything else)
           worker runs (its own run includes the git push)
             -> exit code written to <state>/exit-code
             -> phase written
+            -> pid file removed
             -> completion marker touched LAST
 
-        Order matters twice. The push happens inside the worker's own run, so it
-        is complete before the marker exists -- a caller that waits for terminal
-        status has its results in GitHub already (invariant 9). And the marker is
-        touched after the exit code is written, so "marker present" can never be
-        read as terminal while the exit code is still missing.
+        Order matters three times. The push happens inside the worker's own run,
+        so it is complete before the marker exists -- a caller that waits for
+        terminal status has its results in GitHub already (invariant 9). The
+        marker is touched after the exit code is written, so "marker present" can
+        never be read as terminal while the exit code is still missing. And the
+        pid file is written before the worker starts and removed after it stops,
+        so `cancel` has a signal target for exactly the interval in which there
+        is something to signal (issue #36).
     #>
     param(
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Environment,
@@ -1880,18 +1920,237 @@ function New-SandboxLaunchCommand {
     $creds = "$StateDir/$($script:SandboxCredentialFileName)"
     $loadCreds = "if [ -f $creds ]; then . $creds; rm -f $creds; fi; "
 
-    $inner = $loadCreds + "env " + ($assignments -join " ") + " $Entrypoint >> $StateDir/session.log 2>&1; " +
+    # FIRST act of the detached wrapper: record its own pid. `$$` is the pid of
+    # the `bash -c` that setsid made a session leader, so it is also the process
+    # GROUP id -- one signal to `-<pid>` reaches the entrypoint and every child
+    # it spawns. Written before the credential load so the window in which a
+    # cancel can find no pid file is as small as the fork itself.
+    #
+    # It is REMOVED on a normal exit, before the completion marker is touched.
+    # That is what keeps a stale pid from being signalled after the operating
+    # system has recycled it: a pid file that outlives its run only exists when
+    # the wrapper was killed or crashed, and cancel additionally proves the pid
+    # is still ours before signalling anything.
+    $pidFile = "$StateDir/$($script:SandboxWorkerPidFileName)"
+    $recordPid = 'printf %s $$ > ' + $pidFile + '; '
+
+    $inner = $recordPid + $loadCreds + "env " + ($assignments -join " ") + " $Entrypoint >> $StateDir/session.log 2>&1; " +
              "printf %s `$? > $StateDir/exit-code; " +
              "printf %s done > $StateDir/phase; " +
+             "rm -f $pidFile; " +
              "touch $StateDir/done"
 
-    $prelude = "mkdir -p $StateDir && rm -f $StateDir/done $StateDir/exit-code && printf %s starting > $StateDir/phase"
+    $prelude = "mkdir -p $StateDir && rm -f $StateDir/done $StateDir/exit-code $pidFile && printf %s starting > $StateDir/phase"
     # `{ ... & }`: the `&` terminates a list containing only the redirected
     # `setsid`, so exactly that command is backgrounded with its fds on
     # /dev/null. The group returns 0 immediately, keeping the `&&` chain intact.
     $detach = "{ setsid nohup bash -c $(ConvertTo-SandboxShellSingleQuoted $inner) </dev/null >/dev/null 2>&1 & }"
 
     return "$prelude && $detach && printf %s running > $StateDir/phase && echo squad-launched"
+}
+
+function New-SandboxCancelCommand {
+    <#
+    .SYNOPSIS
+        Build the remote command `cancel` runs: stop the worker WITHOUT procps,
+        prove it stopped, and say which of those two happened.
+
+    .DESCRIPTION
+        Replaces the Sprint 5 shape, which was
+
+            pkill -f <entrypoint> >/dev/null 2>&1; rm -f <creds>; \
+            printf %s 143 > exit-code; printf %s cancelled > phase; \
+            touch done; echo squad-cancelled
+
+        and which could not fail (issue #36). `procps` is not in the pinned class
+        image, so `pkill` exited 127; `>/dev/null 2>&1` destroyed the only
+        evidence of that; and a `;`-chain reports the status of its LAST
+        statement, which was an `echo`. The provider read exit 0, returned
+        Cancelled = $true, and the worker ran on for another 51 seconds before
+        overwriting `cancelled`/`143` with its own `done`/`0`.
+
+        Four properties are designed in, and each one is behaviourally tested by
+        scripts/tests/verify-sandbox-cancel.ps1 -- which EVALUATES this string in
+        a real shell against real processes, because the whole defect is that a
+        substring assertion cannot tell the characters of a kill from a kill.
+
+        1. NO EXTERNAL PROCESS TOOLS. `kill` is a bash BUILTIN, so it needs no
+           package; `pkill`, `pgrep` and `ps` are all absent from the image and
+           none of them is used. Liveness and identity come from `/proc`, read
+           with bash builtins. The only external binaries are `rm` and `sleep`,
+           both of which the shipped image demonstrably has.
+
+        2. THE WHOLE PROCESS GROUP, not one process. The launch runs the wrapper
+           under `setsid`, which makes it a session leader, so its pgid equals
+           the pid it recorded -- one `kill -TERM -<pid>` reaches the wrapper,
+           the entrypoint and every Copilot child. A single-process kill would
+           leave the children running and still billing. `kill -TERM <pid>` is
+           kept only as a fallback for the case where the group signal is
+           rejected.
+
+        3. VERIFIED DEATH, THEN ESCALATION. TERM, then up to -TermGraceSeconds
+           of checking, then KILL, then up to -KillGraceSeconds more. "Gone"
+           means no NON-ZOMBIE process anywhere in that process group -- a
+           reaped-but-unwaited leader would otherwise read as alive forever, and
+           a surviving child would otherwise read as dead.
+
+        4. MARKERS ONLY AFTER CONFIRMED DEATH. `exit-code`, `phase` and the
+           completion marker are written ONLY on `killed` or `already-dead`, and
+           in that order (marker last, as everywhere else in this provider). That
+           is what closes the race the live run lost: the worker cannot overwrite
+           `cancelled` with `done` because by the time anything is written the
+           worker no longer exists.
+
+        Everything else is a FAILURE and says so, both on stdout
+        (`squad-cancel-status=<token>`) and in the exit status:
+
+          no-pidfile    nothing recorded a pid -- a sandbox launched by the old
+                        code, or a cancel that raced the fork. Reporting success
+                        here would be the original lie in a new place.
+          bad-pidfile   the recorded pid is not a plain integer >= 2. pid 1 and
+                        pid 0 are refused explicitly: `kill -TERM -1` means EVERY
+                        process the user may signal, and `kill -TERM -0` means
+                        our own process group.
+          not-ours      the pid is live but /proc says it is not running this
+                        worker. The operating system recycles pids; signalling a
+                        whole GROUP on a recycled one is how a cancel turns into
+                        an unrelated outage.
+          kill-failed   the signal itself was rejected.
+          survived      still alive after TERM and KILL.
+          no-proc       /proc is unreadable, so nothing here can be verified.
+          scan-failed   the process scan read NOT ONE /proc entry. That is not
+                        "nothing is running" -- it is "this shell cannot see what
+                        is running", and the two must never be confused. The live
+                        run of #36's first fix confused them: `aca sandbox exec`
+                        runs the command under dash, where `$(< file)` expands to
+                        the empty string instead of the file, so the scan saw no
+                        processes at all and called a live worker already-dead.
+                        The scan therefore COUNTS what it read and refuses to
+                        report a negative it could not have observed.
+
+        The command is strict POSIX sh, because dash is what actually runs it:
+        no `$(< file)`, no `read -d`, no `[[`, no arrays, no `local`. `read`,
+        `case` and `kill` are all shell builtins, so the only external commands
+        are `rm`, `sleep` and `tr` -- and a missing `tr` degrades to `not-ours`,
+        which is a refusal, not a false success.
+
+        The status token, not the exit status, is what the provider believes.
+        `aca sandbox exec` reports on the TRANSPORT (this file's header), so a
+        remote exit code is not a trustworthy channel for a remote verdict --
+        and a missing token is treated as a failed cancel, so a shell that dies
+        early, an image that cannot run the script at all, or a future edit that
+        drops the emission cannot come back as success.
+
+        Deliberately free of double quotes, `!` and `^`, for the same reason
+        New-SandboxPollCommand is: the command must survive PowerShell native
+        argument quoting, cmd.exe's parser and delayed expansion in the offline
+        stub, and the remote shell, so that the argv under test is the argv that
+        ships.
+    #>
+    param(
+        [string]$StateDir = $script:SandboxStateDir,
+        [string]$Entrypoint = $script:SandboxWorkerEntrypoint,
+        [int]$TermGraceSeconds = $script:SandboxCancelTermGraceSeconds,
+        [int]$KillGraceSeconds = $script:SandboxCancelKillGraceSeconds
+    )
+
+    $pidFile = "$StateDir/$($script:SandboxWorkerPidFileName)"
+    $credFile = "$StateDir/$($script:SandboxCredentialFileName)"
+
+    # sqown: is $1 running THIS worker? /proc/<pid>/cmdline is NUL-separated, so
+    # the NULs are turned into spaces by `tr` before the match. If `tr` is absent
+    # the substitution is empty, nothing matches, and the answer is "not ours" --
+    # a refusal, never a false success.
+    $fnOwn = 'sqown() { own=no; case x$(tr ' + "'" + '\0' + "'" + ' ' + "' '" + ' 2>/dev/null < /proc/$1/cmdline) in *' + $Entrypoint + '*) own=yes ;; esac; [ $own = yes ]; }; '
+
+    # sqalive: 0 = a non-zombie process is still in process group $1, 1 = none is,
+    # 2 = THE SCAN ITSELF SAW NOTHING and so cannot answer. /proc/<pid>/stat is
+    # `pid (comm) state ppid pgrp ...`; comm can contain spaces and parentheses,
+    # so the fields are taken after the LAST `)`. A `kill -0` on the leader alone
+    # would miss a surviving child, and would count an unreaped zombie leader as
+    # alive for ever. The read is the `read` BUILTIN: `$(< file)` is a bashism
+    # and expands to nothing under dash, which is the shell that actually runs
+    # this -- and "nothing" would have read as "the worker is gone".
+    $fnAlive = 'sqalive() { g=$1; c=0; for d in /proc/[0-9]*; do s=; read -r s 2>/dev/null < $d/stat || continue; case x$s in x) continue ;; esac; c=$((c+1)); r=${s##*' + "')'" + '}; r=${r# }; t=${r%% *}; case x$t in xZ) continue ;; esac; r=${r#* }; r=${r#* }; if [ x${r%% *} = x$g ]; then return 0; fi; done; if [ $c = 0 ]; then return 2; fi; return 1; }; '
+
+    $waitTerm = 'n=0; while [ $n -lt ' + $TermGraceSeconds + ' ]; do sqalive $p || break; sleep 1; n=$((n+1)); done; '
+    $waitKill = 'n=0; while [ $n -lt ' + $KillGraceSeconds + ' ]; do sqalive $p || break; sleep 1; n=$((n+1)); done; '
+
+    $body =
+        # The brokered credential goes FIRST and unconditionally: a cancel we
+        # could not confirm is exactly when a live token matters most.
+        "rm -f $credFile; " +
+        $fnOwn + $fnAlive +
+        'st=unknown; p=0; k=0; n=0; a=0; c=0; own=no; sv=; ' +
+        # Self-test before anything is believed: read OUR OWN stat with the same
+        # builtin the scan uses. If that comes back empty this shell cannot read
+        # /proc, and every later "not found" would be meaningless.
+        'read -r sv 2>/dev/null < /proc/self/stat; ' +
+        'case x$sv in *[0-9]*) : ;; *) st=no-proc ;; esac; ' +
+        'if [ $st = unknown ]; then ' +
+        "if [ -f $StateDir/done ]; then st=already-terminal; " +
+        "else if [ -s $pidFile ]; then read -r p 2>/dev/null < $pidFile; " +
+        'if [ $p -ge 2 ] 2>/dev/null; then ' +
+        'sqalive $p; a=$?; ' +
+        'if [ $a = 2 ]; then st=scan-failed; ' +
+        'elif [ $a = 0 ]; then ' +
+        'if sqown $p; then ' +
+        'kill -TERM -$p 2>/dev/null && k=1; if [ $k = 0 ]; then kill -TERM $p 2>/dev/null && k=1; fi; ' +
+        'if [ $k = 0 ]; then st=kill-failed; else ' +
+        $waitTerm +
+        'sqalive $p; a=$?; ' +
+        'if [ $a = 0 ]; then kill -KILL -$p 2>/dev/null || kill -KILL $p 2>/dev/null; ' + $waitKill + 'sqalive $p; a=$?; fi; ' +
+        'if [ $a = 0 ]; then st=survived; elif [ $a = 2 ]; then st=scan-failed; else st=killed; fi; ' +
+        'fi; ' +
+        'else st=not-ours; fi; ' +
+        'else st=already-dead; fi; ' +
+        'else st=bad-pidfile; fi; ' +
+        'else st=no-pidfile; fi; fi; fi; ' +
+        # Marker last, exit code first -- the same ordering rule the launch
+        # wrapper obeys, so `marker present` can never be read as terminal while
+        # the exit code is still missing.
+        'case $st in killed|already-dead) ' +
+        "printf %s 143 > $StateDir/exit-code; printf %s cancelled > $StateDir/phase; rm -f $pidFile; : > $StateDir/done ;; esac; " +
+        'case $st in killed|already-dead|already-terminal) echo squad-cancelled ;; esac; ' +
+        'echo squad-cancel-status=$st; ' +
+        'case $st in killed|already-dead|already-terminal) exit 0 ;; esac; exit 9'
+
+    return $body
+}
+
+function ConvertFrom-SandboxCancelOutput {
+    <#
+    .SYNOPSIS
+        Read the cancel script's verdict out of an exec's stdout.
+
+    .DESCRIPTION
+        Returns `Status` (the token, or "" when the sandbox emitted none),
+        `Succeeded` (was it one of the three outcomes that mean the worker is not
+        running) and `Lines` (everything EXCEPT the machine token, which is what
+        the caller echoes to the host so the visible output is unchanged).
+
+        A missing token is NOT success. That is the whole correction: the shape
+        that shipped could only ever say "cancelled", so the provider's careful
+        failure classification never had anything to classify.
+    #>
+    param([string[]]$Lines = @())
+
+    $status = ""
+    $human = @()
+    foreach ($line in @($Lines)) {
+        $text = ([string]$line).Trim()
+        if ($text -match "^squad-cancel-status=(.*)$") {
+            $status = $Matches[1].Trim()
+        } else {
+            $human += [string]$line
+        }
+    }
+
+    return [pscustomobject]@{
+        Status    = $status
+        Succeeded = ($status -and ($script:SandboxCancelSuccessStatuses -contains $status))
+        Lines     = $human
+    }
 }
 
 function New-SandboxPollCommand {
@@ -2455,19 +2714,24 @@ function New-SandboxExecutionProvider {
     # timeout says nothing about whether the worker actually stopped, and a
     # caller told "cancelled" stops looking at a session that is still running
     # and still billing. Only "the sandbox is gone" is success without a cancel.
+    #
+    # Issue #36 is the reason there is a second, EARLIER gate. All of that
+    # classification is about the CALL; none of it could ever engage, because the
+    # command being classified could not fail. The remote script now reports its
+    # own verdict as `squad-cancel-status=<token>` and that verdict is checked
+    # FIRST -- it is the only thing that knows whether the worker is still
+    # running. The classifier below is untouched and still owns every case where
+    # the sandbox said nothing at all.
     $operations["cancel"] = {
         param($Context, $Arguments)
 
         $payload = Resolve-SandboxHandlePayload -Handle $Arguments["Handle"]
         $stateDir = $Context.StateDir
-        $command = "pkill -f $($script:SandboxWorkerEntrypoint) >/dev/null 2>&1; " +
-                   "rm -f $stateDir/$($script:SandboxCredentialFileName); " +
-                   "printf %s 143 > $stateDir/exit-code; " +
-                   "printf %s cancelled > $stateDir/phase; " +
-                   "touch $stateDir/done; echo squad-cancelled"
+        $command = New-SandboxCancelCommand -StateDir $stateDir
 
         $result = Invoke-SandboxCli -Context $Context -Argv @("sandbox", "exec", "-l", "name=$($payload.name)", "-c", $command)
-        foreach ($line in @($result.StdOut)) {
+        $verdict = ConvertFrom-SandboxCancelOutput -Lines @($result.StdOut)
+        foreach ($line in @($verdict.Lines)) {
             Write-Host (Protect-SandboxText -Text ([string]$line) -Secrets $Context.Secrets)
         }
 
@@ -2488,11 +2752,43 @@ function New-SandboxExecutionProvider {
             Write-Host "[squad-aca] WARNING: $unrevoked brokered credential(s) for this session could NOT be revoked and are still live on sandbox group '$($Context.SandboxGroup)'. Revoke them by hand and treat the tokens as exposed."
         }
 
-        if ($result.ExitCode -eq 0) {
-            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $false; CredentialsUnrevoked = $unrevoked }
+        # 1. The SANDBOX's own verdict, when it gave one. It is the only source
+        #    that can distinguish "the worker is gone" from "we sent a string".
+        if ($verdict.Status) {
+            if ($verdict.Succeeded) {
+                return [pscustomobject]@{
+                    Cancelled            = $true
+                    AlreadyTerminal      = ($verdict.Status -eq "already-terminal")
+                    CancelStatus         = $verdict.Status
+                    CredentialsUnrevoked = $unrevoked
+                }
+            }
+            $reason = switch ($verdict.Status) {
+                "no-pidfile"  { "the session recorded no worker pid, so there is nothing this cancel can prove it stopped. A sandbox launched before this check existed will always report this: tear it down with 'aca sandbox delete -l name=$($payload.name) --yes', which goes through the control plane and needs no cooperation from inside the guest" }
+                "bad-pidfile" { "the recorded worker pid is not a signalable process id, and signalling a guessed process group is how a cancel becomes an unrelated outage" }
+                "not-ours"    { "the recorded pid is alive but is NOT this worker -- the operating system recycled it -- so nothing was signalled" }
+                "kill-failed" { "the kill was rejected, so the worker was never signalled" }
+                "survived"    { "the worker was still alive after SIGTERM and SIGKILL" }
+                "no-proc"     { "/proc is unreadable inside the sandbox, so neither the kill nor its result could be verified" }
+                "scan-failed" { "the process scan inside the sandbox read no /proc entry at all, so it could not tell 'nothing is running' from 'this shell cannot see what is running' -- and those two must never be confused" }
+                default       { "the sandbox reported '$($verdict.Status)'" }
+            }
+            $verdictKind = if (@("kill-failed", "survived") -contains $verdict.Status) { "execution" } else { "capability" }
+            throw (New-SandboxFailure -Kind $verdictKind -Message "Refusing to report the session in sandbox '$($payload.name)' as cancelled: $reason. The worker may still be RUNNING and still billing; verify it before treating this session as over.")
         }
+
+        # 2. No verdict at all. A cancel that produced no token told us nothing
+        #    about the worker even if the transport succeeded, so exit 0 is a
+        #    failure here rather than the success it used to be.
+        if ($result.ExitCode -eq 0) {
+            throw (New-SandboxFailure -Kind "execution" -Message "Refusing to report the session in sandbox '$($payload.name)' as cancelled: the cancel ran but the sandbox reported no outcome, so nothing proves the worker stopped. The worker may still be RUNNING and still billing. $(Get-SandboxErrorText -Result $result -Secrets $Context.Secrets)")
+        }
+
+        # 3. The call itself failed. UNCHANGED from Sprint 5: only "the sandbox
+        #    is gone" is success, and every other failure is classified by the
+        #    same deny-list-first mechanism terminate uses.
         if (Test-SandboxGone -Result $result) {
-            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $true; CredentialsUnrevoked = $unrevoked }
+            return [pscustomobject]@{ Cancelled = $true; AlreadyTerminal = $true; CancelStatus = "sandbox-gone"; CredentialsUnrevoked = $unrevoked }
         }
 
         $inconclusive = Test-SandboxTransportInconclusive -Result $result

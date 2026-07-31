@@ -682,3 +682,89 @@ auditability and buys nothing. The follow-on discipline: an exception to a
 security control must be narrower than the control, must stay inside the
 detective layer, and must be documented with its reasoning, or the next reader
 will "fix" it back.
+## Issue #36 - the sandbox cancel that could not fail
+
+**The defect.** The sandbox provider's `cancel` emitted
+`pkill -f <entrypoint> >/dev/null 2>&1; ...; echo squad-cancelled`. `procps` is
+not in the pinned class image, so `pkill` exited **127** into a discarded
+stderr, and the chain's exit status was the trailing `echo`'s - which cannot
+fail. The provider read exit 0 and returned `Cancelled = $true`. Measured live:
+the cancel landed at 12:56:02, the worker ran a further **51 seconds**,
+completed normally at 12:56:53, and **overwrote** the `cancelled`/`143` markers
+with its own `done`/`0`. Fourth instance in this programme of one defect class:
+a control that fails open and cannot detect its own failure.
+
+**The mechanism chosen.** `kill` is a shell **builtin**, so it needs no
+`procps`; `setsid` at launch makes the worker a session leader, so its pgid
+equals its pid and one `kill -TERM -<pid>` reaches the wrapper, the entrypoint
+and any Copilot child. The launch now records the worker's own pid (`printf %s
+$$` as the wrapper's first act - not `$!` from the parent, because `setsid(1)`
+forks only conditionally). The cancel reads it, refuses pids below 2, checks
+`/proc/<pid>/cmdline` still holds the entrypoint (pid-reuse guard), signals the
+group, escalates `TERM` -> `KILL` on a bounded budget, and confirms death by
+scanning `/proc` for any **non-zombie** process left in the group. The
+`cancelled`/`143` markers are written **only after** confirmed death, which is
+what closes the race that let the worker overwrite them. The script prints
+`squad-cancel-status=<token>`; the provider believes the **token**, not the exit
+code, and treats a missing token with exit 0 as a **failure**. Everything else -
+`Test-SandboxGone`, `Get-SandboxFailureClassification`, `Get-SandboxFailureKind`
+and the deny-list-first ordering - was left untouched; the Sprint 5 path still
+runs verbatim when the transport itself fails.
+
+**A pre-existing sandbox has no pid file.** It reports `no-pidfile`, a **failed**
+cancel, and the message names `aca sandbox delete -l name=<name> --yes` as the
+control-plane escape hatch. Reporting success there would have been the same lie
+in a new place.
+
+**The second defect, found only by running it for real.** The first fix passed a
+14-case behavioural probe and every gate - and then failed live, reporting
+`squad-cancel-status=already-dead` while `/proc` showed the worker and both its
+children alive. Root cause: `aca sandbox exec` runs the command under `/bin/sh`,
+which is **dash** on this image. `$(< file)` is a **bashism that expands to the
+empty string under dash** - no error, no exit code. The scan read nothing, and
+"nothing" was being read as "the worker is gone". The probe had not caught it
+because the probe ran the emitted command under **bash**. Three consequences,
+all shipped: the command is strict POSIX `sh` (checked with `dash -n` and
+`bash -n`, and statically screened for bashisms by a new `validate.ps1` section
+6e); the probe now evaluates it via `sh -c`; and the scan is **fail-closed** -
+reading not one `/proc` entry is `scan-failed`, never `already-dead`, and the
+script self-tests by reading its own `/proc/self/stat` with the same builtin
+before it believes any "not found".
+
+**Live proof.** Fresh sandbox from disk `02560016-...`. Worker pid 34 with child
+36. `squad-cancel-status=killed`; inside the guest afterwards the pid file was
+gone, `phase=cancelled`, `exit-code=143`, `CHILD_PROC=GONE`, and the process
+table held only `tini`, the image's idle `sleep` and the query's own `sh`. Still
+`cancelled`/`143` twenty seconds later. A second cancel returned
+`already-terminal` without rewriting anything. Timed inside the guest to remove
+the control-plane round trip: **11 ms** from cancel to confirmed death, against
+51 seconds of continued execution before. Both sandboxes created were deleted
+with `--yes` and the group listed afterwards: empty.
+
+**Mutation.** 14 mutations, **14 caught**. Six deserve naming. Using `pkill`
+instead of the builtin -> the probe's C1/C2 (no kill under a procps-free PATH).
+Signalling the leader instead of the group -> caught only by **elapsed time**:
+the child is a plain `sleep`, so it dies on the first TERM if and only if the
+signal went to the group; otherwise the whole 10 s grace is burned before the
+SIGKILL sweeps it up. That mutant survived the first harness run and the
+assertion was added for it. Removing the verification step -> C8 (`survived`).
+Writing the markers unconditionally -> C3/C4/C5/C8. Removing the fail-closed
+empty-scan branch -> C13. Reverting one `/proc` read to `$(< ... )` -> C1/C2
+under dash. On the PowerShell side: adding a failure token to the success
+allow-list, `Succeeded = $true`, and believing exit 0 with no verdict (the
+original #36 shape) are each caught by `validate.ps1` section 6c.
+
+**Verification.** `validate.ps1` 307 -> **315 passed / 0 failed / 0 skipped**;
+`verify-cli-golden.ps1` **26/26 byte-identical, no golden changed**;
+`verify-launch-detachment.ps1` **PASS**; new
+`scripts/tests/verify-sandbox-cancel.ps1` **PASS, 14 cases under dash**; worker
+suite **10 suites / 739 assertions**, 0 failed; .NET **114** (47 + 67);
+`Squad.Aca.Agents` still has zero package references.
+
+**Lesson recorded.** A test that substring-matches an emitted command proves the
+characters of a kill, not a kill - that is what shipped #36. But the sharper
+lesson is the second one: a behavioural test that runs the command **in the
+wrong shell** is the same failure wearing a better disguise, and it is more
+dangerous because it looks like evidence. Run the artefact you ship, in the
+interpreter production actually uses, against a real process - and when a probe
+reads nothing, make "nothing" a refusal rather than a verdict.

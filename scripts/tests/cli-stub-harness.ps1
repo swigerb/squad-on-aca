@@ -66,6 +66,12 @@
                                transport vs "already gone") is the same
                                classification terminate makes, and it has to be
                                driven independently of the launch exec's rc.
+      SQUAD_STUB_ACA_CANCEL_STATUS the `squad-cancel-status=<token>` the fake
+                               sandbox reports (default `killed`). Set it to
+                               `none` to reproduce issue #36 exactly: the class
+                               image had no `pkill`, the chain ended in an
+                               `echo`, so the exec succeeded and said only
+                               `squad-cancelled` while the worker ran on.
       SQUAD_STUB_ACA_POLL_DIR  directory holding the simulated sandbox state.
                                A poll (`sandbox exec` whose command reads the
                                state dir) reports phase/exit/marker from
@@ -579,9 +585,29 @@ echo squad-launched
 exit /b %SQUAD_STUB_ACA_EXEC_RC%
 :acacancel
 endlocal
-echo squad-cancelled
 if not "%SQUAD_STUB_ACA_CANCEL_ERR%"=="" >&2 echo %SQUAD_STUB_ACA_CANCEL_ERR%
-exit /b %SQUAD_STUB_ACA_CANCEL_RC%
+rem A non-zero rc is a TRANSPORT failure: the remote script never ran, so there
+rem is no verdict to report and the provider must fall back to its classifier.
+if not "%SQUAD_STUB_ACA_CANCEL_RC%"=="0" exit /b %SQUAD_STUB_ACA_CANCEL_RC%
+rem `none` reproduces issue #36 exactly -- the pinned image had no `pkill`, the
+rem chain ended in an `echo`, so the exec succeeded and said only
+rem `squad-cancelled` while the worker kept running and kept billing.
+if "%SQUAD_STUB_ACA_CANCEL_STATUS%"=="none" goto acacancelquiet
+if "%SQUAD_STUB_ACA_CANCEL_STATUS%"=="killed" goto acacancelok
+if "%SQUAD_STUB_ACA_CANCEL_STATUS%"=="already-dead" goto acacancelok
+if "%SQUAD_STUB_ACA_CANCEL_STATUS%"=="already-terminal" goto acacancelok
+rem Every other token is a REPORTED FAILURE, and the stub deliberately exits 0
+rem for it: the provider must believe the sandbox's verdict, not the exec's own
+rem status. That is the whole correction issue #36 asks for.
+echo squad-cancel-status=%SQUAD_STUB_ACA_CANCEL_STATUS%
+exit /b 0
+:acacancelok
+echo squad-cancelled
+echo squad-cancel-status=%SQUAD_STUB_ACA_CANCEL_STATUS%
+exit /b 0
+:acacancelquiet
+echo squad-cancelled
+exit /b 0
 :acalogs
 endlocal
 if exist "%SQUAD_STUB_ACA_POLL_DIR%\session-log.txt" type "%SQUAD_STUB_ACA_POLL_DIR%\session-log.txt"
@@ -781,7 +807,7 @@ function Invoke-SquadCliCapture {
                   "SQUAD_STUB_ACA_RC", "SQUAD_STUB_ACA_ERR",
                   "SQUAD_STUB_ACA_EXEC_RC", "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
                   "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
-                  "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
+                  "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR", "SQUAD_STUB_ACA_CANCEL_STATUS",
                   "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
                   "SQUAD_STUB_ACA_SEED_RC", "SQUAD_STUB_ACA_SEED_STDIN", "SQUAD_STUB_ACA_VAULT_MODE",
                   "SQUAD_STUB_ACA_CRED_RC", "SQUAD_STUB_ACA_CRED_ERR", "SQUAD_STUB_ACA_CRED_ID",
@@ -842,6 +868,7 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_ACA_DELETE_ERR = ""
         $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
         $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "killed"
         $env:SQUAD_STUB_ACA_POLL_DIR = ""
         $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
         $env:SQUAD_STUB_ACA_SEED_RC = "0"
