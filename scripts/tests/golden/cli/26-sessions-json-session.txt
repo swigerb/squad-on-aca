@@ -1,0 +1,38 @@
+### CASE 26-sessions-json-session: squad-aca sessions --json --session stub-session
+### EXITCODE: 0
+### AZ CALLS
+account set --subscription 00000000-0000-0000-0000-000000000000
+containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
+containerapp job execution list --name caj-squad-aca-session --resource-group rg-squad-stub --query [0:50].name -o json
+containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub01 -o json
+containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub02 -o json
+### GH CALLS
+### SQUAD CALLS
+### ACA CALLS
+### STDOUT
+{
+  "schema": "squad-aca/sessions@1",
+  "sessions": [
+    {
+      "sessionName": "stub-session",
+      "executionName": "caj-squad-aca-session-stub01",
+      "executionHandle": "sqx1.eyJ2IjoxLCJwIjoiYWNhLWpvYiIsImQiOnsiam9iIjoiY2FqLXNxdWFkLWFjYS1zZXNzaW9uIiwicmciOiJyZy1zcXVhZC1zdHViIiwiZXhlY3V0aW9uIjoiY2FqLXNxdWFkLWFjYS1zZXNzaW9uLXN0dWIwMSIsImNvbnRhaW5lciI6ImNhai1zcXVhZC1hY2Etc2Vzc2lvbiJ9fQ",
+      "executionMode": "aca-job",
+      "route": "aca-job",
+      "status": "Running",
+      "sandboxClass": null,
+      "repository": "octo/demo",
+      "branch": "squad/stub-session",
+      "mode": "prompt",
+      "source": "local-cli",
+      "startedAt": "2026-01-02T03:04:05",
+      "endedAt": null,
+      "phase": null,
+      "exitCode": null,
+      "inconclusive": null
+    }
+  ]
+}
+
+### STDERR
+

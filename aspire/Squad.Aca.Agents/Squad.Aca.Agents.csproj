@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Squad on ACA — agent contract and control-plane implementation.
+
+    ZERO PACKAGE REFERENCES, AND THAT IS THE POINT. This library is what a
+    Microsoft Agent Framework adapter builds on, but it must never be what
+    forces a preview package on anyone who only wants the contract. The MAF
+    dependency (Microsoft.Agents.AI) is quarantined in its own project in
+    Sprint 2; if a <PackageReference> ever appears here, that quarantine has
+    leaked. scripts/validate.ps1 asserts this.
+
+    TARGET FRAMEWORK — net9.0, deliberately.
+
+      * The AppHost in this solution is net9.0. A net10.0 library could not be
+        referenced from it without bumping the AppHost too, which would drag an
+        unrelated Aspire upgrade into an agent sprint.
+      * Microsoft.Agents.AI targets netstandard2.0/net8.0+, and the upstream
+        Squad.Agents.AI multi-targets net8.0/9.0/10.0 — so a net9.0 core library
+        is referenceable from the Sprint 2 adapter whichever of those it lands
+        on, with no SDK bump.
+      * The build machine has the .NET 10 SDK, which builds net9.0 fine, and the
+        9.0 runtime is installed, so `dotnet test` runs without a rollforward.
+
+    In short: net9.0 is the newest target that keeps BOTH ends of the seam free
+    — the AppHost below it and the MAF adapter above it.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RootNamespace>Squad.Aca.Agents</RootNamespace>
+  </PropertyGroup>
+
+</Project>

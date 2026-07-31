@@ -13,7 +13,7 @@ plane. This scaffold adds a separate, opt-in path that layers cleanly on top:
 | Layer | Responsibility | Where |
 | --- | --- | --- |
 | **Aspire** | Models resources (the Aspire Dashboard OTLP sink + the `squad-worker` container) as code | `Squad.Aca.AppHost` |
-| **Agent Framework** | Exposes the Squad session as an agent abstraction | `AgentAbstraction.cs` (seam only) |
+| **Agent Framework** | Exposes the Squad session as an agent abstraction | `Squad.Aca.Agents` (contract + control-plane implementation, no preview dep) |
 | **ACA** | Remains the production execution substrate | `../scripts/deploy.ps1` |
 | **Squad** | Remains the orchestration system inside the worker | `../worker` |
 
@@ -28,10 +28,56 @@ aspire/
   Squad.Aca.AppHost/
     Squad.Aca.AppHost.csproj   # Aspire AppHost project
     AppHost.cs                 # models the dashboard + optional worker container
-    AgentAbstraction.cs        # compile-safe Agent Framework seam (no preview dep)
     appsettings.json           # non-secret defaults
     appsettings.Development.json  # gitignored; put local overrides/tokens here
+  Squad.Aca.Agents/            # net9.0, ZERO package references
+    AgentAbstraction.cs        # ISquadAgent + its records (the contract)
+    AcaSquadAgent.cs           # ISquadAgent over `squad-aca --json`
+    ISquadCliInvoker.cs        # the fakeable process seam
+    SquadCliProcessInvoker.cs  # the real `pwsh -File squad-aca.ps1` runner
+    SquadCliLocator.cs         # entry-point discovery, no hardcoded paths
+    SquadAgentOptions.cs
+    SquadAgentExceptions.cs
+    SecretRedactor.cs
+  Squad.Aca.Agents.Tests/      # xunit, fully offline
 ```
+
+## `Squad.Aca.Agents` — the agent contract
+
+`ISquadAgent` is what a Microsoft Agent Framework `AIAgent` wraps:
+
+```
+MAF pipeline
+  └─ AIAgent                (sprint 2, isolated, may take a preview dependency)
+       └─ ISquadAgent       (this library, net9.0, zero package references)
+            └─ squad-aca --json  ->  ACA Job | ACA Sandbox
+```
+
+Three properties are deliberate and enforced:
+
+- **Zero package references.** `scripts/validate.ps1` fails the build if a
+  `<PackageReference>` appears in `Squad.Aca.Agents.csproj`. A preview restore
+  failure in the sprint-2 adapter must not be able to take the contract — and
+  everything that depends on it — down with it.
+- **`net9.0`.** The AppHost is `net9.0`, so a `net10.0` contract could not be
+  referenced from it without an unrelated Aspire bump; `Microsoft.Agents.AI`
+  targets `net8.0`+, so a sprint-2 adapter on `net8.0`/`9.0`/`10.0` can reference
+  this without an SDK bump either.
+- **`--json`, not output parsing.** `AcaSquadAgent` talks to the control plane
+  through `squad-aca run|status|sessions --json`. The human-readable output is
+  pinned byte-for-byte by 22 golden captures whose purpose is to catch
+  *unintended* UX changes; making it load-bearing for a machine contract would
+  turn every deliberate wording change into a breaking API change. See
+  [`../docs/agent-contract.md`](../docs/agent-contract.md).
+
+There is deliberately **no poll-to-completion** operation. Squad sessions run
+10–60 minutes and MAF's `RunAsync` is request/response; reconciling those is an
+adapter decision. `RunSessionAsync` returns an opaque handle, and
+`GetSessionStatusAsync` / `CancelSessionAsync` address that handle.
+
+A **fail-closed** route throws `SquadRouteFailedClosedException` with the
+resolver's reason preserved. A repository whose required capabilities cannot be
+met must never look like a dispatch that worked.
 
 ## Package references
 
@@ -41,9 +87,10 @@ The AppHost pins the following (already in `Squad.Aca.AppHost.csproj`):
 - `Aspire.Hosting.AppHost` `9.4.0`
 
 The Microsoft **Agent Framework** packages (`Microsoft.Agents.AI.*`) are preview
-and intentionally **not** referenced here, to keep restore stable. To adopt them,
-add e.g. `Microsoft.Agents.AI` and implement `ISquadAgent` (see
-`AgentAbstraction.cs`).
+and intentionally **not** referenced anywhere in this solution. To adopt them,
+add a **separate** project that references `Squad.Aca.Agents` and implements an
+`AIAgent` over `ISquadAgent`; do not add the package to `Squad.Aca.Agents`
+itself, which `scripts/validate.ps1` enforces.
 
 ## Prerequisites
 
@@ -58,7 +105,12 @@ add e.g. `Microsoft.Agents.AI` and implement `ISquadAgent` (see
 ```powershell
 cd aspire
 dotnet build .\Squad.Aca.sln
+dotnet test  .\Squad.Aca.sln
 ```
+
+The tests are fully offline: every one fakes `ISquadCliInvoker`, so none of them
+starts PowerShell, contacts Azure, or opens a socket. `scripts/validate.ps1` runs
+both commands automatically whenever a dotnet SDK is on PATH.
 
 If restore fails in a locked-down environment, the project and `AppHost.cs`
 remain valid, reviewable scaffolding. See

@@ -51,6 +51,20 @@ $Cases = @(
     @{ Id = "20-run-noprompt";    Args = @("run", "--name", "fixedthree"); NeedsRepo = $true }
     @{ Id = "21-run-implicit";    Args = @("Implicit prompt form", "--name", "fixedfour"); NeedsRepo = $true }
     @{ Id = "22-sync-dryrun";     Args = @("sync", "--dry-run"); NeedsRepo = $true }
+    # --- Machine-readable output (issue #33 S1) -----------------------------
+    # `--json` is an OPT-IN, additive mode. Cases 01-22 above deliberately never
+    # pass it, so those 22 goldens keep pinning the human output byte for byte;
+    # these four pin the machine contract with the same rigour. A change to the
+    # JSON shape is now a reviewable capture diff, exactly like a change to a
+    # table.
+    #
+    # 23 also proves the pass-through rule under --json: `az containerapp job
+    # start`'s STUB-START-ACK must appear under ### STDERR (moved so stdout can
+    # carry one parseable document) and must NOT vanish.
+    @{ Id = "23-run-json";        Args = @("run", "Build the thing and open a PR", "--name", "fixedjson", "--json"); NeedsRepo = $true }
+    @{ Id = "24-sessions-json";   Args = @("sessions", "--json") }
+    @{ Id = "25-status-json";     Args = @("status", "--json") }
+    @{ Id = "26-sessions-json-session"; Args = @("sessions", "--json", "--session", "stub-session") }
 )
 
 function Get-NormalizedCapture {

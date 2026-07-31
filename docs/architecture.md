@@ -14,7 +14,7 @@ be layered on top without changing that default.
 | Execution substrate | Run each session in isolation | Azure Container Apps Jobs |
 | Telemetry sink | Collect logs/traces/metrics | Standalone Aspire Dashboard (default OTLP sink) |
 | Resource modeling (optional) | Model resources as code | .NET Aspire AppHost (`aspire/`) |
-| Agent abstraction (optional) | Expose a session as an agent | Agent Framework seam (`aspire/.../AgentAbstraction.cs`) |
+| Agent abstraction (optional) | Expose a session as an agent | `ISquadAgent` + `AcaSquadAgent` (`aspire/Squad.Aca.Agents`) |
 
 ## Default path (unchanged)
 
@@ -711,10 +711,12 @@ Jobs architecture; it layers on top:
 - **Aspire models resources.** The `Squad.Aca.AppHost` project models the Aspire
   Dashboard OTLP sink and the `squad-worker` container as code, so you can run a
   local, telemetry-wired smoke of the worker before dispatching to ACA.
-- **Agent Framework exposes the agent abstraction.** `AgentAbstraction.cs`
-  defines a compile-safe `ISquadAgent` seam. A real Microsoft Agent Framework
-  `AIAgent` adapter implements it by dispatching to ACA. Preview packages are not
-  referenced by default to keep restore stable.
+- **Agent Framework exposes the agent abstraction.** The `Squad.Aca.Agents`
+  class library defines `ISquadAgent` and implements it (`AcaSquadAgent`) over
+  the control plane's machine-readable `--json` mode. It has **zero package
+  references**, so a Microsoft Agent Framework `AIAgent` adapter — which does
+  take a preview dependency — lives in its own project and cannot destabilise
+  the contract. See [agent-contract.md](agent-contract.md).
 - **ACA remains the execution substrate.** Even with the AppHost, production work
   still runs as ACA Job executions.
 - **Squad remains the orchestration system.** The AppHost does not orchestrate
@@ -726,7 +728,7 @@ Jobs architecture; it layers on top:
 | --- | --- |
 | Deploy and run Squad on ACA | Default path (`scripts/deploy.ps1`, `squad-aca`) |
 | Reproduce telemetry locally / model resources as code | Optional AppHost (`aspire/`) |
-| Expose a Squad session as an Agent Framework agent | Optional agent seam (`aspire/.../AgentAbstraction.cs`) |
+| Expose a Squad session as an Agent Framework agent | Agent contract library (`aspire/Squad.Aca.Agents`, [agent-contract.md](agent-contract.md)) |
 
 The two paths share the same OTLP auth posture (BrowserToken UI, ApiKey OTLP,
 internal-only OTLP ports) and the same worker image.

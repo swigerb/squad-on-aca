@@ -213,6 +213,25 @@ function New-SquadExecutionHandle {
     return "$($script:SquadHandlePrefix)$b64"
 }
 
+function Test-SquadExecutionHandleString {
+    <#
+    .SYNOPSIS
+        Does this string LOOK like an opaque execution handle?
+
+    .DESCRIPTION
+        A cheap shape test, not a validity test. It exists so a call site that
+        accepts "a session name OR an execution name OR a handle" can tell which
+        of the three it was given without swallowing a malformed handle: a string
+        that carries the handle prefix is routed to the decoder, and the decoder
+        is what rejects it loudly if it is corrupt. Answering "not a handle" for
+        a corrupt handle would silently degrade into a name search that could
+        never match.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Handle)
+    if (-not $Handle) { return $false }
+    return $Handle.StartsWith($script:SquadHandlePrefix)
+}
+
 function ConvertFrom-SquadExecutionHandle {
     <#
     .SYNOPSIS

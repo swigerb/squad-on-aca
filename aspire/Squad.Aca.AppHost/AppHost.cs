@@ -5,7 +5,11 @@
 // that architecture. Roles stay layered:
 //
 //   * Aspire        -> models resources (this AppHost).
-//   * Agent Framework -> exposes the agent abstraction (see AgentAbstraction.cs).
+//   * Agent Framework -> exposes the agent abstraction (see
+//                        ../Squad.Aca.Agents/AgentAbstraction.cs; it moved out of
+//                        this project so the contract does not inherit the
+//                        AppHost's Aspire dependencies, and so a Sprint 2 MAF
+//                        adapter can reference it without referencing the host).
 //   * ACA           -> remains the production execution substrate.
 //   * Squad         -> remains the orchestration system inside the worker.
 //
