@@ -1077,3 +1077,155 @@ proven by the mutation that removes the base-constructor redaction.
   does not parse. Assign to a variable first.
 - In a worktree, `.git` is a *file*. `Out-File .git\COMMIT_EDITMSG` fails;
   write the message to a temp file in the repo root instead.
+
+---
+
+## Issue #33 sprint 2 — the Agent Framework adapter (`feat/33-s2-maf-adapter`)
+
+Sprint 1 built `ISquadAgent` and deliberately stopped short of MAF. This sprint
+wraps it as an `AIAgent` in a **separate project**, `aspire/Squad.Aca.Agents.MAF`,
+which holds the only `Microsoft.Agents.AI` reference in the repository.
+
+**The package is no longer preview.** The isolation was designed against a
+preview dependency; `Microsoft.Agents.AI` has since reached GA and shipped
+through **1.16.0**, which is what is pinned — exactly, not as a range. The
+quarantine stayed anyway. A stable package is not a frozen one, part of the
+surface the adapter uses is still `[Experimental]`, and the cost of the
+separation is one `.csproj` against the benefit of a framework break that
+cannot reach the contract or the control plane.
+
+**MEAI001 is the real preview finding.** `AgentRunOptions.ContinuationToken` and
+`AgentResponse.ContinuationToken` are `[Experimental("MEAI001")]` even in the
+stable release, which under `TreatWarningsAsErrors` is a hard build error. The
+suppression lives in exactly one file, `SquadBackgroundResponse.cs`, never in
+the csproj — a project-wide `<NoWarn>` would silently opt every future file into
+an unstable API, which is the quarantine failure mode one level down.
+`validate.ps1` asserts the csproj does not mention MEAI001 at all.
+
+**The API is not the one the older docs describe.** 1.16.0 uses `AgentSession`
+(not `AgentThread`) and `AgentResponse`/`AgentResponseUpdate` (not
+`AgentRunResponse`/`...Update`); the abstract members are `CreateSessionCoreAsync`,
+`SerializeSessionCoreAsync`, `DeserializeSessionCoreAsync`, `RunCoreAsync`,
+`RunCoreStreamingAsync`. This was established by loading the assembly under a
+`MetadataLoadContext` and dumping the real surface, because guessing at it from
+sample code cost time before that.
+
+### The long-run decision: `RunToCompletion` is the default
+
+MAF's `RunAsync` is request/response; a Squad session runs 10–60 minutes. Both
+modes exist and the mode is selectable. The default is the part that matters.
+
+A MAF caller that did not set `AllowBackgroundResponses` is promised a finished
+response, and in a workflow that response's text feeds the next node. Returning
+a receipt there is not a smaller answer — it is a *wrong* one, and nothing in
+the type system objects. The failure is silent: the next node happily summarises
+`"Dispatched session squad-1234"` and the pipeline reports success.
+
+Defaulting to fire-and-forget makes the dangerous case the quiet one.
+Defaulting to completion makes it loud — a caller who cannot wait 40 minutes
+finds out at the first run and switches modes. Fire-and-forget is not worse; it
+is only worse **by accident**.
+
+Precedence: `SquadAcaAgentRunOptions.LongRunMode` → `AllowBackgroundResponses ==
+true` ⇒ `DispatchOnly` → `SquadAcaAgentOptions.DefaultLongRunMode`. Honouring
+MAF's own flag matters: it is how generic code that has never heard of this
+adapter still gets receipt-and-poll semantics.
+
+`DispatchOnly` returns the handle on `AgentResponse.ContinuationToken`; passing
+it back performs one non-blocking read, and the token is re-attached while
+non-terminal and **dropped once terminal**, which is how a caller knows to stop
+asking. That reuses MAF's protocol instead of inventing a parallel one.
+
+Polling waits *before* its first read (a session dispatched a millisecond ago is
+never terminal), backs off 5 s → ×1.5 → 60 s cap, and clamps the final wait to
+the remaining budget so it lands on the deadline rather than past it. `Unknown`
+is deliberately **not** terminal — it means "could not tell", which is a reason
+to keep asking — and the 90-minute bound is what makes that safe.
+
+### Cancellation stops the session; the token it uses is the whole trick
+
+A cancelled run issues the stop **before** rethrowing, on a **fresh**
+`CancellationTokenSource(StopTimeout)`. Forwarding the caller's already-cancelled
+token would abort the stop on its first await and leave a billed ACA session
+running with nobody watching it. That is the difference between *cancelled* and
+*orphaned*, and it is one line apart. `FakeSquadAgent.StopCall.TokenAlreadyCancelled`
+exists solely to make that observable; without it, "cancellation stops the
+session" passes against an implementation that orphans everything it touches.
+
+Timeout does the same and throws `SquadAgentRunTimeoutException` carrying the
+handle — a run that timed out has not necessarily failed, and the caller needs
+to be able to go look.
+
+**Fail-closed survives because the adapter does nothing.** `_inner.RunSessionAsync`
+is called outside every `try`/`catch`, so `SquadRouteFailedClosedException`
+reaches the MAF caller exactly as it left the contract. Verified, not assumed:
+MAF's base `RunAsync` does not wrap exceptions.
+
+### Mutation results — 32 designed, 32 killed, 0 survived
+
+The first pass left four survivors and one bad anchor. All four were real gaps:
+
+| survivor | why it survived | fix |
+|---|---|---|
+| deadline check removed | presented as a **hang**, not a failure — the clamp then hands back a non-positive wait forever | `FakePollingClock` now refuses a non-positive wait (a correct loop never asks for one), plus a test pinning the exact 5+5+2 sequence that ends a 12 s budget |
+| first poll forced to zero wait | the test counted the waits without looking at them | assert the interval's value and that no status read preceded it |
+| schema check removed from the continuation token | the fixture token had no handle, so the handle check rejected it either way | give the foreign token a handle; assert the message names both schemas |
+| `AIAgent` registered as a second instance | stale anchor, mutation never applied | anchor on the comment + call together |
+
+One mutation was **equivalent** and dropped rather than counted: redaction
+removed from the timeout *message*. `SquadAgentException` already redacts every
+message it is handed, so no test could distinguish it. The redundant call was
+deleted and the mutation retargeted at the `LastStatus` **property**, which
+nothing else redacts. Same precedent as sprint 1 — delete the unreachable line,
+do not pad the count.
+
+### Gates
+
+| gate | before | after |
+|---|---|---|
+| `validate.ps1` | 294 / 0 / 0 | **303 / 0 / 0** (+9 new checks) |
+| CLI goldens | 26/26 byte-identical | 26/26 byte-identical |
+| `verify-launch-detachment.ps1` | PASS | PASS |
+| worker suite | 10 suites / 739 assertions | 10 suites / 739 assertions |
+| .NET tests | 47 | **47 + 67 = 114** |
+
+The nine new checks are: three expected files, two csproj-XML parses, the exact
+version pin, the absence of a project-wide MEAI001 suppression, the one-way
+dependency (`Squad.Aca.Agents` must not reference the adapter), and **solution
+membership**. That last one matters more than it looks: `dotnet build`/`test`
+drive the solution, so a project missing from it is a project CI never compiles
+and never tests — and the build stays green, because the code was never looked
+at.
+
+**CI restore: no finding.** The worry was that a preview package would not
+restore under CI's 9.0.x-only SDK. It is not preview, and it restores. Proven by
+installing 9.0.316 to a scratch directory and running restore, build and test
+against it with no prerelease flag and no extra feed: 114/114 passed. No
+conditional project, no feed pin, no visible skip needed.
+
+**Lessons recorded.**
+
+- `git checkout -- <dir>` after `git status` in the *same* command destroyed four
+  uncommitted fixes. Sprint 1 recorded this lesson and it still happened. Commit
+  before any operation that can discard the working tree — and never put a
+  destructive command on the same line as the diagnostic that would have warned
+  you.
+- A mutation that causes an **infinite loop** is not "survived", it is
+  undiagnosed. A harness must distinguish hang from pass, and the better fix is
+  to make the fake reject the impossible input so the hang becomes a clean
+  failure. `FakePollingClock` refusing a non-positive wait converts an unbounded
+  spin — which against a real control plane is a rate limit, not a test problem
+  — into an assertion.
+- A negative test proves nothing if a *different* guard would reject the input
+  anyway. The foreign-token test had a token with no handle, so it passed with
+  the schema check deleted. Construct the fixture so the guard under test is the
+  only thing standing between the input and success.
+- A virtual clock is what makes a 90-minute timeout and a backoff curve testable
+  at all. Shrinking the real timeouts until a test can afford to wait proves the
+  loop terminates and nothing about whether it waited the right amount, which is
+  the only property a rate limit cares about.
+- `MetadataLoadContext` is the way to inspect a package whose dependencies are
+  not loadable in-process; plain `Assembly.LoadFrom` fails on the first missing
+  transitive reference.
+- An explicit `PackageReference` that is *lower* than a transitive one is
+  `NU1605`, not a pin. Pin at or above what the graph already resolved.
