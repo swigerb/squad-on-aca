@@ -46,9 +46,19 @@ jobs:
           echo "PASS: refused as expected (exit $rc)."
           echo "$out" | tail -n 3
 
-      - name: Prove WRITE - start the session job in a mode that does nothing
+      - name: Prove WRITE - start the session job in a mode that pushes nothing
         run: |
+          # `az containerapp job start` requires a full container override when
+          # any override is supplied, so the image is read back from the job
+          # itself rather than hard-coded. This mirrors what the local
+          # dispatcher already does in scripts/squad-aca.ps1.
+          image=$(az containerapp job show -n caj-squad-aca-session -g rg-squad-aca-dev-eastus2 \
+            --query "properties.template.containers[0].image" -o tsv)
+          name=$(az containerapp job show -n caj-squad-aca-session -g rg-squad-aca-dev-eastus2 \
+            --query "properties.template.containers[0].name" -o tsv)
+          echo "image=$image container=$name"
           az containerapp job start \
             -n caj-squad-aca-session -g rg-squad-aca-dev-eastus2 \
+            --image "$image" --container-name "$name" \
             --env-vars SQUAD_MODE=smoke PUSH_CHANGES=false CREATE_PR=false RUN_COPILOT_SMOKE=false \
             --query "name" -o tsv
