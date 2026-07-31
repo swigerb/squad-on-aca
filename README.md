@@ -302,25 +302,45 @@ fail-closed interlocks, the prerequisites in full, and the operational links.
 
 ## Triggering from a GitHub event (Actions as transport)
 
-A session can start from a GitHub event rather than from a laptop. Apply the
-**`squad`** label to an issue, or comment **`/squad <instruction>`**, and a
-GitHub Actions workflow federates to Azure by OIDC and starts the ACA session
-job.
+Label an issue **`squad`**, or comment **`/squad <instruction>`**, and the work
+runs in Azure:
 
-Actions is the **trigger transport only**. The decision, the lease, and the run
-stay in Azure — the workflow calls the same shared dispatch core the CLI, Ralph
-and Watch use, with `actions` as its dispatch source, so all four contend for
-one lease instead of dispatching alongside each other. There is no webhook
-ingress, no always-on replica, and **no stored Azure credential**.
+```
+label an issue  →  GitHub Actions  →  OIDC  →  Azure Container Apps  →  agent  →  branch  →  pull request
+                   (trigger only)     (no stored credential)   (control plane + compute)
+```
+
+**No laptop in the path.** No local CLI, no browser session, no long-lived Azure
+credential anywhere.
+
+| Stage | Runs on |
+|---|---|
+| Decide whether the event is a trigger | GitHub Actions runner |
+| Federate to Azure, claim the shared lease, start the job | GitHub Actions runner |
+| **Route, run the agent, push the branch, open the PR** | **Azure Container Apps** |
+
+The workflow's last act is to start a job and comment the execution name back on
+the issue. It does not wait for the session, poll it, or hold its credential —
+if the runner vanished a second later, the session would still finish and still
+open its pull request.
+
+Actions is the **trigger transport only**. The workflow calls the same shared
+dispatch core the CLI, Ralph and Watch use, with `actions` as its dispatch
+source, so all four contend for one lease instead of dispatching alongside each
+other.
 
 Refusals are deliberate and named: a comment from the App itself
 (`actor-is-this-app`) never dispatches, which is what stops an App token —
 unlike `GITHUB_TOKEN` — from retriggering the workflow with the session's own
 status comment and looping forever.
 
-See [docs/actions-trigger.md](docs/actions-trigger.md) for the full refusal
-table, the duplicate-dispatch model, the identity setup, and the two silent
-traps this path had to avoid.
+This path is proven live. [docs/e2e-results.md](docs/e2e-results.md) records
+five runs including the three that failed and why; the final one wrote that
+evidence file and opened its own pull request from inside Azure.
+
+See [docs/actions-trigger.md](docs/actions-trigger.md) for the sequence diagram,
+the full refusal table, the duplicate-dispatch model, attribution, the identity
+setup, and the traps this path had to avoid.
 
 ## Agent integration (Microsoft Agent Framework)
 

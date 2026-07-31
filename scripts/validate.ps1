@@ -4828,6 +4828,33 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "Nothing checks that the merged environment actually carries a GITHUB_TOKEN reference before the ACA job is started"
     }
 
+    # Attribution. Measured empirically against a real App push: GitHub
+    # attributes a commit ENTIRELY by the author email and not at all by the
+    # token used to push it, so crediting the requester has to be done in the
+    # commit itself.
+    if ($wf -match 'Co-authored-by: \$\{REQUESTER\}') {
+        Add-Pass "Commits from a triggered session credit the requester with a Co-authored-by trailer, so work dispatched on someone's behalf is not attributed to nobody"
+    } else {
+        Add-Fail "The dispatch workflow does not credit the requester on the session's commits"
+    }
+
+    # A requester who sees a label change and then silence cannot tell a running
+    # session from a trigger that quietly refused.
+    if ($wf -match 'gh issue comment' -and $wf -match 'ACA execution') {
+        Add-Pass "The trigger reports back to the issue with the session and ACA execution names, so a requester can tell a running session from a silent refusal"
+    } else {
+        Add-Fail "The dispatch workflow never reports back to the issue, so a requester sees a label change and then silence"
+    }
+
+    # The status comment MUST be posted with GITHUB_TOKEN. Events caused by
+    # GITHUB_TOKEN do not start new workflow runs; an App token would retrigger
+    # this workflow and loop, billing by the minute.
+    if ($wf -match '(?s)Tell the issue where its work went.*?GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN\s*\}\}') {
+        Add-Pass "The status comment is posted with GITHUB_TOKEN, whose events cannot start new workflow runs -- an App token would retrigger this same workflow and loop"
+    } else {
+        Add-Fail "The status comment is not posted with GITHUB_TOKEN. Any other credential retriggers this workflow on its own comment and loops"
+    }
+
     if ($wf -match '--bot-login') {
         Add-Pass "The dispatch workflow passes the App's bot login to the resolver, which is what breaks the retrigger loop an App token would otherwise create"
     } else {

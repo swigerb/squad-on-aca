@@ -1456,3 +1456,23 @@ measured TTL of exactly 3600 seconds, so it is not.
   like an OIDC fault and is an RBAC one.
 - S1's token preflight earned itself here: it caught the missing credential two
   minutes in, naming the fix, instead of failing at the push after a full run.
+
+## Issue #32 S3 - the interaction surface
+
+- **GitHub attributes a commit ENTIRELY by author email, not by the push token.**
+  Measured across three commits pushed with the SAME App installation token:
+  only the one authored as `<BOT_USER_ID>+<slug>[bot]@users.noreply.github.com`
+  linked. The App ID is NOT the bot user id - using it produces a silently
+  unlinked commit that looks fine until you notice there is no avatar.
+- Sessions keep a MACHINE author (the work is machine-authored) and credit the
+  requester with `Co-authored-by:`. That links correctly and does not
+  misrepresent who wrote the code.
+- **The status comment must be posted with GITHUB_TOKEN.** Events caused by
+  GITHUB_TOKEN cannot start new workflow runs; any other credential retriggers
+  this same workflow on its own comment and loops, billing by the minute. Two
+  independent guards now: this, and the resolver refusing its own identity.
+- **@mention mid-sentence is the most likely accidental trigger.** "I think
+  @squad-... could help here" is talking ABOUT the bot, not asking it. The
+  line-start rule covers the mention form exactly as it covers the command.
+- With no bot login configured the mention form is INERT rather than matching an
+  arbitrary "@" prefix - there is no identity to mention.
