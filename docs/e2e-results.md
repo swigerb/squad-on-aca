@@ -1107,4 +1107,42 @@ not a one-off:
 - Sprint 2's goal — the control plane fires from Azure, not a developer's
   laptop — is met and reproducible on `main`. No further code change is
   required to close #32 Sprint 2; #44 tracked the verification only.
-
+
+### Correction: a started execution is not a finished session
+
+The runs above prove the **trigger**. They do not, on their own, prove the
+session, and two of those executions did in fact **fail** after starting. Both
+failures were dispatch defects, and the distinction matters because "Started ACA
+execution" is the last line the workflow ever sees.
+
+| Execution | Trigger | Session | Cause |
+|---|---|---|---|
+| `caj-squad-aca-session-oa5bg21` | PASS | **Failed** | `--env-vars` REPLACES the container environment rather than merging it, so every secret-backed variable was dropped. The session pulled the image, cloned the repository, and died with `Error: No authentication information found`. Fixed in #48. |
+| `caj-squad-aca-session-d1xrmpn` | PASS | **Failed** | `ralph_build_session_env` deliberately skips managed keys when copying the template, so the caller must supply `OV_GITHUB_TOKEN=secretref:...` itself. Measured: 18 template entries in, 15 out — exactly the three secret-backed ones missing. Fixed in #49. |
+| `caj-squad-aca-session-nwxyb1h` | PASS | **Succeeded** | — |
+
+Both were caught by the token preflight added in #42, at roughly two minutes,
+rather than at the push after a full agent run:
+
+```text
+[token-preflight] Credential wiring OK: one absolute-path helper for https://github.com, no URL rewrite, token file 0600.
+[token-preflight] The credential is accepted by the GitHub API.
+[token-preflight] The credential does NOT have push access to swigerb/squad-on-aca (permissions.push=false).
+[token-preflight]   This session intends to PUSH; the push would fail after the whole agent run.
+```
+
+The last of those was not a dispatch defect at all: `deploy.ps1` falls back to
+`gh auth token`, which on this machine returns a **read-only** account's token.
+The preflight named the real problem instead of letting the session run for an
+hour and fail at the push.
+
+One honest gap remains, and the preflight says so itself:
+
+```text
+[token-preflight] Token expiry is UNKNOWN (no SQUAD_TOKEN_EXPIRES_AT and no expiry header); remaining lifetime was NOT checked.
+[token-preflight] Token preflight passed (usability verified, lifetime unverified).
+```
+
+The session job still runs on a long-lived PAT, so the one-hour lifetime check
+has nothing to check. Minting a GitHub App installation token at dispatch time
+and passing `SQUAD_TOKEN_EXPIRES_AT` is tracked separately.
