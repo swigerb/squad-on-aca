@@ -120,6 +120,30 @@ The workflow needs three repository secrets and a federated credential.
 3. Set `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID` as
    repository secrets. There is no client secret.
 
+## Workflow permissions
+
+Permissions default to **nothing** at the workflow level; each job asks for
+exactly what it needs.
+
+| Job | Permission | Why |
+|---|---|---|
+| `resolve` | `contents: read` | Checkout. It reads an event payload and decides; it never needs a write token. |
+| `dispatch` | `id-token: write` | OIDC federation to Azure. The only Azure credential. |
+| `dispatch` | `contents: write` | **The durable lease is stored in this repository, so claiming one is a write.** |
+| `dispatch` | `issues: write` | Apply the shared `squad-aca:dispatched` marker. |
+
+The `contents: write` requirement is easy to get wrong, and was found by the
+first live run rather than by any offline check. With `contents: read` the
+sequence is: OIDC succeeds, the decision resolves, and *then* the claim fails:
+
+```
+Lease store could not write lease 'issue-44':
+gh: Resource not accessible by integration (HTTP 403)
+```
+
+A 403 arriving immediately after a successful Azure login reads like an Azure
+problem. It is not. `validate.ps1` now asserts the grant.
+
 Verify the scoping by attempting to read a *different* job with the same
 identity: it must be refused. A grant that can read the whole resource group
 will pass a "can it start the job" check just as happily.

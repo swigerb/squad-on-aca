@@ -26,10 +26,7 @@ on:
         description: Prompt override
         required: false
 
-permissions:
-  id-token: write      # required for OIDC; this is the ONLY Azure credential
-  contents: read
-  issues: write   # only to apply the shared 'dispatched' marker Ralph also uses
+permissions: {}          # nothing by default; each job asks for exactly what it needs
 
 concurrency:
   # Two rapid triggers on the same issue queue rather than race. This is a
@@ -41,6 +38,8 @@ concurrency:
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout only; this job reads an event and decides
     outputs:
       dispatch: ${{ steps.decide.outputs.dispatch }}
       reason: ${{ steps.decide.outputs.reason }}
@@ -83,6 +82,13 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.dispatch == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write    # OIDC federation to Azure; the ONLY Azure credential
+      contents: write   # the durable lease is stored IN this repository, so claiming
+                        # one is a WRITE. With contents:read the claim fails with
+                        # 'Resource not accessible by integration' (HTTP 403) -- found
+                        # by the first live end-to-end run, not by any offline gate.
+      issues: write     # apply the shared 'squad-aca:dispatched' marker Ralph also uses
     steps:
       - uses: actions/checkout@v4
 

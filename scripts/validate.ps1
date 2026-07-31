@@ -4804,10 +4804,33 @@ if (-not (Test-Path $dispatchWorkflow)) {
     # The lease prevents a CONCURRENT double dispatch. It does not prevent a
     # SEQUENTIAL one: once released, Ralph's five-minute poll finds the issue
     # still unlabelled and dispatches it again.
+    # The lease prevents a CONCURRENT double dispatch. It does not prevent a
+    # SEQUENTIAL one: once released, Ralph's five-minute poll finds the issue
+    # still unlabelled and dispatches it again.
     if ($wf -match 'squad-aca:dispatched' -and $wf -match '--add-label') {
         Add-Pass "The dispatch workflow applies the same 'dispatched' marker Ralph uses, so Ralph's poll does not re-dispatch the issue once the lease is released"
     } else {
         Add-Fail "The dispatch workflow does not apply Ralph's dispatch marker label, so Ralph will re-dispatch the same issue on its next poll"
+    }
+
+    # Found by the first live end-to-end run, not by any offline gate: the
+    # durable lease is stored IN this repository, so CLAIMING one is a write.
+    # With `contents: read` the claim fails with "Resource not accessible by
+    # integration" (HTTP 403) after OIDC has already succeeded, which reads like
+    # an Azure problem and is not one.
+    if ($wf -match '(?s)dispatch:.*?permissions:.*?contents:\s*write') {
+        Add-Pass "The dispatch job holds contents: write, without which claiming the durable lease fails with a 403 that looks like an Azure fault and is not one"
+    } else {
+        Add-Fail "The dispatch job does not hold contents: write. The lease store writes to this repository, so the claim will fail with 'Resource not accessible by integration' after OIDC has already succeeded"
+    }
+
+    # A workflow-wide grant would hand `contents: write` to the resolve job too,
+    # which only reads an event payload and decides. Per-job permissions keep
+    # the write confined to the step that needs it.
+    if ($wf -match '(?m)^permissions:\s*\{\s*\}' ) {
+        Add-Pass "Permissions default to NOTHING at the workflow level, so each job asks for exactly what it needs and the resolver never holds a write token"
+    } else {
+        Add-Fail "The dispatch workflow grants permissions workflow-wide rather than per job, so the event resolver holds the same write token as the dispatcher"
     }
 }
 
