@@ -1373,3 +1373,35 @@ measured TTL of exactly 3600 seconds, so it is not.
   The credential cases passed for the wrong reason until the helper was copied
   and chmod +x'd the way the Dockerfile does. The `ANONYMOUS` line in the
   fixture's auth log is what exposed it - an exit code alone would not have.
+
+## Issue #32 S2 - Actions as trigger transport, not a second control plane
+
+- **ACA silently ignores a PARTIAL container override.** `job start --env-vars`
+  is applied only when name, image, cpu AND memory are all supplied. With a
+  partial spec the execution starts, reports success, and runs the TEMPLATE's
+  baked-in values - so a session dispatched to work an issue would quietly run
+  `SQUAD_MODE=smoke` instead. Ralph already guarded this; the Actions path
+  nearly relearned it. Reading an existing dispatcher before writing a new one
+  is what caught it.
+- **There is no `issue` mode.** Unknown SQUAD_MODE exits 64. Sessions dispatch
+  as `prompt`, the mode Ralph uses.
+- **A lease prevents a CONCURRENT double dispatch, not a SEQUENTIAL one.** Once
+  released, Ralph's five-minute poll finds the issue unlabelled and dispatches
+  again. The `squad-aca:dispatched` marker is the other half, and must be
+  applied only after a CONFIRMED start or a failed dispatch is never retried.
+- **An App token retriggers workflows where GITHUB_TOKEN does not.** The
+  built-in token's inability to start new runs is a real safety property that
+  disappears the moment an App credential is used. The loop break belongs in the
+  resolver, checked before any other branch.
+- **A guard nothing can falsify is worse than no guard.** A "skip lines starting
+  with >" quote guard was written, then deleted: a line beginning with `>`
+  cannot also begin with the command prefix, so removing it changed no outcome
+  and no mutation could catch its absence. It was inviting a test that passed
+  for a reason unrelated to the code it claimed to cover. The line-start rule is
+  what actually makes quoting inert, and mutating THAT fails four assertions.
+- **Scope proof needs a negative control.** "The identity can start the job"
+  says nothing about whether it can also start every other job. Reading a
+  SIBLING job and requiring a refusal is what makes the scoping claim real.
+- **The federated path was written but never run.** Zero repository secrets,
+  zero workflow runs, zero federated credentials. A workflow file is not
+  evidence; a green run is.

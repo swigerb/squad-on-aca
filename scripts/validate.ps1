@@ -4726,6 +4726,112 @@ if (-not (Test-Path $evidenceVerifier)) {
 }
 
 # ---------------------------------------------------------------------------
+# The Actions trigger surface (issue #32 S2)
+# ---------------------------------------------------------------------------
+Write-Section "The Actions trigger is a transport, not a second control plane"
+
+$dispatchWorkflow = Join-Path $RepoRoot '.github/workflows/squad-dispatch.yml'
+if (-not (Test-Path $dispatchWorkflow)) {
+    Add-Fail "The Actions dispatch workflow (.github/workflows/squad-dispatch.yml) is missing, so nothing triggers a session from a GitHub event"
+} else {
+    $wf = Get-Content -LiteralPath $dispatchWorkflow -Raw
+
+    # OIDC is the whole reason this path needs no stored Azure credential. A
+    # workflow that fell back to a client secret would still work, which is
+    # exactly why the absence has to be asserted rather than assumed.
+    if ($wf -match '(?m)^\s*id-token:\s*write\b') {
+        Add-Pass "The dispatch workflow requests id-token: write, so it can federate to Azure without a stored credential"
+    } else {
+        Add-Fail "The dispatch workflow does not request id-token: write, so OIDC federation cannot work"
+    }
+
+    if ($wf -match 'client-secret|AZURE_CLIENT_SECRET|creds:\s*\$\{\{\s*secrets') {
+        Add-Fail "The dispatch workflow references an Azure client secret. The federated path exists so no long-lived Azure credential is stored in GitHub"
+    } else {
+        Add-Pass "The dispatch workflow stores NO Azure client secret -- the only Azure credential is the federated token minted per run"
+    }
+
+    # pull_request_target runs with a writable token in the context of the BASE
+    # repository while checking out attacker-controlled code. On a public
+    # repository with a dispatch trigger that is a direct path to running a
+    # fork's code with the App's permissions.
+    if ($wf -match '(?m)^\s*pull_request_target\s*:') {
+        Add-Fail "The dispatch workflow triggers on pull_request_target, which would run fork-controlled code with this repository's credentials"
+    } else {
+        Add-Pass "The dispatch workflow does NOT trigger on pull_request_target, so a fork cannot reach the control plane"
+    }
+
+    # The shared decision core is the only thing that keeps Ralph's poll and an
+    # Actions trigger from starting the same work twice. A workflow that
+    # invented its own lease key would look identical in the logs and dispatch
+    # in parallel.
+    if ($wf -match '--dispatch-source\s+actions' -and $wf -match 'squad-dispatch\.js\s+decide') {
+        Add-Pass "The dispatch workflow routes through the SHARED decision core with dispatch source 'actions', so it contends for the same lease as Ralph rather than dispatching alongside it"
+    } else {
+        Add-Fail "The dispatch workflow does not use the shared decision core (squad-dispatch.js decide --dispatch-source actions), so its lease key is its own and a double dispatch is possible"
+    }
+
+    if ($wf -match "if:\s*steps\.lease\.outputs\.claimed\s*==\s*'true'") {
+        Add-Pass "The ACA job is started ONLY when the lease claim succeeded, so losing the race stands the trigger down instead of racing a running session"
+    } else {
+        Add-Fail "The dispatch workflow starts the ACA job without gating on a successful lease claim"
+    }
+
+    if ($wf -match '--bot-login') {
+        Add-Pass "The dispatch workflow passes the App's bot login to the resolver, which is what breaks the retrigger loop an App token would otherwise create"
+    } else {
+        Add-Fail "The dispatch workflow does not pass --bot-login, so a comment made by the App itself could retrigger the workflow and loop"
+    }
+
+    # ACA applies a per-execution --env-vars override ONLY when a COMPLETE
+    # container spec is supplied. Supply a partial one and the override is
+    # SILENTLY ignored: the execution starts, reports success, and runs the
+    # template's baked-in SQUAD_MODE=smoke instead of the work that was asked
+    # for. Ralph hit this in live E2E and guards against it; this path must too.
+    if ($wf -match '--cpu\b' -and $wf -match '--memory\b' -and $wf -match '--image\b' -and $wf -match '--container-name\b') {
+        Add-Pass "The dispatch workflow supplies a COMPLETE container spec (image, container name, cpu, memory) on job start, without which ACA silently ignores the env override and runs the template's defaults"
+    } else {
+        Add-Fail "The dispatch workflow starts the ACA job without a complete container spec (needs --image, --container-name, --cpu and --memory). ACA would ignore the env override and the session would run the template's baked-in mode while reporting success"
+    }
+
+    # There is no `issue` mode in the worker; an unknown SQUAD_MODE exits 64.
+    if ($wf -match 'SQUAD_MODE=prompt') {
+        Add-Pass "The dispatch workflow starts sessions in 'prompt' mode, the same mode Ralph dispatches with -- the worker exits 64 on an unknown mode"
+    } else {
+        Add-Fail "The dispatch workflow does not use SQUAD_MODE=prompt; the worker has no 'issue' mode and exits 64 on anything it does not recognise"
+    }
+
+    # The lease prevents a CONCURRENT double dispatch. It does not prevent a
+    # SEQUENTIAL one: once released, Ralph's five-minute poll finds the issue
+    # still unlabelled and dispatches it again.
+    if ($wf -match 'squad-aca:dispatched' -and $wf -match '--add-label') {
+        Add-Pass "The dispatch workflow applies the same 'dispatched' marker Ralph uses, so Ralph's poll does not re-dispatch the issue once the lease is released"
+    } else {
+        Add-Fail "The dispatch workflow does not apply Ralph's dispatch marker label, so Ralph will re-dispatch the same issue on its next poll"
+    }
+}
+
+$actionsEventModule = Join-Path $RepoRoot 'worker/lib/actions-event.js'
+$decisionModule = Join-Path $RepoRoot 'worker/lib/dispatch-decision.js'
+if ((Test-Path $actionsEventModule) -and (Test-Path $decisionModule)) {
+    $decisionText = Get-Content -LiteralPath $decisionModule -Raw
+    if ($decisionText -match "DISPATCH_SOURCES\s*=\s*\[[^\]]*'actions'") {
+        Add-Pass "'actions' is a first-class dispatch source in the shared core, so a lease it claims is recognised by every other dispatcher"
+    } else {
+        Add-Fail "'actions' is not in DISPATCH_SOURCES, so the shared core would silently fall back to a default source and the lease would not identify its owner"
+    }
+} else {
+    Add-Fail "worker/lib/actions-event.js or worker/lib/dispatch-decision.js is missing"
+}
+
+$actionsSuite = Join-Path $RepoRoot 'worker/tests/test_actions_event.sh'
+if (Test-Path $actionsSuite) {
+    Add-Pass "The Actions trigger resolver has a behavioural suite (worker/tests/test_actions_event.sh), so its refusals are exercised and not merely intended"
+} else {
+    Add-Fail "worker/tests/test_actions_event.sh is missing, so the trigger's refusals -- including the retrigger loop break -- are untested"
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Section "Summary"

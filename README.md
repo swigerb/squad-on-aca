@@ -22,7 +22,8 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Second execution plane (opt-in preview) | ACA Sandboxes behind `SQUAD_ACA_ENABLE_SANDBOX`, for per-session isolation and default-deny egress. Off by default; ACA Jobs stay the default and the rollback path |
 | Agent tool policy | Every session resolves an `attended` or `autonomous` tier before any agent starts; unattended runs lose destructive infrastructure verbs. `--yolo` is never emitted |
 | Governance-path protection | `.squad/` policy, identity, and audit state is made read-only and hash-verified for the session; a violation fails the run and pushes nothing |
-| Duplicate-dispatch protection | A durable lease is claimed before compute is requested, shared by the CLI, Ralph, and the watcher (`squad-aca leases`) |
+| Event-driven trigger | A GitHub Actions workflow (`squad-dispatch.yml`) fires on an issue label or a `/squad` comment, federates to Azure by OIDC, and starts the ACA session job. Actions is the trigger transport only; the decision, the lease, and the run all stay in Azure. No webhook ingress, no always-on replica, and no stored Azure credential |
+| Duplicate-dispatch protection | A durable lease is claimed before compute is requested, shared by the CLI, Ralph, the watcher, and the Actions trigger (`squad-aca leases`) |
 | Callable as an agent (opt-in) | Exposed as a Microsoft Agent Framework `AIAgent` (`Microsoft.Agents.AI` 1.16.0) in `aspire/Squad.Aca.Agents.MAF`, over a framework-free `ISquadAgent` contract. A MAF pipeline dispatches a session, polls it, and reads the route back; the worker and the ACA Jobs default are unchanged |
 | CI/CD | GitHub Actions workflow with Azure OIDC login |
 
@@ -299,6 +300,28 @@ With the flag off, a repository that genuinely needs a non-default capability is
 See [docs/sandboxes.md](docs/sandboxes.md) for what the plane does, the
 fail-closed interlocks, the prerequisites in full, and the operational links.
 
+## Triggering from a GitHub event (Actions as transport)
+
+A session can start from a GitHub event rather than from a laptop. Apply the
+**`squad`** label to an issue, or comment **`/squad <instruction>`**, and a
+GitHub Actions workflow federates to Azure by OIDC and starts the ACA session
+job.
+
+Actions is the **trigger transport only**. The decision, the lease, and the run
+stay in Azure — the workflow calls the same shared dispatch core the CLI, Ralph
+and Watch use, with `actions` as its dispatch source, so all four contend for
+one lease instead of dispatching alongside each other. There is no webhook
+ingress, no always-on replica, and **no stored Azure credential**.
+
+Refusals are deliberate and named: a comment from the App itself
+(`actor-is-this-app`) never dispatches, which is what stops an App token —
+unlike `GITHUB_TOKEN` — from retriggering the workflow with the session's own
+status comment and looping forever.
+
+See [docs/actions-trigger.md](docs/actions-trigger.md) for the full refusal
+table, the duplicate-dispatch model, the identity setup, and the two silent
+traps this path had to avoid.
+
 ## Agent integration (Microsoft Agent Framework)
 
 Squad on ACA is callable **as an agent**. `aspire/Squad.Aca.Agents.MAF` exposes
@@ -323,9 +346,10 @@ dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
 ```
 
 `RunAsync` waits for the session to finish by default; fire-and-forget is opt-in.
-Cancellation genuinely stops an ACA Job — and **does not yet stop a sandbox
-worker**, which reports success while the worker keeps running
-([#36](https://github.com/swigerb/squad-on-aca/issues/36)).
+Cancellation genuinely stops an ACA Job, and since
+[#36](https://github.com/swigerb/squad-on-aca/issues/36) it stops a sandbox
+worker too — the provider signals the process group and **confirms the process
+is dead** before writing any marker, rather than trusting an exit code.
 
 See [docs/maf-adapter.md](docs/maf-adapter.md) for the integration in full,
 [docs/agent-contract.md](docs/agent-contract.md) for the `--json` wire contract,
