@@ -1120,6 +1120,7 @@ execution" is the last line the workflow ever sees.
 | `caj-squad-aca-session-oa5bg21` | PASS | **Failed** | `--env-vars` REPLACES the container environment rather than merging it, so every secret-backed variable was dropped. The session pulled the image, cloned the repository, and died with `Error: No authentication information found`. Fixed in #48. |
 | `caj-squad-aca-session-d1xrmpn` | PASS | **Failed** | `ralph_build_session_env` deliberately skips managed keys when copying the template, so the caller must supply `OV_GITHUB_TOKEN=secretref:...` itself. Measured: 18 template entries in, 15 out — exactly the three secret-backed ones missing. Fixed in #49. |
 | `caj-squad-aca-session-nwxyb1h` | PASS | **Succeeded** | — |
+| `caj-squad-aca-session-blm7t3n` | PASS | **Succeeded** | Sprint 3 and 4 final live verification for #32, driven by issue [#55](https://github.com/swigerb/squad-on-aca/issues/55): an `issues_comment` `/squad` trigger ([run 30673535717](https://github.com/swigerb/squad-on-aca/actions/runs/30673535717)) resolved with a requester (`swigerb`), claimed a fresh lease, started this ACA session, and commented the execution details back on the issue — confirming status-comment and requester-attribution behavior end to end. |
 
 Both were caught by the token preflight added in #42, at roughly two minutes,
 rather than at the push after a full agent run:
