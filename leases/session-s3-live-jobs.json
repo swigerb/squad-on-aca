@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-s3-live-jobs",
+  "sessionId": "s3-live-jobs",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-07-31T12:49:31.064Z",
+  "lastHeartbeatAt": "2026-07-31T12:49:31.064Z",
+  "updatedAt": "2026-07-31T12:49:31.064Z",
+  "terminalReason": null,
+  "executionRef": null
+}
