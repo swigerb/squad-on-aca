@@ -757,3 +757,12 @@ body="$(printf '%s\n\n%s\n' \
   'A heading' \
   '| a | table |')"
 ```
+Every `run:` block is also extracted and checked with `bash -n`, because a
+workflow's shell scripts are scripts nothing else in this repository executes.
+
+That gate catches **syntax**. It cannot catch **ordering** — `set -u` finding a
+variable used before it is assigned is a runtime error, and it happened: a
+refactor moved a `commit_message=` assignment below its own use, and the only
+thing that noticed was a live dispatch. The live end-to-end run is therefore
+still the last gate, not a formality. Both are worth having; neither replaces
+the other.

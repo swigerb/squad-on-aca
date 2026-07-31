@@ -5024,6 +5024,14 @@ if (-not (Test-Path $workflowDir)) {
     if (-not $yamlParser) {
         Add-Skip "No Python with PyYAML available to parse workflow files. A workflow that does not parse fails as a run with no job and no log, and nothing else here would catch it."
     } else {
+        $bashExe = $null
+        foreach ($candidate in @('C:\Program Files\Git\bin\bash.exe', 'C:\Program Files\Git\usr\bin\bash.exe', 'bash')) {
+            if (Get-Command $candidate -ErrorAction SilentlyContinue) { $bashExe = $candidate; break }
+        }
+        if (-not $bashExe) {
+            Add-Skip "No bash available to syntax-check workflow run blocks."
+        }
+
         foreach ($wfFile in ($workflowFiles | Sort-Object Name)) {
             $parseOutput = & $yamlParser -c @"
 import sys, yaml
@@ -5052,6 +5060,61 @@ print('OK')
             } else {
                 Add-Fail "$($wfFile.Name) does not parse as a GitHub workflow ($joined). GitHub reports this as a failed RUN named after the file, with no job and no log -- and no grep-based check can see it, because a column-0 line inside a 'run: |' block ends the block while leaving every searched string in place"
             }
+
+        # Every `run:` block is a shell script that nothing else here executes.
+        # A syntax error in one is a failure that only appears at dispatch time,
+        # halfway through a live run, after Azure has already been paid.
+        #
+        # This catches SYNTAX. It cannot catch ordering -- `set -u` finding a
+        # variable used before assignment is a RUNTIME error, and the live
+        # end-to-end run remains the only gate for that. Both are worth having;
+        # neither replaces the other.
+        if ($bashExe) {
+            $extractDir = Join-Path ([System.IO.Path]::GetTempPath()) ("squad-wf-run-" + [Guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+            try {
+                $extract = & $yamlParser -c @"
+import sys, os, yaml
+src, outdir = sys.argv[1], sys.argv[2]
+d = yaml.safe_load(open(src, encoding='utf-8'))
+n = 0
+for job_name, job in (d.get('jobs') or {}).items():
+    default_shell = ((d.get('defaults') or {}).get('run') or {}).get('shell') or \
+                    ((job.get('defaults') or {}).get('run') or {}).get('shell') or 'bash'
+    for i, step in enumerate(job.get('steps') or []):
+        if not isinstance(step, dict) or 'run' not in step:
+            continue
+        shell = step.get('shell') or default_shell
+        if str(shell).lower() not in ('bash', 'sh'):
+            continue
+        n += 1
+        path = os.path.join(outdir, '%s-%s-%d.sh' % (os.path.basename(src), job_name, i))
+        open(path, 'w', encoding='utf-8', newline='\n').write(str(step['run']))
+print(n)
+"@ $wfFile.FullName $extractDir 2>&1
+
+                $blockCount = 0
+                [int]::TryParse((($extract -join '').Trim()), [ref]$blockCount) | Out-Null
+                $scripts = @(Get-ChildItem -LiteralPath $extractDir -Filter '*.sh' -File -ErrorAction SilentlyContinue)
+
+                if ($scripts.Count -eq 0) {
+                    Add-Pass "$($wfFile.Name) has no shell run blocks to syntax-check"
+                } else {
+                    $bad = @()
+                    foreach ($script in $scripts) {
+                        $syntax = & $bashExe -n $script.FullName 2>&1
+                        if ($LASTEXITCODE -ne 0) { $bad += "$($script.Name): $($syntax -join ' ')" }
+                    }
+                    if ($bad.Count -eq 0) {
+                        Add-Pass "All $($scripts.Count) shell run block(s) in $($wfFile.Name) parse under bash -n, so a syntax error cannot wait until dispatch time to appear"
+                    } else {
+                        Add-Fail "A shell run block in $($wfFile.Name) does not parse: $($bad -join ' | ')"
+                    }
+                }
+            } finally {
+                Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
         }
     }
 }
