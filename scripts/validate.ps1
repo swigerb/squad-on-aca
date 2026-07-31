@@ -230,6 +230,8 @@ if (-not (Test-Path $aspireDir)) {
         "Squad.Aca.Agents.MAF\Squad.Aca.Agents.MAF.csproj",
         "Squad.Aca.Agents.MAF\SquadAcaAIAgent.cs",
         "Squad.Aca.Agents.MAF.Tests\Squad.Aca.Agents.MAF.Tests.csproj",
+        "Squad.Aca.Agents.MAF.Sample\Squad.Aca.Agents.MAF.Sample.csproj",
+        "Squad.Aca.Agents.MAF.Sample\Program.cs",
         "README.md"
     )
     foreach ($rel in $expected) {
@@ -328,7 +330,8 @@ if (-not (Test-Path $aspireDir)) {
             "Squad.Aca.Agents\Squad.Aca.Agents.csproj",
             "Squad.Aca.Agents.Tests\Squad.Aca.Agents.Tests.csproj",
             "Squad.Aca.Agents.MAF\Squad.Aca.Agents.MAF.csproj",
-            "Squad.Aca.Agents.MAF.Tests\Squad.Aca.Agents.MAF.Tests.csproj")) {
+            "Squad.Aca.Agents.MAF.Tests\Squad.Aca.Agents.MAF.Tests.csproj",
+            "Squad.Aca.Agents.MAF.Sample\Squad.Aca.Agents.MAF.Sample.csproj")) {
             if ($slnText -notlike "*$proj*") { $missingFromSln += $proj }
         }
         if ($missingFromSln.Count -eq 0) {
@@ -338,6 +341,33 @@ if (-not (Test-Path $aspireDir)) {
         }
     } else {
         Add-Fail "aspire/Squad.Aca.sln missing"
+    }
+
+    # The sample host is the ONLY project here that prints control-plane output to
+    # a terminal, and live output is exactly where a token leaks. Every Console
+    # write it makes must go through SecretRedactor, so this asserts the property
+    # mechanically rather than trusting a reviewer to notice a bare
+    # Console.WriteLine added later.
+    $sampleDir = Join-Path $aspireDir "Squad.Aca.Agents.MAF.Sample"
+    if (Test-Path $sampleDir) {
+        $unredacted = @()
+        foreach ($file in (Get-ChildItem -Path $sampleDir -Filter *.cs -File -Recurse |
+                Where-Object { $_.FullName -notmatch '\\(bin|obj)\\' })) {
+            $lineNumber = 0
+            foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
+                $lineNumber++
+                if ($line -match 'Console\.(Out|Error)?\.?Write' -and $line -notmatch 'SecretRedactor\.Redact') {
+                    $unredacted += "$($file.Name):$lineNumber"
+                }
+            }
+        }
+        if ($unredacted.Count -eq 0) {
+            Add-Pass "Every Console write in the MAF sample host passes through SecretRedactor"
+        } else {
+            Add-Fail "MAF sample host writes to the console without redacting: $($unredacted -join ', ')"
+        }
+    } else {
+        Add-Fail "aspire/Squad.Aca.Agents.MAF.Sample missing"
     }
 
     # .NET build AND test run whenever a dotnet SDK is present -- NOT behind

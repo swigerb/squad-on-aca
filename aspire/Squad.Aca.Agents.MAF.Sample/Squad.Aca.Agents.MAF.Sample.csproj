@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Squad on ACA — runnable Microsoft Agent Framework sample host.
+
+    This is the project that turns "the adapter compiles" into "a real MAF host
+    resolved an AIAgent and a Squad session ran on Azure". Sprints 1 and 2 were
+    entirely offline and faked; nothing had ever executed against ACA through
+    the adapter until this host existed.
+
+    IT IS A CONSOLE HOST, NOT A LIBRARY. It takes package references freely —
+    the quarantine rule constrains Squad.Aca.Agents (zero PackageReference) and
+    keeps Microsoft.Agents.AI confined to Squad.Aca.Agents.MAF. A sample that
+    consumes both is downstream of that boundary, so referencing the adapter is
+    exactly what it is supposed to demonstrate.
+
+    IT IS IN THE SOLUTION ON PURPOSE. A sample outside Squad.Aca.sln is a sample
+    CI never compiles, which is how sample code rots into something that no
+    longer builds against the API it documents. scripts/validate.ps1 asserts its
+    solution membership alongside the other agent projects.
+
+    TARGET FRAMEWORK — net9.0, matching Squad.Aca.Agents and the adapter.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>Squad.Aca.Agents.MAF.Sample</RootNamespace>
+    <AssemblyName>squad-aca-maf-sample</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Host.CreateApplicationBuilder — the shape Squad.Agents.AI's own quickstart
+      uses, so a host that already wires one Squad agent recognises this one.
+      Pinned exactly, for the same reason the adapter pins Microsoft.Agents.AI:
+      a floating range lets a routine restore change what a sample demonstrates
+      with no diff to review.
+    -->
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Squad.Aca.Agents.MAF\Squad.Aca.Agents.MAF.csproj" />
+  </ItemGroup>
+
+</Project>
