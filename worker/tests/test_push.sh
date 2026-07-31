@@ -260,4 +260,66 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# F. Incremental checkpoints. The branch is the durable artifact: if the
+#    credential expires mid-run, a session that has pushed nothing loses
+#    everything, and a session that has checkpointed loses one increment.
+# ---------------------------------------------------------------------------
+F="${WORK}/f"
+rm -rf "$F"; mkdir -p "$F"
+git_quiet init --bare "${F}/remote.git"
+git_quiet clone "${F}/remote.git" "${F}/client"
+(
+  cd "${F}/client"
+  git config user.email t@example.com; git config user.name t
+  git checkout -q -B work
+  echo one >f; git add -A; git commit -qm one
+) >/dev/null 2>&1
+
+( cd "${F}/client" && PUSH_CHANGES=true SQUAD_INCREMENTAL_PUSH=true squad_push_checkpoint work "step one" ) >/dev/null 2>&1
+f_after_first="$(git --git-dir="${F}/remote.git" rev-parse refs/heads/work 2>/dev/null || echo none)"
+assert_ne "none" "$f_after_first" "a checkpoint pushes work that exists NOW, so an expiry later costs one increment instead of the whole run"
+
+echo two >"${F}/client/f"
+( cd "${F}/client" && PUSH_CHANGES=true SQUAD_INCREMENTAL_PUSH=true squad_push_checkpoint work "step two" ) >/dev/null 2>&1
+f_after_second="$(git --git-dir="${F}/remote.git" rev-parse refs/heads/work)"
+assert_ne "$f_after_first" "$f_after_second" "a later checkpoint moves the remote again"
+
+f_rc=0
+( cd "${F}/client" && PUSH_CHANGES=true SQUAD_INCREMENTAL_PUSH=true squad_push_checkpoint work "nothing changed" ) >/dev/null 2>&1 || f_rc=$?
+assert_eq "0" "$f_rc" "a checkpoint with nothing to commit is a silent no-op, not an error"
+f_after_noop="$(git --git-dir="${F}/remote.git" rev-parse refs/heads/work)"
+assert_eq "$f_after_second" "$f_after_noop" "and it creates no empty commit"
+
+# A checkpoint that CANNOT push must never end a session that is still working.
+G="${WORK}/g"
+rm -rf "$G"; mkdir -p "$G"
+git_quiet init "${G}/client"
+(
+  cd "${G}/client"
+  git config user.email t@example.com; git config user.name t
+  git remote add origin "${G}/nonexistent-remote.git"
+  git checkout -q -B work
+  echo x >f; git add -A; git commit -qm x
+  echo y >f
+) >/dev/null 2>&1
+g_rc=0
+g_out="$( cd "${G}/client" && PUSH_CHANGES=true SQUAD_INCREMENTAL_PUSH=true squad_push_checkpoint work "doomed" 2>&1 )" || g_rc=$?
+assert_eq "0" "$g_rc" "a checkpoint whose push FAILS still returns 0 -- an intermediate push that cannot happen must not kill a session that is still working"
+assert_contains "$g_out" "The session is not over" "and it says so, so the log does not read like a fatal error"
+
+h_rc=0
+( cd "${F}/client" && PUSH_CHANGES=false squad_push_checkpoint work "no push mode" ) >/dev/null 2>&1 || h_rc=$?
+assert_eq "0" "$h_rc" "a session that is not pushing does not checkpoint either"
+
+echo three >"${F}/client/f"
+( cd "${F}/client" && PUSH_CHANGES=true SQUAD_INCREMENTAL_PUSH=false squad_push_checkpoint work "opted out" ) >/dev/null 2>&1
+f_optout="$(git --git-dir="${F}/remote.git" rev-parse refs/heads/work)"
+assert_eq "$f_after_second" "$f_optout" "SQUAD_INCREMENTAL_PUSH=false genuinely disables checkpointing -- the remote did not move"
+
+echo four >"${F}/client/f"
+( cd "${F}/client" && PUSH_CHANGES=true squad_push_checkpoint work "default" ) >/dev/null 2>&1
+f_default="$(git --git-dir="${F}/remote.git" rev-parse refs/heads/work)"
+assert_eq "$f_after_second" "$f_default" "checkpointing is OFF BY DEFAULT: this worker runs the agent as one copilot invocation, so a mid-run 'git add -A; git commit' races the agent's own index and can capture a half-finished state. Opting in is a decision for sessions with safe boundaries, not a default for everyone"
+
 test_summary

@@ -4932,6 +4932,60 @@ if (Test-Path $actionsSuite) {
     Add-Fail "worker/tests/test_actions_event.sh is missing, so the trigger's refusals -- including the retrigger loop break -- are untested"
 }
 
+# A lease is claimed BEFORE compute is requested, so a dispatcher that dies in
+# between leaves a lease held by a session that does not exist -- and the issue
+# is then blocked forever, because every future trigger correctly sees `active`
+# and stands down. Several such leases were produced by hand while debugging
+# this sprint, and each needed a human with a CLI to release.
+$sweepWorkflow = Join-Path $RepoRoot '.github/workflows/squad-lease-sweep.yml'
+if (Test-Path $sweepWorkflow) {
+    $sweep = Get-Content -LiteralPath $sweepWorkflow -Raw
+    if ($sweep -match 'squad-dispatch\.js sweep') {
+        Add-Pass "Stale leases are reconciled by a scheduled sweep using the SHARED sweep, so a dispatcher that died between claim and start cannot block an issue until a human notices"
+    } else {
+        Add-Fail "The lease reconciliation workflow does not call the shared 'squad-dispatch.js sweep', so it would apply its own staleness rules"
+    }
+
+    if ($sweep -match "cron:\s*'[^']*\*/[1-9]\b") {
+        Add-Fail "The lease sweep runs more often than hourly. A lease heartbeats while its session lives, so a genuinely stale lease is stale for a long time -- and this repository has already had a rate-limit outage from an unbounded sweep"
+    } else {
+        Add-Pass "The lease sweep runs no more often than hourly, spending rate-limit budget in proportion to how rare a stale lease actually is"
+    }
+
+    if ($sweep -match '/rate_limit') {
+        Add-Pass "The sweep reports the remaining rate-limit budget each run, so drift towards the ceiling is visible before it is an outage"
+    } else {
+        Add-Fail "Nothing reports the rate-limit budget, so the first sign of exhaustion would be a failure"
+    }
+} else {
+    Add-Fail ".github/workflows/squad-lease-sweep.yml is missing, so a lease orphaned between claim and start blocks its issue until a human releases it by hand"
+}
+
+$deployScript = Join-Path $RepoRoot 'scripts/deploy.ps1'
+if (Test-Path $deployScript) {
+    $deployText = Get-Content -LiteralPath $deployScript -Raw
+    # `az containerapp job delete` runs whenever the image changes, and a role
+    # assignment scoped to a RESOURCE dies with that resource. Observed live:
+    # the Actions identity silently lost its grant on redeploy and the next
+    # triggered run failed with "No subscriptions found" -- which reads like an
+    # OIDC fault and is an RBAC one.
+    if ($deployText -match '--role\s+"Container Apps Jobs Operator"' -and
+        $deployText -match '--assignee-object-id\s+\$ghaPrincipalId' -and
+        $deployText -match 'az containerapp job show --name \$jobName[^\r\n]*--query id') {
+        Add-Pass "deploy.ps1 re-grants Container Apps Jobs Operator to the GitHub Actions principal, scoped to the session job's own resource id, after recreating it -- a job delete silently destroys resource-scoped assignments and the next triggered run would fail with 'No subscriptions found', which looks like an OIDC fault and is not"
+    } else {
+        Add-Fail "deploy.ps1 does not assign 'Container Apps Jobs Operator' to the GitHub Actions principal scoped to the session job after recreating it. A resource-scoped role assignment dies with the resource, so every image-changing deploy would silently break the Actions trigger"
+    }
+} else {
+    Add-Fail "scripts/deploy.ps1 is missing"
+}
+
+if ($false) {
+    Add-Pass "unreachable"
+} else {
+    $null = $null
+}
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

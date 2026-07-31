@@ -10,7 +10,8 @@ param(
     [string]$DefaultRepository = "",
     [string]$DefaultRef = "",
     [switch]$UseKeyVault,
-    [string]$KeyVaultName = ""
+    [string]$KeyVaultName = "",
+    [string]$GitHubActionsIdentityName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -367,6 +368,42 @@ $outputs = [ordered]@{
     defaultRepository = $DefaultRepository
     defaultRef = $DefaultRef
     logAnalyticsWorkspace = $workspaceName
+}
+
+# --- The Actions trigger's grant, reconciled (issue #32 S4) -------------------
+#
+# `az containerapp job delete` above runs whenever the image changes, and a role
+# assignment scoped to a RESOURCE dies with that resource. The GitHub Actions
+# federated identity therefore LOSES its grant on every image-changing deploy,
+# and the next triggered run fails with "No subscriptions found" -- which reads
+# like an OIDC fault and is an RBAC one. Observed live, not theorised.
+#
+# The grant is reconciled here rather than widened to the resource group,
+# because "Container Apps Jobs Operator" scoped to the single session job is the
+# whole point: the trigger can start THAT job and nothing else.
+#
+# Absent identity is not an error. The Actions trigger is optional; a deployment
+# that never uses it should not fail for want of a grant nobody wants.
+$ghaIdentityName = if ($GitHubActionsIdentityName) { $GitHubActionsIdentityName } else { "uai-$NamePrefix-gha" }
+$ghaPrincipalId = az identity show --name $ghaIdentityName --resource-group $ResourceGroupName --query principalId -o tsv 2>$null
+if ($ghaPrincipalId) {
+    $jobScope = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query id -o tsv 2>$null
+    if ($jobScope) {
+        $existingGrant = az role assignment list --assignee $ghaPrincipalId --scope $jobScope `
+            --query "[?roleDefinitionName=='Container Apps Jobs Operator'].id" -o tsv 2>$null
+        if ($existingGrant) {
+            Write-Host "GitHub Actions identity '$ghaIdentityName' already holds Container Apps Jobs Operator on $jobName."
+        } else {
+            Write-Host "Re-granting Container Apps Jobs Operator on $jobName to '$ghaIdentityName' (a job delete drops resource-scoped assignments)."
+            az role assignment create `
+                --assignee-object-id $ghaPrincipalId `
+                --assignee-principal-type ServicePrincipal `
+                --role "Container Apps Jobs Operator" `
+                --scope $jobScope | Out-Null
+        }
+    }
+} else {
+    Write-Host "No GitHub Actions identity '$ghaIdentityName' in $ResourceGroupName; skipping the Actions trigger grant."
 }
 
 $outputsPath = Join-Path $repoRoot "deploy.outputs.json"

@@ -1,0 +1,65 @@
+name: Squad lease reconciliation
+
+# Issue #32 S4. A lease is claimed BEFORE compute is requested, so a dispatcher
+# that dies between the claim and a confirmed start leaves a lease held by a
+# session that does not exist. The issue is then blocked: every future trigger
+# sees `active` and correctly stands down, forever.
+#
+# This session produced several such leases by hand while debugging the Actions
+# trigger, and every one had to be released manually. That is the argument for
+# this workflow existing: a stall that needs a human with a CLI is a stall that
+# lasts until someone notices.
+#
+# The sweep is the SHARED one (`squad-dispatch.js sweep`), not a second
+# implementation, so it applies exactly the same staleness rules the CLI, Ralph
+# and Watch already agree on.
+
+on:
+  schedule:
+    # Hourly. Deliberately NOT every five minutes: a lease heartbeat runs while
+    # a session lives, so a genuinely stale lease is stale for a long time, and
+    # sweeping aggressively spends rate-limit budget on a rare event. This
+    # repository has already had one self-inflicted rate-limit outage from an
+    # unbounded sweep.
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: squad-lease-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the lease store lives in this repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sweep leases whose owner is gone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          before="$(node worker/lib/squad-dispatch.js list --repository "${GITHUB_REPOSITORY}")"
+          echo "$before" | jq -c '{total: (.leases|length), claimed: [.leases[]|select(.state=="claimed")]|length}'
+
+          result="$(node worker/lib/squad-dispatch.js sweep --repository "${GITHUB_REPOSITORY}")"
+          echo "$result" | jq -c '{outcome, swept: (.leases//[]|length)}'
+
+          after="$(node worker/lib/squad-dispatch.js list --repository "${GITHUB_REPOSITORY}")"
+          echo "$after" | jq -c '{total: (.leases|length), claimed: [.leases[]|select(.state=="claimed")]|length}'
+
+      - name: Report the rate-limit budget
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Installation tokens get 5,000 requests/hour. That is ample for
+          # event-driven work and fatal for O(n) polling. Secondary limits bite
+          # sooner: 80 content-creation requests per minute and 500 per hour,
+          # which a comment-happy agent reaches. Surfacing the number each hour
+          # means a drift towards the ceiling is visible before it is an outage.
+          gh api /rate_limit --jq '.resources.core | "core: \(.remaining)/\(.limit) remaining, resets \(.reset|todate)"'
