@@ -1514,3 +1514,15 @@ measured TTL of exactly 3600 seconds, so it is not.
 - I only found it by running the live end-to-end test AGAIN after S3 and S4.
   Merging on green CI would have shipped a dead trigger.
 - Build multi-line strings in a `run:` block with printf, never literally.
+
+## Issue #32 - what static gates can and cannot see
+
+- `bash -n` on every extracted `run:` block catches SYNTAX. It does not catch
+  ORDERING: a refactor moved a `commit_message=` assignment below its own use
+  and `set -u` only found it during a live dispatch, after Azure had been paid.
+- The live end-to-end run is the last gate, not a formality. Three defects this
+  sprint were invisible to every offline check: an unparseable workflow, a
+  variable used before assignment, and a lease outcome nobody had enumerated.
+- Each time the fix was to add the gate that would have caught it AND keep
+  running the live test. Adding only the gate would have been the comfortable
+  half.
