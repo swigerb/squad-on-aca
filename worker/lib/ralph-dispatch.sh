@@ -259,6 +259,9 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
       # Compute is already running, or the work already finished. Reconcile the
       # label so the issue stops appearing as a candidate. This is the
       # crash-between-claim-and-label repair path.
+      if declare -F squad_credential_refresh_env >/dev/null 2>&1; then
+        squad_credential_refresh_env || true
+      fi
       gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$RALPH_DISPATCH_LABEL" >/dev/null 2>&1 || true
       log "Ralph: issue #${issue_number} already has a live lease (${claim_outcome}); not dispatching again."
       return 0
@@ -339,6 +342,14 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
   # Label ONLY after a confirmed start. A labeling failure here is non-fatal:
   # the job is already running, so we log it and let the (idempotent) next run
   # reconcile the label rather than treating the dispatch as failed.
+  #
+  # `gh` is a fresh process but inherits this shell's exported GH_TOKEN, which
+  # was captured at session start. Ralph dispatches for as long as it runs, so
+  # re-read the token file first (issue #32). The guard keeps this file usable
+  # by any caller that has not sourced squad-credentials.sh.
+  if declare -F squad_credential_refresh_env >/dev/null 2>&1; then
+    squad_credential_refresh_env || true
+  fi
   if ! gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --add-label "$RALPH_DISPATCH_LABEL" >/dev/null 2>&1; then
     log "Ralph: dispatched issue #${issue_number} to ${session_name} but could not add the '${RALPH_DISPATCH_LABEL}' label; it may be re-dispatched next run."
     return 0

@@ -1335,3 +1335,41 @@ no `procps`. Filed, not patched in passing.
 - Live control-plane output echoes the subscription GUID (the `az` job-execution
   JSON is relayed verbatim). Redaction at the print site handles tokens; GUIDs
   still have to be redacted by hand when the output goes into `docs/`.
+
+## Issue #32 S1 - the credential must survive the run, not just start it
+
+The token was baked into git config once, at session start; the push is 10 to 60
+minutes later. With a PAT that is harmless. A GitHub App installation token has a
+measured TTL of exactly 3600 seconds, so it is not.
+
+- **A clone proves nothing about a credential on a PUBLIC repository.** Measured:
+  clone with an expired token exits 0, no warning. The push is the first
+  operation that actually tests it, and it fails at the LATEST possible moment,
+  after the whole run is spent. Any test asserting "the clone worked" would stay
+  green with the credential helper deleted.
+- **The fix is a git credential helper re-reading a 0600 token FILE**, not a
+  config rewrite. Proven end to end: stale token -> push refused -> rewrite ONLY
+  the token file -> push succeeds, same working copy, no re-clone, and no
+  credential or url config changed.
+- **`if ! git push ...; then rc=$?; fi` sets rc to 0, always.** Inside the
+  then-branch of a negated condition `True` is the status of the NEGATION, which
+  is 0 exactly when the command failed. The caller's `exit "$rc"` therefore
+  reported a REFUSED push as a successful session. This is the PR #9 defect,
+  reintroduced in new code while the surrounding comment cited PR #9 by name.
+  Writing about a trap is not the same as avoiding it.
+- **Inline logic in entrypoint.sh is untestable logic.** Nothing under
+  worker/tests/ sources entrypoint.sh, which is exactly why the above had no
+  coverage. Extracting to worker/lib/ and testing the lib is the convention here
+  for a reason; the push now lives in worker/lib/squad-push.sh.
+- **A ruleset refusal is exit 1; an expired token is exit 128.** Different
+  faults, different remedies. Measured against a real ruleset. Retrying a
+  ruleset refusal after a token refresh wastes the retry and misdescribes the
+  fault, so only `auth` is retried.
+- **ACA Jobs cannot be refreshed mid-session.** `az containerapp job` has no
+  `exec`; `job execution` is view-only; `az containerapp exec` targets
+  Container Apps. Verified against the CLI. Sandboxes can, via
+  `aca sandbox fs write`. There is deliberately NO Jobs refresh test.
+- **A test helper that is not executable looks exactly like an auth failure.**
+  The credential cases passed for the wrong reason until the helper was copied
+  and chmod +x'd the way the Dockerfile does. The `ANONYMOUS` line in the
+  fixture's auth log is what exposed it - an exit code alone would not have.

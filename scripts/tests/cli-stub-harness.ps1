@@ -567,6 +567,7 @@ exit /b 1
 :acaexec2
 setlocal enabledelayedexpansion
 if not "!CMD:squad-credentials-vault=!"=="!CMD!" goto acavault
+if not "!CMD:squad-credential-refreshed=!"=="!CMD!" goto acarefresh
 if not "!CMD:squad-launched=!"=="!CMD!" goto acalaunch
 if not "!CMD:squad-cancelled=!"=="!CMD!" goto acacancel
 if not "!CMD:echo marker=!"=="!CMD!" goto acapoll
@@ -579,6 +580,16 @@ rem The real vault exec reports the mode it achieved; the provider refuses to
 rem upload into anything but 700, so the stub must report a real value.
 echo squad-credentials-vault-%SQUAD_STUB_ACA_VAULT_MODE%
 exit /b %SQUAD_STUB_ACA_SEED_RC%
+:acarefresh
+endlocal
+rem The MID-SESSION credential refresh (issue #32). Like the vault exec, the
+rem real command reports the mode it ACHIEVED rather than what it attempted, and
+rem the provider refuses anything that is not 600 -- a wider mode discloses the
+rem token for the rest of the session, and `missing` means the upload never
+rem landed and the worker is still holding the OLD token. The stub must
+rem therefore be able to report a wrong answer, not only a right one.
+echo squad-credential-refreshed-%SQUAD_STUB_ACA_REFRESH_MODE%
+exit /b %SQUAD_STUB_ACA_REFRESH_RC%
 :acalaunch
 endlocal
 echo squad-launched
@@ -810,6 +821,7 @@ function Invoke-SquadCliCapture {
                   "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR", "SQUAD_STUB_ACA_CANCEL_STATUS",
                   "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
                   "SQUAD_STUB_ACA_SEED_RC", "SQUAD_STUB_ACA_SEED_STDIN", "SQUAD_STUB_ACA_VAULT_MODE",
+                  "SQUAD_STUB_ACA_REFRESH_MODE", "SQUAD_STUB_ACA_REFRESH_RC",
                   "SQUAD_STUB_ACA_CRED_RC", "SQUAD_STUB_ACA_CRED_ERR", "SQUAD_STUB_ACA_CRED_ID",
                   "SQUAD_STUB_ACA_CRED_STDIN", "SQUAD_STUB_ACA_CREDDEL_RC", "SQUAD_STUB_ACA_CREDDEL_ERR",
                   "SQUAD_ACA_ENABLE_SANDBOX", "SQUAD_ACA_SANDBOX_CLI",
@@ -886,6 +898,11 @@ function Invoke-SquadCliCapture {
         # refusal sets this to something else after the capture environment is
         # built.
         if (-not $env:SQUAD_STUB_ACA_VAULT_MODE) { $env:SQUAD_STUB_ACA_VAULT_MODE = "700" }
+        # Same rule for the mid-session refresh exec (issue #32): an unset knob
+        # expands to the literal `%NAME%` under cmd, which is neither 600 nor a
+        # number, so the refusal path would fire for the wrong reason.
+        if (-not $env:SQUAD_STUB_ACA_REFRESH_MODE) { $env:SQUAD_STUB_ACA_REFRESH_MODE = "600" }
+        if (-not $env:SQUAD_STUB_ACA_REFRESH_RC) { $env:SQUAD_STUB_ACA_REFRESH_RC = "0" }
         $env:SQUAD_STUB_ACA_SEED_STDIN = $CredentialFileCapture
         # THE golden-portability pin for Sprint 5. A CLI capture must always be
         # taken with the sandbox feature flag OFF, whatever the developer's shell

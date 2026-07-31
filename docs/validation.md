@@ -167,6 +167,73 @@ the inventory must fail the anti-drift check. Both are reproduced by editing the
 generator, running `validate.ps1` (or `verify-launch-detachment.ps1` for the
 probe path), and reverting.
 
+## Credential handling under a one-hour token
+
+Issue #32 replaced the token baked into `url.<...>.insteadOf` at session start
+with a git credential helper that re-reads a `0600` token file on every git
+operation. Three suites cover it, and all three run against **real** git rather
+than a simulation:
+
+| Suite | What it exercises |
+|---|---|
+| `worker/tests/test_credentials.sh` | The helper and the token file, against a real smart-HTTP remote (`worker/tests/lib/fake-git-https-server.js`, driving the actual `git http-backend`) that answers `401` until a correct credential arrives. |
+| `worker/tests/test_token_preflight.sh` | The fail-fast gate: lifetime versus estimated run duration, live credential probe, and the setups it refuses to start under. |
+| `worker/tests/test_push.sh` | Exit-code propagation and the retry-after-refresh path. |
+
+### Why the obvious test would have been worthless
+
+`swigerb/squad-on-aca` is a **public** repository. An unauthenticated clone
+succeeds, and so does a clone with an expired token — exit 0, no warning. A test
+that observed "the clone worked" would stay green with the credential helper
+deleted entirely.
+
+So the fixture demands a credential and records what crossed the wire:
+
+```
+PRESENTED x-access-token:ghs-rotated-bbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+The assertion is about the credential, not the exit code. There is also an
+`ANONYMOUS` control: with no helper configured the same fixture refuses the
+push, which is what makes every success below evidence rather than coincidence.
+
+### The regression that made `test_push.sh` necessary
+
+The push logic used to live inline in `worker/entrypoint.sh`. Nothing under
+`worker/tests/` sources that file, so it was logic no test could reach — and it
+shipped with the exact defect that sank PR #9:
+
+```bash
+if ! git push ...; then
+  push_rc=$?      # 0, ALWAYS: $? here is the status of the NEGATION
+fi
+```
+
+Proven in a real shell:
+
+```
+if ! (exit 128); then rc=$?; fi   ->  rc=0
+(exit 128) || rc=$?                ->  rc=128
+```
+
+The caller ended with `exit "$push_rc"`, so a push git had **refused** would
+have exited 0 and the session would have been recorded as successful with
+nothing pushed. The logic now lives in `worker/lib/squad-push.sh` so it can be
+executed by a test, and `test_push.sh` case B asserts a refused push returns
+non-zero while case C — the control — runs the *old* shape against the same
+refused push and shows it returning 0. Without case C, case B could pass for the
+wrong reason.
+
+Re-introducing the old shape fails five named assertions.
+
+### What is NOT covered
+
+- **A mid-session refresh under ACA Jobs**, because there is no channel to
+  perform one — see `docs/sandboxes.md`, "Refresh channel matrix". A test
+  implying otherwise would restate a wish.
+- **Real GitHub tokens.** The suites use a local fixture; the live path is
+  exercised by the token preflight against the real API at session start.
+
 ## Proving the CLI has not changed
 
 Two guards drive the same 22-invocation matrix (`scripts/tests/cli-capture-cases.ps1`)

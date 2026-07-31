@@ -2232,8 +2232,8 @@ if (-not (Test-Path $providerLib)) {
                     $sbBashisms += "$sbGen emits a shell command the portability inventory does not cover, so nothing screens it for the bashism that reported a live worker as already-dead in issue #36"
                 }
             }
-            if ($sbEmitted.Count -lt 6) {
-                $sbBashisms += "the portability inventory shrank to $($sbEmitted.Count) command(s); the launch, cancel, poll, credential-vault, logs and credential-file fragments are all run by /bin/sh and must all stay covered"
+            if ($sbEmitted.Count -lt 7) {
+                $sbBashisms += "the portability inventory shrank to $($sbEmitted.Count) command(s); the launch, cancel, poll, credential-vault, credential-refresh, logs and credential-file fragments are all run by /bin/sh and must all stay covered"
             }
             # The log tail used to be a bare literal at its call site. A command
             # that exists only inline is a command no screen can reach, so its
@@ -2243,7 +2243,7 @@ if (-not (Test-Path $providerLib)) {
             }
         }
         if ($sbBashisms.Count -eq 0) {
-            Add-Pass "All 6 emitted shell commands (launch, cancel, poll, credential-vault, logs, credential-file) are strict POSIX sh with no bashism, and every New-Sandbox*Command generator is covered by the inventory -- 'aca sandbox exec' runs them under dash, where the first fix's `$(< file)` silently expanded to nothing and reported a live worker as already-dead"
+            Add-Pass "All 7 emitted shell commands (launch, cancel, poll, credential-vault, credential-refresh, logs, credential-file) are strict POSIX sh with no bashism, and every New-Sandbox*Command generator is covered by the inventory -- 'aca sandbox exec' runs them under dash, where the first fix's `$(< file)` silently expanded to nothing and reported a live worker as already-dead"
         } else {
             Add-Fail "An emitted sandbox command is not dash-safe ($($sbBashisms -join '; '))"
         }

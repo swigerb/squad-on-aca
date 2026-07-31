@@ -32,6 +32,17 @@ assert_contains() {
   echo "ok - ${msg}"
 }
 
+assert_ne() {
+  local unexpected="$1" actual="$2" msg="${3:-}"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ "$unexpected" == "$actual" ]]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo "FAIL: ${msg} (expected anything BUT: '${unexpected}')"
+    return 0
+  fi
+  echo "ok - ${msg}"
+}
+
 assert_not_contains() {
   local haystack="$1" needle="$2" msg="${3:-}"
   TESTS_RUN=$((TESTS_RUN + 1))

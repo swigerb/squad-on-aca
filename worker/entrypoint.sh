@@ -61,9 +61,46 @@ log "Mode: ${SQUAD_MODE}"
 log "Squad OTLP endpoint: ${ASPIRE_OTLP_GRPC_ENDPOINT}"
 log "Copilot OTLP endpoint: ${ASPIRE_OTLP_HTTP_ENDPOINT}"
 
-if [[ -n "${GH_TOKEN:-}" ]]; then
-  git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+# --- Credentials (issue #32) -------------------------------------------------
+# The token used to be baked into git config ONCE, at session start:
+#
+#   git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf ...
+#
+# The whole agent run sits between that line and the push in
+# commit_and_push_if_needed. With a long-lived PAT that is harmless; with a
+# GitHub App installation token, whose TTL is a hard 1 hour, it is a live
+# failure mode -- and the LATEST possible one. Measured: a clone with an expired
+# token succeeds (exit 0, no warning, because the repository is public), and the
+# push then fails with exit 128 "Invalid username or token" after the entire run
+# is spent.
+#
+# The rewrite is replaced by a credential helper that re-reads a 0600 token FILE
+# on every git operation, so a refreshed file is picked up with no re-clone and
+# no git config rewrite. Everything to do with that lives in
+# worker/lib/squad-credentials.sh.
+SQUAD_CREDENTIALS_LIB="${SQUAD_CREDENTIALS_LIB:-/usr/local/lib/squad-on-aca/squad-credentials.sh}"
+if [[ ! -f "$SQUAD_CREDENTIALS_LIB" ]]; then
+  log "Credential library not found at ${SQUAD_CREDENTIALS_LIB}."
+  log "Without it the worker cannot install the credential helper, so a token refreshed mid-session could never be picked up and a long run would fail at the push. Refusing to start."
+  exit 78
 fi
+# shellcheck source=lib/squad-credentials.sh
+source "$SQUAD_CREDENTIALS_LIB"
+
+SQUAD_PUSH_LIB="${SQUAD_PUSH_LIB:-/usr/local/lib/squad-on-aca/squad-push.sh}"
+if [[ ! -f "$SQUAD_PUSH_LIB" ]]; then
+  log "Push library not found at ${SQUAD_PUSH_LIB}."
+  log "Without it the worker would push without classifying a credential failure, so an expired token would end the run as an anonymous non-zero after the whole agent run is spent. Refusing to start."
+  exit 78
+fi
+# shellcheck source=lib/squad-push.sh
+source "$SQUAD_PUSH_LIB"
+
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  squad_credential_write_token "$GH_TOKEN"
+fi
+squad_credential_install_helper
+
 git config --global user.name "${GIT_AUTHOR_NAME:-Remote Squad}"
 git config --global user.email "${GIT_AUTHOR_EMAIL:-squad-on-aca@users.noreply.github.com}"
 git config --global --add safe.directory "$REPO_DIR" || true
@@ -104,6 +141,33 @@ elif [[ -f "${REPO_DIR}/${CAPABILITY_MANIFEST_RELATIVE}" ]]; then
   exit 78
 else
   log "Capability preflight script not found at ${CAPABILITY_PREFLIGHT_SCRIPT} and no manifest present; skipping."
+fi
+
+# --- Token preflight (issue #32) ---------------------------------------------
+# Fail at minute 2, not minute 55. The clone above succeeds with an EXPIRED
+# token when the repository is public, so nothing so far has proved the
+# credential can do the one thing the session ends with. This gate exercises it
+# and compares its remaining lifetime against the estimated run duration. It
+# runs BEFORE anything that starts an agent, and after the clone so it can
+# report against the repository this session actually targets.
+TOKEN_PREFLIGHT_SCRIPT="${TOKEN_PREFLIGHT_SCRIPT:-/usr/local/lib/squad-on-aca/squad-token-preflight.sh}"
+token_preflight_disabled=false
+case "${SQUAD_TOKEN_PREFLIGHT:-}" in
+  disabled|disable|off|false|0) token_preflight_disabled=true ;;
+esac
+if [[ "${SKIP_TOKEN_PREFLIGHT:-false}" == "true" ]]; then
+  token_preflight_disabled=true
+fi
+if [[ -x "$TOKEN_PREFLIGHT_SCRIPT" ]]; then
+  "$TOKEN_PREFLIGHT_SCRIPT"
+elif [[ "$token_preflight_disabled" == "true" ]]; then
+  log "Token preflight script not found at ${TOKEN_PREFLIGHT_SCRIPT}; preflight explicitly disabled, continuing."
+elif [[ "${PUSH_CHANGES:-false}" == "true" ]]; then
+  log "Token preflight script missing at ${TOKEN_PREFLIGHT_SCRIPT} but this session intends to PUSH; failing closed rather than discovering an unusable credential after the whole agent run."
+  log "Set SQUAD_TOKEN_PREFLIGHT=disabled (or SKIP_TOKEN_PREFLIGHT=true) to override at your own risk."
+  exit 78
+else
+  log "Token preflight script not found at ${TOKEN_PREFLIGHT_SCRIPT} and this session does not push; skipping."
 fi
 
 if [[ ! -f ".squad/team.md" ]]; then
@@ -183,6 +247,12 @@ squad_lease_report() {
   shift
   [[ -n "${SQUAD_LEASE_KEY:-}" && -n "${GITHUB_REPOSITORY:-}" ]] || return 0
   [[ -f "$SQUAD_DISPATCH_CLI" ]] || return 0
+  # The heartbeat runs for the WHOLE session (every 300s by default), so by the
+  # last tick the GH_TOKEN this shell exported at startup may be an hour old.
+  # `gh` is spawned fresh by dispatch-lease.js and inherits this environment, so
+  # re-reading the token file here is what keeps a long session's lease writable
+  # after a refresh. Best-effort, like every other lease call.
+  squad_credential_refresh_env || true
   node "$SQUAD_DISPATCH_CLI" "$op" \
     --repository "$GITHUB_REPOSITORY" \
     --lease-key "$SQUAD_LEASE_KEY" "$@" >/dev/null 2>&1 || true
@@ -237,8 +307,39 @@ commit_and_push_if_needed() {
   git checkout -B "$branch"
   git add -A
   git commit -m "${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}"
-  git push --set-upstream origin "$branch"
+
+  # THE PUSH IS THE MOMENT THE CREDENTIAL IS FIRST REALLY TESTED (issue #32).
+  # Everything before it -- including the clone -- succeeds against a public
+  # repository with an expired token. The push does not: it fails with exit 128
+  # and "Invalid username or token".
+  #
+  # Two things happen here that did not before:
+  #
+  #   * the credential helper re-reads the token FILE for this push, so a token
+  #     the control plane refreshed mid-session is used automatically. That is
+  #     why the retry below is worth anything: the mitigation was proven by
+  #     probe (expired -> exit 128 -> rewrite ONLY the token file -> exit 0,
+  #     same repository, same process, no git config change);
+  #   * a failure whose text says the CREDENTIAL was rejected is classified as
+  #     `auth` using the shared taxonomy and exits ${SQUAD_EXIT_CREDENTIAL},
+  #     instead of aborting as an anonymous non-zero and being read as "the
+  #     agent's work failed".
+  # The push is the moment the credential is first really tested (issue #32).
+  # Everything before it -- including the clone -- succeeds against a public
+  # repository with an expired token. The push does not: it fails with exit 128
+  # and "Invalid username or token".
+  #
+  # The logic lives in worker/lib/squad-push.sh because nothing under
+  # worker/tests/ sources this file, so exit-code handling written inline here
+  # would be untestable -- and untested exit-code handling is what sank PR #9.
+  squad_push_branch "$branch" || exit $?
+
   if [[ "${CREATE_PR:-true}" == "true" ]]; then
+    # `gh` reads GH_TOKEN from its environment. It is a fresh process, so it
+    # WOULD honour a refreshed token -- except that this shell exported GH_TOKEN
+    # at startup and an exported variable is frozen for the life of the shell.
+    # Re-read the file into the environment immediately before the call.
+    squad_credential_refresh_env || true
     gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}" || true
   fi
 }
@@ -247,6 +348,11 @@ case "${SQUAD_MODE:-smoke}" in
   smoke)
     log "Running smoke checks."
     squad_policy_announce direct
+    # Runs seconds after start, so the exported token is almost certainly still
+    # good -- but the same rule is applied everywhere `gh` is invoked, because a
+    # call site that is an exception today becomes the one that was forgotten
+    # tomorrow.
+    squad_credential_refresh_env || true
     gh repo view "$GITHUB_REPOSITORY" --json nameWithOwner,defaultBranchRef >/tmp/repo.json
     cat /tmp/repo.json
     squad status || true
@@ -404,9 +510,14 @@ NODE
     # to avoid triggering member assignment.
     RALPH_DISPATCH_LABEL="${RALPH_DISPATCH_LABEL:-squad-aca:dispatched}"
     blocked_labels_regex='(^|,)(blocked|status:blocked|status:wontfix|status:on-hold)(,|$)'
+    # `az login --identity` above can take a while, and Ralph itself is a
+    # long-lived dispatcher: everything from here on is `gh`, so re-read the
+    # token file into the environment first.
+    squad_credential_refresh_env || true
     gh label create "$RALPH_DISPATCH_LABEL" --repo "$GITHUB_REPOSITORY" --color 5319E7 --description "Dispatched by Squad on ACA Ralph" --force >/dev/null 2>&1 || true
 
     issues_json="$(mktemp)"
+    squad_credential_refresh_env || true
     gh issue list \
       --repo "$GITHUB_REPOSITORY" \
       --state open \

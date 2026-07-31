@@ -207,6 +207,14 @@ function Get-SquadEmittedShellCommand {
     }
 
     $commands += [pscustomobject]@{
+        Id        = "credential-refresh"
+        Generator = "New-SandboxCredentialRefreshCommand"
+        Shell     = "sh"
+        Command   = (New-SandboxCredentialRefreshCommand)
+        Note      = 'the MID-SESSION credential refresh (issue #32): copies an uploaded token into the 0600 token file the worker''s git credential helper re-reads on every git operation, and echoes the mode it achieved. A silent empty expansion of that mode reads as "not 600", which refuses the refresh -- fail-closed, but only by accident, and the cost of getting it wrong is a session that keeps pushing with an expired token.'
+    }
+
+    $commands += [pscustomobject]@{
         Id        = "logs"
         Generator = "New-SandboxLogsCommand"
         Shell     = "sh"

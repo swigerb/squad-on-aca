@@ -32,9 +32,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --chown=squad:squad entrypoint.sh /usr/local/bin/squad-on-aca
-COPY --chown=squad:squad lib/squad-capability-preflight.sh lib/parse-capabilities.js lib/resolve-capability-route.js lib/dispatch-decision.js lib/dispatch-lease.js lib/squad-dispatch.js lib/ralph-dispatch.sh lib/git-checkout.sh lib/agent-policy.js lib/squad-policy.sh /usr/local/lib/squad-on-aca/
-RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh \
-    && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh
+COPY --chown=squad:squad lib/squad-capability-preflight.sh lib/squad-token-preflight.sh lib/squad-credentials.sh lib/squad-push.sh lib/squad-git-credential-helper.sh lib/parse-capabilities.js lib/resolve-capability-route.js lib/dispatch-decision.js lib/dispatch-lease.js lib/squad-dispatch.js lib/ralph-dispatch.sh lib/git-checkout.sh lib/agent-policy.js lib/squad-policy.sh /usr/local/lib/squad-on-aca/
+RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-credentials.sh /usr/local/lib/squad-on-aca/squad-push.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh \
+    && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh
 
 USER squad
 WORKDIR /workspace

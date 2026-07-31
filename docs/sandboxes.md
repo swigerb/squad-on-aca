@@ -107,6 +107,65 @@ The shipped catalog keeps one deliberately unapproved class
 repository's manifest can only ever *request* a capability — it can never add a
 class, add an egress destination, widen a credential list, or name an image.
 
+## Refresh channel matrix
+
+A GitHub App installation token has a hard **one-hour TTL**, measured, not
+assumed:
+
+```
+$ mint an installation token
+"expires_at": "2026-07-31T19:08:30Z",
+"ttlSeconds": 3600
+```
+
+An agent run of 10 to 60 minutes sits between the moment a session receives its
+credential and the moment it pushes. The worker therefore reads its token
+through a git credential helper that re-reads a `0600` token file on **every**
+git operation (`worker/lib/squad-git-credential-helper.sh`), so a token the
+control plane rewrites mid-session is picked up with no re-clone and no
+`git config` change.
+
+Whether anything *can* rewrite that file depends on the plane:
+
+| Plane | Mid-session refresh | Why |
+|---|---|---|
+| **ACA Sandboxes** | **Yes** | `aca sandbox fs write` is a real file channel into a running sandbox, and the provider already uses it to deliver credentials. `Invoke-SquadSandboxCredentialRefresh` stages a new token and swaps it in. |
+| **ACA Jobs** (default, and the rollback path) | **No** | There is no exec or file channel into a running job execution. `az containerapp job` exposes `create/delete/list/show/start/stop/update`, plus `execution`, which is **view-only**; `az containerapp exec` targets Container Apps, not jobs. Verified against the CLI, not inferred from documentation. |
+
+Two consequences follow, and neither is papered over:
+
+- Under **Jobs**, the only defence is the fail-fast preflight
+  (`worker/lib/squad-token-preflight.sh`). It exercises the credential and
+  compares its remaining lifetime against `SQUAD_ESTIMATED_RUN_MINUTES`
+  *before* the agent starts, so an unusable credential costs two minutes rather
+  than an entire run. If the token cannot survive the estimate, the session
+  refuses to start.
+- There is deliberately **no Jobs refresh test**. A test implying Jobs can be
+  refreshed would be a test that restates a wish rather than observing a
+  behaviour, which is the defect class this repository has spent five rejected
+  pull requests learning to avoid.
+
+The refresh itself does not trust an exit code. `aca sandbox exec` returns a
+`squad-credential-refreshed-<mode>` verdict token and the provider refuses any
+answer that is not `squad-credential-refreshed-600` — the same discipline
+issue #36 forced on cancellation, where a command that could not run reported
+success.
+
+### What the push does when the credential has expired anyway
+
+`squad_push_branch` (`worker/lib/squad-push.sh`) classifies the failure using
+the **shared** taxonomy rather than a second one:
+
+| Situation | git exit | Classified | What happens |
+|---|---|---|---|
+| Token rejected | `128` | `auth` | Re-read the token file, retry **once**. If it still fails, exit `77` (credential) with an explicit message. |
+| Branch ruleset refusal | `1` | `execution` | Propagated unchanged. Refreshing a token cannot fix branch protection, and saying otherwise sends an operator to rotate a healthy credential. |
+
+Those two are genuinely different and were measured separately. A clone, by
+contrast, proves nothing: against a **public** repository a clone with an
+expired token succeeds with exit 0 and no warning. The push is the first
+operation that actually tests the credential.
+
 ## Why the plane exists
 
 Sandboxes give a session two properties the ACA Jobs plane does not have.
