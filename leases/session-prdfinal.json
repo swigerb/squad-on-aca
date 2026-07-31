@@ -7,11 +7,11 @@
   "dispatchSource": "local-cli",
   "route": "sandbox",
   "executionMode": "sandbox",
-  "state": "dispatched",
+  "state": "reclaimed",
   "attempts": 1,
   "startedAt": "2026-07-29T23:49:50.258Z",
   "lastHeartbeatAt": "2026-07-29T23:50:05.044Z",
-  "updatedAt": "2026-07-29T23:50:05.044Z",
-  "terminalReason": null,
+  "updatedAt": "2026-07-31T20:25:43.463Z",
+  "terminalReason": "heartbeat-expired",
   "executionRef": null
 }
