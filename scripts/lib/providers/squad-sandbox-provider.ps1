@@ -220,12 +220,34 @@ $script:SandboxFailureRules = @(
     [pscustomobject]@{
         Kind     = "auth"
         # "unauthorized" covers "Unauthorized" and "unauthorized_client".
+        #
+        # The git/`gh` phrases were added for issue #32. A push that fails with
+        # exit 128 because the installation token expired mid-run is a CREDENTIAL
+        # fault, not a generic execution failure, and an operator told "the
+        # session failed" rotates nothing while an operator told "auth" rotates
+        # the token. Every one is a multi-word phrase, or a number anchored to
+        # one, for the reason spelled out above the rule table: this repository
+        # has already shipped a bare "429" that matched the hex of a correlation
+        # GUID and inverted the whole taxonomy. `requested URL returned error:
+        # 403` cannot occur inside a GUID; `403` alone can.
+        #
+        # The same phrase list is implemented for the worker in
+        # worker/lib/squad-credentials.sh (SQUAD_CREDENTIAL_FAULT_PATTERNS).
+        # scripts/validate.ps1 asserts the two agree, so the taxonomy stays ONE
+        # taxonomy in two languages rather than two that drift.
         Patterns = @(
             "AADSTS", "unauthorized", "invalid_client", "Forbidden",
             "CheckAccess", "AuthorizationFailed", "AuthorizationPermissionMismatch",
             "does not have authorization", "aca login", "az login",
             "refresh token has expired", "ExpiredAuthenticationToken",
             "InvalidAuthenticationToken", "authentication failed",
+            "Invalid username or token", "Invalid username or password",
+            "Authentication failed for", "could not read Username",
+            "could not read Password", "terminal prompts disabled",
+            "Bad credentials", "Write access to repository not granted",
+            "requested URL returned error: 40[13]",
+            "Support for password authentication was removed",
+            "token has expired", "Resource not accessible by integration",
             "(?<![0-9A-Za-z-])401(?![0-9A-Za-z-])",
             "(?<![0-9A-Za-z-])403(?![0-9A-Za-z-])"
         )
@@ -281,6 +303,31 @@ $script:SandboxCredentialTypes = [ordered]@{
 # breath, so its on-disk lifetime is the gap between two execs rather than the
 # life of the session.
 $script:SandboxCredentialFileName = ".squad-creds"
+
+# The token file the worker's git credential helper re-reads on EVERY git
+# operation (issue #32), and the staging path a mid-session refresh is uploaded
+# to before being copied into it.
+#
+# These are separate from $script:SandboxCredentialFileName on purpose. The
+# credential FILE is sourced and deleted by the launch, so it is gone seconds
+# into the run; the TOKEN FILE must survive for the whole session, because it is
+# the thing a refresh rewrites. Both live in the same 0700 state directory.
+#
+# The staging hop exists because `aca sandbox fs write` uploads as ROOT with
+# mode 0644 and the session user cannot chmod a root-owned file. Copying the
+# uploaded bytes into the token file under `umask 077`, as the session user,
+# is what produces a 0600 token file rather than a world-readable one.
+$script:SandboxGitTokenFileName = "git-token"
+$script:SandboxGitTokenStagedFileName = "git-token.staged"
+
+# The exit code worker/entrypoint.sh uses when the SESSION failed because the
+# GitHub credential was refused, not because the work failed (EX_NOPERM). It is
+# mapped onto the `auth` kind of the shared taxonomy in
+# ConvertFrom-SandboxPollOutput. Kept as a named constant here and as
+# SQUAD_EXIT_CREDENTIAL in worker/lib/squad-credentials.sh; scripts/validate.ps1
+# asserts the two agree, because a silent divergence would turn every credential
+# fault back into an anonymous `execution` failure.
+$script:SandboxWorkerCredentialExitCode = 77
 
 # Worker environment variables that carry a credential, grouped into the PLANES
 # PRD #6 requires. Each plane resolves ONE token and exports it under its own
@@ -1441,6 +1488,200 @@ function Get-SandboxCredentialStaging {
 }
 
 # ---------------------------------------------------------------------------
+# Mid-session credential refresh (issue #32)
+# ---------------------------------------------------------------------------
+#
+# READ THIS BEFORE ASSUMING THE TWO SUBSTRATES ARE SYMMETRIC. They are not.
+#
+#   ACA Sandboxes  have `aca sandbox fs write` and `aca sandbox exec`, so a
+#                  running session CAN be handed a new token. That is what the
+#                  functions below do.
+#   ACA Jobs       have NO exec and NO file channel into a running job
+#                  execution. Verified against azure-cli 2.81.0:
+#                  `az containerapp job` exposes create/delete/list/show/start/
+#                  stop/update plus `execution list|show`, and `az containerapp
+#                  exec` targets a Container APP replica, not a job execution.
+#                  `az containerapp job update`/`secret set` change the job
+#                  TEMPLATE, which affects only FUTURE executions.
+#
+# So a mid-session refresh is IMPOSSIBLE under Jobs, which is both the default
+# and the rollback path. Jobs rely on squad-token-preflight.sh alone. The
+# credential helper is still correct for both -- it is what makes a refresh
+# possible where a channel exists -- but nothing here should be read as
+# implying Jobs can be refreshed. See docs/sandboxes.md, "Refresh channel
+# matrix", and there is deliberately NO Jobs refresh test, because a test that
+# implied one would be describing something that cannot happen.
+
+function New-SandboxGitTokenFileContent {
+    <#
+    .SYNOPSIS
+        The exact bytes of the token file the worker's git credential helper
+        reads on every git operation.
+
+    .DESCRIPTION
+        The RAW token plus a trailing newline. Not a shell fragment: unlike
+        $script:SandboxCredentialFileName, this file is never sourced, it is
+        read with `IFS= read -r`. That is why it is not screened for bashisms --
+        there is no shell to be portable to.
+
+        The token is validated against $script:SandboxTokenPattern first, and a
+        rejection never echoes the value.
+
+        LF unconditionally. A CR would become part of the password the helper
+        hands to git, and the resulting 401 would look like an expired token.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Token)
+
+    if ($Token -notmatch $script:SandboxTokenPattern) {
+        throw (New-SandboxFailure -Kind "capability" -Message "Refusing to write the git token file: the value contains characters outside the unreserved token set, so it was either truncated, wrapped, or is not a token. The value is not echoed.")
+    }
+    return "$Token`n"
+}
+
+function New-SandboxCredentialRefreshCommand {
+    <#
+    .SYNOPSIS
+        The exec that installs an uploaded token as the session's live
+        credential, at mode 0600.
+
+    .DESCRIPTION
+        Runs AFTER `aca sandbox fs write` has uploaded the new token to the
+        staging path. It exists because `fs write` uploads as ROOT with mode
+        0644 and the session user cannot chmod a root-owned file -- so the
+        uploaded bytes are COPIED, by the session user under `umask 077`, into
+        the token file the helper reads, and the root-owned staging file is
+        unlinked (which the session user may do, because the 0700 directory is
+        its own).
+
+        The worker needs no signal and no restart: its credential helper opens
+        the token file afresh on every git operation, so the next push uses the
+        new value. Proven by probe -- expired token, push exit 128, rewrite ONLY
+        this file, push exit 0, same repository and same process.
+
+        Strict POSIX sh: `aca sandbox exec` runs it under /bin/sh, which is dash
+        on the pinned class image. No `[[`, no `local`, and above all no
+        `$(< file)` -- the construct that expands to nothing under dash with no
+        error, and reported a live worker as already-dead in issue #36.
+
+        It reports what it ACHIEVED rather than what it attempted: the caller
+        refuses any answer that is not `squad-credential-refreshed-600`, so a
+        copy that silently produced a wider mode is a failed refresh rather than
+        a quiet disclosure.
+    #>
+    param([string]$StateDir = $script:SandboxStateDir)
+
+    $token = "$StateDir/$($script:SandboxGitTokenFileName)"
+    $staged = "$StateDir/$($script:SandboxGitTokenStagedFileName)"
+
+    return "umask 077; mkdir -p $StateDir && chmod 700 $StateDir && " +
+           "if [ -s $staged ]; then cp $staged $token && chmod 600 $token && rm -f $staged && " +
+           "echo squad-credential-refreshed-`$(stat -c %a $token); " +
+           "else echo squad-credential-refreshed-missing; fi"
+}
+
+function Invoke-SquadSandboxCredentialRefresh {
+    <#
+    .SYNOPSIS
+        Deliver a fresh GitHub token to a RUNNING sandbox session.
+
+    .DESCRIPTION
+        SANDBOX ONLY, AND DELIBERATELY NOT A PROVIDER OPERATION. The
+        provider contract in scripts/lib/squad-aca-provider.ps1 is exactly six
+        operations that EVERY provider must implement, and ACA Jobs cannot
+        implement this one -- there is no channel. Adding a seventh operation
+        would force the Jobs provider to supply a refresh that could only ever
+        be a lie. So this is a sandbox-specific function that a caller reaches
+        for knowingly, and the neutral contract stays honest.
+
+        The delivery path is the one already proven for the initial credential:
+
+          1. the vault exec re-asserts the 0700 state directory and reports the
+             mode it ACHIEVED; anything but 700 refuses the upload, because the
+             directory is the only protection the platform allows a root-owned
+             uploaded file;
+          2. the token is written to a private LOCAL file and uploaded by path,
+             so it is in no argument vector on either side of the boundary;
+          3. the refresh exec copies it into the token file at 0600 as the
+             session user and removes the staged copy, and reports the mode it
+             achieved.
+
+        The worker is neither signalled nor restarted. Its credential helper
+        re-reads the token file on the next git operation.
+
+    .OUTPUTS
+        A result object with Refreshed (bool) and Detail. Throws a tagged
+        failure (New-SandboxFailure) when the refresh could not be completed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][string]$SandboxName,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Token
+    )
+
+    Assert-SandboxIdentifier -Value $SandboxName -Name "The sandbox name" -Kind "label" | Out-Null
+
+    # Validated BEFORE anything is written or uploaded, and the value is never
+    # echoed in the rejection.
+    $content = New-SandboxGitTokenFileContent -Token $Token
+
+    $stateDir = [string]$Context.StateDir
+    $vault = Invoke-SandboxCli -Context $Context -Argv @(
+        "sandbox", "exec", "-l", "name=$SandboxName", "-c", (New-SandboxCredentialVaultCommand -StateDir $stateDir)
+    )
+    if ($vault.ExitCode -ne 0) {
+        $kind = Get-SandboxFailureKind -Result $vault
+        if (-not $kind) { $kind = "execution" }
+        throw (New-SandboxFailure -Kind $kind -Message "Could not prepare the credential directory in sandbox '$SandboxName' for a refresh ($($vault.SafeArgv), exit $($vault.ExitCode)): $(Get-SandboxErrorText -Result $vault -Secrets $Context.Secrets)")
+    }
+
+    $vaultMode = ""
+    if (($vault.StdOut -join "`n") -match "squad-credentials-vault-(\d+)") { $vaultMode = $Matches[1] }
+    if ($vaultMode -ne "700") {
+        throw (New-SandboxFailure -Kind "capability" -Message "Refusing to refresh credentials in sandbox '$SandboxName': $stateDir is mode '$(if ($vaultMode) { $vaultMode } else { 'unknown' })', not 700. The uploaded file is owned by root and cannot be chmod'ed by the session user, so the directory is the only thing protecting it.")
+    }
+
+    $localPath = ""
+    $uploaded = $null
+    try {
+        $localPath = New-SandboxLocalCredentialFile -Content $content
+        $uploaded = Invoke-SandboxCliWithSecretStdin -Context $Context -Secret "" -SecretValues @($Token) -Argv @(
+            "sandbox", "fs", "write", "-l", "name=$SandboxName",
+            "--path", "$stateDir/$($script:SandboxGitTokenStagedFileName)",
+            "--file", $localPath
+        )
+    } finally {
+        if ($localPath -and (Test-Path $localPath)) {
+            Remove-Item -Force -ErrorAction SilentlyContinue $localPath
+        }
+    }
+    if ($uploaded.ExitCode -ne 0) {
+        $kind = Get-SandboxFailureKind -Result $uploaded
+        if (-not $kind) { $kind = "execution" }
+        throw (New-SandboxFailure -Kind $kind -Message "Could not upload the refreshed credential to sandbox '$SandboxName' ($($uploaded.SafeArgv), exit $($uploaded.ExitCode)): $(Get-SandboxErrorText -Result $uploaded -Secrets $Context.Secrets)")
+    }
+
+    $installed = Invoke-SandboxCli -Context $Context -Argv @(
+        "sandbox", "exec", "-l", "name=$SandboxName", "-c", (New-SandboxCredentialRefreshCommand -StateDir $stateDir)
+    )
+    if ($installed.ExitCode -ne 0) {
+        $kind = Get-SandboxFailureKind -Result $installed
+        if (-not $kind) { $kind = "execution" }
+        throw (New-SandboxFailure -Kind $kind -Message "Could not install the refreshed credential in sandbox '$SandboxName' ($($installed.SafeArgv), exit $($installed.ExitCode)): $(Get-SandboxErrorText -Result $installed -Secrets $Context.Secrets)")
+    }
+
+    $installedMode = ""
+    if (($installed.StdOut -join "`n") -match "squad-credential-refreshed-(\S+)") { $installedMode = $Matches[1] }
+    if ($installedMode -ne "600") {
+        throw (New-SandboxFailure -Kind "capability" -Message "The refreshed credential in sandbox '$SandboxName' ended up as '$(if ($installedMode) { $installedMode } else { 'unknown' })', not 600. A token readable by another account in the sandbox is disclosed for the rest of the session, and 'missing' means the upload never landed, so the worker is still holding the OLD token.")
+    }
+
+    return [pscustomobject]@{
+        Refreshed = $true
+        Detail    = "sandbox '$SandboxName': the token file $stateDir/$($script:SandboxGitTokenFileName) was replaced at mode 600. The worker's credential helper re-reads it on its next git operation; nothing was signalled or restarted."
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Egress policy generation
 # ---------------------------------------------------------------------------
 
@@ -1828,6 +2069,15 @@ function New-SandboxWorkerEnvironment {
         # substrate, which is precisely what the PRD forbids. It is a routing
         # fact, not a credential, so nothing secret is added by including it.
         SQUAD_DISPATCH_SOURCE = [string]$Request.dispatchSource
+        # WHERE THE REFRESHABLE TOKEN LIVES (issue #32). A PATH, not a secret --
+        # which is exactly why it belongs here and the token itself does not.
+        # The worker writes its starting token to this file at 0600 and its git
+        # credential helper re-reads it on every git operation;
+        # Invoke-SquadSandboxCredentialRefresh rewrites the same path
+        # mid-session. Pointing it at the 0700 state directory is what makes a
+        # refresh reachable at all: it is the only directory in the sandbox this
+        # control plane can write into.
+        SQUAD_GIT_TOKEN_FILE = "$($Context.StateDir)/$($script:SandboxGitTokenFileName)"
     }
     if ($Request.repository.ref) { $vars["GITHUB_REF"] = [string]$Request.repository.ref }
     if ($prefs.subSquad) { $vars["SQUAD_SUB_SQUAD"] = [string]$prefs.subSquad }
@@ -2249,11 +2499,28 @@ function ConvertFrom-SandboxPollOutput {
         $status = "Running"
     }
 
+    # WHY THE WORKER'S EXIT CODE IS CLASSIFIED HERE (issue #32). A session that
+    # ends because its GitHub credential expired mid-run is not a failure of the
+    # work -- it is a failure of the credential, and the two want opposite
+    # responses: re-run the work, versus mint a new token. The worker exits
+    # $script:SandboxWorkerCredentialExitCode (EX_NOPERM) for exactly that case,
+    # and it is mapped onto the SAME taxonomy every other failure in this
+    # provider uses ($script:SandboxFailureKinds), so a caller has one
+    # vocabulary rather than two.
+    #
+    # The mapping is on the CODE, not on log text, so nothing here can collide
+    # with a correlation GUID the way a bare substring match once did.
+    $failureKind = ""
+    if ($status -eq "Failed") {
+        $failureKind = if ($exitCode -eq $script:SandboxWorkerCredentialExitCode) { "auth" } else { "execution" }
+    }
+
     return [pscustomobject]@{
-        Status   = $status
-        Phase    = $phase
-        ExitCode = $exitCode
-        Marker   = $marker
+        Status      = $status
+        Phase       = $phase
+        ExitCode    = $exitCode
+        Marker      = $marker
+        FailureKind = $failureKind
     }
 }
 
@@ -2272,10 +2539,12 @@ function ConvertTo-SandboxExecutionRecord {
         Class        = [string]$Payload.class
         Phase        = [string]$State.Phase
         ExitCode     = $State.ExitCode
+        FailureKind  = [string]$State.FailureKind
         Inconclusive = $Inconclusive
     }
     $record = New-SquadExecutionRecord -Handle $Handle -Status ([string]$State.Status) -Display $display
     Add-Member -InputObject $record -MemberType NoteProperty -Name Inconclusive -Value $Inconclusive -Force
+    Add-Member -InputObject $record -MemberType NoteProperty -Name FailureKind -Value ([string]$State.FailureKind) -Force
     return $record
 }
 
@@ -2599,13 +2868,13 @@ function New-SandboxExecutionProvider {
             # healthy 60-minute run at the two-minute mark.
             if ($poll.ExitCode -ne 0 -and (Test-SandboxTransportInconclusive -Result $poll)) {
                 return ConvertTo-SandboxExecutionRecord -Handle $Arguments["Handle"] -Payload $payload `
-                    -State ([pscustomobject]@{ Status = "Unknown"; Phase = "inconclusive"; ExitCode = $null; Marker = "unknown" }) `
+                    -State ([pscustomobject]@{ Status = "Unknown"; Phase = "inconclusive"; ExitCode = $null; Marker = "unknown"; FailureKind = "" }) `
                     -Inconclusive $true
             }
             if ($poll.ExitCode -ne 0) {
                 if (Test-SandboxGone -Result $poll) {
                     return ConvertTo-SandboxExecutionRecord -Handle $Arguments["Handle"] -Payload $payload `
-                        -State ([pscustomobject]@{ Status = "Unknown"; Phase = "gone"; ExitCode = $null; Marker = "absent" })
+                        -State ([pscustomobject]@{ Status = "Unknown"; Phase = "gone"; ExitCode = $null; Marker = "absent"; FailureKind = "" })
                 }
                 throw "Could not poll sandbox '$($payload.name)' ($($poll.SafeArgv), exit $($poll.ExitCode)): $(Get-SandboxErrorText -Result $poll -Secrets $Context.Secrets)"
             }
