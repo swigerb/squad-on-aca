@@ -2192,37 +2192,60 @@ if (-not (Test-Path $providerLib)) {
             Add-Fail "The emitted cancel/launch command shape regressed ($($sbShape -join '; '))"
         }
 
-        # --- 6e. the emitted cancel is POSIX sh, because dash is what runs it --
+        # --- 6e. EVERY emitted command is POSIX sh, because dash runs them all -
         # `aca sandbox exec` hands the command to /bin/sh, which is dash on the
         # class image. The first fix for #36 was written in bash: `$(< file)` is
         # a bashism that expands to the EMPTY STRING under dash, so the process
         # scan saw nothing, and "saw nothing" was read as "the worker is gone".
         # It passed every bash test and reported a live worker as already-dead on
         # the first real sandbox. A bashism here is not a style question.
+        #
+        # Issue #40 widened this from the cancel command to ALL of them. Every
+        # command below crosses the same boundary into the same shell; the cancel
+        # is simply the one that has already been caught. The screen itself lives
+        # in scripts/lib/squad-shell-portability.ps1 so that the behavioural
+        # probe under scripts/tests uses the SAME rules and the SAME inventory --
+        # a screen that disagrees with the probe about what ships is a third
+        # thing to keep in sync, and this repository has already been bitten by
+        # a check that quietly stopped describing production.
         $sbBashisms = @()
-        foreach ($bashism in @(
-            @{ Pattern = '\$\(<';          Why = 'command substitution of a bare redirect ($(< file)) -- expands to NOTHING under dash' },
-            @{ Pattern = 'read [^;|]*-d '; Why = "read -d, which dash's read does not have" },
-            @{ Pattern = '\[\[';           Why = "the [[ keyword, which dash does not have" },
-            @{ Pattern = '\blocal ';       Why = "local, which is not in POSIX sh" },
-            @{ Pattern = '\bfunction ';    Why = "the function keyword, which dash does not have" },
-            @{ Pattern = '\+=';            Why = "+= assignment, which dash does not have" },
-            @{ Pattern = '<<<';            Why = "a here-string, which dash does not have" },
-            @{ Pattern = '\$\{[A-Za-z_][A-Za-z0-9_]*\[';  Why = "an array subscript, which dash does not have" }
-        )) {
-            if ($sbCancelCmd -match $bashism.Pattern) { $sbBashisms += "uses $($bashism.Why)" }
-        }
-        # A failed input redirection is reported by the SHELL itself, so a
-        # trailing 2>/dev/null is applied too late and the error reaches the
-        # operator's output. Every read of a /proc path must silence stderr
-        # BEFORE it opens the file.
-        foreach ($m in [regex]::Matches($sbCancelCmd, 'read -r [A-Za-z_]+ < ')) {
-            $sbBashisms += "opens a file for `read` before redirecting stderr ('$($m.Value)'), so a vanished /proc entry prints a shell error into the host's output"
+        $sbPortabilityLib = Join-Path $RepoRoot "scripts\lib\squad-shell-portability.ps1"
+        if (-not (Test-Path $sbPortabilityLib)) {
+            $sbBashisms += "scripts/lib/squad-shell-portability.ps1 is missing, so nothing screens the emitted commands for the bashism class that shipped issue #36"
+        } else {
+            . $sbPortabilityLib
+            $sbEmitted = @(Get-SquadEmittedShellCommand)
+            foreach ($sbCmd in $sbEmitted) {
+                $sbBashisms += @(Test-SquadShellPortability -Command $sbCmd.Command -Label $sbCmd.Id -Shell $sbCmd.Shell)
+            }
+
+            # ANTI-DRIFT. The screen is only worth its output if the inventory is
+            # complete, and an inventory maintained by hand goes stale the first
+            # time somebody adds a command. So: reflect over the provider's own
+            # generators and refuse any this inventory does not cover. A new
+            # `New-Sandbox<X>Command` fails here until it is screened.
+            $sbCovered = @($sbEmitted | ForEach-Object { $_.Generator } | Where-Object { $_ })
+            $sbGenerators = @(Get-Command -CommandType Function -Name "New-Sandbox*Command" -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.Name } | Sort-Object -Unique)
+            foreach ($sbGen in $sbGenerators) {
+                if ($sbCovered -notcontains $sbGen) {
+                    $sbBashisms += "$sbGen emits a shell command the portability inventory does not cover, so nothing screens it for the bashism that reported a live worker as already-dead in issue #36"
+                }
+            }
+            if ($sbEmitted.Count -lt 6) {
+                $sbBashisms += "the portability inventory shrank to $($sbEmitted.Count) command(s); the launch, cancel, poll, credential-vault, logs and credential-file fragments are all run by /bin/sh and must all stay covered"
+            }
+            # The log tail used to be a bare literal at its call site. A command
+            # that exists only inline is a command no screen can reach, so its
+            # generator must keep producing exactly the text that shipped.
+            if ((New-SandboxLogsCommand -StateDir "/tmp/squad-session" -Tail 100) -ne "tail -n 100 /tmp/squad-session/session.log 2>/dev/null || true") {
+                $sbBashisms += "New-SandboxLogsCommand no longer emits the log-tail command verbatim, so extracting it changed behaviour instead of only making it screenable"
+            }
         }
         if ($sbBashisms.Count -eq 0) {
-            Add-Pass "The emitted cancel command is strict POSIX sh with no bashism, because 'aca sandbox exec' runs it under dash -- where the first fix's `$(< file)` silently expanded to nothing and reported a live worker as already-dead"
+            Add-Pass "All 6 emitted shell commands (launch, cancel, poll, credential-vault, logs, credential-file) are strict POSIX sh with no bashism, and every New-Sandbox*Command generator is covered by the inventory -- 'aca sandbox exec' runs them under dash, where the first fix's `$(< file)` silently expanded to nothing and reported a live worker as already-dead"
         } else {
-            Add-Fail "The emitted cancel command is not dash-safe ($($sbBashisms -join '; '))"
+            Add-Fail "An emitted sandbox command is not dash-safe ($($sbBashisms -join '; '))"
         }
 
         # --- 7. refusal when the sandbox group carries a managed identity ----
