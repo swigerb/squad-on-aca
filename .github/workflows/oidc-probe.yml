@@ -1,0 +1,54 @@
+name: oidc-probe
+
+# TEMPORARY verification artifact for issue #32.
+# Proves the GitHub -> Azure OIDC trust path works and that the federated
+# identity can actually START the session job -- not merely authenticate.
+# Removed once sprint 2 lands the real dispatcher.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login via OIDC (no stored credential)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prove the token belongs to the federated identity, not a secret
+        run: |
+          az account show --query "{sub:id,type:user.type,name:user.name}" -o json
+
+      - name: Prove READ on the session job
+        run: |
+          az containerapp job show \
+            -n caj-squad-aca-session -g rg-squad-aca-dev-eastus2 \
+            --query "{name:name,trigger:properties.configuration.triggerType}" -o json
+
+      - name: Prove the grant is SCOPED - reading a sibling job must be refused
+        run: |
+          set +e
+          out=$(az containerapp job show -n caj-squad-aca-ralph -g rg-squad-aca-dev-eastus2 2>&1)
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            echo "FAIL: the identity could read caj-squad-aca-ralph, so the role assignment is NOT scoped to the session job."
+            exit 1
+          fi
+          echo "PASS: refused as expected (exit $rc)."
+          echo "$out" | tail -n 3
+
+      - name: Prove WRITE - start the session job in a mode that does nothing
+        run: |
+          az containerapp job start \
+            -n caj-squad-aca-session -g rg-squad-aca-dev-eastus2 \
+            --env-vars SQUAD_MODE=smoke PUSH_CHANGES=false CREATE_PR=false RUN_COPILOT_SMOKE=false \
+            --query "name" -o tsv
