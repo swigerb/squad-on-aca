@@ -1551,7 +1551,7 @@ if (-not (Test-Path $providerLib)) {
         "SQUAD_STUB_ACA_RC", "SQUAD_STUB_ACA_ERR", "SQUAD_STUB_ACA_EXEC_RC",
         "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
         "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
-        "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR",
+        "SQUAD_STUB_ACA_CANCEL_RC", "SQUAD_STUB_ACA_CANCEL_ERR", "SQUAD_STUB_ACA_CANCEL_STATUS",
         "SQUAD_STUB_ACA_POLL_DIR", "SQUAD_STUB_ACA_TIMEOUT_ONCE",
         "SQUAD_STUB_ACA_CRED_RC", "SQUAD_STUB_ACA_CRED_ERR", "SQUAD_STUB_ACA_CRED_ID",
         "SQUAD_STUB_ACA_CRED_STDIN", "SQUAD_STUB_ACA_CREDDEL_RC", "SQUAD_STUB_ACA_CREDDEL_ERR",
@@ -1575,6 +1575,7 @@ if (-not (Test-Path $providerLib)) {
         $env:SQUAD_STUB_ACA_DELETE_ERR = ""
         $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
         $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "killed"
         $env:SQUAD_STUB_ACA_POLL_DIR = ""
         $env:SQUAD_STUB_ACA_TIMEOUT_ONCE = ""
         $env:SQUAD_STUB_ACA_CRED_RC = "0"
@@ -2065,6 +2066,163 @@ if (-not (Test-Path $providerLib)) {
             Add-Pass "Sandbox cancel THROWS on auth, RBAC, throttling and transport failures (never reported as cancelled)"
         } else {
             Add-Fail "Sandbox cancel swallowed a real failure ($($sbCancelFailDetail -join '; '))"
+        }
+
+        # --- 6c. cancel believes the SANDBOX, not the exec's exit code (#36) --
+        # The Sprint 5 command was `pkill ... >/dev/null 2>&1; ...; echo
+        # squad-cancelled`. `procps` is not in the pinned class image, so pkill
+        # exited 127, the redirection destroyed the evidence, and the chain's
+        # status was the echo's -- which cannot fail. Live, the provider reported
+        # Cancelled = $true while the worker ran a further 51 seconds and then
+        # OVERWROTE the cancellation markers with its own done/0.
+        #
+        # Every check below drives the stub to exit 0, because that is what the
+        # real CLI did. A provider that reads the exec's status instead of the
+        # sandbox's verdict passes none of them.
+        $env:SQUAD_STUB_ACA_CANCEL_RC = "0"
+        $env:SQUAD_STUB_ACA_CANCEL_ERR = ""
+
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "none"
+        $sbSilentThrew = $false
+        $sbSilentMsg = ""
+        try { Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null | Out-Null } catch { $sbSilentThrew = $true; $sbSilentMsg = [string]$_.Exception.Message }
+        if ($sbSilentThrew -and $sbSilentMsg -match "\[squad-sandbox:execution\]" -and $sbSilentMsg -match "still billing") {
+            Add-Pass "Sandbox cancel REFUSES to report success when the exec exits 0 but the sandbox reported no outcome -- the exact shape of issue #36, where the chain ended in an echo that could not fail"
+        } else {
+            Add-Fail "Sandbox cancel accepted a silent exit-0 cancel (threw=$sbSilentThrew msg='$sbSilentMsg')"
+        }
+
+        $sbVerdictCases = @(
+            @{ Status = "no-pidfile";  Kind = "capability"; Needle = "recorded no worker pid" },
+            @{ Status = "bad-pidfile"; Kind = "capability"; Needle = "not a signalable process id" },
+            @{ Status = "not-ours";    Kind = "capability"; Needle = "recycled it" },
+            @{ Status = "kill-failed"; Kind = "execution";  Needle = "kill was rejected" },
+            @{ Status = "survived";    Kind = "execution";  Needle = "after SIGTERM and SIGKILL" },
+            @{ Status = "no-proc";     Kind = "capability"; Needle = "/proc is unreadable" },
+            @{ Status = "scan-failed"; Kind = "capability"; Needle = "read no /proc entry at all" }
+        )
+        $sbVerdictOk = $true
+        $sbVerdictDetail = @()
+        foreach ($case in $sbVerdictCases) {
+            $env:SQUAD_STUB_ACA_CANCEL_STATUS = $case.Status
+            $threw = $false
+            $msg = ""
+            try { Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null | Out-Null } catch { $threw = $true; $msg = [string]$_.Exception.Message }
+            if (-not $threw) {
+                $sbVerdictOk = $false
+                $sbVerdictDetail += "$($case.Status): reported success"
+            } elseif ($msg -notmatch ("\[squad-sandbox:" + $case.Kind + "\]")) {
+                $sbVerdictOk = $false
+                $sbVerdictDetail += "$($case.Status): kind was not $($case.Kind) ('$msg')"
+            } elseif ($msg -notmatch [regex]::Escape($case.Needle)) {
+                $sbVerdictOk = $false
+                $sbVerdictDetail += "$($case.Status): message did not say why ('$msg')"
+            } elseif ($msg -match [regex]::Escape($sbSecret)) {
+                $sbVerdictOk = $false
+                $sbVerdictDetail += "$($case.Status): leaked the token"
+            }
+        }
+        if ($sbVerdictOk) {
+            Add-Pass "Every reported cancel failure (no-pidfile, bad-pidfile, not-ours, kill-failed, survived, no-proc, scan-failed) THROWS with its own kind and reason even though the exec exited 0"
+        } else {
+            Add-Fail "A reported cancel failure was treated as success ($($sbVerdictDetail -join '; '))"
+        }
+
+        # A sandbox launched before the pid file existed reports no-pidfile for
+        # ever. The message has to name the way out, or the operator is left with
+        # a session that can never be stopped and never stops billing.
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "no-pidfile"
+        $sbLegacyMsg = ""
+        try { Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null | Out-Null } catch { $sbLegacyMsg = [string]$_.Exception.Message }
+        if ($sbLegacyMsg -match "aca sandbox delete" -and $sbLegacyMsg -match "control plane") {
+            Add-Pass "A pre-existing sandbox with no pid file fails the cancel AND is told the control-plane teardown that does not need the guest's cooperation"
+        } else {
+            Add-Fail "The no-pidfile failure does not tell the operator how to stop the session ('$sbLegacyMsg')"
+        }
+
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "already-dead"
+        $sbDead = Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "already-terminal"
+        $sbTerm = Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>$null
+        if ($sbDead.Cancelled -and -not $sbDead.AlreadyTerminal -and $sbDead.CancelStatus -eq "already-dead" -and
+            $sbTerm.Cancelled -and $sbTerm.AlreadyTerminal -and $sbTerm.CancelStatus -eq "already-terminal") {
+            Add-Pass "The three outcomes that mean the worker is NOT running (killed, already-dead, already-terminal) are success, and a finished session is reported as already terminal rather than as a fresh kill"
+        } else {
+            Add-Fail "cancel mis-reported a not-running worker (dead=$($sbDead.CancelStatus)/$($sbDead.AlreadyTerminal) terminal=$($sbTerm.CancelStatus)/$($sbTerm.AlreadyTerminal))"
+        }
+
+        # The machine token drives the decision; it is not part of what a user
+        # reads. The human line the sandbox prints still reaches the host.
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "killed"
+        $sbHostLines = @(Stop-SquadExecution -Provider $sbProvider -Handle $sbHandle 6>&1 | ForEach-Object { [string]$_ })
+        if (($sbHostLines -join "`n") -match "squad-cancelled" -and ($sbHostLines -join "`n") -notmatch "squad-cancel-status") {
+            Add-Pass "The cancel verdict token is consumed by the provider and kept out of host output, while the human line is still shown"
+        } else {
+            Add-Fail "Host output for a cancel is wrong (lines: $($sbHostLines -join ' | '))"
+        }
+        $env:SQUAD_STUB_ACA_CANCEL_STATUS = "killed"
+
+        # --- 6d. the SHAPE of the emitted commands ---------------------------
+        # Static checks only -- they cannot prove a kill, and the behavioural
+        # proof lives in scripts/tests/verify-sandbox-cancel.ps1, which runs this
+        # exact string in a real shell against real processes. What they CAN do
+        # is stop a procps dependency, or a lost process-group signal, from
+        # coming back unnoticed.
+        $sbCancelCmd = New-SandboxCancelCommand
+        $sbLaunchCmd = New-SandboxLaunchCommand -Environment ([ordered]@{ SQUAD_SHAPE_PROBE = "1" })
+        $sbShape = @()
+        foreach ($banned in @("pkill", "pgrep", "ps -", "ps auxw")) {
+            if ($sbCancelCmd -match [regex]::Escape($banned)) { $sbShape += "names '$banned', which the pinned class image does not have" }
+        }
+        if ($sbCancelCmd -notmatch [regex]::Escape('kill -TERM -$p')) { $sbShape += "does not signal the process GROUP, so the entrypoint's children survive the cancel" }
+        if ($sbCancelCmd -notmatch [regex]::Escape('kill -KILL')) { $sbShape += "never escalates past SIGTERM" }
+        if ($sbCancelCmd -notmatch "worker\.pid") { $sbShape += "does not read the recorded worker pid" }
+        if ($sbCancelCmd -notmatch "squad-cancel-status=") { $sbShape += "emits no machine-readable verdict, so the provider is back to trusting an echo" }
+        if ($sbCancelCmd -notmatch [regex]::Escape('case $st in killed|already-dead)')) { $sbShape += "does not gate the marker writes on a CONFIRMED death" }
+        if ($sbCancelCmd -notmatch "scan-failed") { $sbShape += "does not distinguish a process scan that read NOTHING from a worker that is gone -- the empty-scan case is exactly how the first fix reported a live worker as already-dead" }
+        if ($sbCancelCmd -notmatch [regex]::Escape('/proc/self/stat')) { $sbShape += "does not self-test that this shell can read /proc before believing anything it did not find there" }
+        foreach ($ch in @('"', "!", "^")) {
+            if ($sbCancelCmd.Contains($ch)) { $sbShape += "contains '$ch', which does not survive cmd.exe/delayed expansion in the offline stub" }
+        }
+        if ($sbLaunchCmd -notmatch [regex]::Escape('printf %s $$ > /tmp/squad-session/worker.pid')) { $sbShape += "the launch does not record the worker's own pid as its first act" }
+        if ($sbLaunchCmd -notmatch [regex]::Escape("rm -f /tmp/squad-session/worker.pid; touch /tmp/squad-session/done")) { $sbShape += "the launch does not clear the pid file before touching the completion marker, so a finished run leaves a signalable stale pid" }
+        if ($sbShape.Count -eq 0) {
+            Add-Pass "The emitted cancel command uses no procps binary, signals the whole process group, escalates, gates its marker writes on a confirmed death, and reports a machine-readable verdict"
+        } else {
+            Add-Fail "The emitted cancel/launch command shape regressed ($($sbShape -join '; '))"
+        }
+
+        # --- 6e. the emitted cancel is POSIX sh, because dash is what runs it --
+        # `aca sandbox exec` hands the command to /bin/sh, which is dash on the
+        # class image. The first fix for #36 was written in bash: `$(< file)` is
+        # a bashism that expands to the EMPTY STRING under dash, so the process
+        # scan saw nothing, and "saw nothing" was read as "the worker is gone".
+        # It passed every bash test and reported a live worker as already-dead on
+        # the first real sandbox. A bashism here is not a style question.
+        $sbBashisms = @()
+        foreach ($bashism in @(
+            @{ Pattern = '\$\(<';          Why = 'command substitution of a bare redirect ($(< file)) -- expands to NOTHING under dash' },
+            @{ Pattern = 'read [^;|]*-d '; Why = "read -d, which dash's read does not have" },
+            @{ Pattern = '\[\[';           Why = "the [[ keyword, which dash does not have" },
+            @{ Pattern = '\blocal ';       Why = "local, which is not in POSIX sh" },
+            @{ Pattern = '\bfunction ';    Why = "the function keyword, which dash does not have" },
+            @{ Pattern = '\+=';            Why = "+= assignment, which dash does not have" },
+            @{ Pattern = '<<<';            Why = "a here-string, which dash does not have" },
+            @{ Pattern = '\$\{[A-Za-z_][A-Za-z0-9_]*\[';  Why = "an array subscript, which dash does not have" }
+        )) {
+            if ($sbCancelCmd -match $bashism.Pattern) { $sbBashisms += "uses $($bashism.Why)" }
+        }
+        # A failed input redirection is reported by the SHELL itself, so a
+        # trailing 2>/dev/null is applied too late and the error reaches the
+        # operator's output. Every read of a /proc path must silence stderr
+        # BEFORE it opens the file.
+        foreach ($m in [regex]::Matches($sbCancelCmd, 'read -r [A-Za-z_]+ < ')) {
+            $sbBashisms += "opens a file for `read` before redirecting stderr ('$($m.Value)'), so a vanished /proc entry prints a shell error into the host's output"
+        }
+        if ($sbBashisms.Count -eq 0) {
+            Add-Pass "The emitted cancel command is strict POSIX sh with no bashism, because 'aca sandbox exec' runs it under dash -- where the first fix's `$(< file)` silently expanded to nothing and reported a live worker as already-dead"
+        } else {
+            Add-Fail "The emitted cancel command is not dash-safe ($($sbBashisms -join '; '))"
         }
 
         # --- 7. refusal when the sandbox group carries a managed identity ----

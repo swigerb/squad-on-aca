@@ -681,8 +681,10 @@ mis-scoped token is never transmitted or written to a service-side log.
 
 **Revoking a brokered credential.** Credentials are created on the **group**
 and inherit group RBAC, so they outlive the sandbox that used them. `terminate`
-and `cancel` revoke them automatically and warn loudly if a revocation fails. By
-hand:
+and `cancel` revoke them automatically and warn loudly if a revocation fails.
+`cancel` removes the on-disk credential file **first and unconditionally**,
+before it tries to signal anything: a stop that cannot confirm the worker died
+is exactly when a live token matters most. By hand:
 
 ```powershell
 aca sandboxgroup credential delete --id <credential id> --yes
@@ -695,6 +697,39 @@ the **values**. The provider refuses to run them at all for that reason.
 audit trail (timestamp, host, method, path, scheme, `matchedRule`).
 
 ### Concurrency, cost and orphans
+
+**Stopping a sandbox session (`squad-aca stop`).** On the sandbox plane a stop
+runs a script inside the guest. The pinned class image has **no `procps`** — no
+`pkill`, `pgrep` or `ps` — so the script uses the shell's `kill` **builtin**.
+The launch records the worker's own pid in `/tmp/squad-session/worker.pid`; the
+stop reads it, signals the whole process group (`setsid` makes the worker a
+session leader, so its pgid equals its pid and one signal reaches its Copilot
+children too), escalates `TERM` → `KILL`, and confirms death by scanning
+`/proc`. The `cancelled` / `143` markers are written **only after** the process
+is confirmed gone, which is what stops a still-running worker from overwriting
+them. The script prints `squad-cancel-status=<token>` and the provider believes
+that token in preference to any exit code.
+
+A stop that cannot prove the worker stopped now **fails**. The reason is in the
+message:
+
+| Token | Meaning | What to do |
+| --- | --- | --- |
+| `killed` / `already-dead` / `already-terminal` | Success — the worker is gone | Nothing |
+| `no-pidfile` | No pid was ever recorded. Usually a sandbox **launched before this fix**, which has no pid file at all | Delete the sandbox: `aca sandbox delete -l name=<name> --yes` |
+| `bad-pidfile` | The pid file held something unusable (empty, non-numeric, 0 or 1) | Same |
+| `not-ours` | That pid is alive but is **not** running the worker entrypoint — a recycled pid | Same |
+| `kill-failed` | The signal was rejected | Same |
+| `survived` | The worker ignored both `TERM` and `KILL` | Same |
+| `no-proc` / `scan-failed` | The guest shell could not read `/proc`, so nothing about the worker can be believed | Same |
+
+In every failing case the session's markers are left untouched and the worker
+must be assumed **still running and still billing**. `terminate` /
+`aca sandbox delete` is the escape hatch: it goes through the ACA control plane
+and needs no co-operation from inside the guest. This is issue
+[#36](https://github.com/swigerb/squad-on-aca/issues/36); before it was fixed a
+stop reported success while the worker ran on for another 51 seconds and
+overwrote the cancellation markers with its own `done` / `0`.
 
 A sandbox bills from creation until it is deleted; auto-suspend stops the meter
 but does **not** delete. Three controls, all of which must be present:

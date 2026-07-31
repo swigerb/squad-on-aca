@@ -767,7 +767,7 @@ policy been applied afterwards. That is strong ordering evidence, not a
 timestamped proof — the `aca` CLI exposes no per-operation timestamps to make it
 one. Stated plainly so nobody quotes it as more than it is.
 
-## S3-5 — Cancellation on the sandbox plane — **FAIL (defect found)**
+## S3-5 — Cancellation on the sandbox plane — **FAIL (defect found)** — *fixed, see S6-1 below*
 
 This is the finding of the sprint.
 
@@ -850,9 +850,11 @@ in the sandbox provider's `cancel`, and **no offline test could have found it**:
 every fake answers the way the real image does not. It is precisely the class of
 failure this sprint existed to look for.
 
-Not fixed here. Sprint 3's hard constraints forbid changing error
+Not fixed in Sprint 3. Sprint 3's hard constraints forbid changing error
 classification, and a portable-kill rewrite needs its own offline coverage
 against an image that has no `procps`. Filed rather than patched in passing.
+**Fixed under [#36](https://github.com/swigerb/squad-on-aca/issues/36); the
+live re-verification is S6-1 below.**
 
 ## S3-6 — Cleanup and orphans — **PASS**
 
@@ -893,5 +895,134 @@ resolve an `AIAgent`, dispatch a real session to ACA Jobs or to an approved
 sandbox class, get the route and terminal status back, and be refused correctly
 when capability routing fails closed. Cancellation genuinely stops an ACA Job.
 
-Cancellation does **not** genuinely stop a sandbox worker, and reports that it
+Cancellation did **not** genuinely stop a sandbox worker, and reported that it
 did. That was invisible for the whole programme until something ran for real.
+It is now fixed and re-verified live — see **S6-1** below.
+
+
+## S6-1 — Cancellation on the sandbox plane, after the #36 fix — **PASS**
+
+Same plane, same pinned class image, same disk
+(`02560016-d170-486d-a99b-aed763296b6c`). The procps probe is unchanged — the
+image still has no `pkill`, `pgrep` or `ps`, and `kill` is still only a shell
+builtin:
+
+```text
+pkill: not found   MISS
+pgrep: not found   MISS
+ps:    not found   MISS
+kill               kill
+```
+
+The launch now records the worker's own pid (`printf %s $$` as the wrapper's
+first act), and the cancel reads it, signals the **process group** with the
+builtin, confirms death by scanning `/proc`, and only then writes the markers.
+Run against a live worker that had spawned a child:
+
+```text
+=== state before cancel ===
+PID=34
+PHASE=running
+CHILD=36
+
+CANCEL SENT AT: 15:06:14.744Z
+=== CANCEL (emitted by New-SandboxCancelCommand) ===
+squad-cancelled
+squad-cancel-status=killed
+CANCEL RETURNED AT: 15:06:16.433Z  ELAPSED_MS=1689
+
+=== AFTER CANCEL (from inside the guest) ===
+PIDFILE=[]
+PHASE=cancelled
+EXITCODE=143
+MARKER=done
+CHILD=36
+CHILD_PROC=GONE
+PROCTABLE:
+1 (tini) S 0 1
+5 (sleep) S 1 5
+52 (sh) R 0 52
+
+=== markers 20s later ===
+PHASE_LATER=cancelled
+EXITCODE_LATER=143
+
+=== SECOND CANCEL (idempotency) ===
+squad-cancelled
+squad-cancel-status=already-terminal
+```
+
+The process table afterwards holds only `tini` (pid 1), the image's own idle
+`sleep` and the `sh` running the query itself. Worker **and** child are gone,
+the markers say `cancelled`/`143`, and — the thing that failed in S3-5 — they
+were **still** `cancelled`/`143` twenty seconds later. A second cancel is
+idempotent (`already-terminal`) and does not rewrite anything.
+
+The 1 689 ms above is a control-plane round trip; a trivial `echo` exec on the
+same sandbox costs 1 451 ms. Timing the cancel **inside** the guest removes the
+transport:
+
+```text
+=== CANCEL #2 (timed inside the guest) ===
+squad-cancelled
+squad-cancel-status=killed
+GUEST_RC=0
+GUEST_MS=11
+```
+
+**11 ms** from cancel to confirmed death, against **51 seconds of continued
+execution** in S3-5. Nothing is assumed: `killed` is only reached after a
+`/proc` scan finds no non-zombie process left in the worker's process group.
+
+Failure is now loud. A cancel that cannot prove the worker stopped reports its
+own reason — `no-pidfile`, `bad-pidfile`, `not-ours`, `kill-failed`,
+`survived`, `no-proc`, `scan-failed` — leaves the session's markers untouched,
+and the provider raises rather than returning `Cancelled = $true`. A sandbox
+launched by the pre-fix code has no pid file and therefore reports
+`no-pidfile`: a **failed** cancel whose message names
+`aca sandbox delete -l name=<name> --yes` as the control-plane escape hatch.
+
+One further defect was found and fixed during this verification, and it is
+worth recording because it is the same failure class one level deeper.
+`aca sandbox exec` runs the command under `/bin/sh`, which is **dash** on this
+image (`/bin/sh -> dash`, and the exec's own `/proc` entry reads `(sh)`). The
+first version of the fix used `$(< file)` to read `/proc/<pid>/stat` — a
+**bashism that expands to the empty string under dash**, with no error and no
+exit code. It scanned zero processes, concluded `already-dead`, wrote
+`cancelled`/`143` and left the worker running:
+
+```text
+squad-cancel-status=already-dead      <- a lie
+32 (bash)  ... pgrp 32                <- still alive
+33 (bash)  ... pgrp 32
+34 (sleep) ... pgrp 32
+```
+
+The offline probe had passed, because it ran the emitted command under **bash**.
+Two changes followed: the command is now strict POSIX `sh` (verified with both
+`dash -n` and `bash -n`, and statically checked for bashisms by `validate.ps1`
+section 6e), and the probe evaluates it via `sh -c` so the test shell matches
+production. The scan is also **fail-closed**: reading not one `/proc` entry is
+`scan-failed`, never `already-dead`, and the script self-tests by reading its
+own `/proc/self/stat` with the same builtin before it believes any "not found".
+
+Every sandbox created for this verification was deleted with `--yes` and the
+group listed afterwards; see S6-2.
+
+## S6-2 — Cleanup after the #36 verification — **PASS**
+
+```text
+$ aca sandbox delete -l name=sq36-live2 --group sbg-squad-aca -g rg-squad-aca-dev-eastus2 --yes
+Deleting sandbox a8b682dd-6233-471a-9a26-7b9776110633...
+Deleted sandbox: a8b682dd-6233-471a-9a26-7b9776110633
+
+$ aca sandbox list --group sbg-squad-aca -g rg-squad-aca-dev-eastus2
+┌────┬───────┬──────────┬────────┐
+│ ID ┆ State ┆ Hostname ┆ Labels │
+╞════╪═══════╪══════════╪════════╡
+└────┴───────┴──────────┴────────┘
+```
+
+The class disk `02560016-d170-486d-a99b-aed763296b6c` was left in place and
+still lists as `Ready`.
+
