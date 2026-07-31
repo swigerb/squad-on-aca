@@ -28,7 +28,7 @@ on:
 
 permissions:
   id-token: write      # required for OIDC; this is the ONLY Azure credential
-  contents: read
+  contents: write # the shared lease lives on the squad-aca-leases ref (Contents API create/update)
   issues: write   # only to apply the shared 'dispatched' marker Ralph also uses
 
 concurrency:
