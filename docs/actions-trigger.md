@@ -139,6 +139,14 @@ Two findings worth keeping:
 Sessions therefore keep a machine author — the work *is* machine-authored — and
 credit the requester with a `Co-authored-by:` trailer, which links correctly and
 does not misrepresent who wrote the code.
+
+**The trailer reaches the commit by two routes, and only one of them is
+reliable.** `COMMIT_MESSAGE` applies when the *worker* commits leftover changes
+in `commit_and_push_if_needed`. Measured on a live run, that is often not what
+happens: the agent committed its own work and opened its own pull request, so
+the worker's message — and its trailer — was never used. The requester is
+therefore also named in the **prompt**, with an instruction to add the trailer.
+That is the only lever that survives the agent doing the whole job itself.
 ## Why Actions rather than a webhook
 
 A webhook receiver would need public ingress, an always-on replica, and a stored

@@ -4838,6 +4838,17 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "The dispatch workflow does not credit the requester on the session's commits"
     }
 
+    # OV_COMMIT_MESSAGE only applies when the WORKER commits leftover changes.
+    # Measured on a live run: the agent committed its own work and opened its own
+    # pull request, so the worker's message -- and its trailer -- was never used.
+    # Telling the AGENT who asked is the only lever that survives the agent doing
+    # the whole job itself.
+    if ($wf -match '(?s)prompt=.*?requested by @\$\{REQUESTER\}') {
+        Add-Pass "The requester is named in the PROMPT as well as the commit message, because an agent that commits and opens its own pull request never uses the worker's commit message"
+    } else {
+        Add-Fail "The requester reaches only the worker's commit message. A live run showed the agent committing its own work and opening its own PR, so that lever never fires and the request is attributed to nobody"
+    }
+
     # A requester who sees a label change and then silence cannot tell a running
     # session from a trigger that quietly refused.
     if ($wf -match 'gh issue comment' -and $wf -match 'ACA execution') {
