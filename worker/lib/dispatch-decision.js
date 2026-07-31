@@ -72,7 +72,14 @@ const {
 const DISPATCH_SCHEMA_VERSION = 1;
 const DEFAULT_MANIFEST_RELATIVE_PATH = 'squad-capabilities.yml';
 
-const DISPATCH_SOURCES = ['local-cli', 'ralph', 'watch'];
+// `actions` was added by issue #32. It is a dispatch SOURCE, not a second
+// dispatcher: a GitHub Actions workflow authenticates to Azure by OIDC and
+// starts the same ACA job with the same decision and the same lease, so
+// Actions is only the trigger transport and the control-plane logic stays in
+// Azure. Adding it here rather than letting the workflow invent its own key is
+// what keeps Ralph's poll and an Actions trigger from dispatching the same
+// issue twice -- they contend for one lease.
+const DISPATCH_SOURCES = ['local-cli', 'ralph', 'watch', 'actions'];
 
 const ACTION_DISPATCH = 'dispatch';
 const ACTION_REFUSE = 'refuse';

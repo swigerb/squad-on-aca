@@ -1,0 +1,195 @@
+name: Squad dispatch (Actions trigger, ACA control plane)
+
+# Issue #32. Actions is the TRIGGER TRANSPORT and nothing more: it authenticates
+# to Azure by OIDC and starts the ACA job. Every decision about whether to run,
+# what to run, and whether someone is already running it is made by the SHARED
+# dispatch core in worker/lib/, the same code the local CLI, Ralph and Watch use.
+#
+# Two properties this path buys over a webhook receiver:
+#   * no public ingress, no always-on replica, and no stored Azure credential --
+#     GitHub requires a 2xx within 10 seconds and does not automatically
+#     redeliver failures, which collides badly with scale-to-zero;
+#   * the lease is shared, so Ralph's poll and an Actions trigger contend for
+#     the same key instead of dispatching the same issue twice.
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number to work
+        required: false
+      prompt:
+        description: Prompt override
+        required: false
+
+permissions:
+  id-token: write      # required for OIDC; this is the ONLY Azure credential
+  contents: read
+  issues: write   # only to apply the shared 'dispatched' marker Ralph also uses
+
+concurrency:
+  # Two rapid triggers on the same issue queue rather than race. This is a
+  # convenience, NOT the safety property -- the lease below is what actually
+  # prevents a double dispatch, because concurrency groups do not span Ralph.
+  group: squad-dispatch-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      dispatch: ${{ steps.decide.outputs.dispatch }}
+      reason: ${{ steps.decide.outputs.reason }}
+      session: ${{ steps.decide.outputs.session }}
+      issue: ${{ steps.decide.outputs.issue }}
+      prompt: ${{ steps.decide.outputs.prompt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide whether this event is a trigger
+        id: decide
+        env:
+          SQUAD_TRIGGER_LABEL: ${{ vars.SQUAD_TRIGGER_LABEL || 'squad' }}
+          SQUAD_COMMAND_PREFIX: ${{ vars.SQUAD_COMMAND_PREFIX || '/squad' }}
+          SQUAD_BOT_LOGIN: ${{ vars.SQUAD_BOT_LOGIN || 'squad-on-aca-control-plane[bot]' }}
+        run: |
+          set -euo pipefail
+          verdict="$(node worker/lib/actions-event.js \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --event-path "${GITHUB_EVENT_PATH}" \
+            --trigger-label "${SQUAD_TRIGGER_LABEL}" \
+            --command-prefix "${SQUAD_COMMAND_PREFIX}" \
+            --bot-login "${SQUAD_BOT_LOGIN}")"
+          echo "verdict: ${verdict}"
+          {
+            echo "dispatch=$(printf '%s' "$verdict" | jq -r '.dispatch')"
+            echo "reason=$(printf '%s' "$verdict" | jq -r '.reason')"
+            echo "session=$(printf '%s' "$verdict" | jq -r '.sessionName // ""')"
+            echo "issue=$(printf '%s' "$verdict" | jq -r '.issueNumber // ""')"
+            echo "prompt=$(printf '%s' "$verdict" | jq -r '.prompt // ""')"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Explain a refusal
+        if: steps.decide.outputs.dispatch != 'true'
+        run: |
+          echo "Not dispatching. Reason: ${{ steps.decide.outputs.reason }}"
+          echo "This is a normal outcome for most events in a repository and is NOT a failure."
+
+  dispatch:
+    needs: resolve
+    if: needs.resolve.outputs.dispatch == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Claim the shared lease
+        id: lease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SESSION: ${{ needs.resolve.outputs.session }}
+          ISSUE: ${{ needs.resolve.outputs.issue }}
+        run: |
+          set -euo pipefail
+          # The SAME decision core the local CLI, Ralph and Watch use, with
+          # `actions` as the dispatch source. The lease is what stops Ralph's
+          # five-minute poll and this trigger from starting the same work twice.
+          decision="$(node worker/lib/squad-dispatch.js decide \
+            --session-id "${SESSION}" \
+            --dispatch-source actions \
+            --repository "${GITHUB_REPOSITORY}" \
+            ${ISSUE:+--issue "${ISSUE}"})"
+          echo "$decision" | jq -c '{leaseKey, routing: .routing.route, action}'
+
+          claim="$(printf '%s' "$decision" | node worker/lib/squad-dispatch.js claim --repository "${GITHUB_REPOSITORY}")"
+          echo "$claim" | jq -c '.'
+          claimed="$(printf '%s' "$claim" | jq -r '.claimed // false')"
+          echo "claimed=${claimed}" >>"$GITHUB_OUTPUT"
+          echo "leaseKey=$(printf '%s' "$decision" | jq -r '.leaseKey')" >>"$GITHUB_OUTPUT"
+          if [ "$claimed" != "true" ]; then
+            echo "Another dispatcher already holds this lease. Standing down -- this is correct behaviour, not a failure."
+          fi
+
+      - name: Start the ACA session job
+        if: steps.lease.outputs.claimed == 'true'
+        id: start
+        env:
+          SESSION: ${{ needs.resolve.outputs.session }}
+          ISSUE: ${{ needs.resolve.outputs.issue }}
+          PROMPT: ${{ needs.resolve.outputs.prompt }}
+          LEASE_KEY: ${{ steps.lease.outputs.leaseKey }}
+          RG: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-squad-aca-dev-eastus2' }}
+          JOB: ${{ vars.ACA_SESSION_JOB_NAME || 'caj-squad-aca-session' }}
+        run: |
+          set -euo pipefail
+
+          # ACA applies a per-execution --env-vars override ONLY when a COMPLETE
+          # container spec is supplied: name, image, cpu AND memory. Supply a
+          # partial one and the override is silently ignored -- the worker runs
+          # with the template's baked-in values, which means SQUAD_MODE=smoke
+          # and a session that quietly does nothing while reporting success.
+          # Ralph learned this in live E2E; this path must not relearn it.
+          spec="$(az containerapp job show -n "$JOB" -g "$RG" \
+            --query "properties.template.containers[0]" -o json)"
+          name=$(printf '%s' "$spec" | jq -r '.name // ""')
+          image=$(printf '%s' "$spec" | jq -r '.image // ""')
+          cpu=$(printf '%s' "$spec" | jq -r '.resources.cpu // ""')
+          memory=$(printf '%s' "$spec" | jq -r '.resources.memory // ""')
+
+          if [ -z "$image" ] || [ -z "$cpu" ] || [ -z "$memory" ]; then
+            echo "The session job template is missing image/cpu/memory. ACA would ignore the env override and run the template defaults, so this dispatch is refused rather than started blind."
+            exit 1
+          fi
+
+          # SQUAD_MODE=prompt is what Ralph dispatches with. There is no
+          # 'issue' mode; an unknown mode exits 64 in the worker.
+          prompt="${PROMPT}"
+          if [ -z "$prompt" ]; then
+            prompt="Work GitHub issue #${ISSUE} in ${GITHUB_REPOSITORY}. Read the issue, implement it, and open a pull request."
+          fi
+
+          exec_name=$(az containerapp job start -n "$JOB" -g "$RG" \
+            --image "$image" --container-name "${name:-$JOB}" \
+            --cpu "$cpu" --memory "$memory" \
+            --env-vars \
+              SQUAD_MODE=prompt \
+              SESSION_NAME="$SESSION" \
+              SQUAD_PROMPT="$prompt" \
+              SQUAD_LEASE_KEY="$LEASE_KEY" \
+              SQUAD_DISPATCH_SOURCE=actions \
+              PUSH_CHANGES=true \
+              CREATE_PR=true \
+              GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            --query name -o tsv)
+
+          echo "exec=${exec_name}" >>"$GITHUB_OUTPUT"
+          echo "Started ACA execution: ${exec_name}"
+          echo "The control plane is now Azure. This workflow's job is done."
+
+      - name: Mark the issue as dispatched
+        if: steps.lease.outputs.claimed == 'true' && steps.start.outputs.exec != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ needs.resolve.outputs.issue }}
+          DISPATCH_LABEL: ${{ vars.RALPH_DISPATCH_LABEL || 'squad-aca:dispatched' }}
+        run: |
+          set -euo pipefail
+          # The SAME marker Ralph uses. Without it Ralph's five-minute poll finds
+          # the issue still unlabelled and dispatches it again once this lease is
+          # released -- the lease prevents a CONCURRENT double dispatch, not a
+          # sequential one. Applied only after a confirmed start, exactly as
+          # Ralph does, so a failed start leaves the issue eligible for retry.
+          if [ -n "$ISSUE" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "$DISPATCH_LABEL" \
+              || echo "Could not apply ${DISPATCH_LABEL}; Ralph may re-dispatch this issue."
+          fi
