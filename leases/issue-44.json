@@ -1,17 +1,17 @@
 {
   "schemaVersion": 1,
   "leaseKey": "issue-44",
-  "sessionId": "issue-44-30664755108",
+  "sessionId": "issue-44-30666116948",
   "repository": "swigerb/squad-on-aca",
   "issueNumber": 44,
   "dispatchSource": "actions",
   "route": "aca-job",
   "executionMode": "aca-job",
-  "state": "released",
-  "attempts": 2,
+  "state": "claimed",
+  "attempts": 3,
   "startedAt": "2026-07-31T20:39:35.894Z",
-  "lastHeartbeatAt": "2026-07-31T21:15:55.552Z",
-  "updatedAt": "2026-07-31T21:15:55.552Z",
-  "terminalReason": "compute-request-failed",
+  "lastHeartbeatAt": "2026-07-31T21:19:17.097Z",
+  "updatedAt": "2026-07-31T21:19:17.097Z",
+  "terminalReason": null,
   "executionRef": null
 }
