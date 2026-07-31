@@ -4811,6 +4811,23 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "The dispatch workflow passes --env-vars without merging the job template's environment. ACA REPLACES rather than merges, so GITHUB_TOKEN and COPILOT_GITHUB_TOKEN would be dropped and the session would fail authentication after cloning"
     }
 
+    # ralph_build_session_env SKIPS every managed key when copying the template
+    # ("if (managed.has(e.name)) continue"), so the CALLER must supply each one
+    # -- including the secret-backed ones as `secretref:<name>`. Using the
+    # builder without them yields a session with no credential at all, which
+    # only surfaces inside the worker.
+    if ($wf -match 'OV_GITHUB_TOKEN="secretref:' -and $wf -match 'OV_COPILOT_GITHUB_TOKEN="secretref:') {
+        Add-Pass "The dispatch workflow supplies the managed secret references explicitly, as Ralph does -- the env builder skips managed keys from the template, so omitting them yields a session with no credential"
+    } else {
+        Add-Fail "The dispatch workflow does not pass OV_GITHUB_TOKEN / OV_COPILOT_GITHUB_TOKEN as secretref overrides. The env builder deliberately skips managed keys from the template, so the session would start with no GitHub credential"
+    }
+
+    if ($wf -match "grep -q '\^GITHUB_TOKEN=secretref:'") {
+        Add-Pass "The dispatch refuses to start when the merged environment carries no GITHUB_TOKEN reference, so a credential-less session is stopped at the dispatcher rather than two minutes into the worker"
+    } else {
+        Add-Fail "Nothing checks that the merged environment actually carries a GITHUB_TOKEN reference before the ACA job is started"
+    }
+
     if ($wf -match '--bot-login') {
         Add-Pass "The dispatch workflow passes the App's bot login to the resolver, which is what breaks the retrigger loop an App token would otherwise create"
     } else {

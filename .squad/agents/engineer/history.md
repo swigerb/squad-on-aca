@@ -1441,3 +1441,18 @@ measured TTL of exactly 3600 seconds, so it is not.
 - A live green workflow proved the TRIGGER, not the SESSION. Confirming the ACA
   execution exists is necessary but still not sufficient; its exit status is the
   next assertion, and it was Failed.
+
+## Issue #32 - the env builder SKIPS managed keys by design
+
+- `ralph_build_session_env` contains `if (managed.has(e.name)) continue` when
+  copying the template: every key in RALPH_MANAGED_ENV_KEYS is deliberately NOT
+  inherited, because the caller is expected to supply it. Reusing the function
+  without reading its CALL SITE produced a session with no GH_TOKEN at all.
+- Reading a shared function is not enough; read how the existing caller uses it.
+  Ralph passes `OV_GITHUB_TOKEN=secretref:github-token` and two more explicitly.
+- `deploy.ps1` RECREATES the session job, which DELETES any role assignment
+  scoped to that job resource. The Actions identity silently lost its grant on
+  redeploy and the next run failed with "No subscriptions found" - which reads
+  like an OIDC fault and is an RBAC one.
+- S1's token preflight earned itself here: it caught the missing credential two
+  minutes in, naming the fix, instead of failing at the push after a full run.
