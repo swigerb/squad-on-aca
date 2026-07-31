@@ -2174,6 +2174,35 @@ function New-SandboxPollCommand {
            "echo phase=`$p; echo exit=`$e; echo marker=`$m"
 }
 
+function New-SandboxLogsCommand {
+    <#
+    .SYNOPSIS
+        The exec a log read runs: tail the session log, never fail because there
+        is nothing to tail yet.
+
+    .DESCRIPTION
+        `|| true` is deliberate. A session that has only just been created has no
+        `session.log`, and `tail` exits non-zero on a missing file; without the
+        `|| true` the provider would classify "the worker has not written a line
+        yet" as a transport or execution failure.
+
+        It lives in a generator rather than inline at the call site for one
+        reason: this repository's shell-portability screen
+        (scripts/lib/squad-shell-portability.ps1) checks the commands it can
+        GENERATE. An emitted shell string that exists only as a literal buried in
+        an operation block is a command nothing can screen, and every command
+        this provider sends is run by `/bin/sh` -- dash on the class image -- so
+        being screenable is the point. The emitted text is unchanged.
+    #>
+    param(
+        [string]$StateDir = $script:SandboxStateDir,
+        [int]$Tail = 100
+    )
+
+    if ($Tail -le 0) { $Tail = 100 }
+    return "tail -n $Tail $StateDir/session.log 2>/dev/null || true"
+}
+
 function ConvertFrom-SandboxPollOutput {
     <#
     .SYNOPSIS
@@ -2679,7 +2708,7 @@ function New-SandboxExecutionProvider {
 
         $result = Invoke-SandboxCli -Context $Context -Argv @(
             "sandbox", "exec", "-l", "name=$($payload.name)",
-            "-c", "tail -n $tail $($Context.StateDir)/session.log 2>/dev/null || true"
+            "-c", (New-SandboxLogsCommand -StateDir $Context.StateDir -Tail $tail)
         )
         if ($result.ExitCode -ne 0) {
             if (Test-SandboxTransportInconclusive -Result $result) {

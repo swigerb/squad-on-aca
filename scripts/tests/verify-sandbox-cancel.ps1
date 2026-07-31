@@ -22,8 +22,11 @@
     Every offline test at the time asserted that the right STRING was sent. Not
     one of them could tell the characters of a kill from a kill, because the
     offline `aca` stub never evaluates the `-c` payload in a shell. This script
-    does: it takes the command from the SHIPPING generator, runs it in bash
-    against processes it really started, and looks at what happened to them.
+    does: it takes the command from the SHIPPING generator, runs it through
+    `sh -c` -- dash, the shell `aca sandbox exec` actually uses -- against
+    processes it really started, and looks at what happened to them. Since issue
+    #40 the LAUNCH that builds each fixture goes through `sh -c` too, so the
+    state every case reads was created the way a real sandbox creates it.
 
     It also runs the ORIGINAL command shape (kept verbatim below) in the same
     procps-free environment as a self-check. If that control ever stops looking
@@ -168,6 +171,11 @@ $c = @{}
 foreach ($id in @("c1", "c2", "c2c", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12", "c13")) {
     $c[$id] = @{ Dir = "$root/$id"; Launch = (New-ProbeLaunch "$root/$id"); Cancel = (New-ProbeCancel "$root/$id") }
     $c[$id].Sh = (New-ShInvocation $c[$id].Cancel)
+    # The LAUNCH crosses the same boundary into the same shell (issue #40), so it
+    # is set up through `sh -c` too. Every fixture below is therefore built by
+    # dash, exactly as a real sandbox builds it, and a launch that only worked
+    # under bash could no longer create the state a cancel case then reads.
+    $c[$id].ShLaunch = (New-ShInvocation $c[$id].Launch)
     $c[$id].Esc = ($c[$id].Cancel -replace "'", "'\''")
 }
 
@@ -236,7 +244,7 @@ markers() {
 # ===================== C1: kills a real worker and its child ================
 echo "SH_IMPL=`$(readlink -f "`$(command -v sh)" 2>/dev/null | sed 's#.*/##')"
 mkworker "$($c['c1'].Dir)" 'sleep 4'
-$($c['c1'].Launch)
+$($c['c1'].ShLaunch)
 sleep 1
 C1PID=`$(cat "$($c['c1'].Dir)/worker.pid" 2>/dev/null)
 C1CHILD=`$(cat "$($c['c1'].Dir)/child.pid" 2>/dev/null)
@@ -268,7 +276,7 @@ echo "C2_PGREP=`$( PATH="`$BIN"; hash -r; command -v pgrep 2>/dev/null || echo M
 
 # ---- C2c CONTROL: the pre-#36 command, in exactly that environment ---------
 mkworker "$($c['c2c'].Dir)" 'sleep 30'
-$($c['c2c'].Launch)
+$($c['c2c'].ShLaunch)
 sleep 1
 C2CPID=`$(cat "$($c['c2c'].Dir)/worker.pid" 2>/dev/null)
 LEGOUT=`$( PATH="`$BIN"; hash -r; $legacy )
@@ -281,7 +289,7 @@ echo "C2C_MARKERS=`$(markers "$($c['c2c'].Dir)")"
 kill -KILL -"`$C2CPID" 2>/dev/null
 # ---- C2 the shipping command, same environment, its own live worker -------
 mkworker "$($c['c2'].Dir)" 'sleep 30'
-$($c['c2'].Launch)
+$($c['c2'].ShLaunch)
 sleep 1
 C2PID=`$(cat "$($c['c2'].Dir)/worker.pid" 2>/dev/null)
 t0=`$(date +%s%N)
@@ -296,7 +304,7 @@ echo "C2_MARKERS=`$(markers "$($c['c2'].Dir)")"
 
 # ===================== C3: no pid file ======================================
 mkworker "$($c['c3'].Dir)" 'sleep 30'
-$($c['c3'].Launch)
+$($c['c3'].ShLaunch)
 sleep 1
 C3PID=`$(cat "$($c['c3'].Dir)/worker.pid" 2>/dev/null)
 rm -f "$($c['c3'].Dir)/worker.pid"
@@ -311,7 +319,7 @@ kill -KILL -"`$C3PID" 2>/dev/null
 
 # ===================== C4: pid file says 1 ==================================
 mkworker "$($c['c4'].Dir)" 'sleep 30'
-$($c['c4'].Launch)
+$($c['c4'].ShLaunch)
 sleep 1
 C4PID=`$(cat "$($c['c4'].Dir)/worker.pid" 2>/dev/null)
 printf %s 1 > "$($c['c4'].Dir)/worker.pid"
@@ -326,7 +334,7 @@ kill -KILL -"`$C4PID" 2>/dev/null
 
 # ===================== C5: pid file names an unrelated process ==============
 mkworker "$($c['c5'].Dir)" 'sleep 30'
-$($c['c5'].Launch)
+$($c['c5'].ShLaunch)
 sleep 1
 C5PID=`$(cat "$($c['c5'].Dir)/worker.pid" 2>/dev/null)
 setsid sleep 45 >/dev/null 2>&1 &
@@ -357,7 +365,7 @@ echo "C6_MARKERS=`$(markers "$($c['c6'].Dir)")"
 
 # ===================== C7: a worker that ignores SIGTERM ====================
 mkworker "$($c['c7'].Dir)" "trap '' TERM" 'sleep 40'
-$($c['c7'].Launch)
+$($c['c7'].ShLaunch)
 sleep 1
 C7PID=`$(cat "$($c['c7'].Dir)/worker.pid" 2>/dev/null)
 t0=`$(date +%s%N)
@@ -372,7 +380,7 @@ echo "C7_MARKERS=`$(markers "$($c['c7'].Dir)")"
 
 # ===================== C8: a process that never dies ========================
 mkworker "$($c['c8'].Dir)" 'sleep 40'
-$($c['c8'].Launch)
+$($c['c8'].ShLaunch)
 sleep 1
 C8PID=`$(cat "$($c['c8'].Dir)/worker.pid" 2>/dev/null)
 # A shell FUNCTION shadows the `kill` builtin, so every signal this cancel sends
@@ -395,7 +403,7 @@ kill -KILL -"`$C8PID" 2>/dev/null
 
 # ===================== C9: the kill is rejected =============================
 mkworker "$($c['c9'].Dir)" 'sleep 30'
-$($c['c9'].Launch)
+$($c['c9'].ShLaunch)
 sleep 1
 C9PID=`$(cat "$($c['c9'].Dir)/worker.pid" 2>/dev/null)
 kill() { return 1; }

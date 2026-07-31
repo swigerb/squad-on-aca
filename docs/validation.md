@@ -33,7 +33,8 @@ pre-push hook.
 | .NET agent libraries | Verifies `aspire/` structure and `.csproj` XML, asserts `Squad.Aca.Agents` has **zero** package references and that `Microsoft.Agents.AI` is pinned exactly in `Squad.Aca.Agents.MAF` alone, and runs `dotnet build` + `dotnet test` when an SDK is present | Ensures the optional integration path stays coherent, and keeps the agent contract free of the Agent Framework dependency so a restore failure in the adapter cannot take the contract down with it |
 | Execution provider contract | Exercises `scripts/lib/squad-aca-provider.ps1` offline against the filesystem-backed fake provider: create/wait/status/logs/cancel/terminate state transitions, idempotent `terminate` (repeat and after external deletion), double `cancel`, handle opacity, and rejection of unknown, malformed, and foreign-provider handles | Proves the provider seam behaves per PRD #6 with no Azure subscription, so a future Sandboxes provider can be developed and tested offline |
 | ACA Job adapter | Drives the **production** adapter (`scripts/lib/providers/squad-aca-job-provider.ps1`) against the fake `az` from `scripts/tests/cli-stub-harness.ps1`: `terminate` on a live execution, on an already-terminal/not-found one, under an auth failure, under RBAC/throttling/network/wrong-subscription/unrecognised failures, and with no `az` on `PATH`; plus `wait` polling `Provisioning -> Running` and timing out on an execution that never becomes ready | The fake provider proves the seam, not the adapter that ships. `terminate` used to return `Terminated = $true` for *every* non-zero `az` exit and label it `AlreadyTerminal`, so an auth failure read as a successful teardown; these checks fail if that returns |
-| ACA Sandboxes provider | Drives `scripts/lib/providers/squad-sandbox-provider.ps1` against a stub `aca`, and — the assertions a stub cannot make — evaluates the **actually emitted** launch and credential-staging commands in a real `bash` under WSL: timing when the caller's streams reach EOF against a still-running worker, and proving a token written to **stdin** reaches the worker verbatim through a `0600` file that the launch sources and removes. Also covers `Protect-SandboxText` directly at realistic credential lengths, and `cancel`'s failure classification | A detach is a shell-grammar property, not a substring: `&` binds looser than `&&`, so a command containing every character of a detach can still hold the exec open until its ~120 s timeout. Credential delivery is the same class of claim: only a real shell can distinguish "the token is not in the argv because it is on stdin" from "the token is not in the argv because it is not delivered at all" |
+| ACA Sandboxes provider | Drives `scripts/lib/providers/squad-sandbox-provider.ps1` against a stub `aca`, and — the assertions a stub cannot make — evaluates the **actually emitted** launch and credential-staging commands through `sh -c` (dash) under WSL: timing when the caller's streams reach EOF against a still-running worker, and proving a token written to **stdin** reaches the worker verbatim through a `0600` file that the launch sources and removes. Also covers `Protect-SandboxText` directly at realistic credential lengths, and `cancel`'s failure classification | A detach is a shell-grammar property, not a substring: `&` binds looser than `&&`, so a command containing every character of a detach can still hold the exec open until its ~120 s timeout. Credential delivery is the same class of claim: only a real shell can distinguish "the token is not in the argv because it is on stdin" from "the token is not in the argv because it is not delivered at all" |
+| Emitted-command shell portability | Screens **every** shell string the sandbox provider emits (`scripts/lib/squad-shell-portability.ps1`) for bashisms — `$(< file)` above all — and asserts by reflection that no `New-Sandbox*Command` generator exists outside the inventory. `verify-launch-detachment.ps1` additionally parses each one with **both** `dash -n` and `bash -n` on a real Linux host | `aca sandbox exec` runs its `-c` payload under `/bin/sh`, which is **dash** on the class image. `$(< file)` is valid bash and silently expands to the empty string under dash — no error, no exit code — which is how issue #36 shipped a cancel that read an empty `/proc` scan and reported a live worker as already-dead. See [Shell portability of emitted commands](#shell-portability-of-emitted-commands) |
 | Sandbox security controls (Sprint 7/8) | Adversarial, offline: the Copilot and git tokens must appear in **no** recorded `aca` argv while provably arriving on stdin; a classic `ghp_`/`gho_`/`ghs_` token is refused **before** any CLI call with a message naming `deploy.ps1`'s single-token default; a manifest that requests an egress host outside the approved class template is refused at policy generation with nothing created; every emitted egress rule must trace to the template; ~12 hostile identifier classes (traversal, CRLF, NUL, leading `-`, over-length) are rejected before API construction and never echoed; hostile manifest text reaches neither policy, error, nor status payload; credential/egress **readback** subcommands are refused outright; the per-class concurrency ceiling holds and a class with no ceiling is a config error; the orphan reaper's selection, keep-list and undecidable-age behaviour; the auth/quota/readiness/transport/execution failure taxonomy; and credential revocation on terminate, on mid-create failure, and when revocation itself fails | An argument vector is world-readable at `/proc/<pid>/cmdline`, brokered credentials live on the **group** and outlive their sandbox, and a leaked sandbox bills indefinitely. Each control is mutation-tested: breaking it must fail a named check, not merely change some text |
 | CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, **stdout content**, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through output and exit code when `az` fails |
 | CLI golden gate wiring | Asserts every capture case in `scripts/tests/cli-capture-cases.ps1` has a committed golden, that the `stop` golden records `az` stdout, and that `.github/workflows/worker-tests.yml` actually runs `verify-cli-golden.ps1` | A guard that is not automated is not a guard; PR #9's regression class shipped once because the only stdout-comparing tool was a manual one |
@@ -67,6 +68,104 @@ Skipped (NOT passes -- the dependency was missing):
 A skip that silently counted as a pass is a check that stops existing the moment
 its dependency goes missing. CI runs on a host where the dependency is present,
 so a skip there is a signal to investigate, not to ignore.
+
+## Shell portability of emitted commands
+
+`aca sandbox exec -c '<command>'` does **not** run `<command>` under bash. It
+runs it under `/bin/sh`, which on the pinned class image is **dash**. Verified
+directly on a fresh sandbox:
+
+```text
+SHELL=/bin/sh
+bashism_result=[]        # $(< /tmp/t)   -- silently empty: no error, no exit code
+posix_result=[hello]     # $(cat /tmp/t)
+```
+
+That silent-empty behaviour is not a curiosity; it is how issue #36 shipped a
+cancel command that looked correct. The `/proc` scan read nothing, and "nothing"
+was interpreted as "the worker is gone", so a running worker was reported as
+already-dead. The command was valid bash and it was tested — under bash.
+
+Issue #40 generalised the fix. A probe that evaluates real behaviour in the
+*wrong shell* can pass while production fails, and that is harder to notice than
+a missing test, because the gate is green and looks meaningful.
+
+### What is guaranteed
+
+**Every shell string the sandbox provider emits is covered**, not just cancel.
+The inventory lives in `scripts/lib/squad-shell-portability.ps1` and is built by
+calling the **shipping generators**, so it can never describe a command that is
+not the one that ships:
+
+| Id | Generator | What it is |
+| --- | --- | --- |
+| `launch` | `New-SandboxLaunchCommand` | Creates the state dir, sources and deletes staged credentials, detaches the worker |
+| `launch-inner` | (the `bash -c '...'` payload inside `launch`) | The detached wrapper. Single-quoted inside `launch`, so neither `dash -n` nor `bash -n` reaches it when parsing the outer command; the detachment probe recovers and checks it separately |
+| `cancel` | `New-SandboxCancelCommand` | The procps-free process-group kill and its verdict |
+| `poll` | `New-SandboxPollCommand` | Reads phase, exit code and completion marker |
+| `credential-vault` | `New-SandboxCredentialVaultCommand` | Creates the `0700` directory the credential file is uploaded into |
+| `logs` | `New-SandboxLogsCommand` | Tails `session.log` |
+| `credential-file` | `New-SandboxCredentialFileContent` | The bytes of the credential file the launch sources |
+
+Three independent gates apply to that inventory:
+
+1. **Static screen** (`validate.ps1`, offline, no dependencies). Rejects the
+   bashism class that caused #36 — command substitution of a bare redirect
+   (`$(< file)`) above all — plus `[[ ]]`, arrays and array subscripts, `local`,
+   the `function` keyword, `+=` string append, here-strings (`<<<`), process
+   substitution (`<(...)`/`>(...)`), `${var^^}`/`${var,,}`/`${!var}`/
+   `${var:offset:length}`, `echo -e`/`-n`, `&>`/`>&word`/`|&`, `$'...'`,
+   `==` inside `[ ]`, `source`, `pushd`/`popd`, `declare`/`typeset`/`let`/
+   `select`/`mapfile`/`shopt`, `export -f`, `trap ... ERR`, `wait -n`, bash-only
+   `read` flags, `{1..9}` brace ranges, and `read -r X < f` with the stderr
+   redirect placed after the input redirect. Each pattern's message names the
+   *real defect* it causes under dash, not the pattern. `${var:-default}` and
+   `${var:+alt}` are portable and are deliberately **not** matched.
+2. **Anti-drift reflection** (`validate.ps1`). Enumerates every
+   `New-Sandbox*Command` function actually defined by the provider and fails if
+   one is not in the inventory. Adding a new emitted command without covering it
+   is a validation failure, so the screen cannot quietly stop being complete.
+3. **Real-shell syntax check** (`verify-launch-detachment.ps1`, needs WSL).
+   Writes each command to a file through a quoted heredoc and parses it with
+   both `dash -n` **and** `bash -n`. Both, because the launch's inner wrapper is
+   genuinely executed by `bash -c` — running only one would trade coverage
+   rather than add it.
+
+`verify-launch-detachment.ps1` also evaluates behaviour in the right shell. It
+proves `/bin/sh` on the probe host really is dash before believing anything else
+(a live canary: `$(< f)` must return nothing while `$(cat f)` returns `hello`),
+runs the emitted launch and the credential-seed command through `sh -c`, and
+still asserts stream-EOF ordering against a live worker rather than matching
+text. The detachment measurement is taken under dash **and** bash: a mis-scoped
+`&` is caught by both.
+
+### What is NOT guaranteed
+
+* **Behavioural correctness.** The screen is a syntax and idiom check. A command
+  that is perfectly portable and perfectly wrong passes it. That is why the
+  behavioural probes exist and why neither replaces the other.
+* **Runtime-interpolated data.** The inventory is generated with representative
+  arguments. A hostile *value* reaching a command is the job of the identifier
+  and manifest validation (see [Security validation](#security-validation)), not
+  of this screen.
+* **Anything outside the provider's emitters.** Shell that the worker container
+  runs from `worker/` is bash by declaration (`#!/usr/bin/env bash`) and is
+  covered by `bash -n` and the worker suite instead.
+* **The credential file's consumer.** `credential-file` is screened as `sh`
+  because the launch sources it with `.` under `/bin/sh`. It is deliberately
+  held to the stricter of its two possible readers.
+* **Shells other than dash and bash.** The class image ships dash; if that ever
+  changes, this guarantee changes with it and the canary in the detachment probe
+  is what will say so.
+
+### Proving the screen works
+
+A screen that has never rejected anything is a comment. It is mutation-tested:
+reintroducing `$(< file)` into each of the six generators must produce a failure
+that names the real defect, and adding a `New-Sandbox*Command` generator outside
+the inventory must fail the anti-drift check. Both are reproduced by editing the
+generator, running `validate.ps1` (or `verify-launch-detachment.ps1` for the
+probe path), and reverting.
 
 ## Proving the CLI has not changed
 

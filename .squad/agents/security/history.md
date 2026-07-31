@@ -768,3 +768,103 @@ wrong shell** is the same failure wearing a better disguise, and it is more
 dangerous because it looks like evidence. Run the artefact you ship, in the
 interpreter production actually uses, against a real process - and when a probe
 reads nothing, make "nothing" a refusal rather than a verdict.
+
+## Issue #40 - the probe that ran in the wrong shell
+
+**The gap, not a bug.** `aca sandbox exec` hands its `-c` payload to `/bin/sh`,
+which on the pinned class image is **dash**. Confirmed independently on a fresh
+sandbox: `SHELL=/bin/sh`, `$(< /tmp/t)` returned `[]` with no error and no exit
+code, while `$(cat /tmp/t)` returned `[hello]`. That silent empty is what shipped
+the broken cancel in #36 - the `/proc` scan read nothing and "nothing" was read
+as "the worker is gone".
+
+The #36 fix closed that for **cancel** only: `verify-sandbox-cancel.ps1` runs the
+emitted command through `sh -c`, the script is checked with `dash -n` as well as
+`bash -n`, and a static bashism screen was added. Launch, poll and the
+credential seed got none of it, and `verify-launch-detachment.ps1` still
+evaluated the launch under **bash**. There was no live defect. That is the point:
+a probe that evaluates real behaviour in the wrong interpreter can be green while
+production fails, and a green gate that looks meaningful is worse than a missing
+one.
+
+**Headline: no shipping command contained a bashism.** Every emitted command was
+screened and every one came back clean. Nothing was fixed because nothing was
+broken. The change is entirely in what the gates can see.
+
+**What the provider actually emits.** Found by reading
+`scripts/lib/providers/squad-sandbox-provider.ps1`, not by trusting a list. Five
+generators - `New-SandboxLaunchCommand`, `New-SandboxCancelCommand`,
+`New-SandboxPollCommand`, `New-SandboxCredentialVaultCommand`,
+`New-SandboxCredentialFileContent` - plus **two** the brief did not mention. The
+`logs` operation built its `tail` command as an inline literal at the call site,
+so no screen could reach it; it was extracted verbatim into
+`New-SandboxLogsCommand` and `validate.ps1` now asserts the emitted text is
+byte-identical, so the extraction cannot have changed behaviour. And the launch's
+detached wrapper is a `bash -c '...'` payload single-quoted **inside** the launch:
+neither `dash -n` nor `bash -n` parses it when parsing the launch, so the
+detachment probe recovers it by regex and checks it as its own command
+(`launch-inner`). Seven commands covered, not four.
+
+**One inventory, two consumers.** `scripts/lib/squad-shell-portability.ps1` holds
+the screen and builds the inventory by calling the **shipping generators**, so it
+can never describe a command that is not the one that ships. Both `validate.ps1`
+section 6e (offline) and `verify-launch-detachment.ps1` (real shell) consume it,
+so the offline gate and the behavioural probe cannot disagree about what exists.
+22 patterns; the message for each names the **defect** it causes under dash, not
+the pattern. Anti-drift is by reflection: `validate.ps1` enumerates every
+`New-Sandbox*Command` the provider actually defines and fails any that is not in
+the inventory, so the screen cannot quietly stop being complete.
+
+**Probes moved into the right shell.** `verify-launch-detachment.ps1` now proves
+`/bin/sh` really is dash before believing anything else - a live canary in the
+same run, `$(< f)` must come back empty while `$(cat f)` returns `hello` - then
+evaluates the emitted launch, the credential-vault exec and the credentialed
+launch through `sh -c`. It kept its behavioural character: it still times when
+the caller's streams reach EOF against a live 3 s worker rather than matching
+text. Detachment is measured under **both** dash and bash, because the inner
+wrapper genuinely is `bash -c` and the pre-#40 probe caught a real mis-scoped `&`
+under bash; running both adds coverage instead of trading it.
+`verify-sandbox-cancel.ps1` had already moved its cancel across; its **launch**
+fixtures now go through `sh -c` too, so the state every case reads was built the
+way a real sandbox builds it.
+
+**Mutation.** A screen that has never rejected anything is a comment.
+Reintroducing `$(< file)` into each of the six generators in turn, one at a time,
+reverting between: **6 of 6 rejected**, each naming the real defect
+("...expands to NOTHING, with no error and no exit code... the exact defect that
+reported a live worker as already-dead in issue #36"). The launch mutation was
+also run through `verify-launch-detachment.ps1`, which failed **twice** - once
+for `launch` and once for `launch-inner`, proving the recovered inner wrapper is
+really being screened. Adding a `New-SandboxUnscreenedCommand` generator outside
+the inventory failed the anti-drift check by name. And the probe was mutated the
+other way to prove it was not weakened: scoping the launch's `&` over the whole
+`&&`-list held the caller 3012 ms under dash and 3018 ms under bash against a
+1500 ms budget, and both were reported. Nothing was traded for the shell change.
+
+**Verification.** `validate.ps1` 315 -> **316 passed / 0 failed / 0 skipped**
+(the +1 is section 1, which emits one parse pass per `.ps1` under `scripts/`;
+section 6e itself was deliberately kept to a single pass/fail pair so the count
+tracks files, not opinions). `verify-cli-golden.ps1` **26/26 byte-identical, no
+golden changed**. `verify-launch-detachment.ps1` **PASS**, `SH_IMPL=dash`,
+`SH_BASHISM=[]`, `SH_POSIX=[hello]`, 14 clean `dash -n`/`bash -n` results,
+`ELAPSED_MS=3` / `BASH_ELAPSED_MS=6`. `verify-sandbox-cancel.ps1` **PASS, 14
+cases**, C2c control still showing the pre-#36 shape succeeding while the worker
+lives. Worker suite **10 suites / 739 assertions**, 0 failed. .NET **114**
+(47 + 67) after `dotnet clean`. `Squad.Aca.Agents` still zero package references.
+dash obtained from WSL Ubuntu: `/usr/bin/dash`, `/bin/sh -> dash`, and the
+in-run canary rather than the symlink is what the probe trusts.
+
+**Left uncovered, deliberately.** The screen is syntax and idiom; a perfectly
+portable and perfectly wrong command passes it, which is why the behavioural
+probes exist and why neither replaces the other. Runtime-interpolated values are
+not screened - a hostile *value* is the identifier and manifest validation's job.
+`worker/` shell is bash by declaration and stays under `bash -n` and the worker
+suite. `credential-file` is screened as `sh` although a bash wrapper could also
+read it, deliberately holding it to the stricter of its two readers.
+
+**Lesson recorded.** #36's lesson was that a substring match proves the
+characters of a kill, not a kill. #40's is narrower and meaner: it is not enough
+to run the real artefact against a real process if you run it under the wrong
+interpreter, because the gate stays green and *looks like evidence*. Prove the
+interpreter in the same run that uses it, and screen every command the process
+emits - including the ones that never had a function to hide behind.

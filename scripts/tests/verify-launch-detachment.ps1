@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
     Proves the worker launch command `New-SandboxLaunchCommand` emits really
-    DETACHES, by running it in a real POSIX shell.
+    DETACHES, by running it in the shell production actually uses -- dash.
 
 .DESCRIPTION
     `aca sandbox exec` has a hard ~120 s client transport timeout. A launch that
@@ -40,6 +40,37 @@
     return rather than racing an asynchronous `mkdir`), and the detached wrapper
     must still record the exit code before touching the completion marker.
 
+    ISSUE #40 -- THE SHELL THIS RUNS IN. Until now every one of those evaluations
+    happened under BASH, while `aca sandbox exec` runs the command under
+    `/bin/sh`, which is dash on the pinned class image. That is not a detail: it
+    is the exact hole that shipped a broken cancel in #36, where `$(< file)`
+    expanded to the empty string under dash with no error and no exit code, and a
+    probe running the same string under bash reported everything fine. A
+    behavioural probe evaluating the shipping artefact in the WRONG interpreter
+    is more dangerous than a missing test, because the gate is green and looks
+    meaningful.
+
+    So every emitted command is now evaluated through `sh -c`, exactly as the
+    sandbox does, and the probe REFUSES to run unless `/bin/sh` is really dash
+    (SH_IMPL below) -- a bash `/bin/sh` would make every assertion prove less
+    than it claims. Three things are checked that were not:
+
+      * SYNTAX, for every command the provider emits (not just the launch):
+        `dash -n` AND `bash -n`. Both, because the launch's inner wrapper is run
+        by an explicit `bash -c` while the outer command is run by dash, so the
+        two dialects are both live in production and a command must satisfy the
+        one that will interpret it.
+      * The STATIC SCREEN in scripts/lib/squad-shell-portability.ps1, applied to
+        every emitted command including the inner wrapper -- the same screen
+        validate.ps1 runs, from the same inventory, so the two cannot disagree
+        about what ships.
+      * DETACHMENT IN BOTH SHELLS. The launch is measured under dash (which is
+        what production uses) and again under bash. The second run is not
+        redundant: `&`-scoping is a grammar property both shells share, the
+        pre-#40 probe caught a real mis-scoped `&` under bash, and keeping the
+        bash measurement means this change strictly adds evidence rather than
+        trading one shell's coverage for another's.
+
 .PARAMETER Distro
     WSL distribution to use on Windows. Defaults to $env:SQUAD_DETACH_PROBE_DISTRO
     or `Ubuntu`. Ignored on Linux/macOS, where `bash` is used directly.
@@ -52,7 +83,8 @@
 
 .OUTPUTS
     Exit 0  every assertion passed.
-    Exit 1  the launch does not detach (or the wrapper's ordering is wrong).
+    Exit 1  the launch does not detach (or the wrapper's ordering is wrong, or an
+            emitted command is not dash-safe).
     Exit 77 no POSIX shell available -- the check DID NOT RUN. Mirrors
             worker/tests/lib/deps.sh; callers must count this as a skip, never
             as a pass.
@@ -80,6 +112,13 @@ if (-not (Test-Path $providerPath)) {
 }
 . $providerPath
 
+$portabilityPath = Join-Path $RepoRoot (Join-Path "scripts" (Join-Path "lib" "squad-shell-portability.ps1"))
+if (-not (Test-Path $portabilityPath)) {
+    Write-Host "FAIL: $portabilityPath not found -- the emitted-command inventory and the bashism screen live there." -ForegroundColor Red
+    exit 1
+}
+. $portabilityPath
+
 if (-not $Distro) {
     $Distro = if ($env:SQUAD_DETACH_PROBE_DISTRO) { $env:SQUAD_DETACH_PROBE_DISTRO } else { "Ubuntu" }
 }
@@ -90,19 +129,27 @@ $onWindows = if ($null -ne $PSVersionTable.Platform) { $PSVersionTable.Platform 
 # Resolve a shell that can actually run the command. On Windows that means WSL:
 # Git Bash / MSYS have no `setsid`, so they would report a false FAILURE rather
 # than a skip, which is worse than not running at all.
+#
+# The HARNESS runs under bash (it needs `date +%s%N`, functions and a stable
+# heredoc, and its own dialect is not what is under test). Every command UNDER
+# TEST is invoked through `sh -c`, which is what `aca sandbox exec` does -- and
+# SH_IMPL below refuses to accept a `/bin/sh` that is not really dash, because a
+# bash `/bin/sh` would silently restore exactly the blind spot issue #40 exists
+# to close. `dash` itself must also be present, for the `dash -n` syntax checks.
 $runner = $null
 $runnerArgs = @()
 $runnerName = ""
 $skipReason = ""
+$shellProbe = "command -v setsid >/dev/null && command -v dash >/dev/null && echo squad-shell-ok"
 
 if ($onWindows) {
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if (-not $wsl) {
         $skipReason = "wsl.exe is not on PATH (Git Bash/MSYS cannot be used: no setsid)"
     } else {
-        $probe = & $wsl.Source -d $Distro -e bash -c "command -v setsid >/dev/null && echo squad-shell-ok" 2>$null
+        $probe = & $wsl.Source -d $Distro -e bash -c $shellProbe 2>$null
         if ($LASTEXITCODE -ne 0 -or (([string[]]$probe -join "") -notmatch "squad-shell-ok")) {
-            $skipReason = "'wsl -d $Distro -e bash' did not run, or the distro has no setsid (exit $LASTEXITCODE)"
+            $skipReason = "'wsl -d $Distro -e bash' did not run, or the distro has no setsid / no dash (exit $LASTEXITCODE). dash is required: the sandbox runs every emitted command under it, and checking them under bash is the defect this probe exists to prevent"
         } else {
             $runner = $wsl.Source
             $runnerArgs = @("-d", $Distro, "-e", "bash", "-s")
@@ -114,9 +161,9 @@ if ($onWindows) {
     if (-not $bash) {
         $skipReason = "bash is not on PATH"
     } else {
-        $probe = & $bash.Source -c "command -v setsid >/dev/null && echo squad-shell-ok" 2>$null
+        $probe = & $bash.Source -c $shellProbe 2>$null
         if ($LASTEXITCODE -ne 0 -or (([string[]]$probe -join "") -notmatch "squad-shell-ok")) {
-            $skipReason = "bash is present but has no setsid (exit $LASTEXITCODE)"
+            $skipReason = "bash is present but has no setsid, or dash is not installed (exit $LASTEXITCODE). dash is required: the sandbox runs every emitted command under it"
         } else {
             $runner = $bash.Source
             $runnerArgs = @("-s")
@@ -144,6 +191,17 @@ $launch = New-SandboxLaunchCommand `
     -Environment ([ordered]@{ SQUAD_DETACH_PROBE = "1" }) `
     -StateDir $probeDir `
     -Entrypoint "$probeDir/worker.sh"
+
+# `aca sandbox exec -c '<cmd>'` runs <cmd> under /bin/sh. Everything the probe
+# evaluates goes through the same door (issue #40), so what is measured is what
+# the sandbox will actually interpret. Same helper, same escaping rule, as
+# verify-sandbox-cancel.ps1.
+function New-ShInvocation([string]$cmd) {
+    return "sh -c '" + ($cmd -replace "'", "'\''") + "'"
+}
+function New-BashInvocation([string]$cmd) {
+    return "bash -c '" + ($cmd -replace "'", "'\''") + "'"
+}
 
 $settle = $WorkerSeconds + 2
 
@@ -222,14 +280,85 @@ if ($copilotGuardErr -notmatch "\[squad-sandbox:capability\]") {
     $staticLeaks += "the launch generator accepted a credential-bearing env assignment (COPILOT_GITHUB_TOKEN) instead of refusing it (error was: '$copilotGuardErr')"
 }
 
+# --------------------------------------------------------------------------
+# Issue #40: every emitted command, screened statically and syntax-checked in
+# BOTH shells that interpret one in production.
+# --------------------------------------------------------------------------
+# The inventory comes from scripts/lib/squad-shell-portability.ps1 -- the same
+# one validate.ps1 screens -- so the offline gate and this probe cannot end up
+# disagreeing about which commands ship.
+#
+# The launch's INNER wrapper is added here rather than there. It is a single
+# quoted word inside the launch, so neither `dash -n` nor `bash -n` looks inside
+# it when they parse the launch, and it is the fragment that actually runs the
+# worker. It is recovered from the shipping launch string (never restated) and
+# checked with `bash -n`, because an explicit `bash -c` is what interprets it.
+$emitted = @(Get-SquadEmittedShellCommand)
+$shellScreen = @()
+if ($emitted.Count -lt 6) {
+    $shellScreen += "the emitted-command inventory has only $($emitted.Count) entries; the launch, cancel, poll, credential-vault, logs and credential-file fragments are all interpreted as shell and must all be covered"
+}
+
+$innerWrapper = ""
+if ($launch -match "bash -c '(.*)' </dev/null") {
+    $innerWrapper = $Matches[1] -replace "'\\''", "'"
+} else {
+    $shellScreen += "the launch no longer hands an inner wrapper to 'bash -c ... </dev/null', so the probe cannot recover the fragment that actually runs the worker and that fragment is now unchecked"
+}
+if ($innerWrapper) {
+    $emitted += [pscustomobject]@{
+        Id        = "launch-inner"
+        Generator = ""
+        Shell     = "bash"
+        Command   = $innerWrapper
+        Note      = "the detached wrapper, recovered from the emitted launch. Run by an explicit 'bash -c', so bash syntax is legitimate here -- but a bare-redirect substitution is still flagged, because it would read as EMPTY the moment this fragment moved to a sh context."
+    }
+}
+
+foreach ($e in $emitted) {
+    $shellScreen += @(Test-SquadShellPortability -Command $e.Command -Label $e.Id -Shell $e.Shell)
+}
+
+# One file per command, written with a QUOTED heredoc so the shell stores the
+# bytes verbatim and does not expand anything on the way in. `dash -n` and
+# `bash -n` then parse the file without executing a single line of it.
+$syntaxBlocks = @()
+foreach ($e in $emitted) {
+    $syntaxBlocks += @"
+cat > "`$SYN/$($e.Id)" <<'SQUADCMDEOF'
+$($e.Command)
+SQUADCMDEOF
+dash -n "`$SYN/$($e.Id)" 2>"`$SYN/$($e.Id).dash.err"; echo "SYNTAX=$($e.Id):dash:`$?:`$(tr -d '\n' < "`$SYN/$($e.Id).dash.err" | cut -c1-160)"
+bash -n "`$SYN/$($e.Id)" 2>"`$SYN/$($e.Id).bash.err"; echo "SYNTAX=$($e.Id):bash:`$?:`$(tr -d '\n' < "`$SYN/$($e.Id).bash.err" | cut -c1-160)"
+"@
+}
+$syntaxScript = ($syntaxBlocks -join "`n")
+
 $script = @"
 set -u
 S='$probeDir'
+SYN="`$S-syntax"
+rm -rf "`$SYN"; mkdir -p "`$SYN"
+
+# Which /bin/sh is this? Every command below is evaluated through 'sh -c'
+# because that is what 'aca sandbox exec' does. If /bin/sh here is bash, the
+# evaluations still run -- but they stop proving anything about dash, which is
+# the whole point of issue #40.
+echo "SH_IMPL=`$(readlink -f "`$(command -v sh)" 2>/dev/null | sed 's#.*/##')"
+printf hello > "`$SYN/canary"
+echo "SH_BASHISM=[`$(sh -c "v=\`$(< `$SYN/canary); printf %s \"\`$v\"")]"
+echo "SH_POSIX=[`$(sh -c "v=\`$(cat `$SYN/canary); printf %s \"\`$v\"")]"
+
+# ---- syntax, every emitted command, in BOTH interpreters -----------------
+$syntaxScript
+rm -rf "`$SYN"
+
+# ---- detachment, under DASH: the shell the sandbox really uses -----------
 rm -rf "`$S"; mkdir -p "`$S"
 printf '%s\n' '#!/usr/bin/env bash' 'sleep $WorkerSeconds' > "`$S/worker.sh"
 chmod +x "`$S/worker.sh"
 t0=`$(date +%s%N)
-out=`$($launch)
+out=`$($(New-ShInvocation $launch))
 t1=`$(date +%s%N)
 echo "ELAPSED_MS=`$(( (t1 - t0) / 1000000 ))"
 echo "OUT=`$out"
@@ -240,12 +369,30 @@ echo "EXIT_FILE=`$(cat "`$S/exit-code" 2>/dev/null)"
 if [ -f "`$S/done" ]; then echo "MARKER=done"; else echo "MARKER=absent"; fi
 rm -rf "`$S"
 
+# ---- detachment, under BASH: kept, not replaced --------------------------
+# '&'-scoping is a grammar property both shells share, and the pre-#40 probe
+# caught a real mis-scoped '&' under bash. Measuring both means #40 ADDS the
+# production shell rather than trading one shell's coverage for another's.
+rm -rf "`$S"; mkdir -p "`$S"
+printf '%s\n' '#!/usr/bin/env bash' 'sleep $WorkerSeconds' > "`$S/worker.sh"
+chmod +x "`$S/worker.sh"
+b0=`$(date +%s%N)
+outb=`$($(New-BashInvocation $launch))
+b1=`$(date +%s%N)
+echo "BASH_ELAPSED_MS=`$(( (b1 - b0) / 1000000 ))"
+echo "BASH_OUT=`$outb"
+echo "BASH_PHASE_AT_RETURN=`$(cat "`$S/phase" 2>/dev/null)"
+sleep $settle
+echo "BASH_MARKER=`$([ -f "`$S/done" ] && echo done || echo absent)"
+rm -rf "`$S"
+
 # ---- credential delivery ------------------------------------------------
 rm -rf "`$S"
 printf '%s\n' '#!/usr/bin/env bash' '{ ps -ww -eo args= 2>/dev/null; cat /proc/*/cmdline 2>/dev/null | tr "\0" " "; } > "$probeDir/argv-snapshot"' 'printf %s "`${GH_TOKEN:-MISSING}" > "$probeDir/seen-token"' 'printf %s "`${GITHUB_TOKEN:-MISSING}" > "$probeDir/seen-token2"' 'printf %s "`${COPILOT_GITHUB_TOKEN:-MISSING}" > "$probeDir/seen-token3"' > /tmp/squad-probe-worker.sh
-# The SHIPPING vault command, run verbatim. It must create the state directory
-# and report the mode it actually achieved.
-VAULTOUT=`$( $vaultCommand )
+# The SHIPPING vault command, run verbatim -- and under 'sh -c', because that is
+# how the provider runs it. It must create the state directory and report the
+# mode it actually achieved.
+VAULTOUT=`$( $(New-ShInvocation $vaultCommand) )
 echo "VAULT=`$VAULTOUT"
 mv /tmp/squad-probe-worker.sh "`$S/worker.sh"
 chmod +x "`$S/worker.sh"
@@ -261,7 +408,7 @@ echo "STAGED=`$?"
 if [ -f "`$S/$credFileName" ]; then echo "CREDFILE=present"; else echo "CREDFILE=absent"; fi
 echo "CREDMODE=`$(stat -c %a "`$S/$credFileName" 2>/dev/null)"
 echo "VAULTMODE=`$(stat -c %a "`$S" 2>/dev/null)"
-out2=`$($launchWithCreds)
+out2=`$($(New-ShInvocation $launchWithCreds))
 echo "OUT2=`$out2"
 sleep 2
 echo "SEEN=`$(cat "`$S/seen-token" 2>/dev/null)"
@@ -277,25 +424,77 @@ if [ -f "`$S/$credFileName" ]; then echo "CREDFILE_AFTER=present"; else echo "CR
 rm -rf "`$S"
 "@ -replace "`r`n", "`n"
 
-Write-Host "Running the emitted launch command under $runnerName (worker sleeps ${WorkerSeconds}s)..." -ForegroundColor Cyan
+Write-Host "Running every emitted command under $runnerName, evaluating each through 'sh -c' (worker sleeps ${WorkerSeconds}s)..." -ForegroundColor Cyan
 $out = ($script | & $runner @runnerArgs 2>&1 | Out-String)
 $elapsed = if ($out -match "ELAPSED_MS=(\d+)") { [int]$Matches[1] } else { -1 }
+$bashElapsed = if ($out -match "BASH_ELAPSED_MS=(\d+)") { [int]$Matches[1] } else { -1 }
 $flat = ($out -replace "`r?`n", " | ").Trim()
 
 $failures = @()
 
+# --- issue #40: is this really the shell production uses? ------------------
+# Asserted BEFORE anything else, because if /bin/sh here is bash then every
+# `sh -c` evaluation below still runs and still passes -- while proving nothing
+# about dash. That is precisely the failure this probe was rewritten to remove,
+# so it is a hard failure and never a quiet caveat.
+$failures += $shellScreen
+if ($out -notmatch "SH_IMPL=dash") {
+    $failures += "/bin/sh in the probe environment is not dash (saw '$(if ($out -match 'SH_IMPL=(\S*)') { $Matches[1] } else { 'nothing' })'). 'aca sandbox exec' runs every emitted command under dash, and the whole point of evaluating them through 'sh -c' is that bash HIDES bashisms -- a bash /bin/sh makes every assertion below prove less than it claims"
+}
+if ($out -notmatch [regex]::Escape("SH_BASHISM=[]")) {
+    $failures += "the dash canary did not behave like dash: a bare-redirect command substitution returned a VALUE in this shell, so this shell is not the one that silently returns nothing -- the evaluations below cannot detect the issue #36 defect class"
+}
+if ($out -notmatch [regex]::Escape("SH_POSIX=[hello]")) {
+    $failures += "the POSIX control read nothing, so the canary above proves nothing (the file it reads is missing, not the expansion)"
+}
+
+# --- issue #40: syntax, every emitted command, in both interpreters --------
+$syntaxSeen = @{}
+foreach ($m in [regex]::Matches($out, "SYNTAX=([a-z\-]+):(dash|bash):(\d+):([^\r\n]*)")) {
+    $id = $m.Groups[1].Value
+    $sh = $m.Groups[2].Value
+    $rc = [int]$m.Groups[3].Value
+    $err = $m.Groups[4].Value.Trim()
+    $syntaxSeen["$id/$sh"] = $true
+    $expected = @($emitted | Where-Object { $_.Id -eq $id })
+    if ($rc -ne 0) {
+        # A `bash -n` failure on a command that only dash runs is still a
+        # failure worth reporting: the two grammars overlap almost completely,
+        # and a construct only one of them accepts is a portability trap
+        # whichever direction it points.
+        $failures += "the $id command failed '$sh -n' (exit $rc): $err. It is run by $(if ($expected) { $expected[0].Shell } else { 'sh' }) in production, and a command that will not parse cannot do anything it claims"
+    }
+}
+foreach ($e in $emitted) {
+    foreach ($sh in @("dash", "bash")) {
+        if (-not $syntaxSeen.ContainsKey("$($e.Id)/$sh")) {
+            $failures += "the $($e.Id) command was never syntax-checked with '$sh -n' -- a check that did not run is not a pass"
+        }
+    }
+}
+
 if ($elapsed -lt 0) {
     $failures += "the probe produced no timing at all"
 } elseif ($elapsed -ge $ReturnBudgetMs) {
-    $failures += ("the caller was held for ${elapsed}ms against a ${WorkerSeconds}s worker (budget ${ReturnBudgetMs}ms) -- " +
+    $failures += ("the caller was held for ${elapsed}ms under DASH against a ${WorkerSeconds}s worker (budget ${ReturnBudgetMs}ms) -- " +
                   "a '&' scoped over the whole '&&'-list backgrounds everything and leaves fd 0/1/2 open, so " +
                   "'aca sandbox exec' blocks to its ~120s timeout and create tears the session down")
 }
-if ($out -notmatch "OUT=.*squad-launched") { $failures += "the launch did not report squad-launched" }
+if ($out -notmatch "OUT=.*squad-launched") { $failures += "the launch did not report squad-launched under dash" }
 if ($out -notmatch "PHASE_AT_RETURN=running") { $failures += "phase was not 'running' at return -- the prelude and the phase write are mis-ordered (an asynchronous prelude races the phase write on a fresh sandbox, where the state dir does not exist yet)" }
 if ($out -notmatch "PHASE_FINAL=done") { $failures += "the detached worker never wrote phase=done" }
 if ($out -notmatch "EXIT_FILE=0") { $failures += "the detached wrapper did not record the worker's exit code" }
 if ($out -notmatch "MARKER=done") { $failures += "the detached wrapper never touched the completion marker" }
+
+# --- the same launch, under bash: coverage ADDED, not traded --------------
+if ($bashElapsed -lt 0) {
+    $failures += "the bash cross-check produced no timing, so the mis-scoped-'&' coverage the pre-#40 probe had is now missing rather than doubled"
+} elseif ($bashElapsed -ge $ReturnBudgetMs) {
+    $failures += "the caller was held for ${bashElapsed}ms under BASH against a ${WorkerSeconds}s worker (budget ${ReturnBudgetMs}ms) -- the '&' is scoped over the whole '&&'-list"
+}
+if ($out -notmatch "BASH_OUT=.*squad-launched") { $failures += "the launch did not report squad-launched under bash" }
+if ($out -notmatch "BASH_PHASE_AT_RETURN=running") { $failures += "phase was not 'running' at return under bash" }
+if ($out -notmatch "BASH_MARKER=done") { $failures += "the detached wrapper never touched the completion marker under bash" }
 
 # --- credential delivery --------------------------------------------------
 $failures += $staticLeaks
@@ -318,11 +517,13 @@ Write-Host "Probe output: $flat"
 Write-Host ""
 
 if ($failures.Count -eq 0) {
-    Write-Host "PASS: the emitted launch command detaches - the caller's streams reached EOF in ${elapsed}ms while a ${WorkerSeconds}s worker kept running, and the wrapper recorded exit code then completion marker." -ForegroundColor Green
+    Write-Host "PASS: /bin/sh in this environment is DASH (canary: a bare-redirect substitution returned nothing, the cat control returned 'hello'), so every evaluation below ran in the interpreter 'aca sandbox exec' actually uses." -ForegroundColor Green
+    Write-Host "PASS: all $($emitted.Count) emitted shell commands (launch, cancel, poll, credential-vault, logs, credential-file, and the launch's inner bash wrapper) parse under BOTH 'dash -n' and 'bash -n', and none contains a bashism." -ForegroundColor Green
+    Write-Host "PASS: the emitted launch command detaches - under dash the caller's streams reached EOF in ${elapsed}ms, and under bash in ${bashElapsed}ms, while a ${WorkerSeconds}s worker kept running; the wrapper recorded exit code then completion marker." -ForegroundColor Green
     Write-Host "PASS: the credentials delivered as a FILE reached the worker verbatim -- the state directory is 0700 (the only control the platform allows, since 'aca sandbox fs write' uploads root-owned 0644), the launch sourced the file and removed it, the git and Copilot planes each received their OWN value, the launch generator REFUSES a credential-bearing env assignment, and no process held either token in its argv while the worker held them in its environment." -ForegroundColor Green
     exit 0
 }
 
-Write-Host "FAIL: the emitted launch command does not behave as a detached launch." -ForegroundColor Red
+Write-Host "FAIL: the emitted commands are not dash-safe, or the launch does not behave as a detached launch." -ForegroundColor Red
 $failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
 exit 1
