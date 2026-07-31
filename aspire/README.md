@@ -50,6 +50,9 @@ aspire/
     ISquadPollingClock.cs      # the seam that tests a 90-minute timeout in ms
     SquadAcaAgentServiceCollectionExtensions.cs  # AddSquadAcaAgent()
   Squad.Aca.Agents.MAF.Tests/  # xunit, fully offline
+  Squad.Aca.Agents.MAF.Sample/ # runnable MAF host; the live end-to-end evidence
+    Program.cs                 # resolves the base AIAgent from DI and calls it
+    SampleOptions.cs           # prompt/repo/mode from arguments or environment
 ```
 
 ## `Squad.Aca.Agents` — the agent contract

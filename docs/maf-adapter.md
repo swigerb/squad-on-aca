@@ -87,6 +87,23 @@ register a redundant keyed copy of it.
 Both forms also take an explicit inner-agent factory
 (`AddSquadAcaAgent(sp => myAgent, configure)`) when the inner agent is not in DI.
 
+### A host you can actually run
+
+`aspire/Squad.Aca.Agents.MAF.Sample` is a working host built exactly this way.
+It resolves the **base `AIAgent`**, not `SquadAcaAIAgent` — a MAF pipeline holds
+`AIAgent`, so resolving the concrete type would prove the concrete type works and
+say nothing about whether a pipeline that has never heard of Squad can drive it.
+
+```powershell
+dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
+  "fix the flaky test" --repo owner/repo --ref my-branch --no-push
+```
+
+It is also the harness that produced the live evidence in
+[`docs/e2e-results.md`](e2e-results.md) — see its
+[README](../aspire/Squad.Aca.Agents.MAF.Sample/README.md) for every argument and
+the exit-code legend.
+
 ## The long-run problem
 
 MAF's `RunAsync` is request/response. A Squad session runs **10 to 60 minutes**.
@@ -185,6 +202,16 @@ instead: the return value, `SquadAgentRunTimeoutException.SessionCancelled`, and
 the diagnostic sink.
 
 A cancelled *dispatch* stops nothing, because there is no handle yet.
+
+> **Live caveat — the sandbox plane does not honour this yet.** Verified against
+> real Azure on 2026-07-31: on the **ACA Jobs** plane a cancelled MAF call really
+> does stop the session (`az containerapp job execution list` independently
+> reported `Stopped`). On the **sandbox** plane the control plane reports a
+> successful cancel while the worker keeps running — `procps` is absent from the
+> pinned class image, so the provider's `pkill` exits 127 into a discarded
+> stderr and the surrounding command still exits 0. The adapter's half of the
+> contract is correct; the layer beneath it is not. Evidence and root cause:
+> [`docs/e2e-results.md` S3-5](e2e-results.md).
 
 ## Streaming
 

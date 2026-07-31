@@ -566,3 +566,332 @@ The ACA Jobs plane is **healthy and fit to build on**: 7 of 8 checks pass, and
 the single failure is a logging-path defect with a working fallback and a
 tracked fix. Sandbox work may proceed.
 
+
+---
+
+# Sprint 3 (issue #33) — MAF adapter, live end-to-end
+
+- **Date (UTC):** 2026-07-31
+- **Commit at time of the runs:** `c2e8191` (`Add a runnable MAF sample host for the ACA agent`)
+- **Subscription / tenant:** redacted. Resource group `rg-squad-aca-dev-eastus2`,
+  sandbox group `sbg-squad-aca`, region East US 2.
+- **Run by:** engineer agent, GitHub identity `swigerb`.
+- **Driver for every run below:** `aspire/Squad.Aca.Agents.MAF.Sample`, resolving
+  the **base `AIAgent`** from DI. Nothing here calls `SquadAcaAIAgent` directly,
+  and nothing here calls `squad-aca` directly.
+
+Sprints 1 and 2 were entirely offline. Every claim about the adapter was an
+assertion against a scripted `ISquadAgent`. These are the first runs that put a
+real Squad session on real Azure through it.
+
+> All output below is quoted from the live console. Subscription GUIDs are
+> replaced with `<subscription>`; no token appears because the host reads none
+> and redacts everything it prints.
+
+## S3-1 — ACA Jobs plane, run to completion — **PASS**
+
+```powershell
+dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
+  "Reply with a one-line summary of what this repository does. Do not change any files." `
+  --repo swigerb/squad-on-aca --ref feat/33-s3-live-e2e --no-push `
+  --session s3-live-jobs --poll-seconds 15 --timeout-minutes 30
+```
+
+```text
+agent      : squad-on-aca (ef20155408e94483975fcb4aebeb2c07)
+repository : swigerb/squad-on-aca
+ref        : feat/33-s3-live-e2e
+push       : False
+mode       : RunToCompletion
+timeout    : 00:30:00
+prompt     : Reply with a one-line summary of what this repository does. Do not change any files.
+
+  [squad-aca] squad-aca run exited 0
+  [squad-aca] Everything up-to-date
+{
+  "id": "/subscriptions/<subscription>/resourceGroups/rg-squad-aca-dev-eastus2/providers/Microsoft.App/jobs/caj-squad-aca-session/executions/caj-squad-aca-session-7pzwpc2",
+  "name": "caj-squad-aca-session-7pzwpc2",
+  "resourceGroup": "rg-squad-aca-dev-eastus2"
+}
+  [squad-aca] dispatched s3-live-jobs route=AcaJob mode=RunToCompletion
+  [squad-aca] squad-aca sessions exited 0
+  [squad-aca] squad-aca sessions exited 0
+Squad session 's3-live-jobs' finished on route 'aca-job' with status 'Succeeded'. Handle: sqx1.eyJ2IjoxLCJwIjoiYWNhLWpvYiIsImQiOnsiam9iIjoiY2FqLXNxdWFkLWFjYS1zZXNzaW9uIiwicmciOiJyZy1zcXVhZC1hY2EtZGV2LWVhc3R1czIiLCJleGVjdXRpb24iOiJjYWotc3F1YWQtYWNhLXNlc3Npb24tN3B6d3BjMiIsImNvbnRhaW5lciI6ImNhai1zcXVhZC1hY2Etc2Vzc2lvbiJ9fQ.
+
+  squad.dispatched       = True
+  squad.executionMode    = AcaJob
+  squad.exitCode         = (null)
+  squad.fallbackReason   = (null)
+  squad.handle           = s3-live-jobs
+  squad.longRunMode      = RunToCompletion
+  squad.phase            = (null)
+  squad.route            = aca-job
+  squad.sandboxClass     = (null)
+  squad.sessionName      = s3-live-jobs
+  squad.status           = Succeeded
+  squad.terminal         = True
+
+elapsed    : 00:01:19.3202305
+```
+
+| | |
+|---|---|
+| Route | `aca-job` (the unconditional default, unchanged) |
+| Execution handle | `executionHandle` was **null**, as documented — ACA names executions asynchronously. `statusPollRef` (`s3-live-jobs`) became `squad.handle`. The ACA execution name `caj-squad-aca-session-7pzwpc2` surfaced in the continuation token. |
+| Terminal status | `Succeeded`, `squad.terminal = True` |
+| Real elapsed | **1 m 19.3 s** |
+
+Corroborated independently from Azure:
+
+```text
+Name                           Status     Start                      End
+-----------------------------  ---------  -------------------------  -------------------------
+caj-squad-aca-session-7pzwpc2  Succeeded  2026-07-31T12:49:39+00:00  2026-07-31T12:50:28+00:00
+```
+
+The null `executionHandle` is the detail most likely to be read as a bug. It is
+not: it is why `AcaSquadAgent` prefers `statusPollRef`, and this run is the first
+time that preference has been exercised against a control plane that actually
+returns null rather than a fake that was told to.
+
+## S3-2 — Cancellation on the Jobs plane — **PASS, verified from Azure**
+
+```powershell
+dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
+  "Write a detailed 500-word analysis of every script in the scripts/ directory, then wait and re-read them. Do not change any files." `
+  --repo swigerb/squad-on-aca --ref feat/33-s3-live-e2e --no-push `
+  --session s3-live-cancel --poll-seconds 10 --cancel-after-seconds 50
+```
+
+```text
+  [squad-aca] dispatched s3-live-cancel route=AcaJob mode=RunToCompletion
+  [squad-aca] squad-aca sessions exited 0
+  [squad-aca] squad-aca stop exited 0
+  [squad-aca] stop requested for handle s3-live-cancel
+CANCELLED after 00:01:05.7628837.
+```
+
+Exit code 5. The client returning "cancelled" proves nothing on its own — that
+is exactly the shape a broken implementation takes. Asked of Azure directly:
+
+```text
+Name                           Status    Start
+-----------------------------  --------  -------------------------
+caj-squad-aca-session-kn4yvdd  Stopped   2026-07-31T12:51:18+00:00
+```
+
+**`Stopped`, from the ACA control plane, not from the client.** The session was
+mid-flight when the token was cancelled and it is no longer running. The
+fresh-`CancellationTokenSource` stop path in `SquadAcaAIAgent` does what the
+offline tests said it does.
+
+Orphan check across the whole job:
+
+```text
+$ az containerapp job execution list ... --query "[?properties.status=='Running']"
+(no rows)
+```
+
+## S3-3 — `fail-closed` — **PASS**
+
+A throwaway branch carried a `squad-capabilities.yml` requiring `python3` and
+`pip3`, which the default worker image does not provide. Run with
+`SQUAD_ACA_ENABLE_SANDBOX` unset:
+
+```text
+  [squad-aca] squad-aca run exited 1
+FAIL-CLOSED — capability routing refused this session. Nothing was started.
+  reason       : sandbox-feature-disabled-and-default-insufficient
+  sandboxClass : sandbox-python-3-12
+  exitCode     : 1
+  message      : Capability routing failed closed for session 's3-live-failclosed'; nothing was dispatched. Reason: sandbox-feature-disabled-and-default-insufficient. ...
+  elapsed      : 00:00:08.2453971
+```
+
+Exit code 3 — `SquadRouteFailedClosedException`, carrying its reason, **not** a
+generic failure, even though the control plane also exited 1. That ordering
+(`route == "fail-closed"` classified before the exit code is looked at) is the
+whole point, and 8.2 s with no ACA execution created confirms "nothing was
+started" is literal.
+
+## S3-4 — Sandbox plane, run to completion — **PASS**
+
+Same branch, `SQUAD_ACA_ENABLE_SANDBOX=1`:
+
+```text
+[squad-aca] sandbox squad-s3-live-sandbox: created, default-deny egress applied, worker launched detached.
+  [squad-aca] dispatched s3-live-sandbox route=Sandbox mode=RunToCompletion
+Squad session 's3-live-sandbox' finished on route 'sandbox' with status 'Succeeded' (phase done) (exit code 0). Sandbox class: sandbox-python-3-12.
+
+  squad.dispatched       = True
+  squad.executionMode    = Sandbox
+  squad.exitCode         = 0
+  squad.longRunMode      = RunToCompletion
+  squad.phase            = done
+  squad.route            = sandbox
+  squad.sandboxClass     = sandbox-python-3-12
+  squad.sessionName      = s3-live-sandbox
+  squad.status           = Succeeded
+  squad.terminal         = True
+
+elapsed    : 00:00:43.7897842
+```
+
+| | |
+|---|---|
+| Route | `sandbox`, reported through the MAF response as `squad.route` / `squad.sandboxClass` |
+| Class | `sandbox-python-3-12` — the approved, pinned class the manifest demanded |
+| Terminal status | `Succeeded`, phase `done`, exit code `0` |
+| Real elapsed | **43.8 s** |
+
+Egress on the live sandbox:
+
+```text
+Default action:     Deny
+Traffic inspection: Full
+Host rules:
+  - *.github.com: Allow
+  - github.com: Allow
+  - *.githubcopilot.com: Allow
+  - *.githubusercontent.com: Allow
+  - pypi.org: Allow
+  - *.pypi.org: Allow
+  - files.pythonhosted.org: Allow
+```
+
+Default-deny, with exactly the manifest's two hosts added to the GitHub
+baseline. On ordering: the control plane emits its single line only after both
+the egress call and the launch have returned, and the worker cloned GitHub
+successfully under a deny-by-default policy it could not have satisfied had the
+policy been applied afterwards. That is strong ordering evidence, not a
+timestamped proof — the `aca` CLI exposes no per-operation timestamps to make it
+one. Stated plainly so nobody quotes it as more than it is.
+
+## S3-5 — Cancellation on the sandbox plane — **FAIL (defect found)**
+
+This is the finding of the sprint.
+
+```text
+[squad-aca] sandbox squad-s3-live-sbcancel: created, default-deny egress applied, worker launched detached.
+  [squad-aca] dispatched s3-live-sbcancel route=Sandbox mode=RunToCompletion
+  [squad-aca] squad-aca stop exited 0
+  [squad-aca] stop requested for handle sqx1.eyJ2IjoxLCJwIjoic2FuZGJveCIsImQiOnsibmFtZSI6InNxdWFkLXMzLWxpdmUtc2JjYW5jZWwiLC...
+CANCELLED after 00:01:07.1377280.
+```
+
+The client reported cancelled and `squad-aca stop` exited 0. Asked of the
+sandbox itself afterwards:
+
+```text
+$ ls -la --time-style=full-iso /tmp/squad-session
+drwxrwxrwt 5 root  root   4096 2026-07-31 12:55:19 ..            <- sandbox created
+drwx------ 2 squad squad  4096 2026-07-31 12:56:02 .             <- cancel ran (touched done, removed cred)
+-rw-r--r-- 1 squad squad     0 2026-07-31 12:56:53 done
+-rw-r--r-- 1 squad squad     1 2026-07-31 12:56:53 exit-code
+-rw-r--r-- 1 squad squad     4 2026-07-31 12:56:53 phase
+-rw-r--r-- 1 squad squad 11754 2026-07-31 12:56:53 session.log
+
+$ cat /tmp/squad-session/phase       -> done
+$ cat /tmp/squad-session/exit-code   -> 0
+$ tail session.log
+  AI Credits 31.7 (1m 31s)
+  [squad-policy] Governance integrity verified: no protected path changed.
+```
+
+The cancel landed at **12:56:02**. The worker went on running for another
+**51 seconds** and completed normally at 12:56:53, overwriting the `143` /
+`cancelled` the cancel had written with its own `0` / `done`.
+
+Root cause, probed directly in the pinned class image:
+
+```text
+pkill: NOT-FOUND
+pgrep: NOT-FOUND
+ps:    NOT-FOUND
+kill:  kill
+--- the exact pkill the provider issues ---
+pkill exit=127
+--- the exact full cancel chain the provider issues ---
+squad-cancelled
+chain exit=0
+```
+
+`scripts/lib/providers/squad-sandbox-provider.ps1` cancels with:
+
+```sh
+pkill -f /usr/local/bin/squad-on-aca >/dev/null 2>&1; rm -f .../credential; \
+printf %s 143 > .../exit-code; printf %s cancelled > .../phase; \
+touch .../done; echo squad-cancelled
+```
+
+`procps` is not installed in `sandbox-python-3-12`, so `pkill` exits **127**.
+Its stderr is discarded by the `2>&1` redirect, and because the chain's exit
+status is that of the final `echo`, the whole command **exits 0**. The provider
+reads exit 0, returns `Cancelled = $true`, and the caller is told the session
+stopped while it is still running and still billing.
+
+The provider comment directly above this code says a caller told "cancelled"
+must never stop looking at a session that is still running and still billing.
+The classification logic around the call honours that scrupulously. The command
+it classifies cannot fail.
+
+Mitigations that did hold on this run:
+
+- The brokered credential **was** removed from the sandbox (`rm -f` needs no
+  `procps`), so the session did not outlive its token.
+- `sandboxgroup credential list` afterwards returned `[]`.
+- The sandbox was still deletable, and `terminate` (which goes through the ACA
+  control plane, not through a shell inside the guest) is unaffected.
+
+This is not the MAF adapter's defect. The adapter did exactly what it promised —
+it issued the stop on a fresh token before rethrowing, and the Jobs plane
+(S3-2) proves that path genuinely stops a session. The bug is one layer below,
+in the sandbox provider's `cancel`, and **no offline test could have found it**:
+every fake answers the way the real image does not. It is precisely the class of
+failure this sprint existed to look for.
+
+Not fixed here. Sprint 3's hard constraints forbid changing error
+classification, and a portable-kill rewrite needs its own offline coverage
+against an image that has no `procps`. Filed rather than patched in passing.
+
+## S3-6 — Cleanup and orphans — **PASS**
+
+Every `aca sandbox delete` was issued with `--yes`, and the group was listed
+afterwards rather than trusted:
+
+```text
+$ aca sandbox delete --id c9d95b60-... --group sbg-squad-aca --yes
+Deleted sandbox: c9d95b60-...
+$ aca sandbox delete --id 01d28bc6-... --group sbg-squad-aca --yes
+Deleted sandbox: 01d28bc6-...
+
+$ aca sandbox list --group sbg-squad-aca --resource-group rg-squad-aca-dev-eastus2
+┌────┬───────┬──────────┬────────┐
+│ ID ┆ State ┆ Hostname ┆ Labels │
+╞════╪═══════╪══════════╪════════╡
+└────┴───────┴──────────┴────────┘
+```
+
+Zero sandboxes. Zero running job executions. Zero brokered credentials on the
+group. The pinned class image is untouched:
+
+```text
+│ 02560016-d170-486d-a99b-aed763296b6c ┆ acrsquadaca....azurecr.io/squad-worker-python@sha256:748bcf32...b69131 ┆ Ready │
+```
+
+Worth recording that **both** sandboxes were still `Running` after their
+sessions reached a terminal state. That is by design — `cancel` deliberately
+leaves the sandbox up so logs stay readable, and teardown is `terminate`'s job —
+but it means a terminal session is not a stopped bill. Anyone reading a green
+"Succeeded" as "nothing is costing money" is wrong, which is why the listing is
+reported here rather than the delete messages.
+
+## Sprint 3 verdict
+
+Four of five live claims hold. A MAF host that has never heard of Squad can
+resolve an `AIAgent`, dispatch a real session to ACA Jobs or to an approved
+sandbox class, get the route and terminal status back, and be refused correctly
+when capability routing fails closed. Cancellation genuinely stops an ACA Job.
+
+Cancellation does **not** genuinely stop a sandbox worker, and reports that it
+did. That was invisible for the whole programme until something ran for real.
