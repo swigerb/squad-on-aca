@@ -4987,6 +4987,76 @@ if ($false) {
 }
 
 # ---------------------------------------------------------------------------
+# Every workflow file must PARSE (issue #32 S4)
+# ---------------------------------------------------------------------------
+Write-Section "Workflow files parse as YAML"
+
+# This gate exists because sprints 3 and 4 both merged a workflow GitHub could
+# not parse, and every check in this file passed.
+#
+# The failure mode is unusually quiet. An unparseable workflow is not a failed
+# STEP -- it is a failed RUN, named after the FILE rather than a job, with no
+# jobs and no log to read. `gh run view --log-failed` answers "log not found".
+# Meanwhile CI stays green, because CI runs validate.ps1 and the worker suite,
+# and neither of them parsed YAML.
+#
+# The specific trap: inside a YAML block scalar (`run: |`), a line beginning at
+# COLUMN 0 ENDS the block. A markdown table or a multi-line commit message
+# written literally is all column-0 lines. Grep-based checks cannot see this --
+# every string they look for is still present in the file.
+$workflowDir = Join-Path $RepoRoot '.github/workflows'
+if (-not (Test-Path $workflowDir)) {
+    Add-Fail ".github/workflows is missing"
+} else {
+    $workflowFiles = @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yml' -File) +
+                     @(Get-ChildItem -LiteralPath $workflowDir -Filter '*.yaml' -File)
+
+    if ($workflowFiles.Count -eq 0) {
+        Add-Fail "No workflow files found to parse"
+    }
+
+    $yamlParser = $null
+    foreach ($candidate in @('python', 'python3', 'py')) {
+        $probe = & $candidate -c "import yaml; print('ok')" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $probe -match 'ok') { $yamlParser = $candidate; break }
+    }
+
+    if (-not $yamlParser) {
+        Add-Skip "No Python with PyYAML available to parse workflow files. A workflow that does not parse fails as a run with no job and no log, and nothing else here would catch it."
+    } else {
+        foreach ($wfFile in ($workflowFiles | Sort-Object Name)) {
+            $parseOutput = & $yamlParser -c @"
+import sys, yaml
+p = sys.argv[1]
+try:
+    d = yaml.safe_load(open(p, encoding='utf-8'))
+except Exception as e:
+    print('PARSE-ERROR ' + str(e).replace('\n', ' | '))
+    sys.exit(0)
+if not isinstance(d, dict):
+    print('PARSE-ERROR the document is not a mapping')
+    sys.exit(0)
+# `on` is the YAML 1.1 boolean True, so a parsed workflow has either.
+if 'jobs' not in d or not d.get('jobs'):
+    print('PARSE-ERROR no jobs')
+    sys.exit(0)
+if ('on' not in d) and (True not in d):
+    print('PARSE-ERROR no trigger')
+    sys.exit(0)
+print('OK')
+"@ $wfFile.FullName 2>&1
+
+            $joined = ($parseOutput -join ' ').Trim()
+            if ($joined -match '^OK') {
+                Add-Pass "$($wfFile.Name) parses as YAML and declares a trigger and at least one job"
+            } else {
+                Add-Fail "$($wfFile.Name) does not parse as a GitHub workflow ($joined). GitHub reports this as a failed RUN named after the file, with no job and no log -- and no grep-based check can see it, because a column-0 line inside a 'run: |' block ends the block while leaving every searched string in place"
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Section "Summary"

@@ -723,3 +723,37 @@ rollback ends with a post-rollback verification checklist that re-runs
 - The secret scans are pattern-based and catch common token shapes, not every
   possible secret. They complement, not replace, a dedicated secret-scanning
   tool in CI.
+
+## Workflow files must parse
+
+Sprints 3 and 4 of #32 both merged a workflow **GitHub could not parse**, and
+every check in `validate.ps1` passed.
+
+The failure mode is unusually quiet:
+
+- it is not a failed **step**, it is a failed **run**, named after the *file*
+  rather than a job;
+- there are no jobs and no log — `gh run view --log-failed` answers
+  `log not found`;
+- CI stays **green**, because CI runs `validate.ps1` and the worker suite, and
+  neither of them parsed YAML.
+
+The specific trap: inside a YAML block scalar (`run: |`), **a line beginning at
+column 0 ends the block.** A markdown table in a `gh issue comment --body`, or a
+multi-line commit message, is all column-0 lines. Grep-based checks cannot see
+this — every string they search for is still in the file, in the right order,
+on the right lines.
+
+`validate.ps1` now parses every file under `.github/workflows/` and asserts each
+one is a mapping with a trigger and at least one job. `worker-tests.yml`
+installs PyYAML explicitly rather than trusting the runner image, because on CI
+a counted SKIP is not a pass.
+
+Build multi-line strings inside a `run:` block with `printf`, never as a
+literal:
+
+```bash
+body="$(printf '%s\n\n%s\n' \
+  'A heading' \
+  '| a | table |')"
+```
