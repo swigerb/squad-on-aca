@@ -4799,6 +4799,18 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "Nothing fails the workflow when a lease is claimed but no ACA execution is started, so a silent no-op reports success and leaves the lease held by a session that does not exist"
     }
 
+    # `--env-vars` REPLACES the container environment rather than merging it.
+    # Passing only the overrides drops every secret-backed variable in the
+    # template -- GITHUB_TOKEN and COPILOT_GITHUB_TOKEN among them -- and the
+    # session dies with "No authentication information found" only AFTER the
+    # image has pulled and the repository has cloned. Ralph already solved this
+    # and its merger is covered by test_ralph_dispatch.sh.
+    if ($wf -match 'ralph_build_session_env') {
+        Add-Pass "The dispatch workflow merges the template environment through Ralph's tested builder, so secret-backed variables survive the per-execution override instead of being silently replaced"
+    } else {
+        Add-Fail "The dispatch workflow passes --env-vars without merging the job template's environment. ACA REPLACES rather than merges, so GITHUB_TOKEN and COPILOT_GITHUB_TOKEN would be dropped and the session would fail authentication after cloning"
+    }
+
     if ($wf -match '--bot-login') {
         Add-Pass "The dispatch workflow passes the App's bot login to the resolver, which is what breaks the retrigger loop an App token would otherwise create"
     } else {

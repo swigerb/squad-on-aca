@@ -84,6 +84,8 @@ success, and runs the template's baked-in values, which means `SQUAD_MODE=smoke`
 and a session that quietly does nothing. Ralph found this in live E2E;
 `validate.ps1` now asserts the complete spec.
 
+**ACA `--env-vars` replaces, it does not merge.** Passing only the per-execution overrides drops every secret-backed variable in the job template — `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` among them. The session then pulls the image, clones the repository, and dies with `Error: No authentication information found`, which reads like a Copilot problem rather than a dispatch one. The workflow reuses Ralph's `ralph_build_session_env`, which merges template values **and** `secretref:` entries with the overrides and is covered by `test_ralph_dispatch.sh`.
+
 **There is no `issue` mode.** The worker's mode list is
 `smoke`, `telemetry-smoke`, `prompt`, `new-project`, `loop`, `ralph`,
 `watch`/`triage`, `shell`. Anything else exits `64`. Sessions are dispatched as
