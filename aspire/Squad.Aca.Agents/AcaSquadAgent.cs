@@ -156,10 +156,10 @@ public sealed class AcaSquadAgent : ISquadAgent
             Route: ParseRoute(route, cli),
             ExecutionMode: ParseMode(RequireString(document, "executionMode", cli), cli),
             Handle: new SquadExecutionHandle(pollRef),
-            SandboxClass: OptionalString(document, "sandboxClass"),
-            FallbackReason: OptionalString(document, "fallbackReason"),
-            Status: RequireString(document, "status", cli),
-            Detail: BuildDetail(document));
+            SandboxClass: Clean(OptionalString(document, "sandboxClass")),
+            FallbackReason: Clean(OptionalString(document, "fallbackReason")),
+            Status: SecretRedactor.Redact(RequireString(document, "status", cli)),
+            Detail: SecretRedactor.Redact(BuildDetail(document)));
     }
 
     /// <inheritdoc/>
@@ -420,4 +420,11 @@ public sealed class AcaSquadAgent : ISquadAgent
         const int limit = 600;
         return redacted.Length <= limit ? redacted : redacted[..limit] + "…";
     }
+
+    // Descriptive fields carry text the control plane echoed from somewhere else,
+    // so they are redacted before a caller ever sees them. IDENTITY fields --
+    // sessionName, executionName, the handle -- deliberately are not: they have to
+    // round-trip to `sessions --session` and `stop` byte-for-byte, and a redacted
+    // identifier addresses nothing. That asymmetry is the reason the split exists.
+    private static string? Clean(string? value) => value is null ? null : SecretRedactor.Redact(value);
 }

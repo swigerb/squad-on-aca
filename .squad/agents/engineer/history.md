@@ -955,3 +955,125 @@ probe sandbox was deleted with `--yes` and `aca sandbox list` is empty.
   whenever a Windows stub has to observe a POSIX-shaped stream.
 - A stray `#>` inside comment-based help breaks PowerShell parsing far from the
   edit. `[System.Management.Automation.Language.Parser]::ParseFile` locates it.
+## Issue #33 sprint 1 — Squad on ACA callable as an agent (`feat/33-s1-agent-core`)
+
+**The seam was under-specified, and the only machine-readable surface was 22
+byte-pinned golden captures.** `AgentAbstraction.cs` lived inside the AppHost
+and returned `SquadSessionResult(SessionName, Dispatched, Detail)`. A MAF caller
+needs more than that: it has to know *where* its work ran (`aca-job` /
+`sandbox` / `fail-closed`), get a handle it can poll, and see the sandbox class
+and the reason the route deviated. Everything the control plane already knows —
+`Resolve-SquadExecutionRoute`, the dispatch decision in
+`worker/lib/squad-dispatch.js`, `New-SessionExecutionProvider` — was reachable
+only by scraping human text. Scraping it would have made the goldens
+load-bearing for a machine contract, so any future wording change becomes a
+breaking API change.
+
+**Three schemas, opt-in, strictly additive.** `squad-aca run|status|sessions`
+gained a `--json` switch emitting `squad-aca/run@1`, `squad-aca/status@1` and
+`squad-aca/sessions@1` with a fixed key order and every key always present.
+Under `--json` the pass-through `az` output is *moved* to stderr (`6>&1` plus
+`[Console]::Error.WriteLine`), never dropped — PR #9 was closed for swallowing
+`az` output and that lesson holds here. No existing invocation changed, so all
+22 original captures stayed byte-identical; four new capture cases (23-26)
+cover the JSON paths.
+
+**Two nullability decisions are the contract's real content.**
+`executionHandle` is `null` for an ACA Job dispatch, because ACA names an
+execution asynchronously and the CLI would otherwise have to invent one; hence
+`statusPollRef`, which is the handle when there is one and the session id when
+there is not, and which is what becomes `SquadSessionResult.Handle`.
+`routeReason` is always present, `fallbackReason` only when the route actually
+*deviated* — the three ordinary reasons map to `null`, so a caller can test
+`fallbackReason != null` to mean "something did not go to plan".
+
+**Fail-closed is a failure, not a quiet success.** `AcaSquadAgent` checks the
+route *before* the exit code, specifically so a fail-closed reason survives even
+though fail-closed also exits 1. Reversing those two checks is mutation M04 and
+the test catches it.
+
+**A defect the repo's own scanner found.** The first test fixtures contained
+literal credential-shaped strings, and `validate.ps1` failed six checks. The
+temptation was an exception list. Instead `FakeCredentials.cs` assembles the
+shapes at runtime from fragments, so nothing credential-shaped is ever on disk
+and the scanner keeps its teeth.
+
+**Live proof.** `validate.ps1` 285/0/0 -> 294/0/0. `verify-cli-golden.ps1`
+22/22 -> 26/26 with the original 22 byte-identical.
+`compare-cli-baseline.ps1 -BaselineRef HEAD` clean.
+`verify-launch-detachment.ps1` PASS. `dotnet build aspire/Squad.Aca.sln`
+succeeded with 0 warnings under `TreatWarningsAsErrors`. `dotnet test` 47/0.
+Worker suite in WSL unchanged at 10 suites / 739 assertions / 0 failed /
+0 skipped.
+
+**Mutation results** (54 mutations, 54 killed, 0 survived; every one of the 42
+test methods kills at least one mutation):
+
+| Mutation | Detected by |
+| --- | --- |
+| sandbox route reported as `aca-job` | `SandboxDispatch_CarriesRouteSandboxClassAndHandle` |
+| sandbox execution mode reported as `aca-job` | `GetSessionStatus_AddressesTheHandleAndDoesNotReResolveTheRoute` |
+| `fail-closed` route no longer recognised | `FailClosedRoute_ThrowsAndDoesNotLookLikeADispatch` |
+| exit code checked before route, so the reason is lost | `FailClosedRoute_ThrowsAndDoesNotLookLikeADispatch` |
+| fail-closed reason / sandbox class dropped | `FailClosedRoute_ThrowsAndDoesNotLookLikeADispatch` |
+| `dispatched:false` treated as success | `NotDispatchedWithoutFailClosed_IsStillAFailure` |
+| missing `dispatched` defaults to true | `MissingDispatchedFlag_ThrowsInsteadOfDefaultingToTrue` |
+| whitespace-only stdout falls through to the parser | `EmptyOutput_ThrowsContractException` |
+| unparseable output classified as dispatch failure | `MalformedJson_ThrowsContractException` |
+| `run` / `sessions` stop requesting `--json` | `RunSession_RequestsJsonModeAndPassesRequestFields`, `GetSessionStatus_AddressesTheHandleAndDoesNotReResolveTheRoute` |
+| wrong session-name / sub-squad / output-branch flag, `--no-push` inverted | `RunSession_RequestsJsonModeAndPassesRequestFields` |
+| status or cancel re-resolves the route by passing `--repo` | `GetSessionStatus_…`, `CancelSession_AddressesTheHandleAndDoesNotReResolveTheRoute` |
+| empty `sessions` array yields a half-populated status | `GetSessionStatus_WithNoMatchingSession_FailsLoudly` |
+| status drops exit code / phase / route / sandbox class | `GetSessionStatus_ReadsTerminalAcaJobState`, `GetSessionStatus_AddressesTheHandleAndDoesNotReResolveTheRoute` |
+| non-zero exit from `run` / `sessions` / `stop` swallowed | `NonZeroExitWithAnOtherwiseValidDocument_IsStillAFailure`, `GetSessionStatus_NonZeroExit_IsSurfaced`, `CancelSession_NonZeroExit_IsSurfaced` |
+| empty-output failure message loses the exit code | `NonZeroExitWithNoOutput_IsSurfacedWithItsExitCode` |
+| blank / missing `statusPollRef` accepted as pollable | `DispatchedWithABlankPollReference_ThrowsToo` |
+| wrong `schema` accepted | `WrongSchema_ThrowsContractException` |
+| unknown route silently falls back to `aca-job` | `UnknownRoute_ThrowsInsteadOfSilentlyFallingBack` |
+| missing required string substituted with a placeholder | `MissingRequiredField_ThrowsInsteadOfSubstitutingAPlaceholder` |
+| status handle echoes the request instead of the substrate's | `GetSessionStatus_ReadsTerminalAcaJobState` |
+| empty handle reaches the CLI | `EmptyHandle_IsRejectedBeforeTheCliIsInvoked` |
+| returned fallback reason not redacted | `TokenIsNeverPresentInAnyReturnedValue` |
+| diagnostic sink receives unredacted stderr | `TokenInControlPlaneStderr_NeverReachesTheDiagnosticSink` |
+| exception base constructor stops redacting | `ExceptionMessages_AreRedactedByTheBaseConstructor` |
+| each of eight redaction patterns removed individually | `CredentialShapes_AreReplaced`, `AuthorizationHeaders_AreReplaced`, `AssignedSecrets_AreReplaced`, `ExceptionMessages_AreRedactedByTheBaseConstructor` |
+| `secretref:` indirection redacted as if it were a secret | `SecretRefIndirection_IsPreserved` |
+| redactor rewrites text it should leave alone | 25 checks, incl. `AcaJobDispatch_MapsEveryContractValue` |
+| `Redact(null)` returns null instead of empty | `NullAndEmpty_AreSafe` |
+| explicit `CliPath` / `SQUAD_ACA_CLI` ignored; stale path returned | `ExplicitCliPath_WinsOverEverythingElse`, `EnvironmentVariable_IsUsedWhenNoExplicitPathIsSet`, `MissingExplicitPath_FallsThroughToTheEnvironmentVariable` |
+| upward search looks in the wrong place | `UpwardSearch_FindsScriptsSquadAcaAboveTheStartDirectory` |
+| resolution failure no longer names where it looked | `NothingResolves_ThrowsAndNamesEveryPlaceItLooked` |
+| a poll-to-completion operation is added to `ISquadAgent` | `ISquadAgent_DoesNotExposePollToCompletion` |
+
+One mutation was found **equivalent** and dropped rather than reported as a
+survivor: echoing the raw payload instead of `Summarize(...)` into the
+unparseable-JSON message is unobservable, because the exception base
+constructor already redacts. That is defence in depth working as intended,
+proven by the mutation that removes the base-constructor redaction.
+
+**Lessons recorded.**
+
+- A mutation harness that replaces the *first* textual occurrence will
+  silently no-op if the anchor also appears in an XML doc comment, and the
+  result is indistinguishable from a surviving mutant. Anchor on code, and
+  treat every survivor as "prove the mutation actually landed" first.
+- Inserting a member immediately before a documented method orphans that
+  method's `<param>` tags onto the new one (CS1572/CS1573). With
+  `GenerateDocumentationFile` plus `TreatWarningsAsErrors`, that is a build
+  break, not a survivor — anchor above the doc comment.
+- `TreatWarningsAsErrors` makes naive mutations (`if (false)`, removing a null
+  guard) fail to compile. Runtime-opaque forms — `if (cli.ExitCode >= 0)`,
+  `if (!fileExists(x))`, `return text!;` — mutate behaviour without changing
+  compilability, and are the only ones that actually test the tests.
+- A test that never kills any mutation is decoration. Cross-referencing the
+  killer list against the full test list found three such tests here; each got
+  a mutation written specifically for it.
+- Redaction has to be split: descriptive fields (`SandboxClass`,
+  `FallbackReason`, `Status`, `Detail`) are redacted, identity fields
+  (`SessionName`, `ExecutionName`, `Handle`) are not, because they must
+  round-trip into `sessions --session` and `stop`. Redacting everything would
+  have produced handles that address nothing.
+- PowerShell `if/else` is not an expression: `-Status (if ($x) {…} else {…})`
+  does not parse. Assign to a variable first.
+- In a worktree, `.git` is a *file*. `Out-File .git\COMMIT_EDITMSG` fails;
+  write the message to a temp file in the repo root instead.

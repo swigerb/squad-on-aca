@@ -159,9 +159,15 @@ public sealed class AcaSquadAgentTests
     [Fact]
     public async Task EmptyOutput_ThrowsContractException()
     {
+        // Whitespace-only, not empty: a control plane that printed a stray newline
+        // and nothing else must be treated as having produced no document, not as
+        // having produced an unparseable one.
         var agent = new AcaSquadAgent(new FakeSquadCliInvoker(FakeSquadCliInvoker.Ok("   ")));
 
-        await Assert.ThrowsAsync<SquadContractException>(() => agent.RunSessionAsync(Request()));
+        SquadContractException error =
+            await Assert.ThrowsAsync<SquadContractException>(() => agent.RunSessionAsync(Request()));
+
+        Assert.Contains("produced no output", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -248,6 +254,51 @@ public sealed class AcaSquadAgentTests
         Assert.Contains("statusPollRef", error.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task DispatchedWithABlankPollReference_ThrowsToo()
+    {
+        // A whitespace-only reference is as unpollable as a null one, and it is
+        // the shape a shell-quoting slip actually produces.
+        const string blankPollRef = """
+            {
+              "schema": "squad-aca/run@1",
+              "sessionName": "fixedjson",
+              "route": "aca-job",
+              "executionMode": "aca-job",
+              "executionHandle": "   ",
+              "statusPollRef": "   ",
+              "dispatched": true,
+              "status": "Requested"
+            }
+            """;
+        var agent = new AcaSquadAgent(new FakeSquadCliInvoker(FakeSquadCliInvoker.Ok(blankPollRef)));
+
+        await Assert.ThrowsAsync<SquadContractException>(() => agent.RunSessionAsync(Request()));
+    }
+
+    [Fact]
+    public async Task MissingRequiredField_ThrowsInsteadOfSubstitutingAPlaceholder()
+    {
+        // No "status". A result that reports status "unknown" reads like a real
+        // observation; it is not one.
+        const string missingStatus = """
+            {
+              "schema": "squad-aca/run@1",
+              "sessionName": "fixedjson",
+              "route": "aca-job",
+              "executionMode": "aca-job",
+              "statusPollRef": "fixedjson",
+              "dispatched": true
+            }
+            """;
+        var agent = new AcaSquadAgent(new FakeSquadCliInvoker(FakeSquadCliInvoker.Ok(missingStatus)));
+
+        SquadContractException error =
+            await Assert.ThrowsAsync<SquadContractException>(() => agent.RunSessionAsync(Request()));
+
+        Assert.Contains("status", error.Message, StringComparison.Ordinal);
+    }
+
     // --- 5. Non-zero exit is surfaced, not swallowed -------------------------
 
     [Fact]
@@ -327,8 +378,26 @@ public sealed class AcaSquadAgentTests
     [Fact]
     public async Task TokenIsNeverPresentInAnyReturnedValue()
     {
-        var agent = new AcaSquadAgent(
-            new FakeSquadCliInvoker(FakeSquadCliInvoker.Ok(CliPayloads.AcaJobRun, $"warning: {LeakedToken}")));
+        // The token is inside the DOCUMENT here, not just on stderr. A test that
+        // only put it on stderr could never fail: no returned value is derived
+        // from stderr, so it would pass no matter what the agent did.
+        string payload = """
+            {
+              "schema": "squad-aca/run@1",
+              "sessionName": "fixedjson",
+              "route": "aca-job",
+              "routeReason": "capability-resolution-aca-job",
+              "executionMode": "aca-job",
+              "executionHandle": null,
+              "statusPollRef": "fixedjson",
+              "sandboxClass": null,
+              "fallbackReason": "git-remote-rejected: TOKEN_PLACEHOLDER",
+              "dispatched": true,
+              "status": "Requested"
+            }
+            """.Replace("TOKEN_PLACEHOLDER", LeakedToken, StringComparison.Ordinal);
+
+        var agent = new AcaSquadAgent(new FakeSquadCliInvoker(FakeSquadCliInvoker.Ok(payload)));
 
         SquadSessionResult result = await agent.RunSessionAsync(Request());
 
@@ -341,6 +410,28 @@ public sealed class AcaSquadAgentTests
             result.Status,
             result.Detail);
         Assert.DoesNotContain(LeakedToken, everything, StringComparison.Ordinal);
+        Assert.DoesNotContain(LeakedTokenPrefix, everything, StringComparison.Ordinal);
+
+        // The identity fields must survive intact -- a redacted handle addresses
+        // nothing.
+        Assert.Equal("fixedjson", result.SessionName);
+        Assert.Equal("fixedjson", result.Handle.Value);
+    }
+
+    [Fact]
+    public void ExceptionMessages_AreRedactedByTheBaseConstructor()
+    {
+        // Not every message reaches an exception through Summarize(). Anything
+        // constructed directly -- now or by a future caller -- must still be
+        // scrubbed, so the guarantee lives in the base constructor rather than in
+        // every call site remembering.
+        var contract = new SquadContractException($"payload was {LeakedToken}");
+        var dispatch = new SquadDispatchFailedException($"stderr said {LeakedToken}", 1);
+        var failClosed = new SquadRouteFailedClosedException($"reason {LeakedToken}", "r", null, 1);
+
+        Assert.DoesNotContain(LeakedToken, contract.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(LeakedToken, dispatch.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(LeakedToken, failClosed.Message, StringComparison.Ordinal);
     }
 
     // --- 7. Status and cancel address the handle -----------------------------
@@ -360,6 +451,7 @@ public sealed class AcaSquadAgentTests
         Assert.Single(invoker.Invocations);
 
         Assert.Equal("sbx-session", status.SessionName);
+        Assert.Equal("sandbox", status.Route);
         Assert.Equal(SquadExecutionMode.Sandbox, status.ExecutionMode);
         Assert.Equal("net-egress-restricted", status.SandboxClass);
         Assert.Equal("Running", status.Status);
@@ -379,6 +471,12 @@ public sealed class AcaSquadAgentTests
         Assert.Equal("Succeeded", status.Status);
         Assert.Equal(0, status.ExitCode);
         Assert.Equal("caj-squad-aca-session-stub01", status.ExecutionName);
+
+        // Addressed by the session id, because an ACA Jobs dispatch has no handle
+        // to mint until ACA has named the execution. Once it has, the status must
+        // report the SUBSTRATE's handle rather than echoing back what it was asked
+        // with -- otherwise a caller never gets the durable reference.
+        Assert.Equal("sqx1.JOBHANDLE", status.Handle.Value);
     }
 
     [Fact]
@@ -401,6 +499,8 @@ public sealed class AcaSquadAgentTests
             () => agent.GetSessionStatusAsync(new SquadExecutionHandle("sqx1.SANDBOXHANDLE")));
 
         Assert.Equal(7, error.ExitCode);
+        Assert.Contains("7", error.Message, StringComparison.Ordinal);
+        Assert.Contains("boom", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
