@@ -163,3 +163,37 @@ Note the exit code. A ruleset refusal is **exit 1**; a rejected credential is
 **exit 128**. The worker classifies them differently, because refreshing a token
 cannot fix branch protection — see `docs/sandboxes.md`, "Refresh channel
 matrix".
+
+## The green-run-that-did-nothing defect
+
+Recorded because it is the most dangerous shape a control plane can take, and
+because it survived a live end-to-end test.
+
+The workflow originally gated its start step on `.claimed`:
+
+```yaml
+claimed="$(printf '%s' "$claim" | jq -r '.claimed // false')"
+...
+if: steps.lease.outputs.claimed == 'true'
+```
+
+**The claim response has never had a `claimed` field.** It carries an
+`outcome`, one of `created`, `repaired`, `active`, `already-terminal`,
+`refused`, `gone`. So `.claimed // false` evaluated to `false` on every run, the
+start step was skipped by its own `if:`, and the workflow reported **success**
+having dispatched nothing — while holding a lease for a session that did not
+exist.
+
+Every line it printed looked right. The event resolved, OIDC succeeded, the
+lease was genuinely created. Only the absence of a new ACA execution gave it
+away.
+
+Three things changed:
+
+1. The lease vocabulary is mapped by `actions-event.js --claim-outcome`, a
+   **tested** module, rather than by a `jq` expression in YAML that no test can
+   reach. An unrecognised outcome is an **error**, never a silent stand-down —
+   a default of "do nothing" is precisely how this stayed invisible.
+2. A final step fails the run when the lease said `start` but no execution name
+   was produced.
+3. `validate.ps1` fails if the workflow ever reads `.claimed` again.

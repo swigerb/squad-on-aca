@@ -4771,10 +4771,32 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "The dispatch workflow does not use the shared decision core (squad-dispatch.js decide --dispatch-source actions), so its lease key is its own and a double dispatch is possible"
     }
 
-    if ($wf -match "if:\s*steps\.lease\.outputs\.claimed\s*==\s*'true'") {
-        Add-Pass "The ACA job is started ONLY when the lease claim succeeded, so losing the race stands the trigger down instead of racing a running session"
+    if ($wf -match "if:\s*steps\.lease\.outputs\.action\s*==\s*'start'") {
+        Add-Pass "The ACA job is started ONLY when the lease classifier says 'start', so losing the race stands the trigger down instead of racing a running session"
     } else {
-        Add-Fail "The dispatch workflow starts the ACA job without gating on a successful lease claim"
+        Add-Fail "The dispatch workflow starts the ACA job without gating on the lease classifier's 'start' verdict"
+    }
+
+    # The workflow once tested `.claimed`, a field the claim response has never
+    # had. It evaluated to false on every run, skipped the start, and reported
+    # the workflow GREEN having dispatched nothing. It survived a live
+    # end-to-end test because every line it printed looked correct.
+    if ($wf -match '\.claimed\b') {
+        Add-Fail "The dispatch workflow reads a 'claimed' field from the lease claim. That field does not exist -- the response carries an 'outcome' -- so the gate is false on every run and the workflow reports success having dispatched nothing"
+    } else {
+        Add-Pass "The dispatch workflow does not read a nonexistent 'claimed' field; it maps the lease OUTCOME through a tested classifier"
+    }
+
+    if ($wf -match '--claim-outcome') {
+        Add-Pass "The lease vocabulary is interpreted by a tested module rather than by a jq expression in YAML that no test can reach"
+    } else {
+        Add-Fail "The dispatch workflow interprets the lease outcome inline instead of through worker/lib/actions-event.js --claim-outcome, so the mapping is untestable"
+    }
+
+    if ($wf -match 'MUST have produced an execution') {
+        Add-Pass "A run that claims a lease and starts nothing FAILS, so 'green but dispatched nothing' -- the defect this workflow already shipped once -- cannot recur silently"
+    } else {
+        Add-Fail "Nothing fails the workflow when a lease is claimed but no ACA execution is started, so a silent no-op reports success and leaves the lease held by a session that does not exist"
     }
 
     if ($wf -match '--bot-login') {

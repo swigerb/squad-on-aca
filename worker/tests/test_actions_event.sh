@@ -127,4 +127,32 @@ weird='{"action":"labeled","label":{"name":"squad"},"issue":{"number":7,"state":
 name="$(GITHUB_RUN_ID='Run/Id With Spaces!' resolve issues "$weird" | field sessionName)"
 assert_eq "$name" "$(printf '%s' "$name" | tr -cd 'a-z0-9-')" "the session name contains only characters an ACA execution name accepts, even when the inputs do not"
 
+# ---------------------------------------------------------------------------
+# Lease-claim outcomes. THE DEFECT THIS SECTION EXISTS FOR:
+#
+# The workflow originally tested `.claimed` -- a field the claim response has
+# never had. `jq '.claimed // false'` evaluated to "false" on every run, the
+# start step was skipped by its own `if:`, and the workflow reported SUCCESS
+# having dispatched nothing. It survived a live end-to-end test because every
+# line it printed looked correct.
+#
+# The mapping lives in the module, not in a jq expression, because a jq
+# expression inside a workflow is reachable by no test.
+# ---------------------------------------------------------------------------
+classify() { node "$MODULE" --claim-outcome "$1"; }
+
+assert_eq "start" "$(classify created | field action)" "a NEW lease means start the session -- 'created' is what a successful first claim actually returns"
+assert_eq "start" "$(classify repaired | field action)" "a REPAIRED lease means start too: a dispatcher that crashed between claim and dispatch must not strand the issue forever"
+assert_eq "stand-down" "$(classify active | field action)" "'active' means another dispatcher holds it -- stand down, which is correct behaviour and not an error"
+assert_eq "stand-down" "$(classify already-terminal | field action)" "'already-terminal' means the work finished -- stand down"
+assert_eq "error" "$(classify refused | field action)" "'refused' means routing could not be resolved, which is a real failure and must not look like a polite decision not to run"
+assert_eq "error" "$(classify claimed | field action)" "the field the workflow ORIGINALLY tested -- 'claimed' -- is not a real outcome, and is treated as an ERROR rather than as a silent stand-down"
+assert_eq "error" "$(classify '' | field action)" "an EMPTY outcome is an error; empty is what a jq lookup of a nonexistent field yields, and that is precisely how the original defect stayed invisible"
+assert_eq "error" "$(classify something-new-in-a-future-release | field action)" "an UNRECOGNISED outcome is an error, so a new lease state added later cannot silently become 'do nothing'"
+
+node "$MODULE" --claim-outcome created >/dev/null 2>&1
+assert_eq "0" "$?" "a startable outcome exits 0"
+node "$MODULE" --claim-outcome claimed >/dev/null 2>&1
+assert_ne "0" "$?" "an ERROR outcome exits non-zero, so the workflow step FAILS instead of skipping a start and reporting green"
+
 test_summary
