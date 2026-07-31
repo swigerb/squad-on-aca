@@ -325,7 +325,11 @@ public sealed class SquadAcaAIAgent : AIAgent
         return new SquadAgentRunTimeoutException(
             $"Squad session '{result.SessionName}' did not reach a terminal state within " +
             $"{elapsed.TotalMinutes.ToString("0.##", CultureInfo.InvariantCulture)} minute(s). " +
-            $"Last observed status: {SecretRedactor.Redact(lastStatus)}. {tail} " +
+            // Not redacted here: the SquadAgentException base redacts every
+            // message it is given, so a second call would be unreachable code
+            // that no test could ever distinguish. The PROPERTY below is a
+            // different matter -- nothing else redacts that one.
+            $"Last observed status: {lastStatus}. {tail} " +
             $"Handle: {result.Handle.Value}",
             result.Handle,
             result.SessionName,

@@ -26,6 +26,18 @@ internal sealed class FakePollingClock : ISquadPollingClock
 
     public Task DelayAsync(TimeSpan duration, CancellationToken cancellationToken)
     {
+        // A correct polling loop never asks to wait for nothing. `interval` is
+        // validated positive and `remaining` is checked positive before the
+        // clamp, so a non-positive wait means the deadline arithmetic broke --
+        // and left unguarded it presents as an infinite zero-length spin against
+        // a real control plane, which is a rate limit, not a test failure.
+        if (duration <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException(
+                $"The polling loop asked to wait {duration}, which a bounded run should never do. " +
+                $"This is wait #{Delays.Count + 1}.");
+        }
+
         Delays.Add(duration);
         UtcNow += duration;
         OnDelay?.Invoke(Delays.Count);

@@ -531,10 +531,49 @@ public class SquadAcaAIAgentTests
 
         (SquadAcaAIAgent agent, FakeSquadAgent squad, FakePollingClock clock) = Build(inner: inner);
 
+        int readsBeforeTheFirstWait = -1;
+        clock.OnDelay = n =>
+        {
+            if (n == 1)
+            {
+                readsBeforeTheFirstWait = squad.StatusReads.Count;
+            }
+        };
+
         await agent.RunAsync("fix it");
 
+        // A session dispatched a millisecond ago is never terminal, so reading
+        // immediately spends a control-plane call to learn nothing.
+        Assert.Equal(0, readsBeforeTheFirstWait);
+        Assert.Equal(TimeSpan.FromSeconds(5), Assert.Single(clock.Delays));
         Assert.Single(squad.StatusReads);
-        Assert.Single(clock.Delays);
+    }
+
+    [Fact]
+    public async Task ATimedOutRunStopsPollingInsteadOfSpinningOnAZeroLengthWait()
+    {
+        var inner = new FakeSquadAgent
+        {
+            DispatchResult = Fixtures.AcaJobDispatch(),
+            RepeatingStatus = Fixtures.Status("Running"),
+        };
+
+        (SquadAcaAIAgent agent, FakeSquadAgent squad, FakePollingClock clock) = Build(
+            o =>
+            {
+                o.RunTimeout = TimeSpan.FromSeconds(12);
+                o.InitialPollInterval = TimeSpan.FromSeconds(5);
+                o.PollBackoffFactor = 1.0;
+            },
+            inner);
+
+        await Assert.ThrowsAsync<SquadAgentRunTimeoutException>(() => agent.RunAsync("long job"));
+
+        // 5 + 5 + 2 and then the deadline check ends it. Without that check the
+        // clamp hands back a non-positive wait forever, which FakePollingClock
+        // refuses precisely so the defect surfaces as a failure instead of a hang.
+        Assert.Equal([TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(2)], clock.Delays);
+        Assert.Equal(3, squad.StatusReads.Count);
     }
 
     [Theory]
@@ -736,11 +775,20 @@ public class SquadAcaAIAgentTests
         (SquadAcaAIAgent agent, FakeSquadAgent squad, _) = Build(inner: inner);
 
         var poll = new AgentRunOptions();
+
+        // Deliberately well-formed and carrying a handle. A foreign token that
+        // happened to be malformed would be rejected by the handle check alone,
+        // and would prove nothing about whether the schema is looked at.
         SquadBackgroundResponse.WithContinuationToken(
             poll,
-            ResponseContinuationToken.FromBytes("{\"schema\":\"someone-else@1\"}"u8.ToArray()));
+            ResponseContinuationToken.FromBytes(
+                """{"schema":"someone-else@1","handle":"theirhandle","sessionName":"theirs"}"""u8.ToArray()));
 
-        await Assert.ThrowsAsync<SquadContractException>(() => agent.RunAsync("ignored", options: poll));
+        SquadContractException error = await Assert.ThrowsAsync<SquadContractException>(
+            () => agent.RunAsync("ignored", options: poll));
+
+        Assert.Contains("squad-aca/continuation@1", error.Message, StringComparison.Ordinal);
+        Assert.Contains("someone-else@1", error.Message, StringComparison.Ordinal);
         Assert.Empty(squad.StatusReads);
     }
 

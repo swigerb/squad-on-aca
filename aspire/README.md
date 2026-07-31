@@ -40,6 +40,16 @@ aspire/
     SquadAgentExceptions.cs
     SecretRedactor.cs
   Squad.Aca.Agents.Tests/      # xunit, fully offline
+  Squad.Aca.Agents.MAF/        # net9.0, the ONLY Microsoft.Agents.AI reference
+    SquadAcaAIAgent.cs         # AIAgent over ISquadAgent (dispatch, poll, stop)
+    SquadAcaAgentOptions.cs    # long-run mode, timeout, backoff, stop budget
+    SquadAcaAgentRunOptions.cs # per-run overrides (AgentRunOptions subclass)
+    SquadAcaAgentSession.cs    # AgentSession carrying the last handle
+    SquadBackgroundResponse.cs # the only MEAI001 suppression in the repo
+    SquadContinuationToken.cs  # squad-aca/continuation@1, schema-checked
+    ISquadPollingClock.cs      # the seam that tests a 90-minute timeout in ms
+    SquadAcaAgentServiceCollectionExtensions.cs  # AddSquadAcaAgent()
+  Squad.Aca.Agents.MAF.Tests/  # xunit, fully offline
 ```
 
 ## `Squad.Aca.Agents` — the agent contract
@@ -70,14 +80,40 @@ Three properties are deliberate and enforced:
   turn every deliberate wording change into a breaking API change. See
   [`../docs/agent-contract.md`](../docs/agent-contract.md).
 
-There is deliberately **no poll-to-completion** operation. Squad sessions run
-10–60 minutes and MAF's `RunAsync` is request/response; reconciling those is an
-adapter decision. `RunSessionAsync` returns an opaque handle, and
-`GetSessionStatusAsync` / `CancelSessionAsync` address that handle.
+There is deliberately **no poll-to-completion** operation *here*. Squad sessions
+run 10–60 minutes and MAF's `RunAsync` is request/response; reconciling those is
+an adapter decision, and it is made in `Squad.Aca.Agents.MAF` below.
+`RunSessionAsync` returns an opaque handle, and `GetSessionStatusAsync` /
+`CancelSessionAsync` address that handle.
 
 A **fail-closed** route throws `SquadRouteFailedClosedException` with the
 resolver's reason preserved. A repository whose required capabilities cannot be
 met must never look like a dispatch that worked.
+
+## `Squad.Aca.Agents.MAF` — the Agent Framework adapter
+
+A separate project, holding the **only** `Microsoft.Agents.AI` reference in the
+repository. A caller that wants the contract without the framework references one
+project; a caller that wants an `AIAgent` references two.
+
+```csharp
+services.AddSingleton<ISquadAgent>(sp => new AcaSquadAgent(/* ... */));
+services.AddSquadAcaAgent(o => o.DefaultRepository = "octo/example");
+```
+
+`AddSquadAcaAgent()` registers `SquadAcaAIAgent` and the base `AIAgent` as the
+**same** instance; `AddKeyedSquadAcaAgent(key, ...)` does the keyed equivalent.
+
+The long-run answer, in one line: **`RunToCompletion` is the default** — a MAF
+caller that did not ask for a background response is promised a finished answer,
+and in a workflow that text feeds the next node, so a receipt there is not a
+smaller answer but a wrong one. `DispatchOnly` is available via
+`AgentRunOptions.AllowBackgroundResponses` or `SquadAcaAgentRunOptions.LongRunMode`.
+Cancellation and timeout both **stop** the ACA session — on a fresh token, since
+the caller's is already dead — rather than orphaning it.
+
+Full rationale, the pinned version, the polling schedule and the MEAI001 finding:
+[`../docs/maf-adapter.md`](../docs/maf-adapter.md).
 
 ## Package references
 
@@ -86,11 +122,13 @@ The AppHost pins the following (already in `Squad.Aca.AppHost.csproj`):
 - SDK: `Aspire.AppHost.Sdk` `9.4.0`
 - `Aspire.Hosting.AppHost` `9.4.0`
 
-The Microsoft **Agent Framework** packages (`Microsoft.Agents.AI.*`) are preview
-and intentionally **not** referenced anywhere in this solution. To adopt them,
-add a **separate** project that references `Squad.Aca.Agents` and implements an
-`AIAgent` over `ISquadAgent`; do not add the package to `Squad.Aca.Agents`
-itself, which `scripts/validate.ps1` enforces.
+The Microsoft **Agent Framework** package `Microsoft.Agents.AI` is pinned at an
+exact **`1.16.0`** in `Squad.Aca.Agents.MAF` and referenced **nowhere else**. It
+has since reached GA, but the quarantine stays: a stable package is not a frozen
+one, part of the surface the adapter uses is still `[Experimental]`, and the cost
+of the separation is one `.csproj`. Do not add the package to
+`Squad.Aca.Agents`, which `scripts/validate.ps1` enforces along with the exact
+pin, the one-way dependency, and solution membership.
 
 ## Prerequisites
 
