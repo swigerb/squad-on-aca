@@ -1025,4 +1025,86 @@ $ aca sandbox list --group sbg-squad-aca -g rg-squad-aca-dev-eastus2
 
 The class disk `02560016-d170-486d-a99b-aed763296b6c` was left in place and
 still lists as `Ready`.
+
+---
+
+# Sprint 2 (issue #32) — GitHub Actions trigger, live end-to-end
+
+Issue [#44](https://github.com/swigerb/squad-on-aca/issues/44) is the E2E
+verification trigger for the [#32](https://github.com/swigerb/squad-on-aca/issues/32)
+control-plane move: **GitHub Action fires on an event → authenticates to Azure
+via OIDC → claims the shared lease → starts the ACA dispatcher job**, with the
+laptop-run `squad-aca.ps1` CLI removed from the trigger path. Applying the
+`squad` label to an issue drives `squad-dispatch.yml`; the same shared decision
+core (`worker/lib/squad-dispatch.js`) that Ralph and Watch use decides,
+claims the lease, and starts the execution, so a proof against `squad-dispatch.yml`
+proves the whole family.
+
+## S2-1 — First live attempt — **FAIL (defect found, fixed in #46)**
+
+Workflow run [30662711996](https://github.com/swigerb/squad-on-aca/actions/runs/30662711996).
+Azure OIDC login succeeded, but the lease-claim step failed with a 403
+(`Resource not accessible by integration`): `squad-dispatch.yml`'s dispatch job
+only granted `contents: read`, while the shared lease is written via the
+GitHub Contents API against the `squad-aca-leases` ref, which needs
+`contents: write`. Fixed in #46 (merged as commit `faa6a3a` on `main`):
+least-privilege layout is now a read-only `resolve` job plus a job-scoped
+`id-token: write`, `contents: write`, `issues: write` on `dispatch`.
+
+## S2-2 — Re-run after the permissions fix — **PASS**
+
+Workflow run [30664755108](https://github.com/swigerb/squad-on-aca/actions/runs/30664755108),
+`issues` trigger on `main` after #46 landed:
+
+```text
+resolve:  verdict: {"dispatch":true,"reason":"label-applied","issueNumber":44,"label":"squad","sessionName":"issue-44-30664755108"}
+dispatch: Azure login succeeds by using OIDC (subject claim - repo:swigerb/squad-on-aca:ref:refs/heads/main)
+dispatch: {"outcome":"repaired", ..., "state":"claimed", ...}
+dispatch: claim outcome 'repaired' -> {"action":"start","reason":"lease-repaired"}
+dispatch: Started ACA execution: caj-squad-aca-session-oa5bg21
+dispatch: Confirmed: ACA execution caj-squad-aca-session-oa5bg21 is running the work.
+```
+
+No more 403 — the lease claim succeeds and produces a real ACA execution.
+
+## S2-3 — Reproducibility pass — **PASS**
+
+Two further independent re-runs confirmed the path is reproducible on `main`,
+not a one-off:
+
+- Run [30666116948](https://github.com/swigerb/squad-on-aca/actions/runs/30666116948):
+  lease claim `repaired` → `action":"start"`, `Started ACA execution:
+  caj-squad-aca-session-d1xrmpn`, guard step confirmed.
+- An intervening run (30665958645) failed Azure OIDC with a transient
+  `No subscriptions found`; the very next re-run succeeded cleanly, so the
+  failure was environmental, not a regression in the OIDC/lease/start path.
+- Run [30667555415](https://github.com/swigerb/squad-on-aca/actions/runs/30667555415)
+  (the run that produced this session, `issue-44-30667555415`, and this PR):
+
+  ```text
+  resolve:  verdict: {"dispatch":true,"reason":"label-applied","issueNumber":44,"label":"squad","sessionName":"issue-44-30667555415"}
+  dispatch: Azure CLI login succeeds by using OIDC.
+  dispatch: {"outcome":"repaired","lease":{"leaseKey":"issue-44","sessionId":"issue-44-30667555415","route":"aca-job","state":"claimed",...}}
+  dispatch: claim outcome 'repaired' -> {"action":"start","reason":"lease-repaired"}
+  dispatch: Started ACA execution: caj-squad-aca-session-nwxyb1h
+  dispatch: Confirmed: ACA execution caj-squad-aca-session-nwxyb1h is running the work.
+  ```
+
+  This session — the one that authored this documentation and its PR — **is**
+  that ACA execution: the loop closes from a label event, through OIDC and the
+  shared lease, to a running agent that pushes real changes back to GitHub,
+  with no laptop in the path.
+
+## Result
+
+- Azure OIDC federation from `squad-dispatch.yml`: **PASS**, reproducible
+  across four independent workflow runs.
+- Shared lease claim (`contents: write` scoped to the `dispatch` job only):
+  **PASS** after #46; the pre-fix 403 is a closed defect, not an open risk.
+- ACA session job start from the Actions trigger, with the full merged
+  environment (managed secret refs included, per #48's env-merge fix):
+  **PASS**, and self-evidenced by this session's own existence.
+- Sprint 2's goal — the control plane fires from Azure, not a developer's
+  laptop — is met and reproducible on `main`. No further code change is
+  required to close #32 Sprint 2; #44 tracked the verification only.
 
