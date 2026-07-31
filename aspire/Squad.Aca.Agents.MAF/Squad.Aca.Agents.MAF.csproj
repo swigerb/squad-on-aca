@@ -1,0 +1,70 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Squad on ACA — Microsoft Agent Framework adapter.
+
+    THE QUARANTINE IS THE POINT. Squad.Aca.Agents (the contract) has zero
+    PackageReference elements and scripts/validate.ps1 asserts it. Every
+    third-party dependency the agent story needs lives HERE instead, so a
+    restore failure, a breaking API change or a package yank in the Agent
+    Framework can only take this project down — not the contract, not the
+    AppHost, and not the control plane.
+
+    The dependency flows one way and only one way:
+
+        Squad.Aca.Agents.MAF  ->  Squad.Aca.Agents      (project reference)
+        Squad.Aca.Agents      ->  (nothing)
+
+    VERSION PINNING. Microsoft.Agents.AI is pinned to an exact version, not a
+    floating range. A floating "1.*" would let a routine `dotnet restore` change
+    the compiled surface of a shipped adapter with no diff to review, which is
+    precisely the instability this quarantine exists to contain. Bumping it is a
+    deliberate, reviewable edit here.
+
+    VERSION VALIDATED: 1.16.0.
+
+    A NOTE ON "PREVIEW". The original AgentAbstraction.cs header said the Agent
+    Framework packages "are still preview and their surface changes between
+    releases". That was true when it was written; as of this sprint
+    Microsoft.Agents.AI ships STABLE — 1.0.0 GA, then 1.1.0 through 1.16.0.
+    The quarantine is kept anyway. Its value was never solely "preview": a caller
+    who wants only the contract should not be forced to restore
+    Microsoft.Extensions.AI, Microsoft.ML.Tokenizers and their transitive graph
+    to get it.
+
+    TARGET FRAMEWORK — net9.0, matching Squad.Aca.Agents. Microsoft.Agents.AI
+    ships netstandard2.0, net472, net8.0, net9.0 and net10.0 assets, so net9.0 is
+    a first-class target for it and needs no SDK bump; CI provisions 9.0.x.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RootNamespace>Squad.Aca.Agents.MAF</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Agents.AI" Version="1.16.0" />
+
+    <!--
+      Declared explicitly, at exactly the version Microsoft.Agents.AI 1.16.0
+      already brings in transitively. AddSquadAcaAgent() is a public API over
+      IServiceCollection, so this project compiles against that assembly whether
+      or not the Agent Framework keeps depending on it; leaning on a transitive
+      reference for a type in our own public signature is how a minor upstream
+      dependency trim becomes our compile break. Pinning it BELOW the transitive
+      version fails restore outright (NU1605 under TreatWarningsAsErrors), so
+      the two are kept in lockstep by construction.
+    -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Squad.Aca.Agents\Squad.Aca.Agents.csproj" />
+  </ItemGroup>
+
+</Project>
