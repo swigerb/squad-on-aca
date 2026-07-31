@@ -7,11 +7,11 @@
   "dispatchSource": "actions",
   "route": "aca-job",
   "executionMode": "aca-job",
-  "state": "claimed",
+  "state": "released",
   "attempts": 3,
   "startedAt": "2026-07-31T20:39:35.894Z",
-  "lastHeartbeatAt": "2026-07-31T21:19:17.097Z",
-  "updatedAt": "2026-07-31T21:19:17.097Z",
-  "terminalReason": null,
+  "lastHeartbeatAt": "2026-07-31T21:36:10.791Z",
+  "updatedAt": "2026-07-31T21:36:10.791Z",
+  "terminalReason": "compute-request-failed",
   "executionRef": null
 }
