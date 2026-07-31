@@ -1229,3 +1229,109 @@ conditional project, no feed pin, no visible skip needed.
   transitive reference.
 - An explicit `PackageReference` that is *lower* than a transitive one is
   `NU1605`, not a pin. Pin at or above what the graph already resolved.
+
+---
+
+## Sprint 3 — issue #33 — live end-to-end (branch `feat/33-s3-live-e2e`)
+
+### What was built
+
+`aspire/Squad.Aca.Agents.MAF.Sample` — a real Microsoft Agent Framework host.
+`Host.CreateApplicationBuilder` → `AddSquadAcaAgent()` → resolve the **base
+`AIAgent`** → invoke → print route, handle, terminal status, elapsed. Prompt,
+repository, ref, mode and timeouts come from arguments or `SQUAD_ACA_SAMPLE_*`
+environment variables; there is no inferred repository and no hardcoded prompt.
+Added to `Squad.Aca.sln` so CI compiles it.
+
+Resolving `AIAgent` rather than `SquadAcaAIAgent` is deliberate. Resolving the
+concrete type would have proved the concrete type works and said nothing about
+whether a MAF pipeline that has never heard of Squad can drive it — which is the
+entire claim of the adapter.
+
+`--cancel-after-seconds` exists solely to make a genuinely cancelled *live* run
+producible. It is the only way the "cancellation stops the session rather than
+orphaning it" claim can be checked against something other than a fake, and it
+is what found the defect below.
+
+### Gate deltas
+
+| Gate | Before | After |
+|---|---|---|
+| `validate.ps1` | 303 / 0 / 0 | **307 / 0 / 0** |
+| CLI goldens | 26 | 26 |
+| `verify-launch-detachment.ps1` | PASS | PASS |
+| worker suite | 10 suites / 739 assertions | 10 suites / 739 assertions |
+| .NET tests | 114 | 114 |
+| `Squad.Aca.Agents` package refs | 0 | 0 |
+
+The +4 is additive and mechanical: two new `$expected` file entries, one
+automatic per-`.csproj` XML check (validate.ps1 loops over every csproj under
+`aspire/`), and one new assertion that no `Console` write in the sample skips
+`SecretRedactor`.
+
+### Live results
+
+Four of five claims held. Full evidence in `docs/e2e-results.md` (S3-1…S3-6).
+
+- **ACA Jobs, run to completion** — route `aca-job`, `Succeeded`, 1 m 19 s.
+  `executionHandle` was genuinely null and `statusPollRef` carried the id, as
+  documented. First time that preference met a control plane that actually
+  returns null rather than a fake told to.
+- **Cancellation on Jobs** — client said cancelled; **Azure independently
+  reported the execution `Stopped`**. This is the one that mattered and it holds.
+- **`fail-closed`** — surfaced as `SquadRouteFailedClosedException` with reason
+  `sandbox-feature-disabled-and-default-insufficient`, exit 3, in 8.2 s with no
+  execution created. Classified before the exit code, so the reason survived the
+  control plane also exiting 1.
+- **Sandbox plane** — route `sandbox`, class `sandbox-python-3-12`, `Succeeded`,
+  phase `done`, 43.8 s, default-deny egress with exactly the manifest's hosts.
+- **Cancellation on the sandbox plane — FAILED.**
+
+### The defect
+
+`squad-sandbox-provider.ps1`'s `cancel` kills the worker with
+`pkill -f /usr/local/bin/squad-on-aca >/dev/null 2>&1`. **`procps` is not in the
+pinned `sandbox-python-3-12` image**, so `pkill` exits 127; its stderr is
+discarded; and because the chain ends in `echo squad-cancelled`, the whole
+command exits **0**. The provider reads 0, returns `Cancelled = $true`, and the
+caller is told the session stopped.
+
+Measured live: cancel landed at 12:56:02, the worker ran on for another **51
+seconds** and completed normally at 12:56:53, overwriting the `143`/`cancelled`
+the cancel had written with its own `0`/`done`.
+
+The comment directly above that code says a caller told "cancelled" must never
+stop looking at a session that is still running and still billing. The
+classification around the call honours that scrupulously. The command being
+classified cannot fail.
+
+Not fixed in this sprint: the constraints forbade touching error classification,
+and a portable-kill rewrite needs its own offline coverage against an image with
+no `procps`. Filed, not patched in passing.
+
+### Lessons
+
+- **A command whose last statement is `echo` cannot report failure.** Every
+  guard downstream of that chain was correct and every one of them was fed a
+  zero. Exit-status discipline in a shell one-liner is not a style question; it
+  is the difference between a cancel and a lie about a cancel.
+- **`>/dev/null 2>&1` on the one command that must work is how a 127 becomes
+  invisible.** The redirect was there to keep output tidy. It hid the only
+  signal that mattered.
+- **Fakes agree with you about the environment.** Every offline test asserted
+  the cancel *command* was issued. None could assert the binary existed. The
+  gap between "we sent the right string" and "the string did anything" is
+  exactly the gap a live sprint exists to close, and it stayed open for six
+  sprints.
+- **A terminal session is not a stopped bill.** Both sandboxes were still
+  `Running` after their sessions reported `Succeeded` — by design, since `cancel`
+  leaves the sandbox up for logs and teardown is `terminate`'s job. Report the
+  group listing, never the delete messages.
+- **`aca sandbox delete` needs `--yes`**, and the listing afterwards is the only
+  evidence worth anything. Confirmed again this sprint.
+- **The client returning "cancelled" is worthless as evidence.** It is the exact
+  shape a broken implementation takes. Only `az containerapp job execution list`
+  saying `Stopped` — or a file mtime inside the guest — settles it.
+- Live control-plane output echoes the subscription GUID (the `az` job-execution
+  JSON is relayed verbatim). Redaction at the print site handles tokens; GUIDs
+  still have to be redacted by hand when the output goes into `docs/`.
