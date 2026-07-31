@@ -266,6 +266,18 @@ function classifyClaim(outcome) {
       return { action: 'stand-down', reason: 'another-dispatcher-holds-the-lease' };
     case 'already-terminal':
       return { action: 'stand-down', reason: 'work-already-finished' };
+    case 'completed':
+      // The lease for this key is in a terminal SUCCESS state and the claim did
+      // NOT adopt it, so there is no lease to run under. Starting anyway would
+      // dispatch an unleased session, which is the double-dispatch protection
+      // deleting itself.
+      //
+      // This is a stand-down rather than an error because nothing is broken:
+      // the work this key names has already been done. It does mean a second
+      // request on the SAME issue is inert until the lease is released, which
+      // is a real limitation of keying leases by issue and is documented in
+      // docs/actions-trigger.md rather than papered over here.
+      return { action: 'stand-down', reason: 'lease-already-succeeded' };
     case 'refused':
       return { action: 'error', reason: 'routing-refused' };
     default:
