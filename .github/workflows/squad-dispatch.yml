@@ -146,6 +146,7 @@ jobs:
           ISSUE: ${{ needs.resolve.outputs.issue }}
           PROMPT: ${{ needs.resolve.outputs.prompt }}
           LEASE_KEY: ${{ steps.lease.outputs.leaseKey }}
+          BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
           RG: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-squad-aca-dev-eastus2' }}
           JOB: ${{ vars.ACA_SESSION_JOB_NAME || 'caj-squad-aca-session' }}
         run: |
@@ -187,17 +188,43 @@ jobs:
           # second merger that would drift.
           source worker/lib/ralph-dispatch.sh
 
+          # ralph_build_session_env SKIPS every key in RALPH_MANAGED_ENV_KEYS
+          # when copying the template ("if (managed.has(e.name)) continue"), so
+          # the caller must supply each managed key itself -- including the
+          # secret-backed ones, as `secretref:<secret-name>`. Copying only the
+          # non-managed template entries is what produced a session with no
+          # GH_TOKEN at all. These overrides deliberately mirror Ralph's own
+          # call site so the two dispatchers hand the worker the same shape.
           mapfile -d '' -t start_env < <(
             SJ_ENV="$(printf '%s' "$spec" | jq -c '.env // []')" \
+            OV_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            OV_GITHUB_REF="${BASE_REF}" \
             OV_SQUAD_MODE="prompt" \
             OV_SESSION_NAME="$SESSION" \
+            OV_SQUAD_POD_ID="$SESSION" \
+            OV_SQUAD_DEPLOYMENT_MODE="squad-per-pod" \
+            OV_OTEL_SERVICE_NAME="squad-${SESSION}" \
+            OV_ENABLE_GITHUB_REMOTE="true" \
+            OV_GITHUB_TOKEN="secretref:github-token" \
+            OV_COPILOT_GITHUB_TOKEN="secretref:copilot-github-token" \
+            OV_OTEL_EXPORTER_OTLP_HEADERS="secretref:otlp-headers" \
             OV_SQUAD_PROMPT="$prompt" \
-            OV_SQUAD_LEASE_KEY="$LEASE_KEY" \
-            OV_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
             OV_PUSH_CHANGES="true" \
             OV_RUN_COPILOT_SMOKE="false" \
+            OV_OUTPUT_BRANCH="squad/issue-${ISSUE:-$SESSION}" \
+            OV_PR_TITLE="Squad: issue #${ISSUE}" \
+            OV_SQUAD_DISPATCH_SOURCE="actions" \
+            OV_SQUAD_LEASE_KEY="$LEASE_KEY" \
             ralph_build_session_env
           )
+
+          # A session that reaches the worker without its credential fails the
+          # token preflight two minutes in -- better than minute 55, but it
+          # should never get that far from here.
+          if ! printf '%s\n' "${start_env[@]}" | grep -q '^GITHUB_TOKEN=secretref:'; then
+            echo "The merged environment carries no GITHUB_TOKEN secret reference; refusing to start a session that cannot push."
+            exit 1
+          fi
           if [ "${#start_env[@]}" -eq 0 ]; then
             echo "The merged session environment is empty; refusing to start a session that would run without its credentials."
             exit 1
