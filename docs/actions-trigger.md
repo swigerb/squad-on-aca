@@ -310,6 +310,28 @@ group. Pass `-GitHubActionsIdentityName` if the identity is not
 `uai-<prefix>-gha`; a deployment with no such identity skips the step, because
 the Actions trigger is optional.
 
+### A second request on the same issue
+
+Leases are keyed by **issue**, so once a session for issue *N* has succeeded,
+the lease for `issue-N` is in a terminal success state. A later `/squad` on the
+same issue resolves correctly and then stands down:
+
+```
+claim outcome 'completed' -> {"action":"stand-down","reason":"lease-already-succeeded"}
+```
+
+That is deliberate rather than a bug being hidden: the claim did **not** adopt
+the lease, so starting anyway would dispatch a session with no lease at all —
+the double-dispatch protection deleting itself.
+
+It is, however, a real limitation of keying leases by issue. To run the same
+issue again, release its lease first:
+
+```bash
+node worker/lib/squad-dispatch.js release --repository <owner>/<repo> \
+  --lease-key issue-<n> --session-id <session>
+```
+
 ### Stale leases
 
 A lease is claimed **before** compute is requested, so a dispatcher that dies in

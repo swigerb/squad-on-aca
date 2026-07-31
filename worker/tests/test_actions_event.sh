@@ -145,6 +145,8 @@ assert_eq "start" "$(classify created | field action)" "a NEW lease means start 
 assert_eq "start" "$(classify repaired | field action)" "a REPAIRED lease means start too: a dispatcher that crashed between claim and dispatch must not strand the issue forever"
 assert_eq "stand-down" "$(classify active | field action)" "'active' means another dispatcher holds it -- stand down, which is correct behaviour and not an error"
 assert_eq "stand-down" "$(classify already-terminal | field action)" "'already-terminal' means the work finished -- stand down"
+assert_eq "stand-down" "$(classify completed | field action)" "'completed' means the lease for this key is in a terminal SUCCESS state and was NOT adopted, so there is no lease to run under -- starting anyway would dispatch an unleased session and delete the double-dispatch protection"
+assert_eq "lease-already-succeeded" "$(classify completed | field reason)" "and it says so by name, because 'the work is already done' and 'someone else is doing it' need different responses from an operator"
 assert_eq "error" "$(classify refused | field action)" "'refused' means routing could not be resolved, which is a real failure and must not look like a polite decision not to run"
 assert_eq "error" "$(classify claimed | field action)" "the field the workflow ORIGINALLY tested -- 'claimed' -- is not a real outcome, and is treated as an ERROR rather than as a silent stand-down"
 assert_eq "error" "$(classify '' | field action)" "an EMPTY outcome is an error; empty is what a jq lookup of a nonexistent field yields, and that is precisely how the original defect stayed invisible"
