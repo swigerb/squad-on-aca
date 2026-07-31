@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "issue-55",
+  "sessionId": "comment-55-30672897644",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": 55,
+  "dispatchSource": "actions",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-07-31T23:27:04.537Z",
+  "lastHeartbeatAt": "2026-07-31T23:27:04.537Z",
+  "updatedAt": "2026-07-31T23:27:04.537Z",
+  "terminalReason": null,
+  "executionRef": null
+}
