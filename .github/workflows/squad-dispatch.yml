@@ -27,9 +27,7 @@ on:
         required: false
 
 permissions:
-  id-token: write      # required for OIDC; this is the ONLY Azure credential
-  contents: write # the shared lease lives on the squad-aca-leases ref (Contents API create/update)
-  issues: write   # only to apply the shared 'dispatched' marker Ralph also uses
+  contents: read # resolve only checks out code; the mutating scopes stay on dispatch for least privilege
 
 concurrency:
   # Two rapid triggers on the same issue queue rather than race. This is a
@@ -83,6 +81,10 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.dispatch == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC; this is the ONLY Azure credential
+      contents: write # the shared lease lives on the squad-aca-leases ref (Contents API create/update), so scope this write to dispatch only
+      issues: write   # only dispatch applies the shared 'dispatched' marker Ralph also uses, after a confirmed start
     steps:
       - uses: actions/checkout@v4
 
