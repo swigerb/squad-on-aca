@@ -1499,3 +1499,18 @@ measured TTL of exactly 3600 seconds, so it is not.
   Several were orphaned by hand this sprint and each needed a human with a CLI.
   Swept hourly - not every five minutes, because a lease heartbeats while alive
   and this repo has already had a rate-limit outage from an unbounded sweep.
+
+## Issue #32 - a workflow that does not PARSE
+
+- Sprints 3 and 4 both merged a workflow GitHub could not parse, and every gate
+  passed. Inside a YAML block scalar (`run: |`) a line beginning at COLUMN 0
+  ENDS the block - and a markdown table, or a multi-line commit message written
+  literally, is all column-0 lines.
+- **Grep cannot see this.** Every string the checks searched for was still in the
+  file, on the right lines, in the right order. Only a PARSER sees it.
+- The symptom is quiet: not a failed step but a failed RUN, named after the FILE,
+  with no job and no log. `gh run view --log-failed` answers "log not found",
+  and CI stays green because CI never parsed YAML.
+- I only found it by running the live end-to-end test AGAIN after S3 and S4.
+  Merging on green CI would have shipped a dead trigger.
+- Build multi-line strings in a `run:` block with printf, never literally.

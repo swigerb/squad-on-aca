@@ -229,13 +229,18 @@ jobs:
           # GitHub login taken from the event payload, and it is placed in a
           # trailer rather than the author field so the commit still reads as
           # machine-authored -- which it is.
+          # Built with printf rather than a literal multi-line string: inside a
+          # YAML block scalar, a line that starts at COLUMN 0 ends the block.
+          # A heredoc or an embedded newline here silently produces a workflow
+          # GitHub cannot parse -- which is not a failed step but a failed RUN,
+          # named after the file rather than the job, and invisible to any check
+          # that greps the file instead of parsing it.
           commit_message="Remote Squad session ${SESSION}"
           if [ -n "${REQUESTER}" ]; then
-            commit_message="${commit_message}
-
-Requested by @${REQUESTER} via the ${TRIGGER_KIND:-Actions} trigger on issue #${ISSUE}.
-
-Co-authored-by: ${REQUESTER} <${REQUESTER}@users.noreply.github.com>"
+            commit_message="$(printf '%s\n\n%s\n\n%s' \
+              "${commit_message}" \
+              "Requested by @${REQUESTER} via the Actions trigger on issue #${ISSUE}." \
+              "Co-authored-by: ${REQUESTER} <${REQUESTER}@users.noreply.github.com>")"
           fi
 
           # A session that reaches the worker without its credential fails the
@@ -295,16 +300,26 @@ Co-authored-by: ${REQUESTER} <${REQUESTER}@users.noreply.github.com>"
           # dispatch. An App token WOULD retrigger it, which is why the resolver
           # also refuses comments from its own identity -- two independent
           # guards, because a runaway here bills by the minute.
+          #
+          # The body is assembled with printf, NOT written as a literal
+          # multi-line string. Inside a YAML block scalar a line beginning at
+          # COLUMN 0 ends the block, and a markdown table is all column-0 lines.
+          # That mistake does not fail a step -- it makes the whole workflow
+          # unparseable, which GitHub reports as a failed run named after the
+          # FILE, with no job and no log.
           [ -n "$ISSUE" ] || exit 0
-          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "Dispatched to Azure Container Apps.
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n\n%s\n' \
+            'Dispatched to Azure Container Apps.' \
+            '| | |' \
+            '|---|---|' \
+            "| Session | \`${SESSION}\` |" \
+            "| ACA execution | \`${EXEC}\` |" \
+            "| Trigger | [this workflow run](${run_url}) |" \
+            'The agent runs in Azure. It will push a branch and open a pull request if it has changes to make. Nothing runs on a developer machine.')"
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "$body" \
+            || echo "Could not comment on #${ISSUE}; the session is running regardless."
 
-| | |
-|---|---|
-| Session | \`${SESSION}\` |
-| ACA execution | \`${EXEC}\` |
-| Trigger | [this workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |
-
-The agent runs in Azure. It will push a branch and open a pull request if it has changes to make. Nothing runs on a developer machine." || echo "Could not comment on #${ISSUE}; the session is running regardless."
       - name: A claimed lease MUST have produced an execution
         if: steps.lease.outputs.action == 'start'
         env:
