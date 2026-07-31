@@ -1,5 +1,35 @@
 # Calling Squad on ACA from a Microsoft Agent Framework pipeline
 
+This is the page to land on for the agent integration. It covers what the
+integration is, what is proven, what is opt-in, and what is currently broken.
+Two companion documents:
+
+- [`docs/agent-contract.md`](agent-contract.md) — the `squad-aca --json` wire
+  contract the .NET side parses. Read it when you care about the documents on
+  the wire, or when you want to consume the control plane from something other
+  than .NET.
+- [ADR 0002](adr/0002-squad-on-aca-as-a-maf-agent.md) — why Squad on ACA is
+  *exposed as* an agent rather than *built on* the framework internally.
+
+## Status at a glance
+
+Verified live against real Azure on 2026-07-31 through the sample host below;
+the run-by-run evidence is in [`docs/e2e-results.md`](e2e-results.md).
+
+| Claim | State |
+|---|---|
+| Dispatch to an ACA Job, poll, terminal status | **Verified** — `Succeeded` in 1 m 19 s |
+| Dispatch to an approved sandbox class | **Verified** — `sandbox-python-3-12`, `Succeeded` in 43.8 s |
+| `fail-closed` reaches the caller with its reason intact | **Verified** — exit 3, nothing started |
+| Cancellation stops the session — **ACA Jobs** | **Verified** — Azure independently reported `Stopped` |
+| Cancellation stops the session — **sandbox** | **Broken.** The stop reports success and the worker keeps running: [#36](https://github.com/swigerb/squad-on-aca/issues/36) |
+| Long-run default | `RunToCompletion`. `DispatchOnly` is opt-in — see [The long-run problem](#the-long-run-problem) |
+| `executionHandle` on a fresh ACA Job dispatch | **`null`**, by design. `statusPollRef` carries the session id instead |
+| `fallbackReason` | Non-`null` **only** when the route deviated from what was asked for |
+| A terminal session | Is **not** a stopped bill — see [Lifecycle and cost](#lifecycle-and-cost) |
+
+## The layering
+
 [`ISquadAgent`](../aspire/Squad.Aca.Agents) is the .NET contract for dispatching a
 Squad session. It is deliberately framework-free: the library it lives in has
 **zero package references**, and [`scripts/validate.ps1`](../scripts/validate.ps1)
@@ -203,7 +233,8 @@ the diagnostic sink.
 
 A cancelled *dispatch* stops nothing, because there is no handle yet.
 
-> **Live caveat — the sandbox plane does not honour this yet.** Verified against
+> **Live caveat — the sandbox plane does not honour this yet
+> ([#36](https://github.com/swigerb/squad-on-aca/issues/36)).** Verified against
 > real Azure on 2026-07-31: on the **ACA Jobs** plane a cancelled MAF call really
 > does stop the session (`az containerapp job execution list` independently
 > reported `Stopped`). On the **sandbox** plane the control plane reports a
@@ -211,7 +242,25 @@ A cancelled *dispatch* stops nothing, because there is no handle yet.
 > pinned class image, so the provider's `pkill` exits 127 into a discarded
 > stderr and the surrounding command still exits 0. The adapter's half of the
 > contract is correct; the layer beneath it is not. Evidence and root cause:
-> [`docs/e2e-results.md` S3-5](e2e-results.md).
+> [`docs/e2e-results.md` S3-5](e2e-results.md). Until #36 is fixed, treat a
+> successful cancel on the sandbox plane as unproven and confirm the session
+> yourself.
+
+## Lifecycle and cost
+
+A **terminal session is not a stopped bill.** Both live sandboxes were still
+`Running` after their sessions reached a terminal state, and that is deliberate:
+`cancel` leaves the sandbox up so its logs stay readable. Teardown is a separate
+operation — `terminate` — and it goes through the ACA control plane rather than
+through a shell inside the guest, so it is unaffected by #36.
+
+Nothing in the MAF surface tears a sandbox down. `RunAsync` returning
+`Succeeded`, a cancellation, and a `SquadAgentRunTimeoutException` all leave the
+substrate exactly as the control plane left it. A host that dispatches to the
+sandbox plane needs its own teardown or reaping story; see
+[`docs/runbook.md`](runbook.md#concurrency-cost-and-orphans). On the ACA Jobs
+plane the question does not arise — a job execution that reaches a terminal
+state has already exited.
 
 ## Streaming
 

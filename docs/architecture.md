@@ -14,7 +14,7 @@ be layered on top without changing that default.
 | Execution substrate | Run each session in isolation | Azure Container Apps Jobs |
 | Telemetry sink | Collect logs/traces/metrics | Standalone Aspire Dashboard (default OTLP sink) |
 | Resource modeling (optional) | Model resources as code | .NET Aspire AppHost (`aspire/`) |
-| Agent abstraction (optional) | Expose a session as an agent | `ISquadAgent` + `AcaSquadAgent` (`aspire/Squad.Aca.Agents`) |
+| Agent abstraction (optional) | Expose a session as an agent | `ISquadAgent` + `AcaSquadAgent` (`aspire/Squad.Aca.Agents`), surfaced as a MAF `AIAgent` by `aspire/Squad.Aca.Agents.MAF` |
 
 ## Default path (unchanged)
 
@@ -714,9 +714,10 @@ Jobs architecture; it layers on top:
 - **Agent Framework exposes the agent abstraction.** The `Squad.Aca.Agents`
   class library defines `ISquadAgent` and implements it (`AcaSquadAgent`) over
   the control plane's machine-readable `--json` mode. It has **zero package
-  references**, so a Microsoft Agent Framework `AIAgent` adapter — which does
-  take a preview dependency — lives in its own project and cannot destabilise
-  the contract. See [agent-contract.md](agent-contract.md).
+  references**, so the Microsoft Agent Framework `AIAgent` adapter — which does
+  take the `Microsoft.Agents.AI` dependency — lives in its own project
+  (`Squad.Aca.Agents.MAF`) and cannot destabilise the contract. See
+  [maf-adapter.md](maf-adapter.md) and [agent-contract.md](agent-contract.md).
 - **ACA remains the execution substrate.** Even with the AppHost, production work
   still runs as ACA Job executions.
 - **Squad remains the orchestration system.** The AppHost does not orchestrate
@@ -728,7 +729,7 @@ Jobs architecture; it layers on top:
 | --- | --- |
 | Deploy and run Squad on ACA | Default path (`scripts/deploy.ps1`, `squad-aca`) |
 | Reproduce telemetry locally / model resources as code | Optional AppHost (`aspire/`) |
-| Expose a Squad session as an Agent Framework agent | Agent contract library (`aspire/Squad.Aca.Agents`, [agent-contract.md](agent-contract.md)) |
+| Expose a Squad session as an Agent Framework agent | MAF adapter (`aspire/Squad.Aca.Agents.MAF`, [maf-adapter.md](maf-adapter.md)) |
 
 The two paths share the same OTLP auth posture (BrowserToken UI, ApiKey OTLP,
 internal-only OTLP ports) and the same worker image.

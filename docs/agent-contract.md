@@ -1,5 +1,9 @@
 # The machine-readable agent contract (`--json`)
 
+> This is the wire-level reference. For the integration as a whole — what is
+> verified, what is opt-in, and what is currently broken — start at
+> [`docs/maf-adapter.md`](maf-adapter.md).
+
 `squad-aca` speaks two languages. Everything it has printed until now is for a
 human at a terminal, and 22 golden captures
 ([`scripts/tests/golden/cli`](../scripts/tests/golden/cli)) pin that output

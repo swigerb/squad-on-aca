@@ -23,6 +23,7 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Agent tool policy | Every session resolves an `attended` or `autonomous` tier before any agent starts; unattended runs lose destructive infrastructure verbs. `--yolo` is never emitted |
 | Governance-path protection | `.squad/` policy, identity, and audit state is made read-only and hash-verified for the session; a violation fails the run and pushes nothing |
 | Duplicate-dispatch protection | A durable lease is claimed before compute is requested, shared by the CLI, Ralph, and the watcher (`squad-aca leases`) |
+| Callable as an agent (opt-in) | Exposed as a Microsoft Agent Framework `AIAgent` (`Microsoft.Agents.AI` 1.16.0) in `aspire/Squad.Aca.Agents.MAF`, over a framework-free `ISquadAgent` contract. A MAF pipeline dispatches a session, polls it, and reads the route back; the worker and the ACA Jobs default are unchanged |
 | CI/CD | GitHub Actions workflow with Azure OIDC login |
 
 ## Quick start
@@ -63,9 +64,9 @@ Before deploying or dispatching, this project assumes:
 - **Telemetry**: the current default OTLP sink is a **standalone Aspire Dashboard**
   running as a Container App. It uses browser-token UI auth and OTLP API-key auth;
   the OTLP ports are internal to the ACA environment.
-- **Optional .NET/Aspire path**: the `aspire/` scaffold additionally requires the
-  .NET SDK 9.0+ and a .NET 9 runtime. It is opt-in and not needed for the default
-  ACA flow. See [aspire/README.md](aspire/README.md).
+- **Optional .NET/Aspire path**: the `aspire/` projects additionally require the
+  .NET SDK 9.0+ and a .NET 9 runtime. They are opt-in and not needed for the
+  default ACA flow. See [aspire/README.md](aspire/README.md).
 
 Deployment writes secrets/tokens to the local, gitignored `deploy.outputs.json`;
 keep it private and never commit it.
@@ -201,13 +202,16 @@ Use Key Vault-backed Container Apps secrets:
 
 `squad-aca` stays a thin ACA remote-runner / control plane. For teams that want
 to model resources as code or expose a session as an agent, the repo includes an
-**optional, opt-in** .NET/Aspire scaffold under [`aspire/`](aspire/). It does not
+**optional, opt-in** .NET/Aspire path under [`aspire/`](aspire/). It does not
 replace the ACA Jobs architecture:
 
 - **Aspire** models resources (the standalone Aspire Dashboard OTLP sink and the
   `squad-worker` container).
-- **Agent Framework** exposes the Squad session as an agent abstraction (a
-  compile-safe seam; preview packages are not referenced by default).
+- **Agent Framework** exposes the Squad session as an `AIAgent`. This is a
+  shipped adapter, not a seam: `Squad.Aca.Agents` holds the framework-free
+  contract and `Squad.Aca.Agents.MAF` holds the one `Microsoft.Agents.AI`
+  reference in the repository. See
+  [Agent integration](#agent-integration-microsoft-agent-framework).
 - **ACA** remains the production execution substrate.
 - **Squad** remains the orchestration system.
 
@@ -225,10 +229,11 @@ See [aspire/README.md](aspire/README.md) and [docs/architecture.md](docs/archite
 Run the static validation gate before pushing:
 
 ```powershell
-.\scripts\validate.ps1            # 285 offline checks: PowerShell parse, worker bash -n,
+.\scripts\validate.ps1            # 307 offline checks: PowerShell parse, worker bash -n,
                                   # secret scan, provider contract, sandbox security
-                                  # controls, CLI golden gate, image evidence, scaffold
-.\scripts\validate.ps1 -RunDotnet # also build the optional aspire scaffold
+                                  # controls, CLI golden gate, image evidence, .NET
+                                  # structure, plus dotnet build/test when an SDK is present
+.\scripts\validate.ps1 -RunDotnet # make a missing dotnet SDK a failure, not a skip
 ```
 
 See [docs/validation.md](docs/validation.md) for the full sprint/E2E checklist and
@@ -293,6 +298,39 @@ With the flag off, a repository that genuinely needs a non-default capability is
 
 See [docs/sandboxes.md](docs/sandboxes.md) for what the plane does, the
 fail-closed interlocks, the prerequisites in full, and the operational links.
+
+## Agent integration (Microsoft Agent Framework)
+
+Squad on ACA is callable **as an agent**. `aspire/Squad.Aca.Agents.MAF` exposes
+the control plane as a Microsoft Agent Framework `AIAgent`: a MAF pipeline
+dispatches a session, waits for it, and reads back where it ran — an ACA Job by
+default, an approved sandbox class when capability routing sends it there. It
+adds a *caller*, not an execution path; the worker is untouched.
+
+```csharp
+services.AddSingleton<ISquadAgent>(sp => new AcaSquadAgent(/* ... */));
+services.AddSquadAcaAgent(o => o.DefaultRepository = "<github-owner>/<repo>");
+
+AIAgent agent = provider.GetRequiredService<AIAgent>();   // the base type a pipeline holds
+AgentResponse response = await agent.RunAsync("Fix the flaky test and open a PR.");
+```
+
+There is a runnable host that does exactly this — it produced the live evidence:
+
+```powershell
+dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
+  "Fix the flaky test and open a PR." --repo "<github-owner>/<repo>" --no-push
+```
+
+`RunAsync` waits for the session to finish by default; fire-and-forget is opt-in.
+Cancellation genuinely stops an ACA Job — and **does not yet stop a sandbox
+worker**, which reports success while the worker keeps running
+([#36](https://github.com/swigerb/squad-on-aca/issues/36)).
+
+See [docs/maf-adapter.md](docs/maf-adapter.md) for the integration in full,
+[docs/agent-contract.md](docs/agent-contract.md) for the `--json` wire contract,
+and [ADR 0002](docs/adr/0002-squad-on-aca-as-a-maf-agent.md) for why the
+framework is not inside the worker.
 
 ## Security notes
 

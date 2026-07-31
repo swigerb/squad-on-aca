@@ -23,15 +23,16 @@ never commit real subscription IDs, tokens, or private URLs.
 
 ## 1. Optional .NET/Aspire path
 
-The .NET/Aspire AppHost is opt-in and not part of the default ACA flow, so
-"rolling it back" means reverting local scaffold changes — no Azure teardown is
-required.
+The .NET/Aspire path — the AppHost, the `Squad.Aca.Agents` contract, and the
+`Squad.Aca.Agents.MAF` adapter — is opt-in and not part of the default ACA flow,
+so "rolling it back" means reverting local changes under `aspire/`. No Azure
+teardown is required, and nothing under `aspire/` runs inside a session.
 
-- Discard uncommitted scaffold edits:
+- Discard uncommitted edits:
   ```powershell
   git checkout -- aspire/
   ```
-- Revert a merged scaffold change by commit:
+- Revert a merged change by commit:
   ```powershell
   git revert <commit-sha>
   ```
@@ -39,7 +40,7 @@ required.
   ```powershell
   Remove-Item -Recurse -Force aspire/Squad.Aca.AppHost/bin, aspire/Squad.Aca.AppHost/obj
   ```
-- Re-validate the scaffold structure and (optionally) rebuild:
+- Re-validate the structure, build, and offline tests:
   ```powershell
   .\scripts\validate.ps1 -RunDotnet
   ```
