@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Offline by construction, exactly like Squad.Aca.Agents.Tests. The only seam
+    to anything real is ISquadAgent, and every test here supplies a fake: no
+    Azure, no PowerShell, no socket, and — because the polling loop runs on an
+    injected ISquadPollingClock — no wall-clock waiting either. The 90-minute
+    timeout path is covered in milliseconds.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Squad.Aca.Agents.MAF.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Squad.Aca.Agents.MAF\Squad.Aca.Agents.MAF.csproj" />
+  </ItemGroup>
+
+</Project>

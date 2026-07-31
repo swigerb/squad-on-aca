@@ -227,6 +227,9 @@ if (-not (Test-Path $aspireDir)) {
         "Squad.Aca.Agents\AgentAbstraction.cs",
         "Squad.Aca.Agents\AcaSquadAgent.cs",
         "Squad.Aca.Agents.Tests\Squad.Aca.Agents.Tests.csproj",
+        "Squad.Aca.Agents.MAF\Squad.Aca.Agents.MAF.csproj",
+        "Squad.Aca.Agents.MAF\SquadAcaAIAgent.cs",
+        "Squad.Aca.Agents.MAF.Tests\Squad.Aca.Agents.MAF.Tests.csproj",
         "README.md"
     )
     foreach ($rel in $expected) {
@@ -262,6 +265,79 @@ if (-not (Test-Path $aspireDir)) {
         }
     } else {
         Add-Fail "aspire/Squad.Aca.Agents/Squad.Aca.Agents.csproj missing"
+    }
+
+    # The other half of the quarantine (issue #33 sprint 2). Asserting that the
+    # contract has no packages only proves half of it: the MAF dependency also has
+    # to actually exist somewhere, be PINNED, and flow in one direction only.
+    # Without these, "zero package references" is satisfied just as well by an
+    # adapter that was never written.
+    $mafCsprojPath = Join-Path $aspireDir "Squad.Aca.Agents.MAF\Squad.Aca.Agents.MAF.csproj"
+    if (Test-Path $mafCsprojPath) {
+        $mafRaw = Get-Content -LiteralPath $mafCsprojPath -Raw
+        $mafXml = [xml]$mafRaw
+
+        $mafPkg = @($mafXml.SelectNodes("//PackageReference")) | Where-Object { $_.Include -eq "Microsoft.Agents.AI" }
+        if ($mafPkg) {
+            $mafVersion = $mafPkg.Version
+            # An exact version, not a floating one. A `1.*` would let a routine
+            # restore change the compiled surface of a shipped adapter with no
+            # diff to review -- exactly the instability the quarantine exists for.
+            if ($mafVersion -match '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
+                Add-Pass "Squad.Aca.Agents.MAF pins Microsoft.Agents.AI to an exact version ($mafVersion)"
+            } else {
+                Add-Fail "Squad.Aca.Agents.MAF must pin Microsoft.Agents.AI to an exact version but has '$mafVersion'"
+            }
+        } else {
+            Add-Fail "Squad.Aca.Agents.MAF does not reference Microsoft.Agents.AI; the MAF adapter has no framework to adapt to"
+        }
+
+        # MEAI001 marks the Agent Framework's experimental background-response
+        # surface (AgentRunOptions/AgentResponse.ContinuationToken). The adapter
+        # uses it deliberately and suppresses the diagnostic in ONE file. A
+        # project-wide <NoWarn> would silently opt every future file into an
+        # unstable API -- the quarantine failure mode, one level down.
+        if ($mafRaw -notmatch 'MEAI001') {
+            Add-Pass "Squad.Aca.Agents.MAF does not suppress MEAI001 project-wide (the experimental surface stays in one file)"
+        } else {
+            Add-Fail "Squad.Aca.Agents.MAF suppresses MEAI001 in the csproj; the experimental Agent Framework surface must stay confined to SquadBackgroundResponse.cs"
+        }
+
+        # One direction only. If the contract ever referenced the adapter, a MAF
+        # restore failure would take the contract down with it and the whole
+        # separation would be decorative.
+        $agentsRaw = if (Test-Path $agentsCsproj) { Get-Content -LiteralPath $agentsCsproj -Raw } else { "" }
+        if ($agentsRaw -notmatch 'Squad\.Aca\.Agents\.MAF') {
+            Add-Pass "Squad.Aca.Agents does not reference the MAF adapter (the dependency flows one way)"
+        } else {
+            Add-Fail "Squad.Aca.Agents references Squad.Aca.Agents.MAF; the quarantine is inverted"
+        }
+    } else {
+        Add-Fail "aspire/Squad.Aca.Agents.MAF/Squad.Aca.Agents.MAF.csproj missing"
+    }
+
+    # `dotnet build`/`dotnet test` below drive the SOLUTION, so a project that is
+    # not in it is a project CI never compiles and never tests. That failure is
+    # invisible -- the build stays green because the code was never looked at --
+    # so membership is asserted rather than assumed.
+    $slnPath = Join-Path $aspireDir "Squad.Aca.sln"
+    if (Test-Path $slnPath) {
+        $slnText = Get-Content -LiteralPath $slnPath -Raw
+        $missingFromSln = @()
+        foreach ($proj in @(
+            "Squad.Aca.Agents\Squad.Aca.Agents.csproj",
+            "Squad.Aca.Agents.Tests\Squad.Aca.Agents.Tests.csproj",
+            "Squad.Aca.Agents.MAF\Squad.Aca.Agents.MAF.csproj",
+            "Squad.Aca.Agents.MAF.Tests\Squad.Aca.Agents.MAF.Tests.csproj")) {
+            if ($slnText -notlike "*$proj*") { $missingFromSln += $proj }
+        }
+        if ($missingFromSln.Count -eq 0) {
+            Add-Pass "Every agent project is in Squad.Aca.sln, so the solution build and test gate covers it"
+        } else {
+            Add-Fail "Not in Squad.Aca.sln (so CI never builds or tests it): $($missingFromSln -join ', ')"
+        }
+    } else {
+        Add-Fail "aspire/Squad.Aca.sln missing"
     }
 
     # .NET build AND test run whenever a dotnet SDK is present -- NOT behind
