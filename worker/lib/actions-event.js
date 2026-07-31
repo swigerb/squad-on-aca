@@ -129,6 +129,7 @@ function resolveEvent(input) {
     return verdict(true, REASON.DISPATCH_LABEL, {
       issueNumber,
       label: applied,
+      requester: actor,
       sessionName: buildSessionName('issue', issueNumber, payload)
     });
   }
@@ -149,7 +150,7 @@ function resolveEvent(input) {
   }
 
   const body = String((payload.comment && payload.comment.body) || '');
-  const command = extractCommand(body, commandPrefix);
+  const command = extractCommand(body, commandPrefix, botLogin);
   if (!command.found) {
     return verdict(false, REASON.SKIP_NO_COMMAND, { issueNumber });
   }
@@ -157,6 +158,8 @@ function resolveEvent(input) {
   return verdict(true, REASON.DISPATCH_COMMAND, {
     issueNumber,
     prompt: command.prompt,
+    requester: actor,
+    trigger: command.via,
     sessionName: buildSessionName('comment', issueNumber, payload)
   });
 }
@@ -173,18 +176,40 @@ function resolveEvent(input) {
  * unfalsifiable guard is worse than none -- it invites a test that passes for a
  * reason unrelated to the code it claims to cover. The line-start rule below is
  * what actually makes quoting inert, and test_actions_event.sh exercises it.
+ *
+ * Two forms are accepted, both subject to the same line-start rule:
+ *
+ *   /squad <instruction>                        the slash command
+ *   @squad-on-aca-control-plane <instruction>   an @mention of the App
+ *
+ * The mention form exists because @mentioning a bot is what people try first.
+ * It is accepted ONLY when a bot login is configured; with no configured
+ * identity there is nothing to mention and the form is inert rather than
+ * matching some arbitrary "@" prefix.
  */
-function extractCommand(body, prefix) {
+function extractCommand(body, prefix, mention) {
+  const forms = [{ token: prefix, via: 'command' }];
+  if (mention) {
+    // GitHub renders the App's login as "name[bot]" but users type "@name".
+    const bare = String(mention).replace(/\[bot\]$/i, '');
+    forms.push({ token: '@' + bare, via: 'mention' });
+    forms.push({ token: '@' + String(mention), via: 'mention' });
+  }
+
   const lines = String(body).split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const lower = trimmed.toLowerCase();
-    if (lower === prefix || lower.startsWith(prefix + ' ')) {
-      return { found: true, prompt: trimmed.slice(prefix.length).trim() };
+    for (const form of forms) {
+      const token = form.token.toLowerCase();
+      if (!token) continue;
+      if (lower === token || lower.startsWith(token + ' ')) {
+        return { found: true, prompt: trimmed.slice(form.token.length).trim(), via: form.via };
+      }
     }
   }
-  return { found: false, prompt: '' };
+  return { found: false, prompt: '', via: null };
 }
 
 function normalizeIssue(value) {

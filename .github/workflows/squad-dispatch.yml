@@ -46,6 +46,7 @@ jobs:
       session: ${{ steps.decide.outputs.session }}
       issue: ${{ steps.decide.outputs.issue }}
       prompt: ${{ steps.decide.outputs.prompt }}
+      requester: ${{ steps.decide.outputs.requester }}
     steps:
       - uses: actions/checkout@v4
 
@@ -70,6 +71,7 @@ jobs:
             echo "session=$(printf '%s' "$verdict" | jq -r '.sessionName // ""')"
             echo "issue=$(printf '%s' "$verdict" | jq -r '.issueNumber // ""')"
             echo "prompt=$(printf '%s' "$verdict" | jq -r '.prompt // ""')"
+            echo "requester=$(printf '%s' "$verdict" | jq -r '.requester // ""')"
           } >>"$GITHUB_OUTPUT"
 
       - name: Explain a refusal
@@ -145,6 +147,7 @@ jobs:
           SESSION: ${{ needs.resolve.outputs.session }}
           ISSUE: ${{ needs.resolve.outputs.issue }}
           PROMPT: ${{ needs.resolve.outputs.prompt }}
+          REQUESTER: ${{ needs.resolve.outputs.requester }}
           LEASE_KEY: ${{ steps.lease.outputs.leaseKey }}
           BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
           RG: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-squad-aca-dev-eastus2' }}
@@ -213,10 +216,27 @@ jobs:
             OV_RUN_COPILOT_SMOKE="false" \
             OV_OUTPUT_BRANCH="squad/issue-${ISSUE:-$SESSION}" \
             OV_PR_TITLE="Squad: issue #${ISSUE}" \
+            OV_COMMIT_MESSAGE="$commit_message" \
             OV_SQUAD_DISPATCH_SOURCE="actions" \
             OV_SQUAD_LEASE_KEY="$LEASE_KEY" \
             ralph_build_session_env
           )
+
+          # Attribution. A commit pushed by the control plane otherwise appears
+          # from nowhere: measured, GitHub attributes a commit ENTIRELY by the
+          # author email and not at all by the token used to push it, so a
+          # trailer is the honest way to record who asked. The requester is a
+          # GitHub login taken from the event payload, and it is placed in a
+          # trailer rather than the author field so the commit still reads as
+          # machine-authored -- which it is.
+          commit_message="Remote Squad session ${SESSION}"
+          if [ -n "${REQUESTER}" ]; then
+            commit_message="${commit_message}
+
+Requested by @${REQUESTER} via the ${TRIGGER_KIND:-Actions} trigger on issue #${ISSUE}.
+
+Co-authored-by: ${REQUESTER} <${REQUESTER}@users.noreply.github.com>"
+          fi
 
           # A session that reaches the worker without its credential fails the
           # token preflight two minutes in -- better than minute 55, but it
@@ -257,6 +277,34 @@ jobs:
             gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --add-label "$DISPATCH_LABEL" \
               || echo "Could not apply ${DISPATCH_LABEL}; Ralph may re-dispatch this issue."
           fi
+      - name: Tell the issue where its work went
+        if: steps.lease.outputs.action == 'start' && steps.start.outputs.exec != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ needs.resolve.outputs.issue }}
+          EXEC: ${{ steps.start.outputs.exec }}
+          SESSION: ${{ needs.resolve.outputs.session }}
+        run: |
+          set -euo pipefail
+          # Without this the requester sees a label change and then silence for
+          # anything up to an hour, with no way to tell a running session from a
+          # trigger that quietly refused.
+          #
+          # Posted with GITHUB_TOKEN on purpose: events caused by GITHUB_TOKEN do
+          # not start new workflow runs, so this comment cannot retrigger the
+          # dispatch. An App token WOULD retrigger it, which is why the resolver
+          # also refuses comments from its own identity -- two independent
+          # guards, because a runaway here bills by the minute.
+          [ -n "$ISSUE" ] || exit 0
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "Dispatched to Azure Container Apps.
+
+| | |
+|---|---|
+| Session | \`${SESSION}\` |
+| ACA execution | \`${EXEC}\` |
+| Trigger | [this workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |
+
+The agent runs in Azure. It will push a branch and open a pull request if it has changes to make. Nothing runs on a developer machine." || echo "Could not comment on #${ISSUE}; the session is running regardless."
       - name: A claimed lease MUST have produced an execution
         if: steps.lease.outputs.action == 'start'
         env:

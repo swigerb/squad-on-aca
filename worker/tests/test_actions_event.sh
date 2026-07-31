@@ -155,4 +155,36 @@ assert_eq "0" "$?" "a startable outcome exits 0"
 node "$MODULE" --claim-outcome claimed >/dev/null 2>&1
 assert_ne "0" "$?" "an ERROR outcome exits non-zero, so the workflow step FAILS instead of skipping a start and reporting green"
 
+# ---------------------------------------------------------------------------
+# Requester attribution and the @mention form (sprint 3)
+# ---------------------------------------------------------------------------
+out="$(resolve issues "$labeled")"
+assert_eq "swigerb" "$(printf '%s' "$out" | field requester)" "a label dispatch records WHO asked, so the resulting commits can credit them instead of appearing from nowhere"
+
+out="$(resolve issue_comment "$comment")"
+assert_eq "swigerb" "$(printf '%s' "$out" | field requester)" "a command dispatch records the commenter as the requester"
+assert_eq "command" "$(printf '%s' "$out" | field trigger)" "and records WHICH form triggered it"
+
+mention='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane please fix the flaky test","user":{"login":"swigerb","type":"User"}}}'
+out="$(resolve issue_comment "$mention")"
+assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "@mentioning the App dispatches -- mentioning a bot is what people try first, so supporting only a slash command loses those requests silently"
+assert_eq "mention" "$(printf '%s' "$out" | field trigger)" "the mention form is recorded distinctly from the slash command"
+assert_eq "please fix the flaky test" "$(printf '%s' "$out" | field prompt)" "the mention's prompt excludes the mention itself"
+
+mention_bot='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane[bot] go","user":{"login":"swigerb","type":"User"}}}'
+assert_eq "true" "$(resolve issue_comment "$mention_bot" | field dispatch)" "the literal '[bot]' suffix GitHub renders is accepted too, since that is what a copy-paste of the rendered name produces"
+
+mention_quoted="$(printf '{\"action\":\"created\",\"issue\":{\"number\":9,\"state\":\"open\"},\"comment\":{\"body\":\"> @squad-on-aca-control-plane go\",\"user\":{\"login\":\"swigerb\",\"type\":\"User\"}}}')"
+assert_eq "false" "$(resolve issue_comment "$mention_quoted" | field dispatch)" "a QUOTED mention does not dispatch -- the mention form is subject to the same line-start rule as the command"
+
+mention_mid='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"I think @squad-on-aca-control-plane could help here","user":{"login":"swigerb","type":"User"}}}'
+assert_eq "false" "$(resolve issue_comment "$mention_mid" | field dispatch)" "mentioning the App mid-sentence does NOT dispatch -- talking ABOUT the bot is not asking it to do something, and this is the single most likely accidental trigger"
+
+self_mention='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane retry","user":{"login":"squad-on-aca-control-plane[bot]","type":"Bot"}},"sender":{"login":"squad-on-aca-control-plane[bot]"}}'
+assert_eq "false" "$(resolve issue_comment "$self_mention" | field dispatch)" "the App mentioning ITSELF does not dispatch -- the loop break covers the new trigger form too"
+
+printf '%s' "$mention" >"${WORK}/event.json"
+no_bot="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json" --trigger-label squad --command-prefix /squad)"
+assert_eq "false" "$(printf '%s' "$no_bot" | field dispatch)" "with NO bot login configured the mention form is inert rather than matching some arbitrary '@' prefix -- there is no identity to mention"
+
 test_summary

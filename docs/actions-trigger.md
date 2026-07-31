@@ -9,17 +9,84 @@ to run, what to run, and whether someone is already running it — is made by th
 shared dispatch core in `worker/lib/`, the same code the local CLI, Ralph and
 Watch use. The control plane stays in Azure.
 
+## The whole path, end to end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as You
+    participant GH as GitHub
+    participant GA as GitHub Actions<br/>(trigger transport)
+    participant AAD as Microsoft Entra ID
+    participant ACA as Azure Container Apps<br/>(control plane + compute)
+    participant Ag as Copilot agent<br/>(in the session)
+
+    Dev->>GH: label an issue `squad`,<br/>or comment `/squad …`
+    GH->>GA: issues.labeled / issue_comment.created
+    GA->>GA: resolve the event<br/>(actions-event.js)
+    Note over GA: refuses its own comments,<br/>other bots, quotes, closed issues
+    GA->>AAD: OIDC token, subject<br/>repo:owner/repo:ref:refs/heads/main
+    AAD-->>GA: federated access token<br/>(no stored credential)
+    GA->>GH: claim the SHARED lease<br/>(squad-dispatch.js)
+    GH-->>GA: outcome: created / repaired / active
+    GA->>ACA: az containerapp job start<br/>(complete container spec + merged env)
+    ACA-->>GA: execution name
+    GA->>GH: comment the session and execution on the issue
+    GA->>GH: label `squad-aca:dispatched`
+    Note over GA: the workflow's job ends here
+    ACA->>Ag: run the session
+    Ag->>Ag: preflight the credential, clone, work
+    Ag->>GH: push a branch, open a pull request
+```
+
+Steps 1 to 11 take about a minute. Everything after step 12 happens in Azure
+with no laptop, no browser session, and no GitHub Actions minutes.
+
+### What runs where
+
+| Stage | Runs on | Holds |
+|---|---|---|
+| Deciding whether the event is a trigger | GitHub Actions runner | the event payload only |
+| Federating to Azure | GitHub Actions runner | a **short-lived** OIDC token; no stored Azure credential |
+| Claiming the lease | GitHub Actions runner | `GITHUB_TOKEN`, scoped to this repository |
+| **Deciding the route, running the agent, pushing** | **Azure Container Apps** | the session's own credential, delivered as an ACA secret |
+
+The workflow's last act is to start a job. It does **not** wait for the session,
+poll it, or hold its credential. If the runner vanished the moment after step 9,
+the session would still finish and still open its pull request.
+
+### Proof that this is real
+
+`docs/e2e-results.md` records five live runs of this exact path, including the
+three that failed and why. The final one — ACA execution
+`caj-squad-aca-session-nwxyb1h` — wrote that evidence file and opened its own
+pull request from inside Azure.
+
 ## How to trigger one
 
 | Trigger | What happens |
 |---|---|
 | Apply the **`squad`** label to an open issue | A session is dispatched to work that issue |
 | Comment **`/squad <instruction>`** on an open issue | A session is dispatched with your instruction as the prompt |
+| Comment **`@squad-on-aca-control-plane <instruction>`** | The same, using an @mention |
 | Comment **`/squad`** with no text | A session is dispatched with a default prompt |
 | Run the workflow manually | `workflow_dispatch`, with optional issue and prompt inputs |
 
 The label and the command prefix are configurable through repository variables
 `SQUAD_TRIGGER_LABEL` and `SQUAD_COMMAND_PREFIX`.
+
+## What you see back
+
+The trigger comments on the issue with the session name, the ACA execution name,
+and a link to the workflow run. Without it a requester sees a label change and
+then silence for up to an hour, with no way to distinguish a running session
+from a trigger that quietly refused.
+
+Commits carry a `Co-authored-by:` trailer naming whoever asked. That matters
+because of an empirical finding: **GitHub attributes a commit entirely by the
+author email and not at all by the token used to push it.** A commit pushed with
+an App installation token but authored as anything else shows as *unlinked* —
+no avatar, no user. See "Attribution" below.
 
 ## What will *not* trigger a session
 
@@ -31,6 +98,7 @@ workflow log, and each is covered by `worker/tests/test_actions_event.sh`.
 | The App itself comments or labels | `actor-is-this-app` |
 | Any other bot issues the command | `actor-is-a-bot` |
 | The command appears in a **quoted** reply (`> /squad ...`) | `comment-carries-no-command` |
+| The App is **@mentioned mid-sentence** (`I think @squad-... could help`) | `comment-carries-no-command` |
 | The command appears mid-sentence | `comment-carries-no-command` |
 | A comment is **edited** to contain the command | `action-not-a-trigger` |
 | The issue is closed | `issue-is-closed` |
@@ -48,6 +116,29 @@ an unbounded loop that bills by the minute.
 The `actor-is-this-app` refusal is what makes the App path safe, and it is
 checked before any other branch so nothing downstream can reach a dispatch.
 
+## Attribution
+
+Measured against a real GitHub App push, because it is not documented:
+
+| Commit author email | GitHub attribution |
+|---|---|
+| `squad-on-aca@users.noreply.github.com` | **`null` — unlinked** |
+| `<APP_ID>+<slug>[bot]@users.noreply.github.com` | **`null` — unlinked** |
+| `<BOT_USER_ID>+<slug>[bot]@users.noreply.github.com` | `squad-on-aca-control-plane[bot]` (Bot) |
+
+Two findings worth keeping:
+
+1. **The push token does not determine authorship at all.** All three commits
+   above were pushed with the same App installation token. Attribution comes
+   purely from the commit's author email.
+2. **The App ID is not the bot user ID.** They are different numbers, and using
+   the App ID — the intuitive choice — produces a silently *unlinked* commit. It
+   looks fine until you notice there is no avatar. The bot user ID comes from
+   `GET /users/<slug>[bot]`.
+
+Sessions therefore keep a machine author — the work *is* machine-authored — and
+credit the requester with a `Co-authored-by:` trailer, which links correctly and
+does not misrepresent who wrote the code.
 ## Why Actions rather than a webhook
 
 A webhook receiver would need public ingress, an always-on replica, and a stored
