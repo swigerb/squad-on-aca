@@ -1566,3 +1566,23 @@ measured TTL of exactly 3600 seconds, so it is not.
 - When a setting has a fallback AND an explicit assignment, the check must read
   the assignment. Ask "what does the deployed thing actually have", not "what
   would it have if nobody set it".
+
+## Future-work sprint 1 - a COPY cannot reach above its build context
+
+- The plan said "ship config/sandbox-classes.json into the image". It could not
+  be done as written: the build context was `worker/` and the file lives in
+  `config/`. Proven with a two-line Dockerfile:
+  `ERROR: "/config/sandbox-classes.json": not found`.
+- **Neither the plan nor my image-shaped simulation caught it, because neither
+  BUILDS anything.** A directory shaped like an image is not an image. The fix
+  needed a context move to the repo root plus a .dockerignore (0.6 MB -> 45 MB
+  otherwise).
+- **`echo EXIT=$?` inside an `az acr run` step is fiction.** A deliberate
+  `exit 70` reported `EXIT_DOLLAR=0`; the task engine consumes `\True` before
+  the shell sees it. I nearly recorded two exit codes that were never observed.
+  Let ACR fail the step and report `exit status 70` itself.
+- `az acr build` is the right verification tool on a locked-down machine: it
+  builds in Azure, so no local image pulls, no corporate egress, and it exercises
+  the EXACT command deploy.ps1 runs rather than a proxy for it.
+- The suite derives its layout by parsing the Dockerfile COPY lines. With a
+  hard-coded list, deleting the catalog from COPY would break nothing.

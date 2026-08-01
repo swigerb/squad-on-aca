@@ -766,3 +766,62 @@ refactor moved a `commit_message=` assignment below its own use, and the only
 thing that noticed was a live dispatch. The live end-to-end run is therefore
 still the last gate, not a formality. Both are worth having; neither replaces
 the other.
+## The shipped image layout
+
+`worker/tests/test_image_layout.sh` builds a throwaway directory shaped like the
+worker image and runs the dispatcher from it with **no `--catalog` override**,
+because that is how Ralph calls it.
+
+It exists because the packaged layout was never tested. Every routing assertion
+passed `--catalog` explicitly, and the dispatch suites exported
+`SQUAD_DISPATCH_CLI` pointing at the repository tree — so the one path
+production actually uses was the one path nothing exercised. `config/sandbox-classes.json`
+was absent from the image, and `squad-dispatch.js decide` exited **70** with
+`catalog-unavailable` on every Ralph run.
+
+**The layout is derived by parsing the Dockerfile `COPY` lines, not hard-coded.**
+That is the difference between a test and a decoration: with a hard-coded list,
+deleting the catalog from `COPY` would break nothing and the suite would stay
+green while the image shipped broken.
+
+### The build context is the repository root
+
+`config/sandbox-classes.json` lives outside `worker/`, and **a `COPY` cannot
+reach above its build context.** Proven, not assumed:
+
+```
+COPY ../config/sandbox-classes.json /usr/local/lib/squad-on-aca/
+ERROR: "/config/sandbox-classes.json": not found
+```
+
+So `scripts/deploy.ps1` builds with `--file worker/Dockerfile <repoRoot>`, and a
+root `.dockerignore` keeps the uploaded context small (0.6 MB of `worker/` would
+otherwise become 45 MB of repository). `validate.ps1` asserts the root context
+and the `--file` flag stay together, because separating them breaks every `COPY`.
+
+### Verified against the real image, not a simulation
+
+An image-shaped directory is still a proxy. The change was also built in ACR
+with the exact command `deploy.ps1` runs, and exercised in the built image:
+
+```
+$ ls /usr/local/lib/squad-on-aca/
+...  sandbox-classes.json  squad-dispatch.js  ...
+
+$ node /usr/local/lib/squad-on-aca/squad-dispatch.js decide ... (no --catalog)
+{"routing":{"route":"aca-job","action":"dispatch",
+ "capability":{"catalogSchemaVersion":1,"catalogProvisional":false, ...}}}
+```
+
+And the negative control, the image deployed before this change, with ACR
+reporting the exit code itself:
+
+```
+squad-dispatch: cannot resolve a dispatch route: sandbox class catalog not found
+failed to run step ID: acb_step_0: exit status 70
+```
+
+A note on how that exit code was obtained, because the first attempt was wrong:
+an `echo EXIT=$?` inside an `az acr run` step reports **0 even for a deliberate
+`exit 70`** — the task engine consumes `$?` before the shell sees it. Any exit
+code read that way is fiction. Let ACR fail the step and report the status.

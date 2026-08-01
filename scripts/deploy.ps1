@@ -95,7 +95,12 @@ if (-not (az acr show --name $AcrName --resource-group $ResourceGroupName --quer
 }
 $loginServer = az acr show --name $AcrName --resource-group $ResourceGroupName --query loginServer -o tsv
 
-az acr build --registry $AcrName --image "squad-worker:$ImageTag" (Join-Path $repoRoot "worker")
+# The build context is the REPOSITORY ROOT, not worker/. worker/Dockerfile must
+# copy config/sandbox-classes.json into the image (it is the catalog the
+# in-image dispatcher reads when no --catalog is passed, which is how Ralph
+# calls it) and a COPY cannot reach above its build context. scripts/validate.ps1
+# asserts this line keeps the root context and the --file flag together.
+az acr build --registry $AcrName --image "squad-worker:$ImageTag" --file "worker/Dockerfile" $repoRoot
 az account set --subscription $SubscriptionId
 $image = "$loginServer/squad-worker:$ImageTag"
 

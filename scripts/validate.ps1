@@ -5092,6 +5092,230 @@ if ($false) {
 }
 
 # ---------------------------------------------------------------------------
+# The shipped image layout (ADR 0003 finding 1 / future-work sprint 1)
+# ---------------------------------------------------------------------------
+Write-Section "Shipped image layout"
+
+# WHY THIS SECTION EXISTS.
+#
+# worker/lib/resolve-capability-route.js shipped in the worker image;
+# config/sandbox-classes.json did not. Ralph runs INSIDE that image and calls
+# `squad-dispatch.js decide` with no --catalog, so catalogSearchPaths() found
+# nothing, `decide` exited 70 with reason "catalog-unavailable", and every cron
+# run logged a plausible-sounding skip and dispatched nothing. 911 worker
+# assertions and 363 checks here were green throughout, because every routing
+# test passed --catalog explicitly and every dispatch test exported
+# SQUAD_DISPATCH_CLI at a repo-relative path.
+#
+# worker/tests/test_image_layout.sh proves the BEHAVIOUR from a layout derived
+# from the Dockerfile. The checks below generalise the defect class instead of
+# fixing one instance of it: they assert that everything a shipped file needs at
+# require() time is itself shipped, and that the behavioural suite has not
+# quietly acquired the override that hid the bug in the first place.
+
+$workerDockerfileLayout = Join-Path $RepoRoot "worker\Dockerfile"
+$imageLayoutSuite       = Join-Path $RepoRoot "worker\tests\test_image_layout.sh"
+$dockerIgnorePath       = Join-Path $RepoRoot ".dockerignore"
+
+# --- Parse the COPY instructions --------------------------------------------
+# Same rule as the bash suite: strict, and loud when it does not understand a
+# form. A parser that guessed would re-open the hole it exists to close.
+$copyRecords = @()
+$copyParseError = $null
+if (-not (Test-Path $workerDockerfileLayout)) {
+    $copyParseError = "worker/Dockerfile is missing"
+} else {
+    foreach ($line in (Get-Content -LiteralPath $workerDockerfileLayout)) {
+        if ($line -notmatch '^\s*COPY\s') { continue }
+        if ($line -match '\\\s*$')  { $copyParseError = "a COPY instruction uses a line continuation, which this parser does not implement"; break }
+        if ($line -match '\[')      { $copyParseError = "a COPY instruction uses the JSON-array form, which this parser does not implement"; break }
+        if ($line -match '--from=') { $copyParseError = "a COPY instruction copies from another build stage, so its source is not a context file"; break }
+        $operands = @(($line -split '\s+') | Where-Object { $_ -ne '' } | Select-Object -Skip 1 | Where-Object { $_ -notlike '--*' })
+        if ($operands.Count -lt 2) { $copyParseError = "a COPY instruction has fewer than two path operands"; break }
+        $copyRecords += ,@{
+            Dest    = $operands[-1]
+            Sources = @($operands[0..($operands.Count - 2)])
+        }
+    }
+}
+
+if ($copyParseError) {
+    Add-Fail "worker/Dockerfile COPY instructions could not be parsed ($copyParseError); the shipped file list is unknown and nothing below could be checked"
+    $shippedSources = @()
+} else {
+    $shippedSources = @($copyRecords | ForEach-Object { $_.Sources })
+    if ($shippedSources.Count -ge 10) {
+        Add-Pass "worker/Dockerfile COPY instructions parsed to $($shippedSources.Count) shipped source files"
+    } else {
+        Add-Fail "worker/Dockerfile COPY instructions parsed to only $($shippedSources.Count) source files; a parse that finds almost nothing would make every layout check below vacuous"
+    }
+
+    # --- 1. Every COPY source exists in the build context --------------------
+    $missingSources = @($shippedSources | Where-Object { -not (Test-Path (Join-Path $RepoRoot ($_ -replace '/', '\'))) })
+    if ($missingSources.Count -eq 0) {
+        Add-Pass "Every worker/Dockerfile COPY source exists in the repository, so 'az acr build' cannot fail on a missing context file"
+    } else {
+        Add-Fail "worker/Dockerfile COPY names $($missingSources.Count) path(s) that do not exist ($($missingSources -join ', ')); the image build would fail"
+    }
+
+    # --- 2. The catalog is shipped, at the name the resolver looks for --------
+    # catalogSearchPaths()[0] is <__dirname>/sandbox-classes.json. The packaged
+    # BASENAME therefore has to be exactly that: shipping it as
+    # sandbox-classes.json.txt would satisfy a "the Dockerfile mentions the
+    # catalog" grep and still leave Ralph dead.
+    $libRecord = $copyRecords | Where-Object { $_.Dest -eq '/usr/local/lib/squad-on-aca/' } | Select-Object -First 1
+    if (-not $libRecord) {
+        Add-Fail "No worker/Dockerfile COPY targets /usr/local/lib/squad-on-aca/; the worker libraries would not be in the image at all"
+    } elseif ($libRecord.Sources -contains 'config/sandbox-classes.json') {
+        Add-Pass "worker/Dockerfile ships config/sandbox-classes.json into /usr/local/lib/squad-on-aca/, which is catalogSearchPaths()[0]; without it Ralph's 'decide' exits 70 with catalog-unavailable on every issue"
+    } else {
+        Add-Fail "worker/Dockerfile does not ship config/sandbox-classes.json into /usr/local/lib/squad-on-aca/; the in-image dispatcher passes no --catalog, so every Ralph dispatch would be refused as catalog-unavailable"
+    }
+
+    $routeResolverPath = Join-Path $RepoRoot "worker\lib\resolve-capability-route.js"
+    if (Test-Path $routeResolverPath) {
+        $resolverText = Get-Content -LiteralPath $routeResolverPath -Raw
+        if ($resolverText -match "path\.join\(__dirname,\s*'sandbox-classes\.json'\)") {
+            Add-Pass "catalogSearchPaths() still looks beside the worker libraries for sandbox-classes.json, which is the path the Dockerfile ships to"
+        } else {
+            Add-Fail "catalogSearchPaths() no longer looks for <__dirname>/sandbox-classes.json; the file the Dockerfile ships into /usr/local/lib/squad-on-aca/ would never be read"
+        }
+    }
+
+    # --- 3. Every shipped require() target is shipped ------------------------
+    # THE GENERALISATION. The catalog was one instance of "a shipped file needs
+    # something the image does not contain". This makes the whole class fail a
+    # build: adding require('./new-thing.js') to a shipped .js without adding it
+    # to COPY is a MODULE_NOT_FOUND at runtime, inside a cron job, with the same
+    # quiet skip as the original defect.
+    $shippedBasenames = @{}
+    foreach ($rec in $copyRecords) {
+        foreach ($src in $rec.Sources) {
+            $leaf = if ($rec.Dest.EndsWith('/')) { Split-Path -Leaf $src } else { Split-Path -Leaf $rec.Dest }
+            $shippedBasenames["$($rec.Dest)$leaf"] = $src
+        }
+    }
+    $unshippedRequires = @()
+    $checkedRequires = 0
+    foreach ($rec in $copyRecords) {
+        if (-not $rec.Dest.EndsWith('/')) { continue }
+        foreach ($src in $rec.Sources) {
+            if ($src -notlike '*.js') { continue }
+            $srcPath = Join-Path $RepoRoot ($src -replace '/', '\')
+            if (-not (Test-Path $srcPath)) { continue }
+            foreach ($m in [regex]::Matches((Get-Content -LiteralPath $srcPath -Raw), "require\(\s*'(\./[^']+)'\s*\)")) {
+                $checkedRequires++
+                $target = "$($rec.Dest)$(Split-Path -Leaf $m.Groups[1].Value)"
+                if (-not $shippedBasenames.ContainsKey($target)) {
+                    $unshippedRequires += "$src requires $($m.Groups[1].Value)"
+                }
+            }
+        }
+    }
+    if ($checkedRequires -eq 0) {
+        Add-Fail "No relative require() was found in any shipped .js file; the shipped-require check would pass vacuously, so it is being treated as a failure"
+    } elseif ($unshippedRequires.Count -eq 0) {
+        Add-Pass "Every shipped require() target is shipped ($checkedRequires relative require(s) across the shipped .js files resolve to files the Dockerfile also copies)"
+    } else {
+        Add-Fail "Every shipped require() target is shipped: FAILED for $($unshippedRequires.Count) ($($unshippedRequires -join '; ')); the module would be missing inside the image and the caller would die with MODULE_NOT_FOUND at runtime"
+    }
+
+    # --- 4. The catalog is normalised the way a JSON file should be ----------
+    # `chmod +x` on a JSON document is meaningless, and CRLF-stripping it is
+    # unnecessary (JSON.parse treats \r as whitespace). Both would be signals
+    # that someone treated the catalog as a script.
+    $dockerLayoutText = Get-Content -LiteralPath $workerDockerfileLayout -Raw
+    $sedLine   = @($dockerLayoutText -split "`n" | Where-Object { $_ -match 'sed -i' }) -join ' '
+    $chmodLine = @($dockerLayoutText -split "`n" | Where-Object { $_ -match 'chmod \+x' }) -join ' '
+    if ($chmodLine -notmatch 'sandbox-classes\.json') {
+        Add-Pass "worker/Dockerfile does not chmod +x the packaged catalog; it is data the dispatcher reads, not a script"
+    } else {
+        Add-Fail "worker/Dockerfile chmod +x's sandbox-classes.json; an executable catalog is a signal it is being treated as a script"
+    }
+    if ($sedLine -notmatch 'sandbox-classes\.json') {
+        Add-Pass "worker/Dockerfile does not CRLF-strip the packaged catalog; JSON.parse already treats CR as whitespace, and .gitattributes pins config/*.json to LF"
+    } else {
+        Add-Fail "worker/Dockerfile CRLF-strips sandbox-classes.json; that list is for shell scripts, and adding data files to it hides which files actually need it"
+    }
+
+    # --- 5. The build context can actually reach those sources ---------------
+    # config/ is OUTSIDE worker/, and a COPY cannot reach above its context, so
+    # the image can only be built from the repository root. Building from
+    # worker/ would fail every COPY -- loudly, but at deploy time rather than
+    # here.
+    $deployLayoutPath = Join-Path $RepoRoot "scripts\deploy.ps1"
+    if (-not (Test-Path $deployLayoutPath)) {
+        Add-Fail "scripts/deploy.ps1 is missing; nothing builds the worker image"
+    } else {
+        $acrBuildLine = @(Get-Content -LiteralPath $deployLayoutPath | Where-Object { $_ -match 'acr build' -and $_ -match 'squad-worker' }) -join ' '
+        if ($acrBuildLine -eq '') {
+            Add-Fail "scripts/deploy.ps1 no longer builds squad-worker with 'az acr build'; the layout checks here describe an image nothing produces"
+        } elseif ($acrBuildLine -match '--file\s+"?worker/Dockerfile"?' -and $acrBuildLine -match '\$repoRoot\s*$') {
+            Add-Pass "scripts/deploy.ps1 builds squad-worker with --file worker/Dockerfile and the REPOSITORY ROOT as context, which is the only context that can reach config/sandbox-classes.json"
+        } else {
+            Add-Fail "scripts/deploy.ps1 does not build squad-worker from the repository root with --file worker/Dockerfile; a worker/-rooted context cannot reach config/sandbox-classes.json and every COPY would fail"
+        }
+    }
+
+    # --- 6. .dockerignore must not exclude anything the Dockerfile copies ----
+    if (Test-Path $dockerIgnorePath) {
+        $ignoreLines = @(Get-Content -LiteralPath $dockerIgnorePath | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' -and $_ -notmatch '^#' })
+        $fancy = @($ignoreLines | Where-Object { $_ -match '[*?!\[]' })
+        if ($fancy.Count -gt 0) {
+            Add-Fail ".dockerignore uses wildcard or re-include patterns ($($fancy -join ', ')); this check only understands literal path prefixes and refuses to guess whether a COPY source survives them"
+        } else {
+            $excluded = @()
+            foreach ($src in $shippedSources) {
+                foreach ($pattern in $ignoreLines) {
+                    $p = $pattern.TrimEnd('/')
+                    if ($src -eq $p -or $src.StartsWith("$p/")) { $excluded += "$src (by '$pattern')" }
+                }
+            }
+            if ($excluded.Count -eq 0) {
+                Add-Pass ".dockerignore excludes nothing worker/Dockerfile copies ($($ignoreLines.Count) literal prefix(es) checked against $($shippedSources.Count) COPY sources)"
+            } else {
+                Add-Fail ".dockerignore excludes $($excluded.Count) file(s) the Dockerfile copies ($($excluded -join ', ')); the build would fail with 'file not found in build context'"
+            }
+        }
+    }
+}
+
+# --- 7. The behavioural suite exists, runs, and passes no override -----------
+# M6 in the sprint plan. The suite's whole value is that it invokes the
+# dispatcher the way PRODUCTION invokes it. One `--catalog "$CATALOG"` on any
+# invocation and it goes back to proving nothing -- which is precisely how the
+# original defect survived 911 assertions.
+if (-not (Test-Path $imageLayoutSuite)) {
+    Add-Fail "worker/tests/test_image_layout.sh is missing; nothing exercises the packaged layout and a Dockerfile edit could silently un-ship the catalog again"
+} else {
+    $suiteLines = Get-Content -LiteralPath $imageLayoutSuite
+    Add-Pass "worker/tests/test_image_layout.sh exists and is picked up by worker/tests/run-tests.sh (test_*.sh)"
+
+    # Command lines only: the assertion MESSAGES have to be able to say
+    # "--catalog", and the setup has to be able to `unset`
+    # SQUAD_SANDBOX_CLASS_CATALOG. What must never appear is the flag or the
+    # variable on a line that actually invokes something.
+    $invocationLines = @($suiteLines | Where-Object {
+        $_ -notmatch '^\s*#' -and ($_ -match '\bnode\s' -or $_ -match 'squad_dispatch_' -or $_ -match 'ralph_dispatch_issue')
+    })
+    $overrides = @($invocationLines | Where-Object { $_ -match '--catalog' -or $_ -match 'SQUAD_SANDBOX_CLASS_CATALOG\s*=' })
+    $exported  = @($suiteLines | Where-Object { $_ -notmatch '^\s*#' -and $_ -match '^\s*export\s+SQUAD_(SANDBOX_CLASS_CATALOG|DISPATCH_CLI)\b' })
+    if ($invocationLines.Count -eq 0) {
+        Add-Fail "worker/tests/test_image_layout.sh contains no dispatcher invocation at all; there is nothing for the no-override check to be about"
+    } elseif ($overrides.Count -eq 0 -and $exported.Count -eq 0) {
+        Add-Pass "test_image_layout.sh passes no catalog override on any of its $($invocationLines.Count) invocation line(s), and exports neither SQUAD_SANDBOX_CLASS_CATALOG nor SQUAD_DISPATCH_CLI, so it exercises the resolution production performs"
+    } else {
+        Add-Fail "test_image_layout.sh passes a catalog override ($(($overrides + $exported) -join ' | ')); handing the dispatcher a catalog is exactly what let the packaging defect survive 911 assertions"
+    }
+
+    if (($suiteLines -join "`n") -match 'COPY') {
+        Add-Pass "test_image_layout.sh derives its layout from the Dockerfile COPY instructions rather than a hard-coded file list, so removing a file from COPY removes it from the test"
+    } else {
+        Add-Fail "test_image_layout.sh no longer reads the Dockerfile COPY instructions; a hard-coded file list would keep passing after the catalog was un-shipped"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Every workflow file must PARSE (issue #32 S4)
 # ---------------------------------------------------------------------------
 Write-Section "Workflow files parse as YAML"

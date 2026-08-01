@@ -74,6 +74,19 @@ routing decision's test surface); it does not depend on sprint 2.
 
 ## Sprint 1: ship the catalog into the worker image and prove the shipped layout resolves a route
 
+> **DONE.** Landed with one correction the plan did not anticipate: `COPY`
+> cannot reach above its build context, so shipping a file from `config/` also
+> required moving the build context to the repository root and adding a
+> `.dockerignore`. Neither the plan nor an image-shaped simulation could catch
+> that, because neither builds. Verified in ACR against the real image:
+> `route: aca-job`, `action: dispatch`, `catalogSchemaVersion: 1` with no
+> `--catalog`; the previously deployed image fails the same probe with ACR
+> reporting `exit status 70`.
+>
+> Mutation results: M1 fails 5 assertions by name; M4 — the control proving the
+> suite can still fail — fails 2. Gates: `validate.ps1` 363 -> **375**, worker
+> suite 14 suites / 911 -> **15 suites / 923**.
+
 **Goal.** A dispatcher running inside the worker image resolves a routing
 decision without being handed a catalog path.
 
