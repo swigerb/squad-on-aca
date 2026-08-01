@@ -1147,3 +1147,4 @@ One honest gap remains, and the preflight says so itself:
 The session job still runs on a long-lived PAT, so the one-hour lifetime check
 has nothing to check. Minting a GitHub App installation token at dispatch time
 and passing `SQUAD_TOKEN_EXPIRES_AT` is tracked separately.
+Attribution verified live on issue #59.
