@@ -21,7 +21,7 @@ sequenceDiagram
     participant ACA as Azure Container Apps<br/>(control plane + compute)
     participant Ag as Copilot agent<br/>(in the session)
 
-    Dev->>GH: label an issue `squad`,<br/>or comment `/squad …`
+    Dev->>GH: label an issue `squad-aca`,<br/>or comment `/squad …`
     GH->>GA: issues.labeled / issue_comment.created
     GA->>GA: resolve the event<br/>(actions-event.js)
     Note over GA: refuses its own comments,<br/>other bots, quotes, closed issues
@@ -66,7 +66,7 @@ pull request from inside Azure.
 
 | Trigger | What happens |
 |---|---|
-| Apply the **`squad`** label to an open issue | A session is dispatched to work that issue |
+| Apply the **`squad-aca`** label to an open issue | A session is dispatched to work that issue |
 | Comment **`/squad <instruction>`** on an open issue | A session is dispatched with your instruction as the prompt |
 | Comment **`@squad-on-aca-control-plane <instruction>`** | The same, using an @mention |
 | Comment **`/squad`** with no text | A session is dispatched with a default prompt |
@@ -88,6 +88,43 @@ author email and not at all by the token used to push it.** A commit pushed with
 an App installation token but authored as anything else shows as *unlinked* —
 no avatar, no user. See "Attribution" below.
 
+## Why the label is `squad-aca` and not `squad`
+
+`squad` is **Squad''s own triage inbox**. `sync-squad-labels.yml` defines it as
+*"Squad triage inbox — Lead will assign to a member"*, and `squad-triage.yml`
+fires on exactly that name:
+
+```yaml
+if: github.event.label.name == ''squad''
+```
+
+Using it as the ACA dispatch trigger gave one label two unrelated meanings:
+*Lead, please route this* and *spend money running a remote container*.
+
+That is not hypothetical. Measured on this repository, applying `squad` fired
+Squad''s triage **within ten seconds**:
+
+```
+20:23:50Z labeled squad             by swigerb
+20:24:00Z labeled squad:lead        by github-actions[bot]
+20:24:05Z labeled go:needs-research by github-actions[bot]
+```
+
+`squad-aca` is also deliberately **not** `squad:`-prefixed, because
+`squad-issue-assign.yml` treats every `squad:*` label as a member assignment —
+the same reason Ralph''s marker has always been `squad-aca:dispatched` rather
+than `squad:dispatched`. It is likewise outside the `go:`, `release:`, `type:`
+and `priority:` namespaces that `squad-label-enforce.yml` manages exclusively.
+
+**Ralph watches the same label.** It has to: if the two dispatchers watched
+different labels they would never see the same work, and the shared lease that
+prevents double dispatch would never actually be exercised. `validate.ps1`
+asserts both that no trigger label collides with Squad''s scheme and that the
+dispatchers agree on one.
+
+Override with the repository variable `SQUAD_TRIGGER_LABEL` (and `RALPH_LABELS`
+for Ralph) if you want a different name — but keep them equal, and keep them out
+of Squad''s namespaces.
 ## What will *not* trigger a session
 
 These are refusals, not bugs. Each one has a named reason that appears in the

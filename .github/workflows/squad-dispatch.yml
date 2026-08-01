@@ -53,7 +53,7 @@ jobs:
       - name: Decide whether this event is a trigger
         id: decide
         env:
-          SQUAD_TRIGGER_LABEL: ${{ vars.SQUAD_TRIGGER_LABEL || 'squad' }}
+          SQUAD_TRIGGER_LABEL: ${{ vars.SQUAD_TRIGGER_LABEL || 'squad-aca' }}
           SQUAD_COMMAND_PREFIX: ${{ vars.SQUAD_COMMAND_PREFIX || '/squad' }}
           SQUAD_BOT_LOGIN: ${{ vars.SQUAD_BOT_LOGIN || 'squad-on-aca-control-plane[bot]' }}
         run: |

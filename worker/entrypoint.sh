@@ -521,7 +521,7 @@ NODE
     gh issue list \
       --repo "$GITHUB_REPOSITORY" \
       --state open \
-      --label "${RALPH_LABELS:-squad}" \
+      --label "${RALPH_LABELS:-squad-aca}" \
       --limit "${RALPH_MAX_ISSUES:-3}" \
       --json number,title,url,labels,assignees > "$issues_json"
 
