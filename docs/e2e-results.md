@@ -1148,3 +1148,77 @@ The session job still runs on a long-lived PAT, so the one-hour lifetime check
 has nothing to check. Minting a GitHub App installation token at dispatch time
 and passing `SQUAD_TOKEN_EXPIRES_AT` is tracked separately.
 Attribution verified live on issue #59.
+
+---
+
+# Issue #62 — `squad-aca` label dispatches, `squad` does not
+
+Requested by @swigerb. Verifies that #61's fix — moving the dispatch trigger
+label off Squad's own `squad` triage label and onto a dedicated `squad-aca`
+label — actually holds both directions: `squad-aca` dispatches, and `squad`
+(the triage inbox `squad-triage.yml` listens for) does **not**.
+
+**Environment:** Node.js, commit `0d483d7` at time of verification, date
+(UTC) 2026-08-01.
+
+## Static evidence (executed)
+
+### 1. Direct invocation of the shared decision core
+
+Running `worker/lib/actions-event.js` (the same module `squad-dispatch.yml`'s
+`resolve` job shells out to) against a synthetic `labeled` event, with no
+`--trigger-label` override so the module's own default applies:
+
+```text
+== squad-aca label ==
+{"dispatch":true,"reason":"label-applied","issueNumber":62,"label":"squad-aca","requester":"swigerb","sessionName":"issue-62-<run>"}
+== squad label ==
+{"dispatch":false,"reason":"label-not-the-trigger-label","label":"squad"}
+```
+
+`squad-aca` dispatches (`dispatch:true`, `reason:"label-applied"`); `squad`
+is refused (`dispatch:false`, `reason:"label-not-the-trigger-label"`) — the
+two labels are opposites, not merely "one of them happens to be refused."
+
+### 2. Regression test added: `worker/tests/test_actions_event.sh`
+
+Before this issue, the suite proved `squad` is refused under the module's
+default trigger label, but nothing asserted that the default (`squad-aca`)
+is actually *accepted* with no override — every earlier passing case in the
+file supplied `--trigger-label squad` explicitly via its `resolve()` helper.
+A typo'd `DEFAULT_TRIGGER_LABEL` could have broken dispatch in production
+while every existing test in the file still passed. Added a case that calls
+the module directly (no `--trigger-label` flag) with a `squad-aca` label and
+asserts `dispatch:true` / `reason:"label-applied"`, alongside the existing
+`squad`-is-refused case, so both directions of the #32/#61 fix are pinned:
+
+```text
+$ bash worker/tests/test_actions_event.sh
+...
+ok - the default trigger label is NOT 'squad' -- that is Squad's own triage inbox, and reusing it makes one label mean both 'Lead, please route this' and 'spend money running a remote container'
+ok - with the DEFAULT trigger label, Squad's own 'squad' label does NOT dispatch a remote session -- an issue dropped in the triage inbox must not start billing
+ok - and it is refused for the right reason
+ok - with NO --trigger-label override, the DEFAULT label 'squad-aca' DOES dispatch -- confirming the two labels are handled as opposites, not just that one of them refuses
+ok - and it dispatches for the expected reason
+
+56 assertions run, 0 failed.
+```
+
+### 3. Full worker suite
+
+`bash worker/tests/run-tests.sh` — 12 of 14 suites pass in this sandbox;
+`test_push.sh` and `test_token_preflight.sh` fail here on pre-existing,
+unrelated environment causes (no network egress for the real git push, and
+no live GitHub credential to preflight against) — neither touches label
+routing and both fail identically without this change.
+
+## Result
+
+- `squad-aca` label → dispatch: **PASS**.
+- `squad` label → no dispatch (routes to `squad-triage.yml` only): **PASS**.
+- Regression coverage for the accepting direction was missing and is now
+  added, so the two directions can't silently drift apart again.
+- No live Actions run was triggered for this verification — the shared
+  decision core that every dispatcher (`local-cli`, `ralph`, `watch`,
+  `actions`) calls was exercised directly, which is what #44/#55's live runs
+  already proved is the same code path `squad-dispatch.yml` executes.
