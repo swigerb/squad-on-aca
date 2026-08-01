@@ -211,4 +211,17 @@ out="$(node "$MODULE" --event-name issues --event-path "${WORK}/event.json" --co
 assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "with the DEFAULT trigger label, Squad's own 'squad' label does NOT dispatch a remote session -- an issue dropped in the triage inbox must not start billing"
 assert_eq "label-not-the-trigger-label" "$(printf '%s' "$out" | field reason)" "and it is refused for the right reason"
 
+# Issue #62: the previous case proves 'squad' is refused under the DEFAULT
+# trigger label, but nothing above proves the DEFAULT ('squad-aca') is
+# actually ACCEPTED with no --trigger-label override -- every earlier
+# dispatching case in this file passes --trigger-label squad explicitly via
+# resolve(). Without this, a regression that silently broke the default
+# (e.g. a typo'd DEFAULT_TRIGGER_LABEL) would pass every test in this file
+# while dispatch was completely dead in production.
+squad_aca_label='{"action":"labeled","label":{"name":"squad-aca"},"issue":{"number":7,"state":"open"},"sender":{"login":"swigerb"}}'
+printf '%s' "$squad_aca_label" >"${WORK}/event.json"
+out="$(node "$MODULE" --event-name issues --event-path "${WORK}/event.json" --command-prefix /squad)"
+assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "with NO --trigger-label override, the DEFAULT label 'squad-aca' DOES dispatch -- confirming the two labels are handled as opposites, not just that one of them refuses"
+assert_eq "label-applied" "$(printf '%s' "$out" | field reason)" "and it dispatches for the expected reason"
+
 test_summary
