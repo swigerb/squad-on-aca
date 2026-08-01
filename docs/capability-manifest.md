@@ -85,7 +85,7 @@ notes: Bootstrap notes for humans or agents working on this repo.
 | `tools[]` | `name`, `required`, `reason` | A tool identifier matched against a **built-in allowlist** of fixed preflight checks. The manifest does not carry shell commands. |
 | `credentials[]` | `name`, `required`, `reason` | An allowlisted environment variable name whose **presence** is checked. Values are never printed. |
 | `services[]` | `name`, `required`, `reason` | An external service the task depends on (for example a database). The worker cannot safely auto-provision or reach arbitrary services, so these are **advisory-only documented dependencies**. `required: true` is **not supported** and is rejected at validation (see below) — declare services `required: false`. |
-| `egress[]` | `host`, `reason` | A network destination the task needs to reach. Advisory only today. |
+| `egress[]` | `host`, `reason` | A network destination the task needs to reach. **Enforced on the ACA Sandboxes plane** (it narrows the approved class's default-deny template, and a destination the template does not already permit is a hard failure); **advisory on the ACA Jobs plane**, which has no per-execution network control. See [What's deliberately out of scope in this phase](#whats-deliberately-out-of-scope-in-this-phase). |
 | `image` | `hint`, `reason` | Advisory pointer to a worker image that would satisfy this repo's needs. Not auto-applied today. |
 | `notes` | string | Free-form guidance for humans or agents. |
 
@@ -530,8 +530,18 @@ see [Image evidence](#image-evidence) and the runbook procedure.
 
 ## What's deliberately out of scope in this phase
 
+> **Corrected 2026-08-01.** This section was written in the voice of the pull
+> request that introduced the manifest, and several sprints have landed since.
+> Four of its claims were stale and one concealed a live defect. The findings,
+> the disposition of each effort, and the evidence are in
+> [ADR 0003](adr/0003-capability-manifest-future-work.md); the scheduled work and
+> how each sprint will be falsified are in
+> [docs/plans/capability-manifest-future-work.md](plans/capability-manifest-future-work.md).
+> The original text is preserved below with corrections marked, because what was
+> believed at the time is part of the record.
+
 These are real, valuable next steps that the manifest is designed to feed,
-but they need more design/security review than fits in one PR:
+but they need more design/security review than fits in one PR.
 
 ### Future: per-task images and Sandboxes
 
@@ -558,14 +568,27 @@ landed:
 
 Still outstanding:
 
-- **Packaging.** `worker/lib/resolve-capability-route.js` is copied into the
-  worker image, but `config/sandbox-classes.json` is not: resolution for a
-  dispatch runs control-plane side, against the repository working tree, before
-  any compute is requested.
+- **Packaging — and this is a live defect, not deferred work.**
+  `worker/lib/resolve-capability-route.js` is copied into the worker image, but
+  `config/sandbox-classes.json` is not. The original text described the
+  consequence as "resolution for a dispatch runs control-plane side": true of the
+  PowerShell CLI and of GitHub Actions, **but not of Ralph**, which runs *inside*
+  the image on a five-minute cron and calls the same resolver. In the image
+  neither default catalog search path exists, so every Ralph dispatch decision
+  returns `catalog-unavailable` / `refuse` and Ralph skips the issue with a log
+  line indistinguishable from a legitimate capability refusal. Verified by
+  running the shipped entry point from an image-shaped directory. No test caught
+  it because every routing assertion passes `--catalog` explicitly or runs from
+  the repository tree. Scheduled as
+  [sprint 1](plans/capability-manifest-future-work.md#sprint-1-ship-the-catalog-into-the-worker-image-and-prove-the-shipped-layout-resolves-a-route).
 - **One manifest-path implementation.** The resolver mirrors the preflight's
-  hardened manifest-path resolution rather than sharing it, because the phase
-  that introduced it deliberately did not modify the shipped
-  `squad-capability-preflight.sh`. The two should be unified.
+  hardened manifest-path resolution rather than sharing it. Still true; the
+  original text's *reason* — "the phase that introduced it deliberately did not
+  modify the shipped `squad-capability-preflight.sh`", to be unified "when Sprint
+  3 introduces the provider seam" — has expired. Sprint 3 landed, the provider
+  seam exists, and the two copies have already begun to drift in how they handle
+  an unreadable repository directory. Scheduled as
+  [sprint 2](plans/capability-manifest-future-work.md#sprint-2-one-manifest-path-implementation).
 
 Whatever consumes the decision, the in-worker preflight stays the final safety
 check: routing chooses *where* to run, and preflight still verifies the
@@ -573,13 +596,53 @@ environment that actually booted.
 
 ### Future: controlled egress
 
+> **Stale as originally written.** The paragraph below said `egress[]` entries
+> "are advisory today because the worker's network policy is not manifest-driven".
+> That is no longer true on the Sandboxes plane, and it understates a different
+> problem on the Jobs plane. Corrected immediately after.
+
 `egress[]` entries are advisory today because the worker's network policy
 is not manifest-driven. A follow-up could generate scoped egress rules (for
 example, ACA environment network rules or a proxy allowlist) from the
 declared `egress[]` hosts, so a task gets exactly the network access it
 declared needing — no more, no less.
 
+**What is actually true.** On the **ACA Sandboxes** plane the policy *is*
+manifest-driven and enforced before repository code runs:
+`New-SandboxEgressPolicy` in
+`scripts/lib/providers/squad-sandbox-provider.ps1` generates it from the
+approved class template plus the manifest's request, where the request may only
+narrow; refuses a class whose `defaultAction` is not `Deny`; refuses a requested
+destination the template does not already permit; and asserts that every emitted
+rule has template provenance. See
+[ADR 0001, G4](adr/0001-aca-sandboxes-feasibility.md#g4--invariant-3-default-deny-capability-scoped-egress--pass).
+
+On the **ACA Jobs** plane — the unconditional default and the rollback path —
+there is no egress logic at all, and the situation is worse than "advisory". The
+catalog declares the default worker's egress as
+`{"defaultAction": "Allow", "hostRules": []}`, so the resolver reports a declared
+destination as *satisfied* by a plane that will not enforce it, with
+`unsatisfiedEgressHosts: []` and no field distinguishing the two cases.
+
+Per-task egress enforcement on the Jobs plane is **rejected, not deferred**: ACA
+Jobs has no per-execution network control, and the only lever — VNet-injecting
+the shared Container Apps environment — is environment-wide rather than
+capability-scoped and would perturb the rollback path itself. What is scheduled
+instead is honesty: the routing decision must state whether the plane it names
+will enforce the declared egress, and must stop reporting an unenforced
+destination as satisfied. See
+[sprint 3](plans/capability-manifest-future-work.md#sprint-3-stop-asserting-egress-is-satisfied-on-a-plane-that-does-not-enforce-it).
+Until that lands, `squad-capability-preflight.sh` prints
+`advisory only, not enforced yet` for a declared host even when the session is
+running inside a sandbox that *is* enforcing it; that message is wrong on the
+sandbox plane and sprint 3 corrects it.
+
 ### Future: short-lived, least-privilege credentials
+
+> **Partly stale.** The description of today's credentials is still accurate, but
+> the *consumption* half of short-lived credentials has since been built and
+> proven, and the closing sentence about Azure role assignments no longer
+> describes the tree.
 
 Today, GitHub access is a long-lived `GITHUB_TOKEN`/`COPILOT_GITHUB_TOKEN`
 pair provisioned once at deploy time, and Azure access is the same
@@ -587,12 +650,40 @@ user-assigned managed identity for every session. The `credentials[]` list
 is a natural input to a future design that mints **short-lived, per-task
 GitHub App installation tokens** scoped to only what a task's manifest
 declares needing, and/or a **per-task Azure identity** with only the
-permissions that task's declared `services`/`tools` require. This PR does
-not change the managed identity's permissions or introduce any new Azure
-role assignments — it only adds the declarative input those future changes
-would consume.
+permissions that task's declared `services`/`tools` require.
 
-None of the above is implemented by this PR. This PR only adds the manifest
-schema, the preflight check, and the documented seams above so future work
-has a concrete, tested foundation to extend rather than needing to
-retrofit one.
+**What has since been built.** Issue #32 delivered the entire consumption side:
+`worker/lib/squad-git-credential-helper.sh` re-reads a `0600` token file on every
+git operation, so a refreshed token is picked up with no re-clone;
+`worker/lib/squad-token-preflight.sh` exercises the credential and compares its
+remaining lifetime against the estimated run duration before the agent starts;
+and the sandbox provider delivers and can swap that file mid-session. A GitHub
+App is registered and installed on this repository, and its installation-token
+TTL is measured at exactly 3600 seconds. See
+[Refresh channel matrix](sandboxes.md#refresh-channel-matrix).
+
+**What is missing is minting, and it is deferred with no sprint.** The App's
+private key was generated and deleted before being stored; Key Vault is unusable
+in this tenant; and a 3600-second token cannot be refreshed inside a running ACA
+Job, so per-task tokens on the default plane would refuse sessions that succeed
+today. Two preconditions — measuring real session durations from existing lease
+records, and deciding where the private key may live — must be answered before
+any sprint is written. The reasoning, the rejected alternatives, and the likely
+eventual shape are in
+[ADR 0003, effort 4](adr/0003-capability-manifest-future-work.md#effort-4-short-lived-least-privilege-credentials).
+
+**Correction:** the original text ended "This PR does not change the managed
+identity's permissions or introduce any new Azure role assignments." That is no
+longer a true statement about the tree. `scripts/deploy.ps1` creates `AcrPull` on
+the ACR and `Contributor` at **resource-group scope** for the session identity,
+and separately reconciles a `Microsoft.App/jobs`-scoped grant for the Actions
+identity, because deleting and recreating the session job on an image change
+destroys a resource-scoped assignment.
+
+> **The original closing paragraph, now wholly stale**, read: "None of the above
+> is implemented by this PR. This PR only adds the manifest schema, the preflight
+> check, and the documented seams above so future work has a concrete, tested
+> foundation to extend rather than needing to retrofit one." The routing
+> decision, the provider seam, dispatch acting on the decision, catalog review
+> with digest pinning, and digest-keyed image evidence have all since landed.
+
