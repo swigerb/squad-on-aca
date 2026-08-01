@@ -301,9 +301,9 @@ if (-not $existingRalphJobImage) {
         --registry-server $loginServer `
         --registry-identity $identityId `
         --secrets @jobAndWatcherSecrets `
-        --env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "RALPH_LABELS=squad" "RALPH_MAX_ISSUES=3" | Out-Null
+        --env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "RALPH_LABELS=squad-aca" "RALPH_MAX_ISSUES=3" | Out-Null
 } else {
-    az containerapp job update --name $ralphJobName --resource-group $ResourceGroupName --image $image --cron-expression "*/5 * * * *" --replica-timeout 240 --set-env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "RALPH_LABELS=squad" "RALPH_MAX_ISSUES=3" | Out-Null
+    az containerapp job update --name $ralphJobName --resource-group $ResourceGroupName --image $image --cron-expression "*/5 * * * *" --replica-timeout 240 --set-env-vars @commonEnv "SQUAD_MODE=ralph" "SESSION_NAME=ralph-scheduled" "SQUAD_POD_ID=ralph-scheduled" "RALPH_LABELS=squad-aca" "RALPH_MAX_ISSUES=3" | Out-Null
     az containerapp job secret set --name $ralphJobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 

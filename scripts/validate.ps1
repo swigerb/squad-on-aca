@@ -4976,8 +4976,22 @@ if ((Test-Path $syncLabels) -and (Test-Path $dispatchWf)) {
     }
     if (Test-Path $entrypointSh) {
         foreach ($m in [regex]::Matches((Get-Content -LiteralPath $entrypointSh -Raw), 'RALPH_LABELS:-([A-Za-z0-9:_.-]+)')) {
-            $triggerLabels += @{ Where = 'worker/entrypoint.sh (Ralph)'; Label = $m.Groups[1].Value }
+            $triggerLabels += @{ Where = 'worker/entrypoint.sh (Ralph fallback)'; Label = $m.Groups[1].Value }
         }
+    }
+    # deploy.ps1 sets RALPH_LABELS EXPLICITLY on the Ralph job, which OVERRIDES
+    # the entrypoint fallback above. Reading only the fallback is how the first
+    # version of this check passed while production disagreed: the fallback said
+    # `squad-aca`, the deployed job said `squad`, and Ralph went on watching
+    # Squad's triage inbox. A default is not a value -- the value is whatever
+    # the deployment sets.
+    $deployPs1 = Join-Path $RepoRoot 'scripts/deploy.ps1'
+    if (Test-Path $deployPs1) {
+        foreach ($m in [regex]::Matches((Get-Content -LiteralPath $deployPs1 -Raw), 'RALPH_LABELS=([A-Za-z0-9:_.-]+)')) {
+            $triggerLabels += @{ Where = 'scripts/deploy.ps1 (deployed value)'; Label = $m.Groups[1].Value }
+        }
+    } else {
+        Add-Fail "scripts/deploy.ps1 is missing, so the label Ralph is actually DEPLOYED with cannot be checked"
     }
     if (Test-Path $actionsModule) {
         foreach ($m in [regex]::Matches((Get-Content -LiteralPath $actionsModule -Raw), "DEFAULT_TRIGGER_LABEL\s*=\s*'([^']+)'")) {

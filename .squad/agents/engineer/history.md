@@ -1549,3 +1549,20 @@ measured TTL of exactly 3600 seconds, so it is not.
   exercised - a safety property that exists only on paper.
 - The gate reads label names OUT of sync-squad-labels.yml rather than hard-coding
   them, so a label added upstream is covered without editing the check.
+
+## Issue #32 - a default is not a value
+
+- My label-collision fix changed `\` in entrypoint.sh
+  and stopped there. **deploy.ps1 sets RALPH_LABELS=squad EXPLICITLY**, which
+  overrides the fallback, so Ralph went on watching Squad's triage inbox. Verified
+  live: the deployed job carried `RALPH_LABELS=squad`.
+- **The gate I wrote to prevent exactly this read the fallback**, not the
+  deployment. It asserted "Ralph and the Actions trigger watch the SAME label"
+  and PASSED while production had them mismatched. Reading a default and calling
+  it the value is the same mistake as grepping a file and calling it parsed.
+- Consequence beyond the collision: the two dispatchers watched DIFFERENT labels,
+  so the shared lease never contended and the duplicate-dispatch protection was
+  unexercised in production - a safety property that existed only on paper.
+- When a setting has a fallback AND an explicit assignment, the check must read
+  the assignment. Ask "what does the deployed thing actually have", not "what
+  would it have if nobody set it".
