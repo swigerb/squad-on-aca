@@ -189,7 +189,7 @@ squad-aca status
 .\scripts\start-watch.ps1 -Repository "<github-owner>/<repo>" -IntervalMinutes 5
 ```
 
-Label work with `squad` or `squad:*`. For SubSquads, commit `.squad/streams.json` and pass `-SubSquad docs` or another stream name.
+Label work with **`squad-aca`**. That is deliberately *not* `squad`, which is Squad's own triage inbox (`sync-squad-labels.yml`) and fires `squad-triage.yml` — one label cannot mean both "Lead, please route this" and "start a billed remote session". For SubSquads, commit `.squad/streams.json` and pass `-SubSquad docs` or another stream name.
 
 ## Production secrets
 
@@ -302,7 +302,7 @@ fail-closed interlocks, the prerequisites in full, and the operational links.
 
 ## Triggering from a GitHub event (Actions as transport)
 
-Label an issue **`squad`**, or comment **`/squad <instruction>`**, and the work
+Label an issue **`squad-aca`**, or comment **`/squad <instruction>`**, and the work
 runs in Azure:
 
 ```

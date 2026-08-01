@@ -4943,6 +4943,86 @@ if (Test-Path $actionsSuite) {
     Add-Fail "worker/tests/test_actions_event.sh is missing, so the trigger's refusals -- including the retrigger loop break -- are untested"
 }
 
+# ---------------------------------------------------------------------------
+# The trigger label must not be one of Squad's own.
+#
+# `squad` is Squad's canonical TRIAGE INBOX label -- sync-squad-labels.yml
+# defines it as "Squad triage inbox — Lead will assign to a member", and
+# squad-triage.yml fires on exactly that name. Using it as the ACA dispatch
+# trigger gave one label two unrelated meanings: "Lead, please route this" and
+# "spend money running a remote container". Measured on this repository:
+# applying it fired Squad's triage within ten seconds.
+#
+# The check reads the label names out of sync-squad-labels.yml rather than
+# hard-coding them, so a label added upstream is covered without editing this.
+# ---------------------------------------------------------------------------
+$syncLabels = Join-Path $RepoRoot '.github/workflows/sync-squad-labels.yml'
+$dispatchWf = Join-Path $RepoRoot '.github/workflows/squad-dispatch.yml'
+$entrypointSh = Join-Path $RepoRoot 'worker/entrypoint.sh'
+$actionsModule = Join-Path $RepoRoot 'worker/lib/actions-event.js'
+
+if ((Test-Path $syncLabels) -and (Test-Path $dispatchWf)) {
+    $syncText = Get-Content -LiteralPath $syncLabels -Raw
+    $squadManaged = @()
+    foreach ($m in [regex]::Matches($syncText, "name:\s*'([^']+)'")) {
+        $squadManaged += $m.Groups[1].Value
+    }
+    $squadManaged = $squadManaged | Sort-Object -Unique
+
+    $triggerLabels = @()
+    $dispatchText = Get-Content -LiteralPath $dispatchWf -Raw
+    foreach ($m in [regex]::Matches($dispatchText, "SQUAD_TRIGGER_LABEL\s*\|\|\s*'([^']+)'")) {
+        $triggerLabels += @{ Where = 'squad-dispatch.yml'; Label = $m.Groups[1].Value }
+    }
+    if (Test-Path $entrypointSh) {
+        foreach ($m in [regex]::Matches((Get-Content -LiteralPath $entrypointSh -Raw), 'RALPH_LABELS:-([A-Za-z0-9:_.-]+)')) {
+            $triggerLabels += @{ Where = 'worker/entrypoint.sh (Ralph)'; Label = $m.Groups[1].Value }
+        }
+    }
+    if (Test-Path $actionsModule) {
+        foreach ($m in [regex]::Matches((Get-Content -LiteralPath $actionsModule -Raw), "DEFAULT_TRIGGER_LABEL\s*=\s*'([^']+)'")) {
+            $triggerLabels += @{ Where = 'worker/lib/actions-event.js'; Label = $m.Groups[1].Value }
+        }
+    }
+
+    if ($triggerLabels.Count -eq 0) {
+        Add-Fail "No dispatch trigger label could be found to check against Squad's own labels"
+    } else {
+        $collisions = @()
+        foreach ($t in $triggerLabels) {
+            if ($squadManaged -contains $t.Label) {
+                $collisions += "$($t.Where) uses '$($t.Label)', which sync-squad-labels.yml manages"
+            }
+            if ($t.Label -like 'squad:*') {
+                $collisions += "$($t.Where) uses '$($t.Label)', and squad-issue-assign.yml treats every 'squad:*' label as a member assignment"
+            }
+            foreach ($prefix in @('go:', 'release:', 'type:', 'priority:')) {
+                if ($t.Label -like "$prefix*") {
+                    $collisions += "$($t.Where) uses '$($t.Label)', which is in the exclusive '$prefix' namespace squad-label-enforce.yml manages"
+                }
+            }
+        }
+
+        if ($collisions.Count -eq 0) {
+            $distinct = ($triggerLabels | ForEach-Object { $_.Label } | Sort-Object -Unique) -join ', '
+            Add-Pass "Every dispatch trigger label ($distinct) is clear of Squad's own labels, so applying one asks for a remote session and nothing else -- 'squad' means 'Lead, please route this' and would fire squad-triage.yml as well"
+        } else {
+            Add-Fail "A dispatch trigger label collides with Squad's own label scheme: $($collisions -join '; ')"
+        }
+
+        # Both dispatchers must watch the SAME label, or the shared-lease
+        # contention story is fiction: they would simply never see the same work.
+        $labelSet = $triggerLabels | ForEach-Object { $_.Label } | Sort-Object -Unique
+        if ($labelSet.Count -eq 1) {
+            Add-Pass "Ralph and the Actions trigger watch the SAME label, which is what makes them contend for one lease rather than covering different work"
+        } else {
+            Add-Fail "The dispatchers watch different trigger labels ($($labelSet -join ', ')). They would never contend for the same lease, so the duplicate-dispatch protection would never actually be exercised"
+        }
+    }
+} else {
+    Add-Fail ".github/workflows/sync-squad-labels.yml or squad-dispatch.yml is missing, so the trigger label cannot be checked against Squad's own labels"
+}
+
 # A lease is claimed BEFORE compute is requested, so a dispatcher that dies in
 # between leaves a lease held by a session that does not exist -- and the issue
 # is then blocked forever, because every future trigger correctly sees `active`

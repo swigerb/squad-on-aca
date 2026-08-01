@@ -189,4 +189,26 @@ printf '%s' "$mention" >"${WORK}/event.json"
 no_bot="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json" --trigger-label squad --command-prefix /squad)"
 assert_eq "false" "$(printf '%s' "$no_bot" | field dispatch)" "with NO bot login configured the mention form is inert rather than matching some arbitrary '@' prefix -- there is no identity to mention"
 
+# ---------------------------------------------------------------------------
+# The trigger label is NOT Squad's own triage label
+# ---------------------------------------------------------------------------
+# `squad` is defined by sync-squad-labels.yml as "Squad triage inbox -- Lead
+# will assign to a member", and squad-triage.yml fires on exactly that name.
+# Measured on this repository: applying it fired Squad's triage within TEN
+# SECONDS, adding squad:lead and go:needs-research alongside the ACA dispatch.
+default_label="$(node -e 'process.stdout.write(require("/tmp/mod.js").DEFAULT_TRIGGER_LABEL)' 2>/dev/null || node -e "process.stdout.write(require('${MODULE}').DEFAULT_TRIGGER_LABEL)")"
+assert_ne "squad" "$default_label" "the default trigger label is NOT 'squad' -- that is Squad's own triage inbox, and reusing it makes one label mean both 'Lead, please route this' and 'spend money running a remote container'"
+
+case "$default_label" in
+  squad:*) is_member_ns=yes ;;
+  *) is_member_ns=no ;;
+esac
+assert_eq "no" "$is_member_ns" "the default trigger label is not in the 'squad:' namespace either, because squad-issue-assign.yml treats every squad:* label as a member assignment"
+
+squad_label='{"action":"labeled","label":{"name":"squad"},"issue":{"number":7,"state":"open"},"sender":{"login":"swigerb"}}'
+printf '%s' "$squad_label" >"${WORK}/event.json"
+out="$(node "$MODULE" --event-name issues --event-path "${WORK}/event.json" --command-prefix /squad)"
+assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "with the DEFAULT trigger label, Squad's own 'squad' label does NOT dispatch a remote session -- an issue dropped in the triage inbox must not start billing"
+assert_eq "label-not-the-trigger-label" "$(printf '%s' "$out" | field reason)" "and it is refused for the right reason"
+
 test_summary

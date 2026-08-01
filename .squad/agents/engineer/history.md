@@ -1526,3 +1526,26 @@ measured TTL of exactly 3600 seconds, so it is not.
 - Each time the fix was to add the gate that would have caught it AND keep
   running the live test. Adding only the gate would have been the comfortable
   half.
+
+## Issue #32 - the trigger label collided with Squad's own
+
+- **`squad` is Squad's canonical TRIAGE INBOX label**, defined by
+  sync-squad-labels.yml as "Squad triage inbox - Lead will assign to a member"
+  and consumed by squad-triage.yml (`if: label.name == 'squad'`). Confirmed in
+  bradygaster/squad upstream, not just in this repo's installed copy.
+- Using it as the ACA dispatch trigger made one label mean two things: "Lead,
+  please route this" and "spend money running a remote container". Measured:
+  applying it fired Squad's triage within TEN SECONDS, adding squad:lead and
+  go:needs-research alongside the dispatch.
+- `squad-aca` is also deliberately NOT `squad:`-prefixed, because
+  squad-issue-assign.yml treats every `squad:*` label as a member assignment.
+  Ralph's marker has always been `squad-aca:dispatched` for that exact reason -
+  the convention was already there and I did not follow it.
+- **Ralph's default RALPH_LABELS was 'squad' too**, so Ralph has been dispatching
+  billed sessions for anything dropped in Squad's triage inbox. Pre-existing, and
+  the same bug; both dispatchers moved together.
+- The two MUST watch the same label. Different labels means they never see the
+  same work, and the shared lease that prevents double dispatch is never
+  exercised - a safety property that exists only on paper.
+- The gate reads label names OUT of sync-squad-labels.yml rather than hard-coding
+  them, so a label added upstream is covered without editing the check.

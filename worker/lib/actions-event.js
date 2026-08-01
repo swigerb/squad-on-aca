@@ -27,7 +27,18 @@
 
 const fs = require('fs');
 
-const DEFAULT_TRIGGER_LABEL = 'squad';
+// NOT 'squad'. That is Squad's own canonical TRIAGE INBOX label, defined by
+// sync-squad-labels.yml as "Squad triage inbox -- Lead will assign to a member"
+// and consumed by squad-triage.yml (if: github.event.label.name == 'squad').
+// Reusing it meant one label carried two unrelated meanings: "Lead, please
+// route this" and "spend money running a remote container". Measured on this
+// repository: applying squad fired Squad's triage within TEN SECONDS, adding
+// squad:lead and go:needs-research alongside the ACA dispatch.
+//
+// squad-aca is deliberately NOT squad:-prefixed either, because
+// squad-issue-assign.yml treats every squad:* label as a member assignment --
+// the same reason Ralph's marker is squad-aca:dispatched.
+const DEFAULT_TRIGGER_LABEL = 'squad-aca';
 const DEFAULT_COMMAND_PREFIX = '/squad';
 
 // Reasons are named constants so a test asserts on a stable token rather than
