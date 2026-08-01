@@ -1,0 +1,21 @@
+# Build context for worker/Dockerfile is the REPOSITORY ROOT (see the comment on
+# the COPY lines in worker/Dockerfile and on the `az acr build` call in
+# scripts/deploy.ps1). Only worker/entrypoint.sh, worker/lib/* and
+# config/sandbox-classes.json are ever copied into the image; everything below
+# is excluded so the context uploaded to ACR stays small.
+#
+# THIS IS A PLAIN PREFIX DENY-LIST ON PURPOSE. scripts/validate.ps1 parses it and
+# fails if any pattern here would exclude a path a Dockerfile COPY names, but it
+# only understands plain paths -- it refuses to evaluate wildcard or re-include
+# (`!`) patterns rather than guess. Adding one of those turns the gate off, so
+# keep this file literal.
+.git
+.github
+.squad
+aspire
+docs
+scripts
+templates
+worker/tests
+worker/images
+config/image-evidence

@@ -31,8 +31,20 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --chown=squad:squad entrypoint.sh /usr/local/bin/squad-on-aca
-COPY --chown=squad:squad lib/squad-capability-preflight.sh lib/squad-token-preflight.sh lib/squad-credentials.sh lib/squad-push.sh lib/squad-git-credential-helper.sh lib/parse-capabilities.js lib/resolve-capability-route.js lib/dispatch-decision.js lib/dispatch-lease.js lib/squad-dispatch.js lib/ralph-dispatch.sh lib/git-checkout.sh lib/agent-policy.js lib/squad-policy.sh /usr/local/lib/squad-on-aca/
+# BUILD CONTEXT IS THE REPOSITORY ROOT, not worker/. It has to be: the image
+# must carry config/sandbox-classes.json, which lives outside worker/, and a
+# COPY cannot reach above its context. scripts/deploy.ps1 therefore builds with
+# `--file worker/Dockerfile <repoRoot>`; scripts/validate.ps1 asserts that,
+# because building from worker/ would fail every COPY below.
+#
+# The catalog is the FIRST path catalogSearchPaths() looks in
+# (<__dirname>/sandbox-classes.json). Without it, `squad-dispatch.js decide`
+# inside the image exits 70 with reason "catalog-unavailable" -- which is what
+# Ralph did on every run before this line existed. worker/tests/test_image_layout.sh
+# derives its throwaway layout from these COPY lines, so deleting an entry here
+# makes that suite fail rather than silently shipping a broken image.
+COPY --chown=squad:squad worker/entrypoint.sh /usr/local/bin/squad-on-aca
+COPY --chown=squad:squad worker/lib/squad-capability-preflight.sh worker/lib/squad-token-preflight.sh worker/lib/squad-credentials.sh worker/lib/squad-push.sh worker/lib/squad-git-credential-helper.sh worker/lib/parse-capabilities.js worker/lib/resolve-capability-route.js worker/lib/dispatch-decision.js worker/lib/dispatch-lease.js worker/lib/squad-dispatch.js worker/lib/ralph-dispatch.sh worker/lib/git-checkout.sh worker/lib/agent-policy.js worker/lib/squad-policy.sh config/sandbox-classes.json /usr/local/lib/squad-on-aca/
 RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-credentials.sh /usr/local/lib/squad-on-aca/squad-push.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh \
     && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh
 
