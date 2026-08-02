@@ -1629,3 +1629,65 @@ measured TTL of exactly 3600 seconds, so it is not.
   and now asserted by name so a reordering cannot silently change it.
 - Not verified: no ACR build. Structural checks and an image-shaped directory
   only. Stated as unverified rather than implied.
+## Future-work sprint 3 - the decision claimed a control the plane does not have
+
+- Added `egressEnforced` and `egressAdvisoryHosts` to the capability decision and
+  surfaced them through the dispatch decision. **No enforcement was added.** The
+  ACA Jobs plane still applies no per-execution network policy; the change is
+  that the decision stopped reporting a declared destination as satisfied by it.
+- The defect was a positive claim, not a missing one. `defaultWorker.egress` is
+  `{defaultAction: Allow, hostRules: []}`, so `egressAllows()` returned true for
+  ANY host and `unsatisfiedEgressHosts` came back `[]`. A consumer could only
+  read that as "satisfied". An absent field is a gap; an empty unsatisfied set is
+  an assertion.
+- **The flag reads the POLICY, never the route name.** A flag derived from
+  `route` is a restatement of `route` and backs no claim, which is exactly the
+  plan's abandon condition. M3 makes that testable rather than rhetorical: under
+  a test-local catalog where `defaultWorker` is default-deny the route is STILL
+  `aca-job`, so a route-derived flag says false where the policy-derived flag
+  says true. Exactly two assertions fail, and they are the only two that exist to
+  separate the two derivations.
+- **The plan's M5 prediction was wrong and saying so was the work.** It predicted
+  the 26 CLI goldens would fail byte-comparison if the fields were computed but
+  not emitted. They do not: **26 / 26 matching** under M5. No stub repository
+  carries a manifest, so no golden ever renders the fields. The worker corpus
+  fails 16 assertions instead. A reviewer trusting the goldens for that class of
+  defect would have been trusting nothing.
+- A second finding from M5: `buildDecision` re-projects through
+  `Object.keys(base)`, but `Object.assign(base, overrides)` mutates `base`, so
+  deleting the keys from the base literal does not unemit them - it moves them to
+  the END of the key order. Only the key-order assertion catches that variant.
+  The "fixed key order" comment is doing less than it reads like it is doing.
+- **The operator surface states the count, never the hosts.** `egress[].host` is
+  repository-controlled text and the warning lands in a terminal and in session
+  logs. M4 - print the hosts - fails a named check whose message says why. The
+  hosts stay machine-readable in `routing.capability.egressAdvisoryHosts`.
+- "Nothing declared" is not "unenforced". An empty `egress[]` reports
+  `egressEnforced: true` on every route, because there is no destination the
+  plane could fail to enforce. M6 asserts both halves.
+- **The route does not move, and that is guarded at two levels.** M7 fails 5
+  worker assertions AND 3 in `validate.ps1`, where a real stubbed CLI dispatch
+  starts 0 ACA jobs instead of 1. A worker-level route assertion alone would not
+  have proved the rollback path still dispatches.
+- Corrected the preflight message. `advisory only, not enforced yet` was FALSE
+  inside a sandbox, where `New-SandboxEgressPolicy` had already generated and
+  applied a default-deny policy before the script ran. It is now keyed on
+  `SQUAD_EXECUTION_MODE`. `SQUAD_DISPATCH_ROUTE` was rejected for this because
+  the sandbox provider never sets it - keying on it would report "not enforced"
+  on the one plane that does enforce.
+- `unsatisfiedEgressHosts` was deliberately left alone. Its documented meaning is
+  "no approved class's egress template permits this", and it is only ever
+  populated on the `no-approved-sandbox-class` path. Adding the advisory hosts to
+  it would have been a different lie: the profile as written does permit them.
+- **I destroyed my own uncommitted work with `git checkout -- <file>` while
+  restoring a mutation.** Reconstructed it from the diff I had already printed,
+  then switched to a file backup for every subsequent mutation. Mutation testing
+  needs a restore mechanism that cannot reach past the mutation.
+- Residual risk, stated rather than buried: `egressEnforced` trusts the catalog.
+  An administrator who gave `defaultWorker` a default-deny policy would get
+  "enforced" on a plane that applies nothing. That is a catalog-integrity
+  obligation and the deliberate trade - the alternative cannot distinguish an
+  enforcing profile from a permissive one at all.
+- Not verified: no ACR build. No file was added to the image and both changed
+  worker files are already on shipped `COPY` lines, so the packaging surface is
+  unchanged - but that is a structural argument, not a build.

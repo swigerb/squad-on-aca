@@ -40,7 +40,7 @@ for any manifest.**
 |---|---|
 | `scripts/validate.ps1` | 363 / 0 / 0 (+ that sprint's new checks) |
 | Worker suite (`worker/tests/run-tests.sh`, WSL) | 14 suites / 911 assertions (+ new) |
-| CLI goldens | 26, byte-identical (sprint 3 regenerates deliberately) |
+| CLI goldens | 26, byte-identical (sprint 3 regenerated them deliberately; **0 files changed**) |
 | .NET (`aspire/`) | 114 (47 + 67) |
 | Markdown links | 0 broken |
 | Probes | `verify-launch-detachment.ps1` (dash), `verify-sandbox-cancel.ps1` (14 cases) |
@@ -319,6 +319,67 @@ line).
 ---
 
 ## Sprint 3: stop asserting egress is satisfied on a plane that does not enforce it
+
+> **DONE.** Landed as scoped, with one correction to this plan's own mutation
+> table and one deviation in an assertion name, both stated below rather than
+> papered over. **No enforcement was added.** The ACA Jobs plane still applies
+> no per-execution network policy; what changed is that the decision, the CLI
+> and the in-worker preflight stopped claiming otherwise. Anyone reading the
+> sprint title as "controlled egress landed" has misread it.
+>
+> `egressEnforced` is derived from the **selected profile's**
+> `egress.defaultAction`, never from the route name — which is what makes the
+> abandon condition testable rather than theoretical. M3 proves it: under a
+> test-local catalog giving `defaultWorker` a default-deny policy the route is
+> still `aca-job`, so a route-derived flag reports `false` where the
+> policy-derived flag reports `true`, and exactly two assertions fail.
+>
+> **Plan correction (M5).** The plan predicted that fields computed internally
+> but not emitted would break the 26 CLI goldens. It does not. Under M5 the
+> goldens compare **26 / 26 matching**: no stub repository carries a manifest,
+> so no golden ever renders the new fields. The worker corpus catches it
+> instead — **16** assertions by name. A reviewer relying on the goldens for
+> this class of defect would have been relying on nothing.
+>
+> A second, smaller finding from M5: `buildDecision` re-projects through
+> `Object.keys(base)`, but `Object.assign(base, overrides)` mutates `base` in
+> place, so deleting the two keys from the base literal does **not** unemit
+> them — it moves them to the end of the key order. Only the key-order
+> assertion catches that variant. M5 was therefore applied at the projection
+> itself, which is the mutation the plan describes.
+>
+> **Assertion-name deviation (M3).** The plan names the assertion
+> `... does not report an unmatched host as advisory`. It is implemented as
+> `... does not report a permitted host as advisory`, because in the M3 fixture
+> the host must be **permitted** by the default-deny rules for the route to
+> stay `aca-job` at all; an unmatched host routes to `fail-closed`, which is
+> asserted separately as the negative half.
+>
+> Mutation results (all applied, observed, restored, suite re-verified green):
+>
+> | # | Mutation | Assertions failed by name |
+> |---|---|---|
+> | M1 | `egressPolicyEnforced` returns `true` unconditionally | **7** — `egress honesty: an egress-declaring manifest on the aca-job route reports egressEnforced false`, `... the unenforced destination is listed in egressAdvisoryHosts`, `... the emitted decision carries egressEnforced`, `... the new fields are emitted in the documented key order`, `... the dispatch decision carries egressEnforced`, `... the dispatch decision states the COUNT of unenforced destinations`, `... the host list stays in the machine-readable capability decision` |
+> | M2 | `egressPolicyEnforced` returns `false` unconditionally | **4** — `egress honesty: an egress-declaring manifest routed to an approved sandbox class reports egressEnforced true`, `... an enforced destination is NOT listed as advisory`, `... a default profile with defaultAction Deny reports egressEnforced true on the aca-job route`, `... does not report a permitted host as advisory` |
+> | M3 | Derive `egressEnforced` from the route **name** (`false` on `aca-job`, `true` on `sandbox`) | **2** — `egress honesty: a default profile with defaultAction Deny reports egressEnforced true on the aca-job route`, `... does not report a permitted host as advisory`. Nothing else moves, which is the point: the two assertions that exist *only* to separate the policy from the route are the two that fail |
+> | M4 | CLI prints the host strings instead of the count | **1** — `validate.ps1`: *The declared egress host 'advisory-token-zzz.example.net' reached the operator surface. Manifest text is repository-controlled; printing it into a terminal or a log is an injection surface.* |
+> | M5 | Fields computed but deleted from the emitted decision | **16** in the worker corpus, including `egress honesty: the emitted decision carries egressEnforced` and `... carries egressAdvisoryHosts`. **The 26 CLI goldens still match** — see the plan correction above |
+> | M6 | Empty `egress[]` treated as unenforced | **2** — `egress honesty: a manifest declaring no egress reports egressEnforced true`, `... no manifest at all reports egressEnforced true` |
+> | M7 | Egress-declaring manifest routed to `fail-closed` | **5** in the worker corpus — `routing: a manifest declaring only advisory egress still dispatches to aca-job`, `egress honesty: the default-deny catalog case still resolves to aca-job`, `dispatch: an advisory-egress manifest still produces a dispatchable decision` (exit 65, not 0), `... is dispatched, not refused`, `... the execution mode is unchanged` — **and 3 in `validate.ps1`**, where a real stubbed CLI dispatch starts **0** ACA jobs instead of 1. The rollback path is guarded at both levels |
+>
+> Gates: `validate.ps1` 388 -> **397 / 0 / 0**; worker suite 16 suites / 981 ->
+> **17 suites / 1022 / 0 failed**; CLI goldens regenerated with
+> `verify-cli-golden.ps1 -Update` and **0 of 26 files changed**, then re-verified
+> **26 / 26 matching** — the stub repositories carry no `squad-capabilities.yml`,
+> so `egressAdvisoryHostCount` is 0 in every case and the new warning never
+> fires; `dotnet test` **114** (47 + 67); markdown links **94 / 0 broken**.
+> ACA Jobs remains the unconditional default: an advisory-egress manifest still
+> routes to `aca-job` and still starts exactly one job.
+>
+> Not verified: the change was **not** built in ACR. `resolve-capability-route.js`
+> and `squad-capability-preflight.sh` are already on shipped `COPY` lines and no
+> file was added to the image, so the packaging surface is unchanged — but that
+> is a structural argument, not a build.
 
 **Goal.** A routing decision states whether the plane it names will enforce the
 manifest's declared egress, and never reports an unenforced destination as

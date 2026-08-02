@@ -5515,6 +5515,170 @@ if (-not (Test-Path $corpusSuitePath)) {
 }
 
 # ---------------------------------------------------------------------------
+# Egress honesty (capability-manifest future-work sprint 3)
+# ---------------------------------------------------------------------------
+Write-Section "Egress honesty"
+
+# THIS SPRINT ADDED NO ENFORCEMENT. It made an existing gap visible. The
+# decision used to report a declared network destination as satisfied on the ACA
+# Jobs plane, which has no per-execution network control at all: `defaultWorker`
+# in the catalog is {defaultAction: Allow, hostRules: []}, so egressAllows()
+# returned true for any host and `unsatisfiedEgressHosts` came back empty. That
+# is a machine-readable assertion of a control that does not exist.
+#
+# What is checked here is the OPERATOR-FACING half, which the worker bash suite
+# cannot reach: what `squad-aca` prints, and what it must never print.
+
+$egressHarness = Join-Path $RepoRoot "scripts\tests\cli-stub-harness.ps1"
+$egressCli = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+if (-not ((Test-Path $egressHarness) -and $IsWindowsHost -and $nodeAvailable)) {
+    Write-Host "  [SKIP] egress honesty CLI checks require Windows + node" -ForegroundColor Yellow
+} else {
+    . $egressHarness
+    $egressStub = $null
+    try {
+        $egressStub = New-SquadCliStubEnvironment
+        Initialize-SquadCliStubRepository -Stub $egressStub | Out-Null
+        $egressManifestPath = Join-Path $egressStub.WorkDir "squad-capabilities.yml"
+
+        # A DISTINCTIVE token, so its absence from the operator surface is
+        # measured rather than assumed. `git` is already in the default worker
+        # profile, so this is the exact reproduction from ADR 0003 finding 3:
+        # tools that fit, plus a destination nothing on this plane will enforce.
+        $egressToken = "advisory-token-zzz.example.net"
+        [System.IO.File]::WriteAllText($egressManifestPath, (@(
+            "version: 1"
+            "tools:"
+            "  - name: git"
+            "    required: true"
+            "egress:"
+            "  - host: $egressToken"
+            "    reason: probe"
+        ) -join "`n") + "`n")
+
+        Reset-SquadCliStubLog -Stub $egressStub
+        $egressRun = Invoke-SquadCliCapture -Stub $egressStub -ScriptPath $egressCli `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "egresshonesty", "do the thing")
+
+        # 1. THE ROUTE DOES NOT MOVE. ACA Jobs is the unconditional default and
+        #    the rollback path; a repository that adds two advisory lines to its
+        #    manifest must still dispatch. Failing closed here was considered and
+        #    rejected in ADR 0003 -- this is the guard on that decision.
+        $egressJobStarts = @($egressRun.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        if ($egressRun.ExitCode -eq 0 -and $egressJobStarts -eq 1) {
+            Add-Pass "routing: a manifest declaring only advisory egress still dispatches to aca-job (the unconditional default and the rollback path are unchanged)"
+        } else {
+            Add-Fail "An advisory-egress manifest no longer dispatches: exit=$($egressRun.ExitCode) jobStarts=$egressJobStarts. ACA Jobs is the rollback path; a repository that adds two advisory lines to its manifest would now stop dispatching entirely."
+        }
+
+        # 2. THE WARNING EXISTS AND NAMES THE COUNT AND THE ROUTE.
+        $egressStreams = "$($egressRun.StdOut)`n$($egressRun.StdErr)"
+        if (($egressStreams -match "declares 1 network destination") -and ($egressStreams -match "'aca-job' route will NOT enforce")) {
+            Add-Pass "egress honesty: the CLI warns that 1 declared destination will NOT be enforced on the 'aca-job' route"
+        } else {
+            Add-Fail "The CLI did not warn about unenforced egress. An operator has no way to tell 'this plane will enforce your egress' from 'this plane will ignore it'. stderr=$($egressRun.StdErr)"
+        }
+
+        # 3. AND IT PRINTS NO HOST STRING. `egress[].host` is
+        #    repository-controlled text; this line lands in an operator's
+        #    terminal and in session logs, so echoing it makes the manifest an
+        #    injection surface into the place a human reads for reassurance.
+        if (($egressRun.StdOut -notmatch [regex]::Escape($egressToken)) -and
+            ($egressRun.StdErr -notmatch [regex]::Escape($egressToken))) {
+            Add-Pass "egress honesty: a declared host never appears on stdout or stderr (the operator surface states the count, never repository-controlled text)"
+        } else {
+            Add-Fail "The declared egress host '$egressToken' reached the operator surface. Manifest text is repository-controlled; printing it into a terminal or a log is an injection surface."
+        }
+
+        # 4. BOTH DIRECTIONS. A manifest with no egress must produce NO warning:
+        #    otherwise the check above is satisfied by a line that is always
+        #    printed, and "nothing declared" would read as "unenforced".
+        [System.IO.File]::WriteAllText($egressManifestPath, (@(
+            "version: 1"
+            "tools:"
+            "  - name: git"
+            "    required: true"
+        ) -join "`n") + "`n")
+        Reset-SquadCliStubLog -Stub $egressStub
+        $quietRun = Invoke-SquadCliCapture -Stub $egressStub -ScriptPath $egressCli `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "egressquiet", "do the thing")
+        $quietStreams = "$($quietRun.StdOut)`n$($quietRun.StdErr)"
+        if ($quietRun.ExitCode -eq 0 -and $quietStreams -notmatch "will NOT enforce") {
+            Add-Pass "egress honesty: a manifest declaring no egress produces no unenforced-destination warning (nothing declared is not unenforced)"
+        } else {
+            Add-Fail "A manifest declaring NO egress still warned about unenforced destinations (exit=$($quietRun.ExitCode)); the warning is unconditional, so its presence proves nothing."
+        }
+        Remove-Item -LiteralPath $egressManifestPath -Force -ErrorAction SilentlyContinue
+    } finally {
+        if ($egressStub) { Remove-SquadCliStubEnvironment -Stub $egressStub }
+    }
+}
+
+# The corrected in-worker message. The old text said "advisory only, not
+# enforced yet" on BOTH planes, which is wrong inside a sandbox: the sandbox
+# provider generated a default-deny policy from the approved class template and
+# applied it before this script ran.
+$preflightPath = Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"
+if (Test-Path $preflightPath) {
+    $preflightText = [System.IO.File]::ReadAllText($preflightPath)
+    if ($preflightText -notmatch "advisory only, not enforced yet") {
+        Add-Pass "preflight: the stale 'advisory only, not enforced yet' egress message is gone (it contradicted the sandbox provider, which does enforce)"
+    } else {
+        Add-Fail "worker/lib/squad-capability-preflight.sh still prints 'advisory only, not enforced yet' for a declared egress host. That is false inside a sandbox, where New-SandboxEgressPolicy generated and applied a default-deny policy before the session started."
+    }
+    if (($preflightText -match "SQUAD_EXECUTION_MODE") -and ($preflightText -match "NOT ENFORCED on this plane")) {
+        Add-Pass "preflight: the egress advisory is plane-aware, keyed on SQUAD_EXECUTION_MODE, and defaults to reporting NOT enforced"
+    } else {
+        Add-Fail "worker/lib/squad-capability-preflight.sh no longer distinguishes the enforcing plane from the non-enforcing one; one message cannot be true on both."
+    }
+} else {
+    Add-Fail "worker/lib/squad-capability-preflight.sh is missing"
+}
+
+# The decision core itself must not derive the claim from the route name. That
+# is the abandon condition in the sprint plan: a flag read off `route` is a
+# restatement of `route` and adds nothing.
+$resolverPath = Join-Path $RepoRoot "worker\lib\resolve-capability-route.js"
+if (Test-Path $resolverPath) {
+    $resolverText = [System.IO.File]::ReadAllText($resolverPath)
+    if ($resolverText -match "function egressPolicyEnforced\([^)]*\)\s*\{[^}]*defaultAction === 'Deny'") {
+        Add-Pass "egress honesty: egressEnforced is derived from the selected profile's egress.defaultAction, not from the route name"
+    } else {
+        Add-Fail "egressPolicyEnforced no longer reads the policy's defaultAction. A flag derived from the route name is a restatement of the route and backs no claim about the policy."
+    }
+    if ($resolverText -match "ROUTE_ACA_JOB ===|route === ROUTE_ACA_JOB\s*\?\s*false") {
+        Add-Fail "The resolver derives an egress claim from the route name."
+    } else {
+        Add-Pass "egress honesty: the resolver contains no route-name test that could stand in for the policy check"
+    }
+} else {
+    Add-Fail "worker/lib/resolve-capability-route.js is missing"
+}
+
+# The worker suite must actually carry the honesty corpus. Sprint 2 learned that
+# a check which only counts files stays green while the cases it names are
+# deleted, so the named assertions are looked for individually.
+$egressSuite = Join-Path $RepoRoot "worker\tests\test_egress_honesty.sh"
+if (Test-Path $egressSuite) {
+    $egressSuiteText = [System.IO.File]::ReadAllText($egressSuite)
+    $requiredCases = @(
+        "an egress-declaring manifest on the aca-job route reports egressEnforced false",
+        "an egress-declaring manifest routed to an approved sandbox class reports egressEnforced true",
+        "a manifest declaring no egress reports egressEnforced true",
+        "a default profile with defaultAction Deny reports egressEnforced true on the aca-job route",
+        "a manifest declaring only advisory egress still dispatches to aca-job"
+    )
+    $missingCases = @($requiredCases | Where-Object { $egressSuiteText -notmatch [regex]::Escape($_) })
+    if ($missingCases.Count -eq 0) {
+        Add-Pass "worker/tests/test_egress_honesty.sh carries all $($requiredCases.Count) paired egress claims (both directions of the boolean, the policy-not-route case, and the unconditional-default guard)"
+    } else {
+        Add-Fail "worker/tests/test_egress_honesty.sh is missing $($missingCases.Count) named case(s): $($missingCases -join '; '). A boolean asserted in one direction only is satisfied by a constant."
+    }
+} else {
+    Add-Fail "worker/tests/test_egress_honesty.sh is missing; the egress honesty claims have no corpus"
+}
+
+# ---------------------------------------------------------------------------
 # Every workflow file must PARSE (issue #32 S4)
 # ---------------------------------------------------------------------------
 Write-Section "Workflow files parse as YAML"

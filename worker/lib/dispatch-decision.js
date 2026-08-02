@@ -53,7 +53,10 @@
  *
  * Redaction: every string emitted here is either a fixed vocabulary term or a
  * value the Sprint 2 resolver already redacted. No manifest text, no prompt, no
- * token, and no secret reference passes through this file.
+ * token, and no secret reference passes through this file. The egress fields
+ * added by the capability-manifest future-work sprint 3 keep that property: the
+ * dispatch-level statement is a COUNT (`egressAdvisoryHostCount`), never a host
+ * string.
  */
 
 const fs = require('fs');
@@ -163,6 +166,19 @@ function buildRouting(capability) {
     }
   }
 
+  // Egress honesty, lifted to the dispatch level (future-work sprint 3). A
+  // consumer that reads only `routing` -- the dispatchers do -- would otherwise
+  // have to reach into `routing.capability` to discover that the plane it is
+  // about to use will not enforce the manifest's declared destinations.
+  //
+  // The COUNT is surfaced, not the hosts. Host strings are repository-
+  // controlled manifest text, and this object is what the operator-facing
+  // dispatchers render and log. The hosts themselves stay in
+  // `routing.capability.egressAdvisoryHosts` for a machine that wants them.
+  const advisoryHosts = Array.isArray(capability.egressAdvisoryHosts)
+    ? capability.egressAdvisoryHosts
+    : [];
+
   return {
     route: capability.route,
     reason: capability.reason,
@@ -171,6 +187,8 @@ function buildRouting(capability) {
     sandboxClass: action === ACTION_DISPATCH && executionMode === 'sandbox' ? capability.sandboxClass : null,
     fallbackReason,
     manifestPresent: capability.manifestPresent,
+    egressEnforced: capability.egressEnforced === true,
+    egressAdvisoryHostCount: advisoryHosts.length,
     detail,
     capability
   };
