@@ -5027,11 +5027,70 @@ if ((Test-Path $syncLabels) -and (Test-Path $dispatchWf)) {
 
         # Both dispatchers must watch the SAME label, or the shared-lease
         # contention story is fiction: they would simply never see the same work.
-        $labelSet = $triggerLabels | ForEach-Object { $_.Label } | Sort-Object -Unique
+        $labelSet = @($triggerLabels | ForEach-Object { $_.Label } | Sort-Object -Unique)
         if ($labelSet.Count -eq 1) {
             Add-Pass "Ralph and the Actions trigger watch the SAME label, which is what makes them contend for one lease rather than covering different work"
         } else {
             Add-Fail "The dispatchers watch different trigger labels ($($labelSet -join ', ')). They would never contend for the same lease, so the duplicate-dispatch protection would never actually be exercised"
+        }
+
+        # The COMMAND PREFIX is a trigger too, and the first version of this
+        # section did not check it -- which is how `/squad` survived the label
+        # rename. This repository defines two Copilot agents in .github/agents/:
+        # `squad` (the ordinary Squad coordinator) and `squad-aca` (the ACA
+        # dispatcher). A command prefix naming the FORMER asks for a remote
+        # billed session using the name of a different agent.
+        $prefixes = @()
+        $eventModule = Join-Path $RepoRoot 'worker/lib/actions-event.js'
+        if (Test-Path $eventModule) {
+            foreach ($m in [regex]::Matches((Get-Content -LiteralPath $eventModule -Raw), "DEFAULT_COMMAND_PREFIX\s*=\s*'([^']+)'")) {
+                $prefixes += @{ Where = 'worker/lib/actions-event.js'; Prefix = $m.Groups[1].Value }
+            }
+        }
+        foreach ($m in [regex]::Matches($dispatchText, "SQUAD_COMMAND_PREFIX\s*\|\|\s*'([^']+)'")) {
+            $prefixes += @{ Where = 'squad-dispatch.yml'; Prefix = $m.Groups[1].Value }
+        }
+
+        if ($prefixes.Count -eq 0) {
+            Add-Fail "No command prefix could be found to check against the repository's agent names"
+        } else {
+            $agentNames = @()
+            $agentsDir = Join-Path $RepoRoot '.github/agents'
+            if (Test-Path $agentsDir) {
+                $agentNames = @(Get-ChildItem -LiteralPath $agentsDir -Filter '*.agent.md' -File |
+                    ForEach-Object { $_.Name -replace '\.agent\.md$', '' })
+            }
+
+            $prefixProblems = @()
+            foreach ($p in $prefixes) {
+                $bare = $p.Prefix -replace '^/', ''
+                # Naming ANOTHER agent in this repository is the failure. Naming
+                # this one is the point.
+                if ($agentNames -contains $bare -and $bare -ne 'squad-aca') {
+                    $prefixProblems += "$($p.Where) uses '$($p.Prefix)', which names the '$bare' agent in .github/agents/ -- a different agent from the ACA dispatcher"
+                }
+                if ($squadManaged -contains $bare) {
+                    $prefixProblems += "$($p.Where) uses '$($p.Prefix)', whose bare form is a label sync-squad-labels.yml manages"
+                }
+            }
+
+            $prefixSet = @($prefixes | ForEach-Object { $_.Prefix } | Sort-Object -Unique)
+            if ($prefixProblems.Count -gt 0) {
+                Add-Fail "A dispatch command prefix collides with something else in this repository: $($prefixProblems -join '; ')"
+            } elseif ($prefixSet.Count -ne 1) {
+                Add-Fail "The command prefix differs between the module default and the workflow ($($prefixSet -join ', ')). One of them is dead configuration and nobody would know which"
+            } else {
+                Add-Pass "The dispatch command prefix ($($prefixSet -join ', ')) names the ACA dispatcher and nothing else -- '/squad' would name the ordinary Squad coordinator agent, which does not dispatch to ACA"
+            }
+
+            # The label and the prefix should refer to the same thing, or the
+            # documentation has to explain two names for one action.
+            $bareSet = @($prefixes | ForEach-Object { ($_.Prefix -replace '^/', '') } | Sort-Object -Unique)
+            if (($bareSet.Count -eq 1) -and ($labelSet.Count -eq 1) -and ($bareSet[0] -eq $labelSet[0])) {
+                Add-Pass "The trigger label and the command prefix are the same word ('$($labelSet[0])'), so both ways of asking for a remote session name the same thing"
+            } else {
+                Add-Fail "The trigger label ($($labelSet -join ', ')) and the command prefix ($($bareSet -join ', ')) are different words for the same action, which the documentation would have to explain away"
+            }
         }
     }
 } else {

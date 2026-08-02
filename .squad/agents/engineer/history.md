@@ -1691,3 +1691,23 @@ measured TTL of exactly 3600 seconds, so it is not.
 - Not verified: no ACR build. No file was added to the image and both changed
   worker files are already on shipped `COPY` lines, so the packaging surface is
   unchanged - but that is a structural argument, not a build.
+
+## The trigger COMMAND collided too, not just the label
+
+- `.github/agents/` defines TWO agents: `squad` ("Your AI team" - the ordinary
+  Squad coordinator) and `squad-aca` ("Dispatch work to an ACA-hosted Squad
+  session"). The command prefix `/squad` named the WRONG one.
+- **The collision gate I wrote after the LABEL incident checked labels only.**
+  It never looked at the command prefix, so `/squad` survived the rename and the
+  two triggers disagreed: label `squad-aca`, command `/squad`.
+- Upstream Squad has no issue_comment handler today (verified against
+  bradygaster/squad templates), so this was pre-emptive rather than a live bug -
+  but it is the exact shape of the label collision, which WAS live.
+- The gate now reads agent names out of `.github/agents/` and fails if a prefix
+  names a different agent, and separately asserts the label and the prefix are
+  the same word.
+- **My own gate had a PowerShell bug that made it decorative**: a single-element
+  pipeline result unwraps to a STRING, so `\[0]` indexed a CHARACTER.
+  The message read "the same word ('s')" and the comparison would have passed for
+  `squad` vs `squid`. Wrap in `@()`. A gate whose message is visibly wrong is
+  a gate whose comparison is probably wrong too.

@@ -21,7 +21,7 @@ sequenceDiagram
     participant ACA as Azure Container Apps<br/>(control plane + compute)
     participant Ag as Copilot agent<br/>(in the session)
 
-    Dev->>GH: label an issue `squad-aca`,<br/>or comment `/squad …`
+    Dev->>GH: label an issue `squad-aca`,<br/>or comment `/squad-aca …`
     GH->>GA: issues.labeled / issue_comment.created
     GA->>GA: resolve the event<br/>(actions-event.js)
     Note over GA: refuses its own comments,<br/>other bots, quotes, closed issues
@@ -67,9 +67,9 @@ pull request from inside Azure.
 | Trigger | What happens |
 |---|---|
 | Apply the **`squad-aca`** label to an open issue | A session is dispatched to work that issue |
-| Comment **`/squad <instruction>`** on an open issue | A session is dispatched with your instruction as the prompt |
+| Comment **`/squad-aca <instruction>`** on an open issue | A session is dispatched with your instruction as the prompt |
 | Comment **`@squad-on-aca-control-plane <instruction>`** | The same, using an @mention |
-| Comment **`/squad`** with no text | A session is dispatched with a default prompt |
+| Comment **`/squad-aca`** with no text | A session is dispatched with a default prompt |
 | Run the workflow manually | `workflow_dispatch`, with optional issue and prompt inputs |
 
 The label and the command prefix are configurable through repository variables
@@ -88,7 +88,26 @@ author email and not at all by the token used to push it.** A commit pushed with
 an App installation token but authored as anything else shows as *unlinked* —
 no avatar, no user. See "Attribution" below.
 
-## Why the label is `squad-aca` and not `squad`
+## Why the label and the command are `squad-aca`, not `squad`
+
+Two things in this repository are called Squad, and they are not the same thing.
+`.github/agents/` defines both:
+
+| Agent | What it is |
+|---|---|
+| `squad` | *"Your AI team. Describe what you're building, get a team of specialists that live in your repo."* |
+| `squad-aca` | *"Dispatch work to an Azure Container Apps-hosted Squad session."* |
+
+So `/squad` names the **wrong one**. It reads as "invoke Squad", and Squad is a
+real, distinct agent here that does not dispatch to ACA. Someone asking the
+ordinary coordinator for help should not be charged for a remote container.
+
+It is also the obvious name for a slash command if upstream Squad ever adds one.
+That is not hypothetical — the **label** collision below is exactly that story,
+already played out.
+
+### The label
+
 
 `squad` is **Squad''s own triage inbox**. `sync-squad-labels.yml` defines it as
 *"Squad triage inbox — Lead will assign to a member"*, and `squad-triage.yml`
@@ -134,7 +153,7 @@ workflow log, and each is covered by `worker/tests/test_actions_event.sh`.
 |---|---|
 | The App itself comments or labels | `actor-is-this-app` |
 | Any other bot issues the command | `actor-is-a-bot` |
-| The command appears in a **quoted** reply (`> /squad ...`) | `comment-carries-no-command` |
+| The command appears in a **quoted** reply (`> /squad-aca ...`) | `comment-carries-no-command` |
 | The App is **@mentioned mid-sentence** (`I think @squad-... could help`) | `comment-carries-no-command` |
 | The command appears mid-sentence | `comment-carries-no-command` |
 | A comment is **edited** to contain the command | `action-not-a-trigger` |
@@ -358,7 +377,7 @@ the Actions trigger is optional.
 ### A second request on the same issue
 
 Leases are keyed by **issue**, so once a session for issue *N* has succeeded,
-the lease for `issue-N` is in a terminal success state. A later `/squad` on the
+the lease for `issue-N` is in a terminal success state. A later `/squad-aca` on the
 same issue resolves correctly and then stands down:
 
 ```

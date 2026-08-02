@@ -22,7 +22,7 @@ Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job exe
 | Second execution plane (opt-in preview) | ACA Sandboxes behind `SQUAD_ACA_ENABLE_SANDBOX`, for per-session isolation and default-deny egress. Off by default; ACA Jobs stay the default and the rollback path |
 | Agent tool policy | Every session resolves an `attended` or `autonomous` tier before any agent starts; unattended runs lose destructive infrastructure verbs. `--yolo` is never emitted |
 | Governance-path protection | `.squad/` policy, identity, and audit state is made read-only and hash-verified for the session; a violation fails the run and pushes nothing |
-| Event-driven trigger | A GitHub Actions workflow (`squad-dispatch.yml`) fires on an issue label or a `/squad` comment, federates to Azure by OIDC, and starts the ACA session job. Actions is the trigger transport only; the decision, the lease, and the run all stay in Azure. No webhook ingress, no always-on replica, and no stored Azure credential |
+| Event-driven trigger | A GitHub Actions workflow (`squad-dispatch.yml`) fires on an issue label or a `/squad-aca` comment, federates to Azure by OIDC, and starts the ACA session job. Actions is the trigger transport only; the decision, the lease, and the run all stay in Azure. No webhook ingress, no always-on replica, and no stored Azure credential |
 | Duplicate-dispatch protection | A durable lease is claimed before compute is requested, shared by the CLI, Ralph, the watcher, and the Actions trigger (`squad-aca leases`) |
 | Callable as an agent (opt-in) | Exposed as a Microsoft Agent Framework `AIAgent` (`Microsoft.Agents.AI` 1.16.0) in `aspire/Squad.Aca.Agents.MAF`, over a framework-free `ISquadAgent` contract. A MAF pipeline dispatches a session, polls it, and reads the route back; the worker and the ACA Jobs default are unchanged |
 | CI/CD | GitHub Actions workflow with Azure OIDC login |
@@ -302,7 +302,7 @@ fail-closed interlocks, the prerequisites in full, and the operational links.
 
 ## Triggering from a GitHub event (Actions as transport)
 
-Label an issue **`squad-aca`**, or comment **`/squad <instruction>`**, and the work
+Label an issue **`squad-aca`**, or comment **`/squad-aca <instruction>`**, and the work
 runs in Azure:
 
 ```
@@ -323,6 +323,8 @@ The workflow's last act is to start a job and comment the execution name back on
 the issue. It does not wait for the session, poll it, or hold its credential —
 if the runner vanished a second later, the session would still finish and still
 open its pull request.
+
+Both names are deliberately squad-aca and not squad: this repository defines **two** agents in `.github/agents/` — squad (the ordinary Squad coordinator) and squad-aca (the ACA dispatcher) — and squad is also Squad's own triage label. See [docs/actions-trigger.md](docs/actions-trigger.md).
 
 Actions is the **trigger transport only**. The workflow calls the same shared
 dispatch core the CLI, Ralph and Watch use, with `actions` as its dispatch
