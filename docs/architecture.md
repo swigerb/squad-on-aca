@@ -102,7 +102,7 @@ The dispatch request carries `schemaVersion`, `sessionId`, `dispatchSource`,
 `executionPreferences`, and `git` — nothing in it names an Azure resource, an
 image, a job, or a sandbox. The response carries `executionMode`,
 `sandboxClass`, `sessionHandle`, `status`, `statusPollRef`, and
-`fallbackReason`. `capabilityResolution` is the slot the Sprint 2 capability
+`fallbackReason`. `capabilityResolution` is the slot the capability
 resolver fills; the seam passes `$null` today.
 
 `create` never writes its own response to the pipeline — it returns it through an
@@ -147,7 +147,7 @@ provider makes. `aca` is resolved through an overridable path
 
 ### The route gate
 
-`Resolve-SquadExecutionRoute` is the single place the Sprint 2 capability
+`Resolve-SquadExecutionRoute` is the single place the capability
 decision (`aca-job` | `sandbox` | `fail-closed`) is acted on, and the single
 place the feature flag is enforced:
 
@@ -304,11 +304,13 @@ a failed session.
 * Every sandbox is labelled `name=squad-<session id>` so a reaper can find
   orphans.
 
-**Known limitation (PRD #6 Sprint 7 owns it).** Worker credentials are currently
-delivered as environment assignments inside the launch command, so they appear in
-that one `aca` process argv on the client. The provider never repeats them —
-not into the dispatch response, not into an error message, not into a rendered
-argv — but replacing this with credential brokerage is Sprint 7's job.
+Credentials are delivered as a **file**, not as environment assignments in the
+launch command, so no process holds a token in its argv. The launch generator
+refuses a credential-bearing env assignment, and
+`scripts/tests/verify-launch-detachment.ps1` asserts `ARGVLEAK=absent` by
+scanning `/proc` while a push is in flight, with a positive control proving the
+scan can find a decoy. The provider never repeats a credential — not into the
+dispatch response, not into an error message, not into a rendered argv.
 
 ## Unified dispatch contract and durable leases
 
@@ -324,7 +326,7 @@ The routing decision and the lease lifecycle live in **Node**, under
 
 | File | Responsibility |
 | --- | --- |
-| `worker/lib/dispatch-decision.js` | The one routing decision. Wraps the Sprint 2 capability resolver and produces `{sessionId, dispatchSource, leaseKey, routing{…}}`. |
+| `worker/lib/dispatch-decision.js` | The one routing decision. Wraps the capability resolver and produces `{sessionId, dispatchSource, leaseKey, routing{…}}`. |
 | `worker/lib/dispatch-lease.js` | The durable lease store, lifecycle, gone-classification and sweeper. |
 | `worker/lib/squad-dispatch.js` | The CLI seam: `decide \| claim \| dispatched \| heartbeat \| complete \| release \| sweep \| list`. |
 

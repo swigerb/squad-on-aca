@@ -4,7 +4,7 @@
 - **Date:** 2026-08-01
 - **Deciders:** Squad (lead), repository owner
 - **Context:** `docs/capability-manifest.md`, section
-  "[What's deliberately out of scope in this phase](../capability-manifest.md#whats-deliberately-out-of-scope-in-this-phase)",
+  "[What's deliberately out of scope in this phase](../capability-manifest.md#limits)",
   which names four follow-on efforts
 - **Companion:** [docs/plans/capability-manifest-future-work.md](../plans/capability-manifest-future-work.md)
   is the sprint plan this ADR authorises. This document records *why*; that one

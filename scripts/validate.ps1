@@ -5141,6 +5141,23 @@ if (Test-Path $deployScript) {
     } else {
         Add-Fail "deploy.ps1 does not assign 'Container Apps Jobs Operator' to the GitHub Actions principal scoped to the session job after recreating it. A resource-scoped role assignment dies with the resource, so every image-changing deploy would silently break the Actions trigger"
     }
+
+    # `gh auth token` returns the ACTIVE account's token, which on a
+    # multi-account machine is often not the account with write access.
+    # Deploying that produces a session that clones, runs the agent for up to an
+    # hour, and fails at the push. Observed here repeatedly: each redeploy
+    # silently reset the session job to a read-only credential.
+    if ($deployText -match 'permissions\.push' -and $deployText -match 'REFUSING') {
+        Add-Pass "deploy.ps1 refuses a GitHub token that cannot push to the default repository, rather than deploying a credential it can already tell will fail at the end of a session"
+    } else {
+        Add-Fail "deploy.ps1 does not check that the GitHub token can push. 'gh auth token' returns the active account's token, so a multi-account machine can silently deploy a read-only credential and every session will fail at the push"
+    }
+
+    if ($deployText -match 'SQUAD_SKIP_TOKEN_CHECK') {
+        Add-Pass "The deploy-time push-access check has a documented escape hatch, so an offline or air-gapped deploy is not blocked by a network call"
+    } else {
+        Add-Fail "The deploy-time push-access check has no opt-out, so a deploy with no network access to the GitHub API cannot proceed"
+    }
 } else {
     Add-Fail "scripts/deploy.ps1 is missing"
 }
