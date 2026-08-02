@@ -61,6 +61,46 @@ function New-HexToken([int]$Bytes = 32) {
 if (-not $GitHubToken) {
     $GitHubToken = (& gh auth token).Trim()
 }
+
+# A token that cannot PUSH produces a session that clones, runs the agent for
+# up to an hour, and then fails at the push. The in-worker token preflight
+# catches it about two minutes in, which is far better than at the push, but a
+# deploy should not hand the worker a credential it can already tell is
+# unusable.
+#
+# This is not hypothetical: `gh auth token` returns the ACTIVE account's token,
+# and on a machine with more than one GitHub account that is often not the
+# account with write access. It happened here, repeatedly, and each redeploy
+# silently reset the session job to a read-only credential.
+#
+# Skipped when -DefaultRepository is empty (nothing to check against) and when
+# SQUAD_SKIP_TOKEN_CHECK is set, so an offline or air-gapped deploy is not
+# blocked by a network call.
+if ($GitHubToken -and $DefaultRepository -and -not $env:SQUAD_SKIP_TOKEN_CHECK) {
+    $pushProbe = $null
+    try {
+        $pushProbe = & gh api "repos/$DefaultRepository" --jq '.permissions.push' `
+            -H "Authorization: token $GitHubToken" 2>$null
+    } catch {
+        $pushProbe = $null
+    }
+
+    if ($LASTEXITCODE -ne 0 -or -not $pushProbe) {
+        Write-Host "[deploy] WARNING: could not confirm push access to $DefaultRepository with the supplied GitHub token. Continuing; the in-worker token preflight will catch an unusable credential at session start." -ForegroundColor Yellow
+    } elseif ($pushProbe.Trim() -ne 'true') {
+        Write-Host ""
+        Write-Host "[deploy] REFUSING: the GitHub token does not have push access to $DefaultRepository (permissions.push=$($pushProbe.Trim()))." -ForegroundColor Red
+        Write-Host "         A session deployed with it would clone, run the agent, and fail at the push." -ForegroundColor Red
+        Write-Host "         'gh auth token' returns the ACTIVE account's token, which on a multi-account" -ForegroundColor Red
+        Write-Host "         machine is often not the one with write access. Check 'gh auth status'." -ForegroundColor Red
+        Write-Host "         Fix: pass -GitHubToken with a token that can push, or set" -ForegroundColor Red
+        Write-Host "         SQUAD_SKIP_TOKEN_CHECK=1 to deploy anyway." -ForegroundColor Red
+        Write-Host ""
+        throw "GitHub token lacks push access to $DefaultRepository"
+    } else {
+        Write-Host "[deploy] GitHub token has push access to $DefaultRepository."
+    }
+}
 if (-not $CopilotGitHubToken) {
     # NOTE (PRD #6, Sprint 7): this collapses two credential planes into one.
     # `gh auth token` returns a CLASSIC token (`ghp_`), and the ACA Sandboxes

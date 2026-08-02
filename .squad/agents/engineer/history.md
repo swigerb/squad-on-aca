@@ -1711,3 +1711,24 @@ measured TTL of exactly 3600 seconds, so it is not.
   The message read "the same word ('s')" and the comparison would have passed for
   `squad` vs `squid`. Wrap in `@()`. A gate whose message is visibly wrong is
   a gate whose comparison is probably wrong too.
+
+## Reference docs are not a changelog
+
+- I had turned `docs/capability-manifest.md` into a running record of what was
+  stale, what a sprint corrected, and what was out of scope. 213 of its 749 lines
+  - 28% - were history nobody using the repository needs. Someone reading it
+  wants to know what the manifest DOES, not what it used to claim.
+- The split that works: **reference docs say what exists, in present tense.
+  ADRs say why. Plans are archives and say so in their title.** Git holds the
+  rest.
+- A stale claim hides better inside a long document. Cutting the section
+  surfaced two more: "the decision is computed and reported but not acted upon"
+  (dispatch has acted since #25) and "credentials appear in that one aca process
+  argv" (they have been file-delivered since sprint 7, and a probe asserts
+  ARGVLEAK=absent).
+- **`gh auth token` returns the ACTIVE account's token.** On a multi-account
+  machine that is often not the one with write access - and deploy.ps1 used it
+  as a silent fallback, so three redeploys in a row reset the session job to a
+  read-only credential. Each time the in-worker preflight caught it two minutes
+  in, which is the right place to catch it but the wrong place to LEARN it.
+  deploy.ps1 now probes permissions.push and refuses.

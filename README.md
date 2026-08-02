@@ -237,7 +237,7 @@ Run the static validation gate before pushing:
 .\scripts\validate.ps1 -RunDotnet # make a missing dotnet SDK a failure, not a skip
 ```
 
-See [docs/validation.md](docs/validation.md) for the full sprint/E2E checklist and
+See [docs/validation.md](docs/validation.md) for the full verification checklist and
 security validation steps (OTLP auth, exposure, RBAC, secret scans, token
 separation, rotation, public sync guard, image pinning).
 
@@ -395,4 +395,16 @@ framework is not inside the worker.
 - `squad-aca sync --sync-all` runs a public repo secret guard that blocks obvious
   secret files and inline tokens before staging.
 
-See [docs/runbook.md](docs/runbook.md), [docs/sandboxes.md](docs/sandboxes.md), [docs/rollback.md](docs/rollback.md), [docs/architecture.md](docs/architecture.md), and [docs/feature-parity.md](docs/feature-parity.md).
+## Documentation
+
+| If you want to | Read |
+|---|---|
+| Deploy it and run a session | [docs/runbook.md](docs/runbook.md) |
+| Trigger sessions from GitHub issues | [docs/actions-trigger.md](docs/actions-trigger.md) |
+| Declare what your repository needs | [docs/capability-manifest.md](docs/capability-manifest.md) |
+| Use the second execution plane | [docs/sandboxes.md](docs/sandboxes.md) |
+| Call Squad on ACA from your own code | [docs/maf-adapter.md](docs/maf-adapter.md) · [docs/agent-contract.md](docs/agent-contract.md) |
+| Understand how it fits together | [docs/architecture.md](docs/architecture.md) |
+| Turn something off | [docs/rollback.md](docs/rollback.md) |
+| Verify a change | [docs/validation.md](docs/validation.md) |
+| Know why a decision was made | [docs/adr/](docs/adr/) |
