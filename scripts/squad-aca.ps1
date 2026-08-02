@@ -1140,6 +1140,35 @@ function Start-LeasedExecution {
             "uses the default ACA Jobs route. The in-worker capability preflight still applies after the clone.")
     }
 
+    # EGRESS HONESTY (capability-manifest future-work sprint 3). The decision no
+    # longer reports a declared destination as satisfied by a plane that will not
+    # enforce it; this is where an operator is told, before compute is requested.
+    #
+    # THE COUNT IS PRINTED, NEVER THE HOSTS. `egress[].host` is
+    # repository-controlled text and this line lands in an operator's terminal
+    # and in session logs, so echoing it would make the manifest an injection
+    # surface into exactly the place a human reads for reassurance. The hosts are
+    # in the machine-readable decision (routing.capability.egressAdvisoryHosts)
+    # for anything that genuinely needs them.
+    #
+    # This does NOT change the route: a repository declaring egress still
+    # dispatches to aca-job when its tools fit the default profile. Failing
+    # closed here would break the unconditional default and the rollback path.
+    $advisoryCount = 0
+    $routingObject = $decision.routing
+    if ($routingObject -and ($routingObject.PSObject.Properties.Name -contains "egressAdvisoryHostCount")) {
+        $advisoryCount = [int]$routingObject.egressAdvisoryHostCount
+    }
+    if ($advisoryCount -gt 0) {
+        $destinations = if ($advisoryCount -eq 1) { "destination" } else { "destinations" }
+        Write-Warning ("Capability manifest declares $advisoryCount network $destinations that the " +
+            "'$([string]$routingObject.route)' route will NOT enforce: that plane applies no per-execution " +
+            "network policy, so declaring a destination neither opens nor restricts anything there. " +
+            "The destinations are in the routing decision, not printed here (manifest text is " +
+            "repository-controlled). An approved sandbox class does enforce them -- see " +
+            "docs/capability-manifest.md.")
+    }
+
     $claim = New-SquadDispatchLease -Decision $decision -Repository $repo
     # Fail-closed on the outcome vocabulary: ONLY `created` and `repaired` mean
     # "you own this work". Anything else -- including any outcome added later --

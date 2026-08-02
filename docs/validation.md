@@ -39,6 +39,7 @@ pre-push hook.
 | CLI behaviour regression | Drives `scripts/squad-aca.ps1` in a child process with stub `az`/`gh` binaries on `PATH` (`scripts/tests/cli-stub-harness.ps1`), asserting exit codes, **stdout content**, and the exact `az` call sequence for `sessions`, `logs`, `stop`, `smoke`, and `doctor` | The provider refactor must be observably invisible; this fails if a call site changes what a user sees, including the `stop` pass-through output and exit code when `az` fails |
 | CLI golden gate wiring | Asserts every capture case in `scripts/tests/cli-capture-cases.ps1` has a committed golden, that the `stop` golden records `az` stdout, and that `.github/workflows/worker-tests.yml` actually runs `verify-cli-golden.ps1` | A guard that is not automated is not a guard; PR #9's regression class shipped once because the only stdout-comparing tool was a manual one |
 | Worker capability tests | Not run by `validate.ps1` (needs `bash`+`node`); run `bash worker/tests/run-tests.sh` directly or via CI | Covers the capability manifest parser, the capability routing decision, preflight contract, Ralph transactional dispatch, and the harness itself |
+| Egress honesty | Drives `scripts/squad-aca.ps1` through the CLI stub harness with a manifest whose declared egress host is a **distinctive token**, and asserts: the route is still `aca-job` and a job actually starts; the CLI warns that *N* destinations will not be enforced on the named route; the token appears in **neither** stdout nor stderr; a manifest declaring no egress produces **no** such warning. Structurally: `squad-capability-preflight.sh` no longer says `advisory only, not enforced yet` and is keyed on `SQUAD_EXECUTION_MODE`; `resolve-capability-route.js` derives `egressEnforced` from the profile's `egress.defaultAction` and contains no route-name substitute; and `worker/tests/test_egress_honesty.sh` still carries all five paired claims | The decision used to report a declared destination as *satisfied* on the ACA Jobs plane, which has no per-execution network control at all — `defaultWorker.egress` is `{Allow, []}`, so `egressAllows()` returned true for any host. **No enforcement was added**; the decision stopped claiming a control it cannot back. The count-not-hosts rule is a redaction property, not cosmetics: `egress[].host` is repository-controlled text landing in an operator terminal and in session logs. Both directions of every boolean are asserted, because a boolean checked one way is satisfied by a constant |
 
 The capability manifest contract itself is documented in
 [capability-manifest.md](capability-manifest.md): manifest schema, built-in
@@ -415,6 +416,7 @@ require_deps node git
 | Suite | Declared dependencies |
 | --- | --- |
 | `test_capability_routing.sh` | `node` |
+| `test_egress_honesty.sh` | `node` |
 | `test_git_checkout.sh` | `git` |
 | `test_parse_capabilities.sh` | `node` |
 | `test_preflight.sh` | `node` |

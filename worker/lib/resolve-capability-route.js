@@ -37,6 +37,11 @@
  *   4. Diagnostics are redacted. Only allowlisted identifier NAMES, fixed reason
  *      codes, and counts are emitted. Free-form manifest text (reason, notes,
  *      raw key names, values) never reaches the output, logs, or errors.
+ *   4a. The decision never claims a control it cannot back. `egressEnforced`
+ *      states whether the profile this route runs under carries an egress
+ *      policy a plane can actually apply, and every declared destination that
+ *      will NOT be enforced is listed in `egressAdvisoryHosts` instead of being
+ *      silently reported as satisfied. See "Egress honesty" below.
  *   5. Anything ambiguous fails closed. A malformed manifest, an unreadable or
  *      invalid catalog, an unsafe manifest path, or an identifier that is
  *      safe-charactered but implausibly long all produce fail-closed — never a
@@ -348,11 +353,53 @@ function egressAllows(policy, host) {
 }
 
 // --------------------------------------------------------------------------
+// Egress honesty
+// --------------------------------------------------------------------------
+
+/**
+ * Whether a profile's egress policy is something a plane can ENFORCE.
+ *
+ * This reads the POLICY, never the route name, and that is the whole point of
+ * the field. `egressAllows()` returns true for every host under
+ * `{defaultAction: "Allow", hostRules: []}`, which is how
+ * `config/sandbox-classes.json` models the default ACA Jobs worker -- an
+ * accurate description of a plane with no per-execution network control. A
+ * policy that permits everything by default and denies nothing is not a
+ * control, so a route running under it enforces nothing, and the decision must
+ * say so rather than reporting the destination as satisfied.
+ *
+ * `defaultAction === "Deny"` is exactly the predicate the enforcing plane
+ * already applies: New-SandboxEgressPolicy in
+ * scripts/lib/providers/squad-sandbox-provider.ps1 REFUSES a class whose
+ * defaultAction is not Deny, generates the policy from the class template
+ * narrowed by the manifest's request, and applies it before repository code
+ * runs.
+ *
+ * The coupling is deliberate and documented (docs/capability-manifest.md,
+ * "Egress honesty"): if an administrator ever gave `defaultWorker` a
+ * default-deny policy, this would report enforced on a plane that applies
+ * nothing. That is a catalog-integrity obligation, not something a route-name
+ * check would have caught -- a route-name check cannot distinguish an
+ * enforcing profile from a permissive one at all, which is why it is not used
+ * here.
+ */
+function egressPolicyEnforced(policy) {
+  return isPlainObject(policy) && policy.defaultAction === 'Deny';
+}
+
+// --------------------------------------------------------------------------
 // Decision construction
 // --------------------------------------------------------------------------
 
 // Single construction point for the decision object so key order is fixed and
 // every field is always present. Golden files depend on this.
+//
+// egressEnforced/egressAdvisoryHosts are DERIVED here rather than passed in by
+// each branch, so a route that forgets to state its egress posture cannot
+// inherit a positive claim. A caller only ever supplies the enforcing half
+// (`egressEnforced: true`), and only when it has selected a profile whose
+// policy a plane applies; anything that does not is unenforced by default,
+// which is the fail-honest direction.
 function buildDecision(overrides) {
   const base = {
     schemaVersion: DECISION_SCHEMA_VERSION,
@@ -371,12 +418,26 @@ function buildDecision(overrides) {
     unsatisfiedTools: [],
     unsatisfiedCredentials: [],
     unsatisfiedEgressHosts: [],
+    // Placeholder only: both fields are recomputed below from the declared
+    // hosts and the caller's claim, so the fail-honest default (unenforced)
+    // applies to every branch that does not select an enforcing profile.
+    egressEnforced: false,
+    egressAdvisoryHosts: [],
     catalogSchemaVersion: null,
     catalogProvisional: true,
     detail: ''
   };
   const merged = Object.assign(base, overrides);
   merged.detail = REASON_DETAILS[merged.reason] || '';
+
+  // "Nothing declared" is not "unenforced": with no declared destination there
+  // is nothing this plane could fail to enforce, so the claim is vacuously
+  // true and the advisory list is empty. With destinations declared, the claim
+  // holds only if the selected profile carries an enforceable policy.
+  const declaredEgressHosts = Array.isArray(merged.egressHosts) ? merged.egressHosts : [];
+  merged.egressEnforced = declaredEgressHosts.length === 0 ? true : merged.egressEnforced === true;
+  merged.egressAdvisoryHosts = merged.egressEnforced ? [] : declaredEgressHosts.slice();
+
   // Re-project through the base key order so overrides can never reorder keys.
   const ordered = {};
   for (const key of Object.keys(base)) ordered[key] = merged[key];
@@ -508,11 +569,17 @@ function resolveCapabilityRoute(input) {
     // image.hint stays advisory here: the default profile already satisfies
     // everything, so the hint cannot change the route. Preserves today's
     // behaviour for the overwhelmingly common case.
+    //
+    // The egress claim, however, is now measured rather than assumed. The
+    // profile this route runs under is `defaultWorker`, so its policy -- not
+    // the route name "aca-job" -- decides whether a declared destination is
+    // enforced or merely advisory.
     return buildDecision(
       Object.assign({}, common, {
         route: ROUTE_ACA_JOB,
         reason: 'default-profile-satisfies-manifest',
-        defaultImageSufficient: true
+        defaultImageSufficient: true,
+        egressEnforced: egressPolicyEnforced(catalog.defaultWorker.egress)
       })
     );
   }
@@ -562,6 +629,11 @@ function resolveCapabilityRoute(input) {
       reason: 'approved-sandbox-class-matched',
       defaultImageSufficient: false,
       sandboxClass: selected.id,
+      // The selected class's own policy decides the egress claim, exactly as
+      // defaultWorker's does on the ACA Jobs route. An approved class carries
+      // a default-deny template that the Sandboxes provider generates from and
+      // applies before repository code runs, so this reports enforced.
+      egressEnforced: egressPolicyEnforced(selected.egress),
       // Catalog-owned value only: this is the alias string as stored in the
       // catalog, echoed back after an exact match. Never raw manifest text.
       imageHint: matchedAlias === null ? null : selected.imageHintAliases.find((alias) => alias === matchedAlias),
@@ -693,6 +765,7 @@ module.exports = {
   ROUTE_FAIL_CLOSED,
   SandboxCatalogError,
   egressAllows,
+  egressPolicyEnforced,
   hostMatchesPattern,
   loadCatalog,
   loadManifest,

@@ -351,7 +351,24 @@ while IFS=$'\t' read -r kind name required; do
       echo "Declared external service (advisory only, not validated): ${name}" >>"$ADVISORIES_FILE"
       ;;
     egress)
-      echo "Declared egress dependency (advisory only, not enforced yet); inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
+      # PLANE-AWARE, because the old single message ("advisory only, not
+      # enforced yet") is now WRONG inside a sandbox. On the ACA Sandboxes plane
+      # New-SandboxEgressPolicy generates a default-deny policy from the
+      # approved class template narrowed by this manifest and applies it before
+      # this script runs; on the ACA Jobs plane there is no per-execution
+      # network control at all, so a declared destination is reachable whether
+      # or not it was declared. SQUAD_EXECUTION_MODE is set to "sandbox" by the
+      # Sandboxes provider and is the same signal agent-policy.js uses to tell
+      # the two planes apart. Unset means the Jobs plane, which is the
+      # fail-honest default: it never claims a control that is absent.
+      #
+      # Neither branch echoes ${name}: the host is repository-controlled text
+      # and this output is the session log.
+      if [[ "${SQUAD_EXECUTION_MODE:-}" == "sandbox" ]]; then
+        echo "Declared egress dependency (ENFORCED on this plane: the sandbox's default-deny egress policy was generated from the approved class template and applied before this session started); inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
+      else
+        echo "Declared egress dependency (NOT ENFORCED on this plane: ACA Jobs applies no per-execution network policy, so declaring a destination neither opens nor restricts it; route to an approved sandbox class for enforced egress); inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"
+      fi
       ;;
     image)
       echo "Manifest declares a custom worker image hint; current worker image is fixed. See docs/capability-manifest.md#future-per-task-images-and-sandboxes and inspect ${MANIFEST_RELATIVE_PATH} for details." >>"$ADVISORIES_FILE"

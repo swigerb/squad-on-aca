@@ -20,6 +20,10 @@
   "unsatisfiedTools": [],
   "unsatisfiedCredentials": [],
   "unsatisfiedEgressHosts": [],
+  "egressEnforced": false,
+  "egressAdvisoryHosts": [
+    "registry.npmjs.org"
+  ],
   "catalogSchemaVersion": 1,
   "catalogProvisional": false,
   "detail": "Every required capability is already provided by the default worker profile, so the existing ACA job is used."

@@ -85,7 +85,7 @@ notes: Bootstrap notes for humans or agents working on this repo.
 | `tools[]` | `name`, `required`, `reason` | A tool identifier matched against a **built-in allowlist** of fixed preflight checks. The manifest does not carry shell commands. |
 | `credentials[]` | `name`, `required`, `reason` | An allowlisted environment variable name whose **presence** is checked. Values are never printed. |
 | `services[]` | `name`, `required`, `reason` | An external service the task depends on (for example a database). The worker cannot safely auto-provision or reach arbitrary services, so these are **advisory-only documented dependencies**. `required: true` is **not supported** and is rejected at validation (see below) — declare services `required: false`. |
-| `egress[]` | `host`, `reason` | A network destination the task needs to reach. **Enforced on the ACA Sandboxes plane** (it narrows the approved class's default-deny template, and a destination the template does not already permit is a hard failure); **advisory on the ACA Jobs plane**, which has no per-execution network control. See [What's deliberately out of scope in this phase](#whats-deliberately-out-of-scope-in-this-phase). |
+| `egress[]` | `host`, `reason` | A network destination the task needs to reach. **Enforced on the ACA Sandboxes plane** (it narrows the approved class's default-deny template, and a destination the template does not already permit is a hard failure). **Not enforced on the ACA Jobs plane**, which has no per-execution network control: declaring a destination there neither opens nor restricts anything, and the routing decision says so rather than reporting it as satisfied — see `egressEnforced` and `egressAdvisoryHosts[]` in [The decision document](#the-decision-document) and [Egress honesty](#egress-honesty). |
 | `image` | `hint`, `reason` | Advisory pointer to a worker image that would satisfy this repo's needs. Not auto-applied today. |
 | `notes` | string | Free-form guidance for humans or agents. |
 
@@ -157,12 +157,16 @@ starts:
      against the running worker using fixed, internally-defined checks.
      Any gap is a **blocking failure**.
    - **Everything else** — optional tools/credentials, advisory `services`,
-     `egress`, and `image` hints — is **advisory only**. It's printed so the
+     `egress`, and `image` hints — is **non-blocking**. It's printed so the
      session log makes the gap visible, but it never blocks the session.
      The worker cannot safely guarantee network reachability or spin up
      services, so treating these as hard failures would produce false
      negatives. (A service declared `required: true` is not advisory — it is
      rejected earlier at manifest validation, per the schema rules above.)
+     `egress` is a special case: non-blocking on every plane, but what the
+     line *says* depends on the plane. Inside a sandbox the destination is
+     genuinely enforced by a generated default-deny policy; on ACA Jobs it is
+     enforced by nothing. See [Egress honesty](#egress-honesty).
 4. On a blocking failure, preflight prints one actionable line per gap
    (what's missing and how to fix it) and exits `78` (`EX_CONFIG`).
    Free-form manifest values are not echoed back in startup errors/logs; check
@@ -250,7 +254,9 @@ stable enough to golden-test and to diff between runs.
 | `imageHintRecognized` | boolean | Whether that hint matched an approved class alias. |
 | `unsatisfiedTools[]` | string[] | Required tools that **no** approved class provides. |
 | `unsatisfiedCredentials[]` | string[] | Required credentials that **no** approved class permits. |
-| `unsatisfiedEgressHosts[]` | string[] | Declared hosts that **no** approved class's egress template permits. |
+| `unsatisfiedEgressHosts[]` | string[] | Declared hosts that **no** approved class's egress template permits. This is a *catalog-coverage* statement, not an enforcement one: it is only ever populated on the `no-approved-sandbox-class` path. An empty list does **not** mean the declared hosts will be enforced — read `egressEnforced` for that. |
+| `egressEnforced` | boolean | Whether the profile this route runs under carries an egress policy a plane will actually apply. Derived from that profile's `egress.defaultAction`, **not** from the route name. Vacuously `true` when nothing was declared. |
+| `egressAdvisoryHosts[]` | string[] | The declared hosts the named plane will **not** enforce. Non-empty exactly when `egressEnforced` is `false` and `egressHosts[]` is non-empty. |
 | `catalogSchemaVersion` | integer \| null | Schema version of the catalog that produced this decision. |
 | `catalogProvisional` | boolean | `true` while the catalog is unreviewed. Consumers must treat a provisional catalog as report-only. |
 | `detail` | string | A fixed, actionable sentence for the `reason`. Never contains manifest text. |
@@ -594,7 +600,13 @@ Whatever consumes the decision, the in-worker preflight stays the final safety
 check: routing chooses *where* to run, and preflight still verifies the
 environment that actually booted.
 
-### Future: controlled egress
+### Egress honesty
+
+> **Read this section title carefully. No enforcement was added.** What landed
+> is a decision that stops claiming a control it cannot back. If you read
+> "controlled egress landed", you have misread it: on the ACA Jobs plane a
+> declared destination is still neither opened nor restricted. The change is
+> that the decision, the CLI and the in-worker preflight now *say* so.
 
 > **Stale as originally written.** The paragraph below said `egress[]` entries
 > "are advisory today because the worker's network policy is not manifest-driven".
@@ -618,24 +630,65 @@ rule has template provenance. See
 [ADR 0001, G4](adr/0001-aca-sandboxes-feasibility.md#g4--invariant-3-default-deny-capability-scoped-egress--pass).
 
 On the **ACA Jobs** plane — the unconditional default and the rollback path —
-there is no egress logic at all, and the situation is worse than "advisory". The
-catalog declares the default worker's egress as
-`{"defaultAction": "Allow", "hostRules": []}`, so the resolver reports a declared
-destination as *satisfied* by a plane that will not enforce it, with
-`unsatisfiedEgressHosts: []` and no field distinguishing the two cases.
+there is no egress logic at all, and the situation used to be worse than
+"advisory". The catalog declares the default worker's egress as
+`{"defaultAction": "Allow", "hostRules": []}`, so `egressAllows()` returned true
+for *any* host and the resolver reported a declared destination as *satisfied*
+by a plane that will not enforce it: `unsatisfiedEgressHosts: []`, and no field
+distinguishing the two cases.
 
 Per-task egress enforcement on the Jobs plane is **rejected, not deferred**: ACA
 Jobs has no per-execution network control, and the only lever — VNet-injecting
 the shared Container Apps environment — is environment-wide rather than
-capability-scoped and would perturb the rollback path itself. What is scheduled
-instead is honesty: the routing decision must state whether the plane it names
-will enforce the declared egress, and must stop reporting an unenforced
-destination as satisfied. See
+capability-scoped and would perturb the rollback path itself.
+
+**What the decision now states.** Two fields, described in
+[The decision document](#the-decision-document):
+
+- `egressEnforced` — `true` only when the profile the named route runs under
+  carries an egress policy a plane will actually apply. It is derived from that
+  profile's `egress.defaultAction`, never from the route name: a flag read off
+  `route` would be a restatement of `route` and would back no claim about the
+  policy. `defaultAction === "Deny"` is precisely the predicate
+  `New-SandboxEgressPolicy` already enforces before it will generate a policy.
+- `egressAdvisoryHosts[]` — the declared destinations the named plane will not
+  enforce. On the ACA Jobs route with a non-empty `egress[]`, every declared
+  host appears here and **none** is reported as satisfied.
+
+"Nothing declared" is not "unenforced": a manifest with no `egress[]` reports
+`egressEnforced: true` and an empty advisory list on every route, because there
+is no destination the plane could fail to enforce.
+
+**The route does not move.** A repository that declares egress and whose tools
+fit the default profile still routes to `aca-job`. Failing closed there would
+break the unconditional default and the rollback path, and is out of scope by
+construction, not by omission.
+
+**The operator surface states the count, never the hosts.** `squad-aca` warns
+that *N* declared destinations will not be enforced on the named route, and
+prints no host string. `egress[].host` is repository-controlled text and that
+warning lands in a terminal and in session logs, so echoing it would make the
+manifest an injection surface into exactly the place a human reads for
+reassurance. The hosts remain available machine-readably in
+`routing.capability.egressAdvisoryHosts`.
+
+`squad-capability-preflight.sh` is plane-aware for the same reason: keyed on
+`SQUAD_EXECUTION_MODE`, it reports a declared host as enforced inside a sandbox
+and as **not** enforced anywhere else. It no longer prints the old
+`advisory only, not enforced yet`, which was false on the sandbox plane. It
+still never blocks a session on a declared host, and it never prints the host.
+
+**Residual risk, stated plainly.** `egressEnforced` trusts the catalog. If an
+administrator ever gave `defaultWorker` an `egress.defaultAction` of `Deny`, the
+decision would report enforced on a plane that applies nothing. That is a
+catalog-integrity obligation. It is also the deliberate trade: the alternative —
+keying on the route name — cannot distinguish an enforcing profile from a
+permissive one at all.
+
+The sprint record — scope, acceptance criteria, and the mutation results that
+back each claim above, including one prediction in the plan that turned out to
+be wrong — is
 [sprint 3](plans/capability-manifest-future-work.md#sprint-3-stop-asserting-egress-is-satisfied-on-a-plane-that-does-not-enforce-it).
-Until that lands, `squad-capability-preflight.sh` prints
-`advisory only, not enforced yet` for a declared host even when the session is
-running inside a sandbox that *is* enforcing it; that message is wrong on the
-sandbox plane and sprint 3 corrects it.
 
 ### Future: short-lived, least-privilege credentials
 
