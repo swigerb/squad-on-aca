@@ -1586,3 +1586,46 @@ measured TTL of exactly 3600 seconds, so it is not.
   the EXACT command deploy.ps1 runs rather than a proxy for it.
 - The suite derives its layout by parsing the Dockerfile COPY lines. With a
   hard-coded list, deleting the catalog from COPY would break nothing.
+
+## Future-work sprint 2 - a distinct exit code is what makes fail-closed a fact
+
+- Collapsed the duplicated manifest-path-safety rule into
+  `worker/lib/locate-manifest.js`. The premise "the two callers now share code"
+  is only meaningful if a mutation to the shared module fails TWO assertions, one
+  per entry point. Measured: M1 fails `corpus/tree-escape-etc: resolver ...` AND
+  `corpus/tree-escape-etc: preflight ...`. Premise holds.
+- **The old bash contract was fail-closed by luck.** "Any non-zero means unsafe"
+  plus an `__ABSENT__` stdout sentinel could not distinguish a module that failed
+  to LOAD (node exits 1) from a hostile path. One plausible refactor - an
+  `exit 0` fast-path when the module is missing - would have turned "manifest is
+  unsafe" into "no manifest present". Distinct exit codes (0/3/4, everything else
+  unclaimed -> refuse with 69) make that downgrade unreachable rather than
+  unlikely.
+- **Asserting an exit code is not asserting a verdict.** Under M1 the preflight
+  STILL exits 78 for `../../../../etc/hostname` - the path check lets it through
+  and the parser then rejects `/etc/hostname` as malformed. An exit-code-only
+  assertion stays green with the traversal boundary gone. The corpus compares
+  output text plus exit code, which is why M1 is visible at all.
+- **Two of the plan's own mutation predictions were wrong, and saying so was the
+  work.** M2 does not fail the symlink-ESCAPE case - `isWithin` catches an
+  outside-pointing symlink independently, so deleting the symlink check only
+  shows up on a symlink INSIDE the tree. M5 cannot fail the missing-locator
+  assertion, because that assertion deletes the file itself. I restructured the
+  block to derive its layout from the Dockerfile COPY list and added a POSITIVE
+  assertion, which is what M5 actually breaks. A mutation table copied from a
+  plan without being run is decoration.
+- The corpus's resolver side goes through `resolve-capability-route.js`'s export,
+  not through `locate-manifest.js` directly. Testing the shared module directly
+  would pass unchanged if the resolver quietly kept a private copy - i.e. it
+  would prove nothing about the thing the sprint claims.
+- The user's abandon-check corpus reported three DIFFERs that were harness
+  artifacts, not drift: an empty env var falls back to the default before it
+  reaches the path logic, and `repoDir` missing/being-a-file is refused by a
+  CALLER-level `exit 64` guard. Unifying those away would have replaced a good
+  operator message with a generic one. Framing is not disagreement; the corpus
+  labels them.
+- Dangling symlink resolves to `absent`, not `unsafe`, because `existsSync`
+  follows the link and returns false before the lstat check. Subtle, current,
+  and now asserted by name so a reordering cannot silently change it.
+- Not verified: no ACR build. Structural checks and an image-shaped directory
+  only. Stated as unverified rather than implied.

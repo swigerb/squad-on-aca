@@ -825,3 +825,97 @@ A note on how that exit code was obtained, because the first attempt was wrong:
 an `echo EXIT=$?` inside an `az acr run` step reports **0 even for a deliberate
 `exit 70`** — the task engine consumes `$?` before the shell sees it. Any exit
 code read that way is fiction. Let ACR fail the step and report the status.
+## One manifest-path implementation
+
+The rule that decides whether the capability manifest at
+`CAPABILITY_MANIFEST_PATH` is safe to read used to exist **twice**: once in
+`worker/lib/resolve-capability-route.js` (routing, outside the session) and once
+as an inline `node - <<'NODE'` heredoc inside
+`worker/lib/squad-capability-preflight.sh` (the in-session gate). Both refuse a
+path that escapes the repository, is absolute, is a symlink, or is not a regular
+file. Two copies of a security rule drift silently: a fix applied to one leaves
+the other protecting less, and nothing fails.
+
+Sprint 2 collapsed them into `worker/lib/locate-manifest.js`. The resolver
+`require()`s it; the preflight `exec`s it as a CLI.
+
+### The corpus is driven through *both* entry points
+
+`worker/tests/test_manifest_path_corpus.sh` reads
+`worker/tests/fixtures/manifest-path-corpus.txt` and runs every shared row
+through the resolver **and** through the real preflight script. That is the
+whole point: **one mutation to the shared module must fail two assertions, one
+per entry point.** If it fails only one, the two callers are not sharing code and
+the unification is a claim rather than a fact — so `validate.ps1` asserts the
+suite names both entry points, and asserts the preflight contains none of
+`isWithin`, `realpathSync`, `lstatSync`, `existsSync`, `statSync`,
+`path.isAbsolute`, `path.resolve`, `path.relative`.
+
+Two subtleties are pinned by name because they are current behaviour and easy to
+"fix" into a regression:
+
+- **A dangling symlink is `absent`, not `unsafe`.** `fs.existsSync` follows the
+  link and returns false, so the `lstat` symlink check is never reached. Moving
+  the symlink check earlier would change this.
+- **A symlink *inside* the tree pointing at a regular file inside the tree is
+  still `unsafe`.** The resolver rejects *any* symlink at the manifest path. It
+  is the `isWithin` check, not the symlink check, that catches a symlink
+  pointing outside — so deleting the symlink check does **not** fail a
+  symlink-escape assertion, only the inside-the-tree one.
+
+The resolver side of the corpus goes through
+`resolve-capability-route.js`'s **export**, not through `locate-manifest.js`
+directly. Testing the shared module directly would pass unchanged if the
+resolver quietly kept a private copy.
+
+Verdicts are compared as **text plus exit code**, not exit code alone. Under a
+mutation that lets `..` escape the tree, `../../../../etc/hostname` resolves as
+*present*, the parser then rejects `/etc/hostname` as malformed, and the
+preflight **still exits 78**. An assertion on the exit code alone stays green
+while the traversal boundary is gone.
+
+### Why criterion 3 exists: a missing module must refuse, not skip
+
+If `locate-manifest.js` is not in the image, the preflight must **refuse the
+session** — exit **69** (`EX_UNAVAILABLE`), with a message naming the missing
+file. It must not report "no capability manifest present" and it must not exit 0.
+
+This is not defensive tidiness. Deleting one filename from a Dockerfile `COPY`
+line is a one-character-class edit that CI does not obviously punish, and the
+failure it would otherwise produce is *"no manifest present, skipping (safe
+default)"* — a **fail-open on a security boundary**, strictly worse than the
+duplication that was removed. Sprint 1 shipped exactly this class of defect: a
+`COPY` that could not reach above its build context, invisible to both the plan
+and an image-shaped simulation because neither built anything.
+
+So the design makes the downgrade unreachable:
+
+| Locator exit | Meaning | Preflight |
+|---|---|---|
+| `0` + a path on stdout | present | proceeds with that path |
+| `0` + empty stdout | (contract violation) | **69** |
+| `3` | absent | `0`, "skipping (safe default)" |
+| `4` | unsafe | `78`, "invalid or unsafe" |
+| `64`, `70`, `1`, anything else | unclaimed | **69** |
+
+The old scheme — "any non-zero means unsafe" plus an `__ABSENT__` stdout
+sentinel — could not express this. A module that failed to load (node exits 1)
+and a hostile path landed on the same branch, so the gate was fail-closed *by
+luck*, and one plausible refactor (an `exit 0` fast-path) would have flipped it.
+Distinct exit codes make "the module is missing" impossible to mistake for a
+verdict.
+
+`69` is deliberately **not** `78`: an operator can tell *your image is
+incomplete* from *your manifest is wrong* without reading the source.
+
+### The missing-module test derives its layout from the Dockerfile
+
+The criterion-3 assertions build a worker library directory by **parsing the
+`COPY` instructions in `worker/Dockerfile`**, the same way `test_image_layout.sh`
+does. A hard-coded file list would keep the suite green for the one edit the
+criterion exists to catch — removing `locate-manifest.js` from `COPY` — because
+the missing-module case deletes the file itself and so is indifferent to whether
+it was ever shipped. The parser is strict and loud: line continuations, the JSON
+array form, and `--from=` all abort the suite rather than falling back to a
+guess. A positive assertion (*the layout the Dockerfile actually ships resolves a
+manifest path*) is what fails when the file is un-shipped.

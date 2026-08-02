@@ -1,0 +1,71 @@
+# Shared manifest-path corpus.
+#
+# ONE list of cases, driven through BOTH entry points by
+# worker/tests/test_manifest_path_corpus.sh:
+#
+#   resolver  -- worker/lib/resolve-capability-route.js's exported locateManifest,
+#                called in process (the control-plane consumer)
+#   preflight -- worker/lib/squad-capability-preflight.sh, run end to end
+#                (the in-worker session gate, which reaches the same code
+#                through the locate-manifest.js CLI)
+#
+# Both must reach the SAME verdict for every `shared` row. That is the sprint's
+# whole claim, and the reason one mutation to locate-manifest.js has to fail two
+# named assertions.
+#
+# Fields, pipe-separated (no field here ever contains a pipe):
+#   id | setup | manifest-relative-path | expected-verdict | framing
+#
+# setup keywords are implemented by build_case() in the suite:
+#   regular          write a valid manifest at the path (parents created)
+#   none             create nothing
+#   dir              mkdir the path
+#   symlink-inside   symlink the path at a real manifest INSIDE the repo
+#   symlink-outside  symlink the path at a real manifest OUTSIDE the repo
+#   symlink-dangling symlink the path at a target that does not exist
+#   escape-file      write a valid manifest in the sibling `outside` directory
+#   repo-missing     the repository directory is never created
+#   repo-is-file     the repository "directory" is a regular file
+#   repo-loop        the repository directory is a self-referential symlink
+#
+# Placeholders: @CTRL@ -> U+0001, @EMPTY@ -> the empty string,
+#               @NUL@  -> U+0000 (resolver side only; see below)
+#
+# framing:
+#   shared  the case reaches the shared path logic through BOTH entry points,
+#           so both must agree. Two assertions.
+#   caller-guard        the preflight refuses at a CALLER-LEVEL guard that runs
+#                       BEFORE path resolution -- `if [[ ! -d "$REPO_DIR" ]] ...
+#                       exit 64`. Both refuse; they refuse in different places,
+#                       and "Repository directory does not exist" is a better
+#                       operator message than a generic unsafe-path refusal, so
+#                       this guard is deliberately NOT unified away. Recording
+#                       it here stops a future reader misreading it as drift.
+#   caller-env-default  the preflight cannot deliver this input at all:
+#                       MANIFEST_RELATIVE_PATH="${CAPABILITY_MANIFEST_PATH:-squad-capabilities.yml}"
+#                       means an EMPTY variable falls back to the default. The
+#                       shared module's empty-path guard is for an in-process
+#                       caller that passes "" explicitly.
+#   caller-argv         the input cannot cross a process boundary: execve
+#                       terminates arguments and environment at NUL, so the
+#                       preflight can never receive it. Resolver side only.
+#
+# id|setup|manifest-relative-path|expected-verdict|framing
+present-regular|regular|squad-capabilities.yml|present|shared
+present-dot-slash|regular|./squad-capabilities.yml|present|shared
+present-nested|regular|config/capabilities.yml|present|shared
+present-with-space|regular|my caps.yml|present|shared
+absent-missing-file|none|not-a-manifest.yml|absent|shared
+absolute-path|none|/etc/hostname|unsafe|shared
+tree-escape-etc|none|../../../../etc/hostname|unsafe|shared
+tree-escape-controlled|escape-file|../outside/outside.yml|unsafe|shared
+control-character|regular|caps@CTRL@.yml|unsafe|shared
+directory-at-path|dir|a-directory.yml|unsafe|shared
+symlink-inside-tree|symlink-inside|squad-capabilities.yml|unsafe|shared
+symlink-outside-tree|symlink-outside|squad-capabilities.yml|unsafe|shared
+symlink-dangling|symlink-dangling|squad-capabilities.yml|absent|shared
+repo-dir-missing|repo-missing|squad-capabilities.yml|unsafe|caller-guard
+repo-dir-is-a-file|repo-is-file|squad-capabilities.yml|unsafe|caller-guard
+repo-dir-symlink-loop|repo-loop|squad-capabilities.yml|unsafe|caller-guard
+empty-relative-path|none|@EMPTY@|unsafe|caller-env-default
+nul-in-path|none|caps@NUL@.yml|unsafe|caller-argv
