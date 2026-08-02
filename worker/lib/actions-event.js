@@ -15,7 +15,7 @@
  *
  * Usage as a CLI (what the workflow calls):
  *   node actions-event.js --event-name issues --event-path "$GITHUB_EVENT_PATH" \
- *        [--trigger-label squad] [--command-prefix /squad] [--bot-login foo[bot]]
+ *        [--trigger-label squad-aca] [--command-prefix /squad-aca] [--bot-login foo[bot]]
  *
  * Prints a single JSON object and exits 0 whether or not it decides to
  * dispatch. A non-zero exit means the INPUT was unusable, which is a different
@@ -39,7 +39,21 @@ const fs = require('fs');
 // squad-issue-assign.yml treats every squad:* label as a member assignment --
 // the same reason Ralph's marker is squad-aca:dispatched.
 const DEFAULT_TRIGGER_LABEL = 'squad-aca';
-const DEFAULT_COMMAND_PREFIX = '/squad';
+// NOT '/squad'. This repository defines TWO Copilot agents in .github/agents/:
+// squad ("Your AI team" -- the ordinary Squad coordinator) and squad-aca
+// ("Dispatch work to an Azure Container Apps-hosted Squad session"). /squad
+// names the WRONG one: it reads as "invoke Squad", and Squad is a real,
+// distinct agent here that does not dispatch to ACA.
+//
+// It is also the obvious name for a slash command if upstream Squad ever adds
+// one -- exactly the shape of the squad LABEL collision, where this project
+// had squatted on Squad's canonical triage label and fired its triage workflow
+// on every dispatch. Upstream has no issue_comment handler today (verified
+// against bradygaster/squad), so this is pre-emptive rather than a live bug.
+//
+// /squad-aca matches the trigger label, so both ways of asking for a remote
+// session use the same word for the same thing.
+const DEFAULT_COMMAND_PREFIX = '/squad-aca';
 
 // Reasons are named constants so a test asserts on a stable token rather than
 // on prose, and so the workflow can branch on one without string-matching a

@@ -536,18 +536,25 @@ see [Image evidence](#image-evidence) and the runbook procedure.
 
 ## What's deliberately out of scope in this phase
 
-> **Corrected 2026-08-01.** This section was written in the voice of the pull
-> request that introduced the manifest, and several sprints have landed since.
-> Four of its claims were stale and one concealed a live defect. The findings,
-> the disposition of each effort, and the evidence are in
-> [ADR 0003](adr/0003-capability-manifest-future-work.md); the scheduled work and
-> how each sprint will be falsified are in
+> **Status, 2026-08-01 — three of these four have now landed.** This section was
+> originally written in the voice of the pull request that introduced the
+> manifest. Several sprints have landed since; four of its claims went stale and
+> one concealed a live defect. The findings and the disposition of each effort
+> are in [ADR 0003](adr/0003-capability-manifest-future-work.md); the sprints and
+> how each was falsified are in
 > [docs/plans/capability-manifest-future-work.md](plans/capability-manifest-future-work.md).
 > The original text is preserved below with corrections marked, because what was
 > believed at the time is part of the record.
 
-These are real, valuable next steps that the manifest is designed to feed,
-but they need more design/security review than fits in one PR.
+| Effort | Disposition |
+|---|---|
+| **Packaging** the catalog into the worker image | **Done** — sprint 1. It was a live defect, not deferred work: Ralph resolved `catalog-unavailable` and exited 70 on every cron run. Fixing it also required moving the Docker build context to the repository root, because a `COPY` cannot reach above its context. |
+| **One manifest-path implementation** | **Done** — sprint 2. `worker/lib/locate-manifest.js` is the single implementation, shared by the resolver and the in-worker preflight. A missing locator **refuses the session** (exit 69) rather than reporting "no manifest present". |
+| **Controlled egress** | **Partly, and deliberately not as originally framed.** Sprint 3 made the decision *honest* — it no longer claims a control the named plane does not have. **No enforcement was added on ACA Jobs**, and per-task egress there is **rejected, not deferred**. |
+| **Short-lived, least-privilege credentials** | **Deferred, with no sprint.** The consumption side is built and proven; minting is blocked. Two preconditions are named in the plan. |
+
+These were real, valuable next steps that the manifest is designed to feed. What
+follows records what each turned out to be.
 
 ### Future: per-task images and Sandboxes
 
@@ -572,9 +579,9 @@ landed:
   declared tools are backed by digest-keyed evidence — so a class cannot claim a
   tool its image does not provide.
 
-Still outstanding:
+What was outstanding, and what became of it:
 
-- **Packaging — and this is a live defect, not deferred work.**
+- **Packaging — FIXED in sprint 1. It was a live defect, not deferred work.**
   `worker/lib/resolve-capability-route.js` is copied into the worker image, but
   `config/sandbox-classes.json` is not. The original text described the
   consequence as "resolution for a dispatch runs control-plane side": true of the

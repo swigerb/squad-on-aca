@@ -1,5 +1,24 @@
 # Sprint plan: capability-manifest future work
 
+> **All three scheduled sprints are DONE, merged, and deployed** as of
+> 2026-08-01. `main` carries them; the worker image was rebuilt and the
+> deployed image was verified to resolve a route with no `--catalog` — the
+> defect sprint 1 existed to fix.
+>
+> | Sprint | Status | Gate movement |
+> |---|---|---|
+> | 1 — ship the catalog into the image | **Done** | `validate.ps1` 363 → 375 |
+> | 2 — one manifest-path implementation | **Done** | 375 → 388 |
+> | 3 — egress honesty | **Done** | 388 → 397 |
+> | *(4 — short-lived credentials)* | **Not scheduled** | — |
+>
+> Worker suite over the three: **14 suites / 911 → 17 suites / 1022**.
+>
+> Each sprint's block below records what actually happened, **including the
+> predictions in this plan that turned out to be wrong.** Three did. They are
+> left visible rather than edited away, because a plan that silently matches its
+> outcome teaches nothing about how much to trust the next one.
+
 **Companion to [ADR 0003](../adr/0003-capability-manifest-future-work.md)**,
 which records why each of the four efforts in
 `docs/capability-manifest.md` was scheduled, reduced, or deferred. Read it

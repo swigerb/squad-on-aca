@@ -224,4 +224,30 @@ out="$(node "$MODULE" --event-name issues --event-path "${WORK}/event.json" --co
 assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "with NO --trigger-label override, the DEFAULT label 'squad-aca' DOES dispatch -- confirming the two labels are handled as opposites, not just that one of them refuses"
 assert_eq "label-applied" "$(printf '%s' "$out" | field reason)" "and it dispatches for the expected reason"
 
+# ---------------------------------------------------------------------------
+# The command prefix names the ACA dispatcher, not the ordinary Squad agent
+# ---------------------------------------------------------------------------
+# .github/agents/ defines BOTH `squad` ("Your AI team" -- the ordinary Squad
+# coordinator) and `squad-aca` ("Dispatch work to an ACA-hosted Squad session").
+# A command prefix of `/squad` names the FORMER: it reads as "invoke Squad", and
+# Squad is a real, distinct agent here that does not dispatch to ACA. It is also
+# the obvious name for a slash command if upstream Squad ever adds one -- the
+# same shape as the `squad` LABEL collision that fired Squad's triage workflow
+# on every ACA dispatch.
+default_prefix="$(node -e "process.stdout.write(require('${MODULE}').DEFAULT_COMMAND_PREFIX)")"
+assert_ne "/squad" "$default_prefix" "the default command prefix is NOT '/squad' -- that names the ordinary Squad coordinator agent in .github/agents/, which does not dispatch to ACA"
+assert_eq "/squad-aca" "$default_prefix" "the default command prefix is '/squad-aca', matching the trigger label so both ways of asking for a remote session use the same word"
+
+plain_squad='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad fix the flaky test","user":{"login":"swigerb","type":"User"}}}'
+printf '%s' "$plain_squad" >"${WORK}/event.json"
+out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
+assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "with the DEFAULT prefix, a bare '/squad' comment does NOT start a billed remote session -- someone asking the ordinary Squad agent for help must not be charged for an ACA container"
+assert_eq "comment-carries-no-command" "$(printf '%s' "$out" | field reason)" "and it is refused for the right reason"
+
+aca_cmd='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad-aca fix the flaky test","user":{"login":"swigerb","type":"User"}}}'
+printf '%s' "$aca_cmd" >"${WORK}/event.json"
+out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
+assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "with the DEFAULT prefix, '/squad-aca' DOES dispatch -- the accepting direction, without which a typo in the default would leave every refusal assertion green while dispatch was dead"
+assert_eq "fix the flaky test" "$(printf '%s' "$out" | field prompt)" "and the prompt excludes the command itself"
+
 test_summary

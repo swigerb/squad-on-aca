@@ -54,7 +54,7 @@ jobs:
         id: decide
         env:
           SQUAD_TRIGGER_LABEL: ${{ vars.SQUAD_TRIGGER_LABEL || 'squad-aca' }}
-          SQUAD_COMMAND_PREFIX: ${{ vars.SQUAD_COMMAND_PREFIX || '/squad' }}
+          SQUAD_COMMAND_PREFIX: ${{ vars.SQUAD_COMMAND_PREFIX || '/squad-aca' }}
           SQUAD_BOT_LOGIN: ${{ vars.SQUAD_BOT_LOGIN || 'squad-on-aca-control-plane[bot]' }}
         run: |
           set -euo pipefail
