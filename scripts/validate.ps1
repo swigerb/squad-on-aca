@@ -122,7 +122,8 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\lib\squad-policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_agent_policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh"),
-    (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh")
+    (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
@@ -5312,6 +5313,204 @@ if (-not (Test-Path $imageLayoutSuite)) {
         Add-Pass "test_image_layout.sh derives its layout from the Dockerfile COPY instructions rather than a hard-coded file list, so removing a file from COPY removes it from the test"
     } else {
         Add-Fail "test_image_layout.sh no longer reads the Dockerfile COPY instructions; a hard-coded file list would keep passing after the catalog was un-shipped"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# The manifest-path decision is defined ONCE
+# (ADR 0003 finding 2 / future-work sprint 2)
+# ---------------------------------------------------------------------------
+Write-Section "One manifest-path implementation"
+
+# WHY THIS SECTION EXISTS.
+#
+# The rules that decide whether a capability manifest path is safe -- reject
+# absolute paths, control characters, escapes from the working tree, symlinks,
+# and anything that is not a regular file -- used to exist TWICE: in
+# worker/lib/resolve-capability-route.js (the control-plane routing decision)
+# and as an inline `node - <<'NODE'` heredoc inside
+# worker/lib/squad-capability-preflight.sh (the in-worker session gate). Two
+# implementations of a path-traversal boundary is the shape of a future CVE: a
+# rule added to one and not the other applies to routing but not to the gate
+# that actually runs inside the session, and nothing fails.
+#
+# They now share worker/lib/locate-manifest.js.
+#
+# The BEHAVIOURAL proof is worker/tests/test_manifest_path_corpus.sh: one corpus
+# driven through both entry points, so a single mutation to the shared module
+# fails two named assertions. The checks below guard the things behaviour cannot
+# see -- that the module is actually shipped, that neither consumer has quietly
+# grown a private copy again, and that the corpus still drives BOTH sides. A
+# restored inline copy inside the preflight would keep the corpus green with ONE
+# failure per mutation instead of two, which looks identical in a summary line.
+$locatorPath        = Join-Path $RepoRoot "worker\lib\locate-manifest.js"
+$preflightShPath    = Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"
+$routeResolverJs    = Join-Path $RepoRoot "worker\lib\resolve-capability-route.js"
+$corpusSuitePath    = Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh"
+$corpusFixturePath  = Join-Path $RepoRoot "worker\tests\fixtures\manifest-path-corpus.txt"
+
+if (-not (Test-Path $locatorPath)) {
+    Add-Fail "worker/lib/locate-manifest.js is missing; the manifest-path rules have no shared home and both consumers would have to re-implement them"
+} else {
+    $locatorText = Get-Content -LiteralPath $locatorPath -Raw
+
+    # --- 1. The shared module is SHIPPED -------------------------------------
+    # Sprint 1's "every shipped require() target is shipped" check already fails
+    # if the resolver requires an unshipped file, but the preflight reaches this
+    # module by exec, not by require(), so that check alone would not see it.
+    $libCopyRecord = $copyRecords | Where-Object { $_.Dest -eq '/usr/local/lib/squad-on-aca/' } | Select-Object -First 1
+    if ($libCopyRecord -and ($libCopyRecord.Sources -contains 'worker/lib/locate-manifest.js')) {
+        Add-Pass "worker/Dockerfile ships worker/lib/locate-manifest.js into /usr/local/lib/squad-on-aca/, which is the only place squad-capability-preflight.sh looks for it"
+    } else {
+        Add-Fail "worker/Dockerfile does not ship worker/lib/locate-manifest.js; the in-worker preflight would refuse every session with exit 69, and the routing resolver would die with MODULE_NOT_FOUND"
+    }
+
+    # --- 2. The verdicts are distinct exit codes ------------------------------
+    # The preflight used to read "any non-zero" as unsafe, which meant a module
+    # that failed to load (node exit 1) and a hostile path produced the same
+    # branch. Distinct codes are what let the preflight refuse on an unclaimed
+    # one instead of guessing.
+    $hasDistinctCodes = ($locatorText -match 'EXIT_ABSENT\s*=\s*3') -and
+                        ($locatorText -match 'EXIT_UNSAFE\s*=\s*4') -and
+                        ($locatorText -match 'EXIT_PRESENT\s*=\s*0')
+    if ($hasDistinctCodes) {
+        Add-Pass "locate-manifest.js gives present/absent/unsafe three distinct exit codes (0/3/4), so a caller can refuse on any code it does not recognise instead of reading 'the module is broken' as a path verdict"
+    } else {
+        Add-Fail "locate-manifest.js no longer defines distinct present/absent/unsafe exit codes; collapsing them re-creates the ambiguity where a missing module and an unsafe path are indistinguishable"
+    }
+
+    # --- 3. The resolver DELEGATES ------------------------------------------
+    if (-not (Test-Path $routeResolverJs)) {
+        Add-Fail "worker/lib/resolve-capability-route.js is missing"
+    } else {
+        $routeResolverText = Get-Content -LiteralPath $routeResolverJs -Raw
+        $resolverDelegates = $routeResolverText -match "require\(\s*'\./locate-manifest\.js'\s*\)"
+        $resolverPrivateCopy = @(@('function isWithin', 'function realpath', 'function locateManifest') |
+            Where-Object { $routeResolverText -like "*$_*" })
+        if ($resolverDelegates -and $resolverPrivateCopy.Count -eq 0) {
+            Add-Pass "resolve-capability-route.js requires ./locate-manifest.js and defines no manifest-path resolution of its own"
+        } elseif (-not $resolverDelegates) {
+            Add-Fail "resolve-capability-route.js no longer requires ./locate-manifest.js; the routing decision would be judging manifest paths by rules the in-worker gate never sees"
+        } else {
+            Add-Fail "resolve-capability-route.js has re-grown a private manifest-path implementation ($($resolverPrivateCopy -join ', ')); a mutation to the shared module would then fail only the preflight's assertions, and the divergence this section exists to prevent would be back"
+        }
+    }
+}
+
+# --- 4. The preflight defines NO path resolution of its own ------------------
+# M4 in the sprint plan. This is an ABSENCE grep, which is the one thing grep is
+# reliable for. It matters because restoring an inline copy while KEEPING the
+# shared module leaves every behavioural assertion green: the corpus would still
+# agree case by case, and a mutation to the shared module would fail one
+# assertion instead of two. That difference is invisible in a summary line and
+# is exactly the divergence that produced this sprint.
+if (-not (Test-Path $preflightShPath)) {
+    Add-Fail "worker/lib/squad-capability-preflight.sh is missing"
+} else {
+    $preflightText = Get-Content -LiteralPath $preflightShPath -Raw
+
+    # Deliberately NOT a grep for "node - <<'NODE'": the preflight still uses one
+    # to flatten a PARSED manifest into rows, and that is not path resolution.
+    # These tokens are specific to deciding whether a path is safe.
+    $pathLogicTokens = @(
+        'isWithin', 'realpathSync', 'lstatSync', 'existsSync', 'statSync',
+        'path.isAbsolute', 'path.resolve', 'path.relative', '__ABSENT__'
+    )
+    $foundPathLogic = @($pathLogicTokens | Where-Object { $preflightText -like "*$_*" })
+    if ($foundPathLogic.Count -eq 0) {
+        Add-Pass "squad-capability-preflight.sh defines no path-resolution of its own (none of: $($pathLogicTokens -join ', ')), so the corpus really does drive one implementation from two entry points"
+    } else {
+        Add-Fail "squad-capability-preflight.sh has re-grown inline path-resolution ($($foundPathLogic -join ', ')); with a second copy present a mutation to the shared module fails ONE assertion instead of two, and the sprint's unification claim is false while every test still passes"
+    }
+
+    # --- 5. The missing-locator path REFUSES ---------------------------------
+    # Criterion 3, and the single most important thing this sprint had to prove.
+    # A new external dependency was created; if it disappears the gate must stop
+    # the session, not report "no manifest present". Turning "unsafe path" into
+    # "no manifest" is a fail-OPEN on a security boundary and is strictly worse
+    # than the duplication that was removed. The behavioural assertions live in
+    # test_manifest_path_corpus.sh; this is the structural half.
+    $referencesLocator = $preflightText -match 'locate-manifest\.js'
+    $refusalCodes = @([regex]::Matches($preflightText, '(?m)^\s*exit\s+(\d+)') | ForEach-Object { $_.Groups[1].Value })
+    $hasRefusalCode = $refusalCodes -contains '69'
+    if ($referencesLocator -and $hasRefusalCode) {
+        Add-Pass "squad-capability-preflight.sh calls locate-manifest.js and has an exit 69 refusal path, so an un-shipped locator stops the session instead of being reported as 'no manifest present'"
+    } elseif (-not $referencesLocator) {
+        Add-Fail "squad-capability-preflight.sh no longer calls locate-manifest.js; either it has an inline copy again or the gate is not resolving the manifest path at all"
+    } else {
+        Add-Fail "squad-capability-preflight.sh has no exit 69 refusal path; a missing or broken locator would have to fall through to one of the existing outcomes, and 'no manifest present' (exit 0) is the fail-open this sprint exists to rule out"
+    }
+
+    # The 78 and 0 contracts are unchanged by the refactor, and must stay that
+    # way: sprint 2 was a refactor with an equivalence proof, not a hardening
+    # pass.
+    if (($refusalCodes -contains '78') -and ($refusalCodes -contains '0') -and ($refusalCodes -contains '64')) {
+        Add-Pass "squad-capability-preflight.sh still exits 78 (unsafe/unsatisfiable), 0 (absent/passed) and 64 (usage); the shared locator changed where the decision is made, not what the gate reports"
+    } else {
+        Add-Fail "squad-capability-preflight.sh no longer emits its documented 0/64/78 exit codes; the unification was supposed to preserve the operator-facing contract exactly"
+    }
+}
+
+# --- 6. The corpus exists and drives BOTH entry points ----------------------
+# A corpus that only exercised one side would prove agreement by construction
+# and could never fail twice, which is the sprint's entire premise.
+if (-not (Test-Path $corpusSuitePath)) {
+    Add-Fail "worker/tests/test_manifest_path_corpus.sh is missing; nothing proves the two entry points reach the same code, and a rule could be added to one consumer only"
+} elseif (-not (Test-Path $corpusFixturePath)) {
+    Add-Fail "worker/tests/fixtures/manifest-path-corpus.txt is missing; the corpus suite has no cases to drive"
+} else {
+    $corpusText = Get-Content -LiteralPath $corpusSuitePath -Raw
+    $drivesPreflight = $corpusText -match 'squad-capability-preflight\.sh'
+    $drivesResolver  = $corpusText -match 'resolve-capability-route\.js'
+    if ($drivesPreflight -and $drivesResolver) {
+        Add-Pass "test_manifest_path_corpus.sh drives the SAME corpus through squad-capability-preflight.sh and resolve-capability-route.js, so one mutation to the shared module must fail two assertions"
+    } else {
+        $missingSide = if (-not $drivesPreflight) { "the preflight" } else { "the routing resolver" }
+        Add-Fail "test_manifest_path_corpus.sh no longer drives $missingSide; a one-sided corpus cannot distinguish 'the two share code' from 'the two happen to agree', which is the distinction this sprint exists to make"
+    }
+
+    # It must read the resolver's EXPORT, not locate-manifest.js directly: going
+    # straight to the shared module would still pass if the resolver kept a
+    # private copy and never called it.
+    if ($corpusText -match 'RESOLVER_MODULE="\$\{WORKER_DIR\}/lib/resolve-capability-route\.js"') {
+        Add-Pass "test_manifest_path_corpus.sh reaches the shared logic through resolve-capability-route.js's export rather than requiring locate-manifest.js directly, so a resolver that stopped delegating would fail rather than pass"
+    } else {
+        Add-Fail "test_manifest_path_corpus.sh no longer resolves its resolver entry point from worker/lib/resolve-capability-route.js; testing the shared module directly would pass even if the resolver kept a private copy"
+    }
+
+    # The missing-locator refusal must be proved against the layout the
+    # Dockerfile actually ships, not a hard-coded file list. A hard-coded list
+    # keeps the suite green while the image ships a preflight that refuses every
+    # session -- the same shape as the packaging defect sprint 1 closed.
+    if (($corpusText -match 'Dockerfile') -and ($corpusText -match 'COPY')) {
+        Add-Pass "test_manifest_path_corpus.sh derives the worker library layout from the Dockerfile COPY instructions, so removing locate-manifest.js from the COPY line fails a behavioural assertion and not just a structural one"
+    } else {
+        Add-Fail "test_manifest_path_corpus.sh no longer derives its layout from the Dockerfile COPY instructions; un-shipping locate-manifest.js would then break only structural checks, and a hard-coded list would keep passing against an image whose preflight refuses every session"
+    }
+
+    $corpusRows = @(Get-Content -LiteralPath $corpusFixturePath |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne '' -and $_ -notmatch '^#' })
+    $sharedRows = @($corpusRows | Where-Object { $_ -match '\|shared$' })
+    if ($sharedRows.Count -ge 12) {
+        Add-Pass "manifest-path-corpus.txt declares $($corpusRows.Count) cases, $($sharedRows.Count) of which reach the shared logic from both entry points"
+    } else {
+        Add-Fail "manifest-path-corpus.txt declares only $($sharedRows.Count) case(s) that reach the shared logic from both entry points (of $($corpusRows.Count) rows); the acceptance criterion lists twelve, and a shrunken corpus quietly narrows the boundary being proved"
+    }
+
+    # The subtle behaviours a naive "preserve behaviour" refactor loses. Both are
+    # current behaviour, both are easy to get wrong, and neither is obvious from
+    # reading the code.
+    foreach ($case in @(
+        @{ Id = 'symlink-dangling';    Verdict = 'absent'; Why = "fs.existsSync FOLLOWS the link and returns false before the symlink check is reached, so a dangling link is absent rather than unsafe" },
+        @{ Id = 'symlink-inside-tree'; Verdict = 'unsafe'; Why = "the rule is 'is this a symlink', not 'does it escape', so a symlink is refused even when it points inside the working tree" }
+    )) {
+        $row = $corpusRows | Where-Object { $_ -like "$($case.Id)|*" } | Select-Object -First 1
+        if ($row -and $row -match "\|$($case.Verdict)\|") {
+            Add-Pass "manifest-path-corpus.txt pins $($case.Id) as $($case.Verdict): $($case.Why)"
+        } else {
+            Add-Fail "manifest-path-corpus.txt no longer pins $($case.Id) as $($case.Verdict); $($case.Why), and a refactor that lost it would change behaviour with no test to say so"
+        }
     }
 }
 

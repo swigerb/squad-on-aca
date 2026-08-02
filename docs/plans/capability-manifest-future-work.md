@@ -178,6 +178,61 @@ None. This is the entry point.
 
 ## Sprint 2: one manifest-path implementation
 
+> **DONE.** Landed as scoped, with two corrections to this plan's own mutation
+> table (below) and one design change the plan did not specify: the CLI reports
+> its verdict as a **distinct exit code per outcome** (`0` present, `3` absent,
+> `4` unsafe) rather than the old "any non-zero means unsafe" plus an
+> `__ABSENT__` stdout sentinel. That old scheme could not distinguish a module
+> that failed to load (node exits `1`) from a hostile path, so criterion 3 held
+> only by luck; with distinct codes every unclaimed code refuses with **69**
+> (`EX_UNAVAILABLE`), which is what makes criterion 3 hold by construction.
+>
+> **M1 fails two assertions, one per entry point** —
+> `corpus/tree-escape-etc: resolver ...` and `corpus/tree-escape-etc: preflight
+> ...` — which is the sprint's premise, measured rather than assumed. It fails
+> 6 by name in total.
+>
+> Corpus verdicts compare **output text plus exit code**, not exit code alone.
+> Under M1 the preflight still exits 78 for `../../../../etc/hostname` (the
+> parser rejects `/etc/hostname` as malformed *after* the path check has already
+> let it through); an exit-code-only assertion would have stayed green with the
+> traversal boundary gone. The second escape case, `tree-escape-controlled`,
+> resolves a *valid* manifest outside the tree and exits **0** under M1.
+>
+> Two plan corrections, stated plainly rather than papered over:
+> **M2** does not fail `corpus: symlink pointing outside the tree is unsafe`,
+> because the second `isWithin` check catches an outside-pointing symlink
+> independently of the symlink check. It fails `corpus/symlink-inside-tree` on
+> both entry points instead, and the corpus carries both cases so this is
+> visible. **M5** cannot fail `preflight: a missing shared locator refuses the
+> session`, because that assertion deletes the file itself and is indifferent to
+> whether it was ever shipped. Block 3 therefore derives its library layout by
+> parsing the Dockerfile `COPY` list, and a positive assertion — *the layout
+> worker/Dockerfile actually ships resolves a manifest path* — is what M5 breaks.
+>
+> Mutation results (all applied, observed, restored):
+>
+> | # | Mutation | Assertions failed by name |
+> |---|---|---|
+> | M1 | `isWithin` accepts `..` | **6** — `corpus/tree-escape-etc` **resolver + preflight**, `corpus/tree-escape-controlled` resolver + preflight, `resolver: an unsafe manifest path reports reason manifest-path-unsafe`, `test_capability_routing.sh: escaping relative manifest path: refused` |
+> | M2 | Delete the `lstat().isSymbolicLink()` check | **2** — `corpus/symlink-inside-tree` resolver + preflight |
+> | M3 | Delete the `isFile()` check | **2** — `corpus/directory-at-path` resolver + preflight |
+> | M4 | Re-add an inline copy in the preflight | **1** — `validate: squad-capability-preflight.sh has re-grown inline path-resolution` |
+> | M5 | Remove from the Dockerfile `COPY` | **4** — `validate: Every shipped require() target is shipped`, `validate: worker/Dockerfile does not ship worker/lib/locate-manifest.js`, `preflight: the layout worker/Dockerfile actually ships resolves a manifest path`, `preflight: the shipped layout finds the manifest rather than refusing` |
+> | M6 | Missing-locator path exits 0 instead of 69 | **7** — including `preflight: a missing shared locator still refuses an UNSAFE manifest path` and `... is NOT reported as 'no manifest present'` |
+> | M7 | Resolver treats `unsafe` as `absent` | **6** — `resolver: ... reports reason manifest-path-unsafe`, `resolver: ... fails closed`, plus 4 in `test_capability_routing.sh` |
+>
+> Gates: `validate.ps1` 375 -> **388 / 0 / 0**; worker suite 15 suites / 923 ->
+> **16 suites / 981**; CLI goldens **26** byte-identical; `dotnet test`
+> **114** (47 + 67); markdown links **94 / 0 broken**. ACA Jobs remains the
+> unconditional default.
+>
+> Not verified: the change was **not** built in ACR. Sprint 1's ACR-verified
+> layout parser is reused unchanged and the new file sits on the same `COPY`
+> line as files already proven to land, but "the image builds with this file in
+> the list" is asserted structurally and by an image-shaped directory, not by a
+> build.
+
 **Goal.** The routing resolver and the in-worker preflight decide whether a
 manifest path is safe by running the same code.
 

@@ -68,6 +68,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { parseCapabilityManifest, validateManifest } = require('./parse-capabilities.js');
+const { locateManifest } = require('./locate-manifest.js');
 
 const DECISION_SCHEMA_VERSION = 1;
 const SUPPORTED_CATALOG_SCHEMA_VERSION = 1;
@@ -573,56 +574,17 @@ function resolveCapabilityRoute(input) {
 // Manifest location + load
 // --------------------------------------------------------------------------
 
-function realpath(value) {
-  return typeof fs.realpathSync.native === 'function' ? fs.realpathSync.native(value) : fs.realpathSync(value);
-}
-
-function isWithin(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return (
-    relative === '' ||
-    (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
-  );
-}
-
-// Mirrors the hardened manifest-path resolution in
-// worker/lib/squad-capability-preflight.sh: reject absolute paths, control
-// characters, symlinks, and anything that escapes the repository working tree.
-// The two implementations are intentionally separate for now — Sprint 2 must not
-// modify the shipped preflight — and should be unified when Sprint 3 introduces
-// the provider seam.
-function locateManifest(repoDir, manifestRelativePath) {
-  if (
-    !manifestRelativePath ||
-    path.isAbsolute(manifestRelativePath) ||
-    /[\u0000-\u001f\u007f]/.test(manifestRelativePath)
-  ) {
-    return { status: 'unsafe' };
-  }
-
-  let repoRoot;
-  try {
-    repoRoot = realpath(repoDir);
-    if (!fs.statSync(repoRoot).isDirectory()) return { status: 'unsafe' };
-  } catch (err) {
-    return { status: 'unsafe' };
-  }
-
-  const candidatePath = path.resolve(repoRoot, manifestRelativePath);
-  if (!isWithin(repoRoot, candidatePath)) return { status: 'unsafe' };
-
-  if (!fs.existsSync(candidatePath)) return { status: 'absent' };
-
-  try {
-    if (fs.lstatSync(candidatePath).isSymbolicLink()) return { status: 'unsafe' };
-    const resolvedPath = realpath(candidatePath);
-    if (!isWithin(repoRoot, resolvedPath)) return { status: 'unsafe' };
-    if (!fs.statSync(resolvedPath).isFile()) return { status: 'unsafe' };
-    return { status: 'present', path: resolvedPath };
-  } catch (err) {
-    return { status: 'unsafe' };
-  }
-}
+// The manifest-path rules live in ONE place: worker/lib/locate-manifest.js.
+// They used to live here AND as an inline node heredoc inside
+// worker/lib/squad-capability-preflight.sh, so a rule could be added to the
+// routing decision without being added to the gate that actually runs in the
+// session. locateManifest is re-exported below so existing callers of this
+// module are unaffected by where the code now lives.
+//
+// This resolver is the module's in-process consumer; the preflight is its CLI
+// consumer. Both verdicts come from the same function, and
+// worker/tests/test_manifest_path_corpus.sh drives the same corpus through both
+// entry points so a change to the rules has to move both, or fail twice.
 
 function loadManifest(manifestPath) {
   let source;

@@ -32,6 +32,10 @@
 # Exit codes:
 #   0   validation passed (or was skipped / no manifest present)
 #   64  usage error
+#   69  the shared manifest-path locator (locate-manifest.js) is missing or
+#       misbehaving, so this gate cannot decide whether the path is safe
+#       (EX_UNAVAILABLE). The session is refused; it is never downgraded to
+#       "no manifest present".
 #   78  one or more required capabilities are missing (EX_CONFIG)
 
 set -Eeuo pipefail
@@ -174,70 +178,65 @@ if [[ ! -d "$REPO_DIR" ]]; then
   exit 64
 fi
 
-if ! manifest_resolution="$(
-  node - "$REPO_DIR" "$MANIFEST_RELATIVE_PATH" <<'NODE'
-const fs = require('fs');
-const path = require('path');
+# --- Manifest path resolution -------------------------------------------------
+# This script does NOT decide whether a manifest path is safe. That decision is
+# made in exactly one place -- worker/lib/locate-manifest.js -- shared with the
+# routing resolver, so a rule can never apply to routing but not to the gate
+# that actually runs inside the session (or the reverse). See
+# docs/adr/0003-capability-manifest-future-work.md, finding 2.
+#
+# CLI contract: exit 0 = present (the resolved path is on stdout), 3 = absent,
+# 4 = unsafe. EVERY other exit code is unclaimed and MUST refuse the session.
+#
+# That is why the verdicts are distinct exit codes and not "non-zero means
+# unsafe" plus a stdout sentinel, which is what this script used to do. Under
+# the old scheme a locator that could not load (node exits 1) was
+# indistinguishable from a bad path, and a locator that exited 0 printing
+# nothing would have read as "no manifest present" -- a fail-OPEN on a
+# path-traversal boundary, which is strictly worse than the duplication this
+# unification removed.
+MANIFEST_LOCATOR="${SCRIPT_DIR}/locate-manifest.js"
 
-const repoDir = process.argv[2];
-const manifestRelativePath = process.argv[3];
-
-function realpath(value) {
-  return typeof fs.realpathSync.native === 'function' ? fs.realpathSync.native(value) : fs.realpathSync(value);
-}
-
-function isWithin(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
-}
-
-if (!manifestRelativePath || path.isAbsolute(manifestRelativePath) || /[\u0000-\u001f\u007f]/.test(manifestRelativePath)) {
-  process.exit(2);
-}
-
-const repoRoot = realpath(repoDir);
-if (!fs.statSync(repoRoot).isDirectory()) {
-  process.exit(3);
-}
-
-const candidatePath = path.resolve(repoRoot, manifestRelativePath);
-if (!isWithin(repoRoot, candidatePath)) {
-  process.exit(2);
-}
-
-if (!fs.existsSync(candidatePath)) {
-  process.stdout.write('__ABSENT__\n');
-  process.exit(0);
-}
-
-const candidateLstat = fs.lstatSync(candidatePath);
-if (candidateLstat.isSymbolicLink()) {
-  process.exit(2);
-}
-
-const resolvedPath = realpath(candidatePath);
-if (!isWithin(repoRoot, resolvedPath)) {
-  process.exit(2);
-}
-
-if (!fs.statSync(resolvedPath).isFile()) {
-  process.exit(2);
-}
-
-process.stdout.write(`${resolvedPath}\n`);
-NODE
-)"; then
-  log "Capability manifest path is invalid or unsafe; refusing to read it."
-  log "Check CAPABILITY_MANIFEST_PATH and ensure it points to a regular file inside the repository."
-  exit 78
+if [[ ! -f "$MANIFEST_LOCATOR" ]]; then
+  log "Manifest path locator is missing: ${MANIFEST_LOCATOR}"
+  log "This worker image is incomplete, so the session cannot decide whether the capability manifest path is safe to read."
+  log "Refusing the session rather than assuming no manifest is present."
+  log "Rebuild and redeploy the worker image: worker/lib/locate-manifest.js must be shipped into /usr/local/lib/squad-on-aca/."
+  exit 69
 fi
 
-if [[ "$manifest_resolution" == "__ABSENT__" ]]; then
-  log "No capability manifest at ${MANIFEST_RELATIVE_PATH}; skipping (safe default)."
-  exit 0
+if manifest_resolution="$(node "$MANIFEST_LOCATOR" "$REPO_DIR" "$MANIFEST_RELATIVE_PATH")"; then
+  locator_rc=0
+else
+  locator_rc=$?
 fi
 
-MANIFEST_PATH="$manifest_resolution"
+case "$locator_rc" in
+  0)
+    if [[ -z "$manifest_resolution" ]]; then
+      log "Manifest path locator reported a manifest but named no path."
+      log "Refusing the session rather than guessing where ${MANIFEST_RELATIVE_PATH} landed."
+      log "Rebuild and redeploy the worker image: ${MANIFEST_LOCATOR} is not honouring the contract this gate depends on."
+      exit 69
+    fi
+    MANIFEST_PATH="$manifest_resolution"
+    ;;
+  3)
+    log "No capability manifest at ${MANIFEST_RELATIVE_PATH}; skipping (safe default)."
+    exit 0
+    ;;
+  4)
+    log "Capability manifest path is invalid or unsafe; refusing to read it."
+    log "Check CAPABILITY_MANIFEST_PATH and ensure it points to a regular file inside the repository."
+    exit 78
+    ;;
+  *)
+    log "Manifest path locator failed with exit ${locator_rc}, which is not a verdict it is allowed to return."
+    log "Refusing the session rather than guessing whether ${MANIFEST_RELATIVE_PATH} is safe to read."
+    log "Rebuild and redeploy the worker image: ${MANIFEST_LOCATOR} must be present and runnable by the image's node."
+    exit 69
+    ;;
+esac
 
 if ! create_secure_workdir; then
   fail "Could not create a secure private work directory; refusing to run with a predictable temp path."
