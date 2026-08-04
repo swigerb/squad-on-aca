@@ -16,6 +16,7 @@ How to decide who handles what.
 | Scope & priorities | lead | What to build next, trade-offs, decisions |
 | Session logging | Scribe | Automatic — never needs routing |
 | RAI review | Rai | Content safety, bias checks, credential detection, ethical review |
+| An executor is stuck | advisor | Two defensible designs, a failing premise, or the same fix failing twice. Guidance only -- the executor keeps the work. |
 
 ## Issue Routing
 
@@ -44,15 +45,41 @@ How to decide who handles what.
 
 ## Model Policy
 
-| Work | Agent | Required model |
-|------|-------|----------------|
-| All work, all roles | every member | `claude-opus-5` |
+The team runs the [advisor strategy][adv]: a cheaper model drives the work end to
+end, and escalates to a frontier model only when it hits something it cannot
+reasonably settle.
 
-All Squad members run `claude-opus-5` only. `.squad/config.json` sets both
-`defaultModel` and an explicit `agentModelOverrides` entry per member, because
-Layer 0 per-agent overrides take precedence over `defaultModel`.
+[adv]: https://claude.com/blog/the-advisor-strategy
 
-If any agent other than `engineer` needs to write implementation code, spawn or hand off that work to `engineer` so code-writing work uses Opus 4.8.
+| Tier | Model | Who | Why |
+|------|-------|-----|-----|
+| Advisor | `claude-opus-5` | advisor, lead, security, Rai, fact-checker | Roles that **judge** rather than execute. A bad call here costs the team a cycle or blocks a release. |
+| Executor | `claude-sonnet-5` | engineer, reviewer, devrel, ralph | Roles that **drive**: call tools, read results, iterate. They escalate rather than guess. |
+| Scribe | `claude-haiku-4.5` | scribe, docs | High volume, low ambiguity. |
+
+`.squad/config.json` sets `defaultModel` to the **executor** model and lists every
+member explicitly, because Layer 0a beats Layer 0b and an unlisted agent is easy
+to misread as deliberate. A new agent added later lands on the executor tier by
+default rather than silently inheriting the frontier one.
+
+### Escalating to the advisor
+
+**Do** — two defensible designs where the wrong one is expensive to unwind; a
+failure suggesting the premise is wrong rather than the code; a security or
+data-loss consequence you are unsure of; the same fix failing twice.
+
+**Don't** — you know what to do and it is merely tedious; a lookup would answer
+it; to have work checked, which is the reviewer's job and happens after; or out
+of caution, because an escalation you did not need teaches the team that
+escalation is free.
+
+**One honest limitation.** Anthropic's advisor tool performs the handoff inside a
+single API request. Squad cannot: an agent needing another agent must end its turn
+and let the coordinator bring one in. So each escalation costs a round trip, which
+is precisely why the rule above matters.
+
+Implementation code still routes to `engineer` — not because of the model, but
+because it owns the implementation.
 
 ## Work Type → Agent
 
@@ -67,3 +94,4 @@ If any agent other than `engineer` needs to write implementation code, spawn or 
 | devrel | devrel | — |
 | security | security | — |
 | docs | docs | — |
+| stuck executor | advisor | — |

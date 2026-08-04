@@ -13,6 +13,7 @@
 | Name | Role | Charter | Status |
 |------|------|---------|--------|
 | lead | lead | `.squad/agents/lead/charter.md` | ✅ Active |
+| advisor | advisor | `.squad/agents/advisor/charter.md` | ✅ Active |
 | engineer | engineer | `.squad/agents/engineer/charter.md` | ✅ Active |
 | reviewer | reviewer | `.squad/agents/reviewer/charter.md` | ✅ Active |
 | devrel | devrel | `.squad/agents/devrel/charter.md` | ✅ Active |

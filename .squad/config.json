@@ -1,22 +1,34 @@
 {
   "version": 1,
-  "defaultModel": "claude-opus-5",
+  "defaultModel": "claude-sonnet-5",
   "agentModelOverrides": {
+    "advisor": "claude-opus-5",
     "lead": "claude-opus-5",
-    "engineer": "claude-opus-5",
-    "reviewer": "claude-opus-5",
     "security": "claude-opus-5",
-    "docs": "claude-opus-5",
-    "devrel": "claude-opus-5",
-    "scribe": "claude-opus-5",
-    "ralph": "claude-opus-5",
     "Rai": "claude-opus-5",
-    "fact-checker": "claude-opus-5"
+    "fact-checker": "claude-opus-5",
+    "engineer": "claude-sonnet-5",
+    "reviewer": "claude-sonnet-5",
+    "devrel": "claude-sonnet-5",
+    "ralph": "claude-sonnet-5",
+    "scribe": "claude-haiku-4.5",
+    "docs": "claude-haiku-4.5"
   },
   "modelPolicy": {
+    "strategy": "advisor",
+    "reference": "https://claude.com/blog/the-advisor-strategy",
     "developmentWork": "Route development work through Squad.",
-    "leadModel": "claude-opus-5",
-    "codeWritingModel": "claude-opus-5",
-    "notes": "All Squad members run Claude Opus 5 only. Both defaultModel and explicit per-agent overrides are set because Layer 0 per-agent overrides take precedence over defaultModel."
+    "executorModel": "claude-sonnet-5",
+    "advisorModel": "claude-opus-5",
+    "scribeModel": "claude-haiku-4.5",
+    "notes": [
+      "Executors drive end to end and escalate to the advisor only when they hit a decision they cannot reasonably settle. Frontier reasoning is applied where it changes the outcome, not to every token of every task.",
+      "Opus is reserved for roles that judge rather than execute: the advisor itself, the lead, and the three review roles whose findings can block a release.",
+      "Haiku runs the scribe and docs. Both are high volume and low ambiguity, which is the shape Haiku is good at.",
+      "defaultModel is claude-sonnet-5 so a NEW agent added later lands on the executor tier by default rather than silently inheriting Opus.",
+      "Every agent is listed explicitly even where it matches defaultModel, because Layer 0a beats Layer 0b and an unlisted agent is easy to misread as deliberate.",
+      "LIMITATION, measured: Anthropic advisor tool performs the handoff inside a single API request. Squad cannot. An agent needing another agent must end its turn and let the coordinator bring one in, so each escalation costs a round trip. See .squad/agents/advisor/charter.md.",
+      "Model ids verified against the Copilot CLI on 2026-08-04: claude-opus-5, claude-sonnet-5 and claude-haiku-4.5 are all available. claude-haiku-5 does NOT exist."
+    ]
   }
 }
