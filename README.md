@@ -394,6 +394,14 @@ framework is not inside the worker.
   never `Unsecured`. OTLP ports stay internal to the ACA environment.
 - `squad-aca sync --sync-all` runs a public repo secret guard that blocks obvious
   secret files and inline tokens before staging.
+- A session can optionally be supervised by [Squad Hub][squad-hub], so a human
+  answers tool approvals from anywhere instead of destructive operations being
+  made unavailable outright. That path drops `--allow-all-tools` and keeps the
+  deny list, so it is a **tightening**: a denied tool is still refused outright
+  and is never offered for approval. See
+  [docs/squad-hub.md](docs/squad-hub.md).
+
+[squad-hub]: https://github.com/swigerb/squad-hub
 
 ## Documentation
 
@@ -403,6 +411,7 @@ framework is not inside the worker.
 | Trigger sessions from GitHub issues | [docs/actions-trigger.md](docs/actions-trigger.md) |
 | Declare what your repository needs | [docs/capability-manifest.md](docs/capability-manifest.md) |
 | Use the second execution plane | [docs/sandboxes.md](docs/sandboxes.md) |
+| Let a human approve tool calls remotely | [docs/squad-hub.md](docs/squad-hub.md) |
 | Call Squad on ACA from your own code | [docs/maf-adapter.md](docs/maf-adapter.md) · [docs/agent-contract.md](docs/agent-contract.md) |
 | Understand how it fits together | [docs/architecture.md](docs/architecture.md) |
 | Turn something off | [docs/rollback.md](docs/rollback.md) |

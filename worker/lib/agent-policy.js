@@ -416,6 +416,26 @@ function resolvePolicy(input) {
     squadFlags,
     squadFlagString: squadFlags.join(' '),
     undeliverableViaSquad: undeliverable,
+    // The SAME policy, for a session supervised by Squad Hub.
+    //
+    // `--allow-all-tools` exists because a container has no TTY and no
+    // approver, so a prompt would hang forever. Squad Hub removes that
+    // premise: it puts a human in front of the prompt, from anywhere.
+    //
+    // Dropping the flag is therefore a TIGHTENING, not a relaxation. Measured
+    // against Copilot CLI 1.0.78 over ACP:
+    //
+    //   * a tool on the deny list raises NO permission request at all -- it is
+    //     refused outright ("denied by policy"), so a human is never even
+    //     offered the chance to approve something this policy forbids. The
+    //     deny list stays a hard floor that the hub cannot lift;
+    //   * a tool that is merely ungated DOES raise a request, carrying the
+    //     literal command. Those are the decisions a person now makes, and
+    //     which previously happened with nobody watching.
+    //
+    // Everything else is carried over untouched, deny patterns included, so
+    // the reviewed policy is still resolved in exactly one place.
+    hubArgv: flags.filter((f) => f !== '--allow-all-tools'),
   };
 }
 
@@ -485,6 +505,13 @@ function main(argv) {
     case 'squad-flags':
       process.stdout.write(`${policy.squadFlagString}\n`);
       return 0;
+    // The policy as a JSON array, for Squad Hub's
+    // SQUAD_HUB_AGENT_EXTRA_ARGS_JSON. JSON rather than lines because that is
+    // the shape the hub's channel takes, and because it is the encoding that
+    // keeps a multi-word deny pattern whole end to end.
+    case 'hub-argv-json':
+      process.stdout.write(`${JSON.stringify(policy.hubArgv)}\n`);
+      return 0;
     case 'undeliverable':
       process.stdout.write(
         policy.undeliverableViaSquad.length
@@ -523,7 +550,7 @@ function main(argv) {
     }
     default:
       process.stderr.write(
-        'Usage: agent-policy.js [json|flags|argv|squad-flags|undeliverable|tier|reason|' +
+        'Usage: agent-policy.js [json|flags|argv|squad-flags|hub-argv-json|undeliverable|tier|reason|' +
           'governance-paths|mutable-governance-patterns|classify-governance-path <path>]\n'
       );
       return 78;
