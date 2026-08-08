@@ -398,7 +398,10 @@ framework is not inside the worker.
   answers tool approvals from anywhere instead of destructive operations being
   made unavailable outright. That path drops `--allow-all-tools` and keeps the
   deny list, so it is a **tightening**: a denied tool is still refused outright
-  and is never offered for approval. See
+  and is never offered for approval. Verified end to end on Container Apps — a
+  job raised a card carrying the literal command and waited for a person. Opt-in
+  and opt-out are both free: with no hub configured nothing changes, and the
+  image builds with `SQUAD_HUB_SPEC=none` and no squad-hub in it at all. See
   [docs/squad-hub.md](docs/squad-hub.md).
 
 [squad-hub]: https://github.com/swigerb/squad-hub
