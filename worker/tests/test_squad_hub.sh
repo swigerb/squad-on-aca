@@ -228,6 +228,18 @@ DOCKERFILE="$(cat "${WORKER_DIR}/Dockerfile")"
 assert_contains "$DOCKERFILE" "worker/lib/squad-hub.sh" "the supervision library is copied into the image"
 assert_contains "$DOCKERFILE" "squad-hub@"              "squad-hub is installed, at a pinned version"
 
+# A pinned version that lacks `oneshot` builds, deploys, and then fails at the
+# agent with "Supervised session failed (exit 2)" -- the CLI prints its usage
+# and exits 2, which points at nothing. squad-hub@0.2.0 did exactly that.
+# The image must prove the verb exists at BUILD time.
+assert_contains "$DOCKERFILE" "squad-hub oneshot" \
+  "the build asserts the pinned squad-hub actually has the 'oneshot' verb"
+
+# The library and the image have to agree on which verb is being called, or
+# the assertion above guards the wrong thing.
+assert_contains "$(cat "$HUB_LIB")" "squad-hub oneshot" \
+  "the supervision library calls the same verb the image checks for"
+
 # ---------------------------------------------------------------------------
 # 6. Device identity — the binding that makes the token safe to ship
 # ---------------------------------------------------------------------------

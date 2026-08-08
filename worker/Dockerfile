@@ -24,7 +24,19 @@ RUN apt-get update \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
     && npm config set fetch-retries 5 \
     && npm config set fetch-retry-maxtimeout 120000 \
-    && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 squad-hub@0.2.0 \
+    && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 squad-hub@0.3.0 \
+    # Assert the pinned squad-hub actually HAS the verb this image depends on.
+    #
+    # worker/lib/squad-hub.sh calls `squad-hub oneshot`. Pinning a version that
+    # predates it does not fail the build, does not fail the deploy, and does
+    # not fail until a supervised session reaches the agent -- where the CLI
+    # prints its usage, exits 2, and the job dies with "Supervised session
+    # failed (exit 2)" pointing at nothing in particular. That happened once,
+    # with squad-hub@0.2.0, and cost a full build-deploy-run cycle to see.
+    #
+    # One line here turns that into a build failure with the reason in it.
+    && (squad-hub --help 2>&1 | grep -q 'squad-hub oneshot' \
+        || (echo "FATAL: the pinned squad-hub has no 'oneshot' verb, which worker/lib/squad-hub.sh requires. Pin a version that has it." >&2; exit 1)) \
     && useradd -m -s /bin/bash squad \
     && mkdir -p /workspace \
     && chown -R squad:squad /workspace /home/squad \
