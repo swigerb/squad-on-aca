@@ -228,6 +228,53 @@ DOCKERFILE="$(cat "${WORKER_DIR}/Dockerfile")"
 assert_contains "$DOCKERFILE" "worker/lib/squad-hub.sh" "the supervision library is copied into the image"
 assert_contains "$DOCKERFILE" "squad-hub@"              "squad-hub is installed, at a pinned version"
 
+# ---------------------------------------------------------------------------
+# 6. Device identity — the binding that makes the token safe to ship
+# ---------------------------------------------------------------------------
+echo "-- device identity --"
+
+# A device token is minted with a device-id prefix binding so a credential
+# shipped to a cloud job cannot claim to be someone's laptop. The hub ENFORCES
+# that binding at registration, which means the id this job registers under has
+# to actually start with the bound prefix.
+#
+# It cannot be left to squad-hub's default. That default is a hex hash of the
+# app name, and a hex string can never begin with "aca-" -- so following this
+# repository's own documented advice would have refused every supervised
+# session with exit 77. These assertions exist because that shipped once.
+hub_device_id() {
+  env -u CONTAINER_APP_JOB_EXECUTION_NAME -u CONTAINER_APP_REPLICA_NAME "$@" \
+    bash -c 'source "'"$HUB_LIB"'"; squad_hub_device_id'
+}
+
+DID="$(hub_device_id CONTAINER_APP_JOB_EXECUTION_NAME=caj-squad-aca-session-abc123)"
+assert_eq "aca-caj-squad-aca-session-abc123" "$DID" \
+  "the device id STARTS with the prefix a bound token requires, and carries the execution"
+
+# Two executions of the same job must not share one device slot: squad-hub is
+# explicit that two attachments on one id fight over it.
+DID2="$(hub_device_id CONTAINER_APP_JOB_EXECUTION_NAME=caj-squad-aca-session-def456)"
+assert_ne "$DID" "$DID2" "two job executions register as two devices, not one"
+
+# The hub lowercases the bound prefix and then does a plain prefix test, so an
+# id with a capital in it would silently fail to match.
+assert_eq "aca-caj-squad-aca-upper" "$(hub_device_id CONTAINER_APP_JOB_EXECUTION_NAME=CAJ-Squad-ACA-UPPER)" \
+  "the device id is lowercased, because the hub's prefix test is"
+
+# An operator who minted with a different prefix must be able to match it
+# without editing the image.
+assert_eq "job-xyz" "$(hub_device_id SQUAD_HUB_DEVICE_ID_PREFIX=job- CONTAINER_APP_JOB_EXECUTION_NAME=xyz)" \
+  "the prefix is overridable, for a token minted with a different one"
+
+# Off ACA there is no execution name; the id must still be composed rather than
+# left bare, or every device would register as the prefix alone and collide.
+assert_eq "aca-box42" "$(hub_device_id HOSTNAME=box42)" \
+  "outside ACA the id still has a unique part"
+
+# And it has to actually reach squad-hub, or none of the above matters.
+assert_contains "$(cat "$HUB_LIB")" 'SQUAD_HUB_DEVICE_ID="$(squad_hub_device_id)"' \
+  "the composed device id is passed to squad-hub oneshot"
+
 echo ""
 echo "squad-hub supervision: ${TESTS_RUN} assertions, ${TESTS_FAILED} failed"
 exit $(( TESTS_FAILED > 0 ? 1 : 0 ))
