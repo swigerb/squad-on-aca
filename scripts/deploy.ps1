@@ -69,6 +69,56 @@ if ($SquadHubUrl -and $SquadHubUrl -notmatch '^https://') {
     throw "-SquadHubUrl must be an https:// URL; a device token must not travel in clear text."
 }
 
+# --- The device-id prefix binding has to match what the job registers as -----
+#
+# A device token may be bound to a device-id PREFIX, and the advice above tells
+# operators to use one. The hub ENFORCES that binding at registration: an id
+# that does not start with the bound prefix is refused, and the job exits 77
+# some minutes later inside a container nobody is watching.
+#
+# The binding is a claim in the token, so it can be read here without any
+# crypto -- this is not verifying the signature (only the hub can), it is
+# reading the operator's own stated intent back to them and checking it agrees
+# with what worker/lib/squad-hub.sh will actually send.
+if ($SquadHubToken) {
+    $expectedPrefix = "aca-"   # squad_hub_device_id()'s default in worker/lib/squad-hub.sh
+    $boundPrefix = $null
+    try {
+        $body = $SquadHubToken.Split(".")[1]
+        # base64url -> base64, then pad to a multiple of 4.
+        $b64 = $body.Replace("-", "+").Replace("_", "/")
+        if ($b64.Length % 4) { $b64 = $b64.PadRight($b64.Length + (4 - $b64.Length % 4), "=") }
+        $claims = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) | ConvertFrom-Json
+        $boundPrefix = $claims.did
+    } catch {
+        # An unreadable body is not necessarily a bad token -- the format could
+        # change. Warn rather than block: the hub is the authority on validity,
+        # and refusing a token this script merely could not parse would be this
+        # script overreaching.
+        Write-Warning "Could not read the device-id binding out of -SquadHubToken; skipping the prefix check."
+    }
+    if ($boundPrefix -and -not $expectedPrefix.StartsWith($boundPrefix)) {
+        throw @"
+-SquadHubToken is bound to device ids beginning "$boundPrefix", but these jobs
+register as "$expectedPrefix<execution name>". The hub would refuse every session
+with exit 77.
+
+Either mint the token with a prefix these jobs match:
+
+  squad-hub device-token --hub $SquadHubUrl --token <your own token> ``
+      --label "aca jobs" --prefix $expectedPrefix
+
+or set SQUAD_HUB_DEVICE_ID_PREFIX on the job to "$boundPrefix" so the id it
+registers under starts with what the token allows.
+"@
+    }
+    if ($boundPrefix) {
+        Write-Host "  squad hub     token is bound to device ids beginning `"$boundPrefix`" (jobs register as `"$expectedPrefix...`")" -ForegroundColor DarkGray
+    } else {
+        Write-Warning "-SquadHubToken is not bound to a device-id prefix. It could register as ANY device, including one impersonating your laptop. Mint with --prefix $expectedPrefix."
+    }
+}
+
 if (-not $ImageTag) {
     $ImageTag = try {
         (git -C $repoRoot rev-parse --short HEAD).Trim()

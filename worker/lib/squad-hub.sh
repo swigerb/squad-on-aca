@@ -47,6 +47,36 @@ SQUAD_HUB_EXIT_NO_APPROVER=75
 SQUAD_HUB_EXIT_REFUSED=77
 SQUAD_HUB_DEVICE_TOKEN_PREFIX="sqhd1."
 
+# The device id this job registers under.
+#
+# A device token may be minted with a device-id PREFIX binding, and the docs
+# here tell an operator to use one (`--prefix aca-`) precisely so a credential
+# shipped to a cloud job cannot claim to be someone's laptop. The hub enforces
+# that binding at registration: a device id that does not start with the bound
+# prefix is refused.
+#
+# So the id cannot be left to squad-hub's default. Its default is a hash of the
+# app name -- stable, which is right for a long-lived replica, and hex, which
+# can never begin with "aca-". Following the documented advice would have
+# refused every session with exit 77.
+#
+# Per EXECUTION, not per app: two concurrent job executions are two separate
+# ephemeral devices, and squad-hub is explicit that two attachments sharing one
+# id fight over the same device slot.
+SQUAD_HUB_DEVICE_ID_PREFIX="${SQUAD_HUB_DEVICE_ID_PREFIX:-aca-}"
+
+# Compose the device id this execution registers under.
+#
+# ACA sets CONTAINER_APP_JOB_EXECUTION_NAME for a job and
+# CONTAINER_APP_REPLICA_NAME for an app; the last fallback keeps this working
+# in a plain container and in the test suite, where neither exists.
+squad_hub_device_id() {
+  local unique="${CONTAINER_APP_JOB_EXECUTION_NAME:-${CONTAINER_APP_REPLICA_NAME:-${HOSTNAME:-$$}}}"
+  # Lowercased because the hub normalises the bound prefix to lower case and
+  # then does a plain prefix test; a capital here would silently not match.
+  printf '%s%s' "$SQUAD_HUB_DEVICE_ID_PREFIX" "$unique" | tr '[:upper:]' '[:lower:]'
+}
+
 squad_hub_log() {
   printf '[squad-hub] %s\n' "$*"
 }
@@ -124,6 +154,7 @@ squad_hub_run() {
   policy_json="$(squad_hub_policy_json)"
 
   squad_hub_log "Supervising this session with the hub at ${SQUAD_HUB_URL}."
+  squad_hub_log "Registering as device $(squad_hub_device_id)."
   squad_hub_log "Tool policy: --allow-all-tools dropped, deny list intact."
   squad_hub_log "  A denied tool is still refused outright and is never offered to a human."
   squad_hub_log "  Anything else now asks, and waits for a person to answer."
@@ -132,6 +163,7 @@ squad_hub_run() {
   SQUAD_HUB_ONESHOT=1 \
   SQUAD_HUB_PROMPT="$prompt" \
   SQUAD_HUB_CWD="$REPO_DIR" \
+  SQUAD_HUB_DEVICE_ID="$(squad_hub_device_id)" \
   SQUAD_HUB_AGENT_EXTRA_ARGS_JSON="$policy_json" \
     squad-hub oneshot || rc=$?
 
@@ -147,6 +179,8 @@ squad_hub_run() {
     "$SQUAD_HUB_EXIT_REFUSED")
       squad_hub_log "The hub refused this device. Retrying a policy refusal never succeeds."
       squad_hub_log "Check that the device token is current and that its prefix matches this job."
+      squad_hub_log "This job registers as \"$(squad_hub_device_id)\", so a token minted with"
+      squad_hub_log "--prefix must use a prefix that id starts with (default \"aca-\")."
       ;;
     *)
       squad_hub_log "Supervised session failed (exit ${rc})."
