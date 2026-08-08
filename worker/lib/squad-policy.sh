@@ -204,7 +204,15 @@ squad_policy_announce() {
     # channel that keeps multi-word deny patterns whole -- so nothing is
     # undeliverable here, and saying which flag was dropped (and why that is a
     # tightening) is the part an operator reading a log actually needs.
-    squad_policy_log "Copilot flags (via Squad Hub, ACP): ${SQUAD_POLICY_FLAGS}"
+    #
+    # Printed with --allow-all-tools REMOVED, not merely annotated. It read
+    # "Copilot flags (via Squad Hub, ACP): --allow-all-tools ..." on the line
+    # directly above "MINUS --allow-all-tools", so the log showed a session
+    # MORE permissive than the one that actually ran. This repository's whole
+    # position is that a log which misstates the applied policy is as bad as no
+    # policy; that holds when the misstatement is in the safe direction too,
+    # because an operator who spots it has no way to tell which line is lying.
+    squad_policy_log "Copilot flags (via Squad Hub, ACP): ${SQUAD_POLICY_FLAGS//--allow-all-tools /}"
     squad_policy_log "  MINUS --allow-all-tools: a human at the hub answers what would otherwise auto-run."
     squad_policy_log "  Deny patterns are unchanged and are still refused outright, never offered for approval."
   else

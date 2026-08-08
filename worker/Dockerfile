@@ -13,6 +13,30 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # now resolved per session by worker/lib/agent-policy.js and passed explicitly,
 # so what a session is allowed to do is decided in one reviewable place.
 
+# Which squad-hub to install, or whether to install it at all.
+#
+# THE INTEGRATION IS OPTIONAL AND MUST STAY OPTIONAL. A worker that never
+# attaches to a hub is the normal case, and it must keep building and running
+# when squad-hub is unavailable, unpublished, or simply unwanted. So:
+#
+#   SQUAD_HUB_SPEC=squad-hub@0.3.0  (default) install the pinned npm version
+#   SQUAD_HUB_SPEC=none                       do not install it at all
+#   SQUAD_HUB_SPEC=github:owner/repo#<sha>    install from an immutable git ref
+#
+# The default installs it because it costs one small dependency and means an
+# operator can turn supervision on with two environment variables instead of a
+# rebuild. `none` exists so that convenience never becomes a requirement: it
+# builds a worker with no squad-hub in it, which behaves exactly as this image
+# did before the integration existed.
+#
+# The git-ref form exists so integration work is not blocked on a publish --
+# the hub and this worker change together, and requiring a trip through
+# registry.npmjs.org to test a two-file change turns a ten-minute loop into a
+# release. It is not a hole to smuggle a package through: whoever passes a
+# build arg already controls the Dockerfile. Anything other than the default
+# should be a SHA, never a branch, or the image is not reproducible.
+ARG SQUAD_HUB_SPEC=squad-hub@0.3.0
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg openssh-client \
     && mkdir -p /etc/apt/keyrings \
@@ -24,19 +48,30 @@ RUN apt-get update \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
     && npm config set fetch-retries 5 \
     && npm config set fetch-retry-maxtimeout 120000 \
-    && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 squad-hub@0.3.0 \
-    # Assert the pinned squad-hub actually HAS the verb this image depends on.
-    #
-    # worker/lib/squad-hub.sh calls `squad-hub oneshot`. Pinning a version that
-    # predates it does not fail the build, does not fail the deploy, and does
-    # not fail until a supervised session reaches the agent -- where the CLI
-    # prints its usage, exits 2, and the job dies with "Supervised session
-    # failed (exit 2)" pointing at nothing in particular. That happened once,
-    # with squad-hub@0.2.0, and cost a full build-deploy-run cycle to see.
-    #
-    # One line here turns that into a build failure with the reason in it.
-    && (squad-hub --help 2>&1 | grep -q 'squad-hub oneshot' \
-        || (echo "FATAL: the pinned squad-hub has no 'oneshot' verb, which worker/lib/squad-hub.sh requires. Pin a version that has it." >&2; exit 1)) \
+    && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 \
+    # Record what was asked for, so a running container can be ASKED which
+    # squad-hub it has rather than guessed at -- including "none".
+    && printf '%s\n' "$SQUAD_HUB_SPEC" > /etc/squad-hub-spec \
+    && if [ "$SQUAD_HUB_SPEC" = "none" ] || [ -z "$SQUAD_HUB_SPEC" ]; then \
+         echo "squad-hub not installed (SQUAD_HUB_SPEC=none). Hub supervision will be unavailable in this image; every other mode is unaffected."; \
+       else \
+         npm install -g "$SQUAD_HUB_SPEC" \
+         # Assert the installed squad-hub actually HAS the verb this image
+         # depends on.
+         #
+         # worker/lib/squad-hub.sh calls `squad-hub oneshot`. Installing a
+         # version that predates it does not fail the build, does not fail the
+         # deploy, and does not fail until a supervised session reaches the
+         # agent -- where the CLI prints its usage, exits 2, and the job dies
+         # with "Supervised session failed (exit 2)" pointing at nothing in
+         # particular. That happened once, with squad-hub@0.2.0, and cost a
+         # full build-deploy-run cycle to see.
+         #
+         # It runs inside this branch, so it checks an override just as well as
+         # the default -- and cannot make an image that opted OUT fail to build.
+         && (squad-hub --help 2>&1 | grep -q 'squad-hub oneshot' \
+             || (echo "FATAL: squad-hub '$SQUAD_HUB_SPEC' has no 'oneshot' verb, which worker/lib/squad-hub.sh requires. Install a version that has it, or build with SQUAD_HUB_SPEC=none to leave hub supervision out." >&2; exit 1)); \
+       fi \
     && useradd -m -s /bin/bash squad \
     && mkdir -p /workspace \
     && chown -R squad:squad /workspace /home/squad \

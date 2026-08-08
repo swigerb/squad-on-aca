@@ -46,6 +46,38 @@ policy() {
 }
 
 # ---------------------------------------------------------------------------
+# 0. Off by default — the property everything else is allowed to assume
+# ---------------------------------------------------------------------------
+echo "-- optional by default --"
+
+# The single most important assertion in this file. Supervision is a CHOICE.
+# With neither variable set, squad_hub_enabled must say no, the entrypoint must
+# take the path it always took, and a worker that has never heard of a hub must
+# behave exactly as it did before this integration existed.
+#
+# Asserted first, and by BEHAVIOUR rather than by reading the entrypoint,
+# because everything below it -- every refusal, every abort -- is only
+# acceptable while this holds. A refusal that fires when no hub was asked for
+# is not a safety property, it is an outage.
+hub_enabled_rc() {
+  env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN "$@" \
+    bash -c 'source "'"$HUB_LIB"'"; if squad_hub_enabled; then echo enabled; else echo disabled; fi' 2>&1
+}
+
+assert_eq "disabled" "$(hub_enabled_rc)" \
+  "with NO hub configured, supervision is off -- the integration is opt-in"
+
+assert_eq "enabled" "$(hub_enabled_rc SQUAD_HUB_URL=https://h.example SQUAD_HUB_TOKEN=sqhd1.x)" \
+  "with both halves configured, supervision is on"
+
+# Half a configuration is a mistake, not a preference. Either alone would
+# otherwise deploy a job that cannot attach and cannot say why.
+assert_contains "$(hub_enabled_rc SQUAD_HUB_URL=https://h.example)" "cannot attach" \
+  "a URL with no token refuses rather than running half-configured"
+assert_contains "$(hub_enabled_rc SQUAD_HUB_TOKEN=sqhd1.x)" "no hub to attach to" \
+  "a token with no URL refuses rather than running half-configured"
+
+# ---------------------------------------------------------------------------
 # 1. The hub policy is the same policy, minus exactly one flag
 # ---------------------------------------------------------------------------
 echo "-- the hub argv --"
@@ -80,6 +112,21 @@ assert_contains "$HUB_JSON" '"shell(az)"'            "shell(az) survives to the 
 assert_contains "$HUB_JSON" '"shell(git config)"'      "a multi-word deny pattern survives as ONE argument"
 assert_contains "$HUB_JSON" '"shell(gh auth)"'         "shell(gh auth) survives whole"
 assert_contains "$HUB_JSON" '"shell(gh repo delete)"'  "a three-word deny pattern survives whole"
+
+# The ANNOUNCEMENT must match the argv, or the log is evidence of a session
+# that did not happen. It printed the full flag list -- --allow-all-tools
+# included -- on the line directly above "MINUS --allow-all-tools", so an
+# operator reading the log saw a MORE permissive session than the one that ran.
+# Wrong in the safe direction is still wrong: there is no way to tell from the
+# log which of the two contradicting lines to believe.
+ANNOUNCE="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+  SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=ralph \
+  bash -c 'source "'"${WORKER_DIR}/lib/squad-policy.sh"'"; squad_policy_resolve >/dev/null 2>&1; squad_policy_announce hub' 2>&1)"
+FLAGS_LINE="$(printf '%s\n' "$ANNOUNCE" | grep 'Copilot flags (via Squad Hub')"
+assert_not_contains "$FLAGS_LINE" "--allow-all-tools" \
+  "the announced hub flags do NOT list --allow-all-tools, because the session will not have it"
+assert_contains "$FLAGS_LINE" "shell(git config)" \
+  "the announcement still shows the deny patterns that ARE applied"
 
 # It has to be parseable as an array of strings, because that is precisely what
 # the hub's channel demands; anything else makes the hub refuse to start.
@@ -228,12 +275,57 @@ DOCKERFILE="$(cat "${WORKER_DIR}/Dockerfile")"
 assert_contains "$DOCKERFILE" "worker/lib/squad-hub.sh" "the supervision library is copied into the image"
 assert_contains "$DOCKERFILE" "squad-hub@"              "squad-hub is installed, at a pinned version"
 
+# ---------------------------------------------------------------------------
+# THE INTEGRATION IS OPTIONAL, AND MUST STAY OPTIONAL
+# ---------------------------------------------------------------------------
+# A worker that never attaches to a hub is the normal case. Convenience is
+# allowed to make supervision easy to switch on; it is not allowed to make it
+# impossible to leave out. Two distinct properties, both asserted:
+#
+#   1. BUILD-time: the image must build with no squad-hub in it at all, so an
+#      npm outage, an unpublished version, or a policy against the dependency
+#      cannot break a worker for people who never use the hub.
+#   2. RUN-time: with no hub configured, nothing about a session changes.
+#
+# Property 2 is covered by the supervision-gate assertions elsewhere in this
+# file. These cover property 1, which the verb assertion very nearly destroyed:
+# an unconditional `|| exit 1` made squad-hub a hard build dependency.
+assert_contains "$DOCKERFILE" 'SQUAD_HUB_SPEC" = "none"' \
+  "the image can be built with NO squad-hub at all (SQUAD_HUB_SPEC=none)"
+
+# The install must not sit in the unconditional `npm install -g` line, or
+# `none` would install a package literally named "none" and the opt-out would
+# be a confusing failure instead of an opt-out.
+NPM_LINE="$(grep 'npm install -g @github/copilot' "${WORKER_DIR}/Dockerfile")"
+assert_not_contains "$NPM_LINE" "SQUAD_HUB_SPEC" \
+  "squad-hub is installed conditionally, not welded into the unconditional install line"
+
+# The default still installs it: opting out should be a choice, not the price
+# of admission for everyone.
+assert_contains "$DOCKERFILE" "ARG SQUAD_HUB_SPEC=squad-hub@" \
+  "the squad-hub install defaults to a pinned npm version, not a git ref"
+assert_not_contains "$DOCKERFILE" "ARG SQUAD_HUB_SPEC=github:" \
+  "the DEFAULT install is never a git ref -- that is for an explicit override only"
+
 # A pinned version that lacks `oneshot` builds, deploys, and then fails at the
 # agent with "Supervised session failed (exit 2)" -- the CLI prints its usage
 # and exits 2, which points at nothing. squad-hub@0.2.0 did exactly that.
 # The image must prove the verb exists at BUILD time.
 assert_contains "$DOCKERFILE" "squad-hub oneshot" \
-  "the build asserts the pinned squad-hub actually has the 'oneshot' verb"
+  "the build asserts the installed squad-hub actually has the 'oneshot' verb"
+
+# ...but that assertion must live INSIDE the install branch. Outside it, an
+# image built with SQUAD_HUB_SPEC=none would fail on a missing command -- the
+# opt-out would not opt out of anything.
+VERB_CHECK_LINE="$(grep -n "squad-hub --help" "${WORKER_DIR}/Dockerfile" | cut -d: -f1)"
+BRANCH_LINE="$(grep -n 'SQUAD_HUB_SPEC" = "none"' "${WORKER_DIR}/Dockerfile" | cut -d: -f1)"
+if [[ -n "$VERB_CHECK_LINE" && -n "$BRANCH_LINE" && "$VERB_CHECK_LINE" -gt "$BRANCH_LINE" ]]; then
+  TESTS_RUN=$((TESTS_RUN + 1))
+  echo "ok - the verb assertion is inside the install branch, so opting out still builds"
+else
+  TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+  echo "FAIL: the verb assertion is not inside the install branch; SQUAD_HUB_SPEC=none would fail the build"
+fi
 
 # The library and the image have to agree on which verb is being called, or
 # the assertion above guards the wrong thing.
