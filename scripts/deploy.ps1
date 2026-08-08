@@ -11,13 +11,63 @@ param(
     [string]$DefaultRef = "",
     [switch]$UseKeyVault,
     [string]$KeyVaultName = "",
-    [string]$GitHubActionsIdentityName = ""
+    [string]$GitHubActionsIdentityName = "",
+    # --- Squad Hub supervision (optional) ------------------------------------
+    # A hub lets a session ASK a human to approve a tool call instead of having
+    # destructive operations made unavailable outright. Leave both blank and
+    # nothing changes: sessions run exactly as they do today.
+    #
+    # SquadHubToken must be a DEVICE token (`sqhd1.`...), minted with a device-id
+    # prefix so a credential shipped to a cloud job cannot claim to be someone's
+    # laptop. It is stored as a secret and referenced, never set as a plain
+    # environment variable:
+    #
+    #   squad-hub device-token --hub <url> --token <your own token> \
+    #       --label "aca jobs" --prefix aca- --ttl-hours 4
+    [string]$SquadHubUrl = "",
+    [string]$SquadHubToken = ""
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $azureDir = Join-Path $repoRoot ".azure"
 New-Item -ItemType Directory -Force -Path $azureDir | Out-Null
+
+# --- Squad Hub preflight -----------------------------------------------------
+# Checked HERE, at the desk, rather than at minute two inside a container nobody
+# is watching. Both halves or neither: a URL with no token cannot attach and a
+# token with no URL has nowhere to go, so either alone is a misconfiguration
+# that would silently deploy jobs which refuse to start.
+if ($SquadHubUrl -and -not $SquadHubToken) {
+    throw "-SquadHubUrl was given without -SquadHubToken. A hub with no device credential cannot be attached to."
+}
+if ($SquadHubToken -and -not $SquadHubUrl) {
+    throw "-SquadHubToken was given without -SquadHubUrl. There is no hub for the device to dial."
+}
+if ($SquadHubToken -and -not $SquadHubToken.StartsWith("sqhd1.")) {
+    # A device token is recognisable without doing any crypto -- the hub mints
+    # them with a distinctive prefix precisely so a caller can route on sight.
+    # Refusing a personal credential here is the difference between a job that
+    # can be a device and a job that can do everything its owner can.
+    throw @"
+-SquadHubToken does not look like a device token (expected the "sqhd1." prefix).
+
+A device token is minted FOR a device and can be a device and NOTHING else: it
+cannot read the hub's API, start work on another device, or watch your sessions.
+Shipping a personal token to a container instead hands that job everything you
+can do.
+
+Mint one, bound to a device-id prefix so it cannot claim to be your laptop:
+
+  squad-hub device-token --hub $SquadHubUrl --token <your own token> ``
+      --label "aca jobs" --prefix aca- --ttl-hours 4
+"@
+}
+if ($SquadHubUrl -and $SquadHubUrl -notmatch '^https://') {
+    # The device token travels on this connection. Plain http would put a live
+    # credential on the wire.
+    throw "-SquadHubUrl must be an https:// URL; a device token must not travel in clear text."
+}
 
 if (-not $ImageTag) {
     $ImageTag = try {
@@ -158,7 +208,12 @@ az role assignment create --assignee $identityPrincipalId --role Contributor --s
 $jobAndWatcherSecrets = @(
     "github-token=$GitHubToken",
     "copilot-github-token=$CopilotGitHubToken",
-    "otlp-headers=$otlpHeader"
+    "otlp-headers=$otlpHeader",
+    # Always present, empty when supervision is off. `--secrets` REPLACES the
+    # set on update, so a secret that is merely omitted when the operator stops
+    # passing a token would leave the previous one in place forever -- the same
+    # trap SQUAD_COPILOT_FLAGS documents below.
+    "squad-hub-token=$SquadHubToken"
 )
 $secretStore = "container-app-secrets"
 
@@ -177,11 +232,13 @@ if ($UseKeyVault) {
     $githubTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name github-token --value $GitHubToken --query id -o tsv
     $copilotTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name copilot-github-token --value $CopilotGitHubToken --query id -o tsv
     $otlpHeadersSecretId = az keyvault secret set --vault-name $KeyVaultName --name otlp-headers --value $otlpHeader --query id -o tsv
+    $squadHubTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name squad-hub-token --value $SquadHubToken --query id -o tsv
 
     $jobAndWatcherSecrets = @(
         "github-token=keyvaultref:$githubTokenSecretId,identityref:$identityId",
         "copilot-github-token=keyvaultref:$copilotTokenSecretId,identityref:$identityId",
-        "otlp-headers=keyvaultref:$otlpHeadersSecretId,identityref:$identityId"
+        "otlp-headers=keyvaultref:$otlpHeadersSecretId,identityref:$identityId",
+        "squad-hub-token=keyvaultref:$squadHubTokenSecretId,identityref:$identityId"
     )
     $secretStore = "key-vault"
 }
@@ -287,6 +344,16 @@ $commonEnv = @(
     # OPERATOR EXTRAS (model, log level, reasoning effort); a permission-widening
     # flag in it now aborts the session instead of applying.
     "SQUAD_COPILOT_FLAGS=",
+    # Squad Hub supervision. Both are set on EVERY deploy, empty when it is off,
+    # for the same reason SQUAD_COPILOT_FLAGS above is cleared rather than
+    # omitted: `--set-env-vars` MERGES, so an operator who stops passing a hub
+    # would otherwise leave a stale URL and a revoked token on the job forever.
+    #
+    # The token is a SECRET REFERENCE, never a literal. A device token is still
+    # a credential; it just cannot do very much -- it can be a device and
+    # nothing else, and cannot read the hub's API or drive another device.
+    "SQUAD_HUB_URL=$SquadHubUrl",
+    "SQUAD_HUB_TOKEN=$(if ($SquadHubToken) { 'secretref:squad-hub-token' } else { '' })",
     "AZURE_SUBSCRIPTION_ID=$SubscriptionId",
     "AZURE_RESOURCE_GROUP=$ResourceGroupName",
     "AZURE_CLIENT_ID=$identityClientId",

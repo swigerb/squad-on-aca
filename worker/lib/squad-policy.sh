@@ -199,6 +199,14 @@ squad_policy_announce() {
       squad_policy_log "NOT enforced on this path: ${SQUAD_POLICY_UNDELIVERABLE[*]}"
       squad_policy_log "  Reason: 'squad --copilot-flags' splits its value on whitespace, so a multi-word deny pattern cannot survive it. Governance-path enforcement below is unaffected."
     fi
+  elif [[ "$via" == "hub" ]]; then
+    # The hub path carries the SAME policy minus --allow-all-tools, over a JSON
+    # channel that keeps multi-word deny patterns whole -- so nothing is
+    # undeliverable here, and saying which flag was dropped (and why that is a
+    # tightening) is the part an operator reading a log actually needs.
+    squad_policy_log "Copilot flags (via Squad Hub, ACP): ${SQUAD_POLICY_FLAGS}"
+    squad_policy_log "  MINUS --allow-all-tools: a human at the hub answers what would otherwise auto-run."
+    squad_policy_log "  Deny patterns are unchanged and are still refused outright, never offered for approval."
   else
     squad_policy_log "Copilot flags: ${SQUAD_POLICY_FLAGS}"
   fi

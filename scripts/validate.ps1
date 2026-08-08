@@ -4450,12 +4450,96 @@ if (-not (Test-Path $workerWorkflow)) {
         Add-Fail "No CI job runs worker/tests/run-tests.sh; the policy enforcement suites would be developer-only"
     }
 }
-foreach ($suite in @('worker\tests\test_agent_policy.sh', 'worker\tests\test_governance_guard.sh')) {
+foreach ($suite in @('worker\tests\test_agent_policy.sh', 'worker\tests\test_governance_guard.sh', 'worker\tests\test_squad_hub.sh')) {
     if (Test-Path (Join-Path $RepoRoot $suite)) {
         Add-Pass "$($suite -replace '\\','/') exists"
     } else {
         Add-Fail "$($suite -replace '\\','/') is missing; the policy controls have no behavioural coverage"
     }
+}
+
+# --- 5b. Squad Hub supervision is a TIGHTENING, or it is not shipped ---------
+# A hub lets a session ask a human instead of having destructive operations
+# made unavailable outright. That is only acceptable while three things hold,
+# and each is checked here as well as in worker/tests/test_squad_hub.sh --
+# because this file is the gate that runs before a deploy.
+$hubLib = Join-Path $RepoRoot "worker\lib\squad-hub.sh"
+if (-not (Test-Path $hubLib)) {
+    Add-Fail "worker/lib/squad-hub.sh is missing; a hub-configured session would have no supervision path"
+} else {
+    $hubText = Get-Content -LiteralPath $hubLib -Raw
+
+    # 1. It must never fall back to the unsupervised path.
+    if ($hubText -match 'must not' -and $hubText -match 'blanket tool approval') {
+        Add-Pass "squad-hub.sh refuses rather than falling back to unsupervised blanket tool approval"
+    } else {
+        Add-Fail "squad-hub.sh does not state (or enforce) the no-fallback rule; a hub outage could silently downgrade a supervised session"
+    }
+
+    # 2. It must refuse a credential that is not a device token.
+    if ($hubText -match 'sqhd1\.') {
+        Add-Pass "squad-hub.sh refuses a credential that is not a device token"
+    } else {
+        Add-Fail "squad-hub.sh does not check the device-token prefix; a personal credential could be shipped to a job"
+    }
+
+    # 3. It must refuse a hub argv that still carries --allow-all-tools.
+    if ($hubText -match '--allow-all-tools') {
+        Add-Pass "squad-hub.sh guards against --allow-all-tools surviving onto the hub path"
+    } else {
+        Add-Fail "squad-hub.sh has no --allow-all-tools guard; supervision could raise no approval cards at all"
+    }
+}
+
+# The resolver's hub variant: same policy, minus exactly one flag.
+if ($nodeCmd -and (Test-Path $policyResolver)) {
+    $prevMode = [Environment]::GetEnvironmentVariable('SQUAD_MODE')
+    $prevSrc = [Environment]::GetEnvironmentVariable('SQUAD_DISPATCH_SOURCE')
+    [Environment]::SetEnvironmentVariable('SQUAD_MODE', 'prompt')
+    [Environment]::SetEnvironmentVariable('SQUAD_DISPATCH_SOURCE', 'ralph')
+    $hubArgv = (& node $policyResolver hub-argv-json 2>&1) -join "`n"
+    [Environment]::SetEnvironmentVariable('SQUAD_MODE', $prevMode)
+    [Environment]::SetEnvironmentVariable('SQUAD_DISPATCH_SOURCE', $prevSrc)
+
+    if ($hubArgv -match '"--allow-all-tools"') {
+        Add-Fail "The hub argv still contains --allow-all-tools; a supervised session would auto-approve everything and raise no cards"
+    } else {
+        Add-Pass "The hub argv drops --allow-all-tools, so a supervised session actually asks"
+    }
+    # The hard floor. Measured against Copilot CLI 1.0.78 over ACP, a denied
+    # tool raises NO permission request at all -- so these patterns are what
+    # keeps a human at the hub from being able to approve something forbidden.
+    if ($hubArgv -match '"--deny-tool"') {
+        Add-Pass "The hub argv keeps the deny list, which a human at the hub cannot override"
+    } else {
+        Add-Fail "The hub argv carries no deny rules; supervision would be the only control left"
+    }
+    # The multi-word patterns are why the channel is JSON rather than a string.
+    if ($hubArgv -match '"shell\(git config\)"') {
+        Add-Pass "A multi-word deny pattern survives into the hub argv as one argument"
+    } else {
+        Add-Fail "A multi-word deny pattern did not survive into the hub argv; the policy would be torn in transport"
+    }
+}
+
+# deploy.ps1 must set BOTH hub variables on every deploy, empty when off.
+# `--set-env-vars` merges, so omitting them would leave a stale URL and a
+# revoked token on an existing job forever -- the same trap SQUAD_COPILOT_FLAGS
+# is cleared to avoid.
+if ($deployText -match '"SQUAD_HUB_URL=') {
+    Add-Pass "deploy.ps1 always sets SQUAD_HUB_URL, so turning supervision off actually removes it"
+} else {
+    Add-Fail "deploy.ps1 does not set SQUAD_HUB_URL; a previously configured hub would survive every redeploy"
+}
+if ($deployText -match 'secretref:squad-hub-token') {
+    Add-Pass "deploy.ps1 passes the hub device token by secret reference, never as a literal env var"
+} else {
+    Add-Fail "deploy.ps1 does not reference the hub token as a secret; a credential would sit in the job template"
+}
+if ($deployText -match 'sqhd1\.') {
+    Add-Pass "deploy.ps1 refuses a hub credential that is not a device token, at the desk rather than in a container"
+} else {
+    Add-Fail "deploy.ps1 does not preflight the hub token; a personal credential could be deployed to a job"
 }
 
 # --- 6. Governance paths cover what the PRD names ---------------------------

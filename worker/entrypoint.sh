@@ -209,6 +209,26 @@ squad_policy_harden "$REPO_DIR"
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
 
+# --- Squad Hub supervision (optional) ----------------------------------------
+# Loaded next to the policy it depends on, and BEFORE any mode runs an agent.
+# Absent library with a hub configured is a refusal, not a downgrade: the whole
+# point of the library is to keep a supervised session from quietly becoming an
+# unsupervised one.
+SQUAD_HUB_LIB="${SQUAD_HUB_LIB:-/usr/local/lib/squad-on-aca/squad-hub.sh}"
+if [[ -f "$SQUAD_HUB_LIB" ]]; then
+  # shellcheck source=lib/squad-hub.sh
+  source "$SQUAD_HUB_LIB"
+elif [[ -n "${SQUAD_HUB_URL:-}" || -n "${SQUAD_HUB_TOKEN:-}" ]]; then
+  log "A hub was configured but the supervision library is missing at ${SQUAD_HUB_LIB}."
+  log "Refusing to run unsupervised with blanket tool approval instead."
+  exit 78
+fi
+
+# One question, asked the same way by every mode that runs an agent.
+squad_hub_should_supervise() {
+  declare -f squad_hub_enabled >/dev/null 2>&1 && squad_hub_enabled
+}
+
 # Verified once per session, before anything is published. Called at the top of
 # commit_and_push_if_needed so a governance rewrite can never reach the remote,
 # and at the end of every mode that runs an agent so a non-pushing session still
@@ -451,11 +471,17 @@ NODE
   prompt)
     require SQUAD_PROMPT
     log "Running one-shot Squad prompt."
-    squad_policy_announce direct
-    OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
-      COPILOT_OTEL_ENABLED=true \
-      COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-      copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+    if squad_hub_should_supervise; then
+      squad_hub_preflight
+      squad_policy_announce hub
+      squad_hub_run "$SQUAD_PROMPT"
+    else
+      squad_policy_announce direct
+      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+        COPILOT_OTEL_ENABLED=true \
+        COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
+        copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+    fi
     commit_and_push_if_needed
     ;;
   new-project)
@@ -464,11 +490,17 @@ NODE
     export OUTPUT_BRANCH="${OUTPUT_BRANCH:-squad/bootstrap-${SESSION_NAME}}"
     export PR_TITLE="${PR_TITLE:-Bootstrap project with Squad on ACA}"
     log "Running new-project bootstrap Squad prompt."
-    squad_policy_announce direct
-    OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
-      COPILOT_OTEL_ENABLED=true \
-      COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-      copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+    if squad_hub_should_supervise; then
+      squad_hub_preflight
+      squad_policy_announce hub
+      squad_hub_run "$SQUAD_PROMPT"
+    else
+      squad_policy_announce direct
+      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+        COPILOT_OTEL_ENABLED=true \
+        COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
+        copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+    fi
     commit_and_push_if_needed
     ;;
   loop)
