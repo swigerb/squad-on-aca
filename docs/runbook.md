@@ -206,6 +206,16 @@ All policy output is prefixed `[squad-policy]` in the session log (`.\scripts\lo
 | `Agent history appended (permitted): … +N bytes` | informational — the audit trail grew by `N` bytes and the prior content is intact | none; this is the exclusion working as intended |
 | `Permission denied` writing under `.squad/` in agent output | the agent tried to edit governance state | expected; the agent should route the change through a PR |
 | `NOT enforced on this path: shell(git config) …` | informational, on `squad watch` / `squad loop` only | see the limitation note below; governance enforcement is unaffected |
+| `Copilot flags (via Squad Hub, ACP): …` | informational — this session is supervised, so a human answers tool approvals. The list shown is what will actually apply: no `--allow-all-tools`, deny list intact | none |
+| `the hub refused this device` / exit **77** | the device token is expired, revoked, or bound to a device-id prefix this job does not match | the line above names the id the job registered as (`aca-<execution>`). Mint with `--prefix aca-`, or set `SQUAD_HUB_DEVICE_ID_PREFIX` to match the token |
+| `SQUAD_HUB_TOKEN does not look like a device token` / exit **78** | a personal or hub-user credential was shipped where a device token belongs | mint one: `squad-hub device-token --hub <url> --token <your own token> --prefix aca-`. A device token can be a device and nothing else |
+| `the session is waiting for approval and no hub is connected` / exit **75** | a tool asked for permission with no approver reachable | make the hub reachable, or dispatch the run unattended. The job stops rather than billing to its ceiling |
+| `squad-hub is not installed in this image` / exit **78** | the image was built with `SQUAD_HUB_SPEC=none` but a hub is configured | rebuild without that build arg, or unset `SQUAD_HUB_URL`/`SQUAD_HUB_TOKEN` on the job |
+| `A hub was configured but the supervision library is missing` / exit **78** | the image predates the integration, or the Dockerfile `COPY` lost `lib/squad-hub.sh` | rebuild and redeploy the worker image. It refuses rather than running unsupervised with blanket tool approval |
+
+Hub supervision is **opt-in**: with neither `SQUAD_HUB_URL` nor
+`SQUAD_HUB_TOKEN` set, none of the above applies and a session runs exactly as
+it always has. See [squad-hub.md](squad-hub.md).
 
 To see the tier a session chose without running it:
 
