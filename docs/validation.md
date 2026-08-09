@@ -595,28 +595,29 @@ These map to the Security review items. Each has a concrete way to verify it.
 
 ### RBAC / identity scope
 
-- **Current state (documented risk):** the user-assigned managed identity is
-  granted **Contributor** on the resource group so Ralph can start session job
-  executions (`Microsoft.App/jobs/start/action`). This is broader than needed.
-- **Do not broaden** identity/RBAC further.
-- **Future improvement / optional hardening:** replace Contributor with a custom
-  role limited to job start + read. Only adopt if it does not break deployment.
-  Example custom role definition (review before applying):
-  ```jsonc
-  {
-    "Name": "Squad ACA Job Dispatcher",
-    "IsCustom": true,
-    "Description": "Start and read ACA jobs for Squad dispatch",
-    "Actions": [
-      "Microsoft.App/jobs/read",
-      "Microsoft.App/jobs/start/action",
-      "Microsoft.App/jobs/executions/read"
-    ],
-    "AssignableScopes": ["/subscriptions/<sub-id>/resourceGroups/<rg>"]
-  }
-  ```
-  Validate a session dispatch still succeeds after swapping the role before
-  removing Contributor.
+- **Current state:** the user-assigned managed identity holds **AcrPull** on the
+  registry and **Container Apps Jobs Operator** scoped to the **session job**.
+  That covers `Microsoft.App/jobs/read` and `Microsoft.App/jobs/*/action`, which
+  is exactly the two calls Ralph makes (`containerapp job show`, `job start`).
+- It previously held **Contributor** on the resource group. `deploy.ps1` now
+  removes that grant when it finds one, because narrowing only new deployments
+  would leave every existing environment broad forever.
+- **Do not broaden** identity/RBAC further. `validate.ps1` fails the build if the
+  deploy script grants Contributor on the resource group again, if it stops
+  granting the job-scoped role, or if it stops removing the old grant.
+- **Resource-scoped assignments are fragile by design.** A `containerapp job
+  delete` — which happens on every image-changing deploy — takes the assignment
+  with it. Both this grant and the GitHub Actions trigger's grant are therefore
+  reconciled on every deploy rather than created once.
+- **A custom role is not needed.** `Container Apps Jobs Operator` scoped to a
+  single job is narrower than a custom role scoped to a resource group, and it
+  is built in, so there is nothing to keep in step with the platform.
+
+### Egress
+
+Unrestricted, deliberately. The reasoning, what it does and does not protect now
+that the identity is out of the session, and the price of changing it, are in
+[egress-assessment.md](egress-assessment.md).
 
 ### Secret scans
 

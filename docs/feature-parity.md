@@ -45,7 +45,7 @@ Ralph is not a separate container image. The `squad-worker` image contains all r
 | `caj-squad-aca-session` | Manual | One full remote Squad team session per execution |
 | `ca-squad-aca-watch` | Container App, scale 0/1 | Optional long-running watcher |
 
-Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Contributor` on the resource group so it can start session jobs. The broad `Contributor` grant is a documented existing risk; see [validation.md](validation.md#rbac--identity-scope) for a narrower custom-role hardening path.
+Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Container Apps Jobs Operator` scoped to the session job — the two calls it makes, against the one job it makes them against. Sessions do not hold the identity at all: it is removed from the environment of every mode except `ralph`. See [runbook.md](runbook.md#identity-and-rbac) and [egress-assessment.md](egress-assessment.md).
 
 ## Capability-aware execution
 

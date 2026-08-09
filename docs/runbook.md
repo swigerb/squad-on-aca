@@ -96,11 +96,18 @@ Dispatch is transactional and isolated per issue (see `worker/lib/ralph-dispatch
 The user-assigned managed identity has:
 
 ```text
-AcrPull on ACR
-Contributor on the resource group
+AcrPull on the ACR
+Container Apps Jobs Operator on the session job (resource-scoped)
 ```
 
-The Contributor assignment lets Ralph start ACA session job executions. Scope it more narrowly if your tenant has a custom role for `Microsoft.App/jobs/start/action`.
+That is what Ralph needs to start a session: `containerapp job show` and
+`containerapp job start`, against that one job. The role is scoped to the job
+rather than the resource group, so a `job delete` — which every image-changing
+deploy performs — drops the assignment; `deploy.ps1` reconciles it on each run
+and removes an older resource-group `Contributor` grant if it finds one.
+
+Sessions themselves never use this identity, and do not hold it: see
+[Agent tool policy](#agent-tool-policy).
 
 ## GitHub remote sessions
 
@@ -1177,12 +1184,17 @@ permission cannot be read.
 - Use `-UseKeyVault` for Key Vault-backed Container Apps secrets.
 - Keep `deploy.outputs.json` private; it contains the Aspire browser token. It is gitignored along with `.azure/` and `.env`.
 - `.squad/` should live in the target GitHub repo when you want Squad memory and team state to travel with code.
-- **RBAC (existing risk):** the user-assigned managed identity holds `Contributor`
-  on the resource group so Ralph can start session job executions. This is broader
-  than required. Do not broaden it further. A custom-role hardening path (limited
-  to `Microsoft.App/jobs/start/action` + read) is documented in
-  [validation.md](validation.md#rbac--identity-scope); adopt it only if it does not
-  break deployment.
+- **RBAC:** the user-assigned managed identity holds `AcrPull` on the registry and
+  `Container Apps Jobs Operator` scoped to the **single session job** — the two
+  calls Ralph makes (`containerapp job show`, `job start`) and nothing else. It
+  previously held `Contributor` on the resource group; a deploy now removes that
+  if it finds one. The grant is resource-scoped, so a job delete drops it and
+  `deploy.ps1` reconciles it on every run.
+- **The identity is not in a session:** every mode except `ralph` has
+  `IDENTITY_ENDPOINT`/`IDENTITY_HEADER` removed from its environment before the
+  agent starts, because those two values are the whole credential and `curl` can
+  exchange them. Egress is deliberately left unrestricted; the reasoning and the
+  price of changing that are in [egress-assessment.md](egress-assessment.md).
 - **OTLP auth is preserved:** BrowserToken for the UI, ApiKey for OTLP, never
   `Unsecured`. OTLP ports stay internal to the ACA environment.
 - **Public sync guard:** `squad-aca sync --sync-all` blocks obvious secret files
