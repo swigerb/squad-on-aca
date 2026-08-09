@@ -4542,6 +4542,30 @@ if ($deployText -match 'sqhd1\.') {
     Add-Fail "deploy.ps1 does not preflight the hub token; a personal credential could be deployed to a job"
 }
 
+# The session identity's grant must stay narrow.
+#
+# It held `Contributor` on the resource group while needing exactly two calls
+# against one job. That matters because the holder is an agent running a prompt
+# and the deny list does not cover `curl`, so the instance metadata endpoint --
+# and therefore this identity -- is reachable from inside a session. A scope
+# that quietly widens again is precisely the thing nobody notices, so it is
+# asserted rather than trusted to review.
+if ($deployText -match '--role Contributor --scope \$resourceGroupId') {
+    Add-Fail "deploy.ps1 grants the session identity Contributor on the whole resource group; it needs only Container Apps Jobs Operator on the session job"
+} else {
+    Add-Pass "deploy.ps1 does not grant the session identity Contributor on the resource group"
+}
+if ($deployText -match '(?s)Granting Container Apps Jobs Operator on \$jobName to') {
+    Add-Pass "deploy.ps1 grants the session identity Container Apps Jobs Operator scoped to the single session job"
+} else {
+    Add-Fail "deploy.ps1 does not grant the session identity a job-scoped role; it would be unable to start a session"
+}
+if ($deployText -match 'Removing the old resource-group Contributor grant') {
+    Add-Pass "deploy.ps1 removes a previously granted resource-group Contributor, so already-deployed environments are narrowed too"
+} else {
+    Add-Fail "deploy.ps1 does not remove an existing Contributor grant; environments deployed before the change would keep it forever"
+}
+
 # --- 6. Governance paths cover what the PRD names ---------------------------
 if ($nodeCmd -and (Test-Path $policyResolver)) {
     $govOut = (& node $policyResolver governance-paths 2>&1) -join "`n"

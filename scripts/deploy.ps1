@@ -253,7 +253,11 @@ $identityClientId = az identity show --name $identityName --resource-group $Reso
 $acrId = az acr show --name $AcrName --resource-group $ResourceGroupName --query id -o tsv
 $resourceGroupId = az group show --name $ResourceGroupName --query id -o tsv
 az role assignment create --assignee $identityPrincipalId --role AcrPull --scope $acrId 2>$null | Out-Null
-az role assignment create --assignee $identityPrincipalId --role Contributor --scope $resourceGroupId 2>$null | Out-Null
+# NOTE: the session identity's grant is NOT made here. It used to be
+# `Contributor` on the whole resource group, which is far more than it needs and
+# is reachable from inside a session -- see the reconcile block near the end of
+# this script, which grants `Container Apps Jobs Operator` on the single session
+# job instead. It has to run after that job exists.
 
 $jobAndWatcherSecrets = @(
     "github-token=$GitHubToken",
@@ -566,6 +570,54 @@ if ($ghaPrincipalId) {
     }
 } else {
     Write-Host "No GitHub Actions identity '$ghaIdentityName' in $ResourceGroupName; skipping the Actions trigger grant."
+}
+
+# --- The session identity's grant, narrowed from Contributor -----------------
+#
+# This identity used to hold `Contributor` on the whole RESOURCE GROUP. What it
+# actually does with Azure is two commands, both against the one session job:
+# `containerapp job show` and `containerapp job start`. Contributor on the group
+# additionally lets it read every secret, rewrite every job, and delete the
+# registry -- none of which it was ever asked to do.
+#
+# That matters more than an unused permission usually would, because the thing
+# holding this identity is an AGENT RUNNING A PROMPT. The deny list stops it
+# calling `az`, but not `curl`, and the instance metadata endpoint answers to
+# curl, so the identity is reachable from inside a session by anyone who can
+# influence what the agent does. The grant is therefore sized to what a
+# compromised session would be able to do with it.
+#
+# `Container Apps Jobs Operator` on the single job covers `jobs/read` and
+# `jobs/*/action`. Scoped to a resource, so like the grant above it dies with a
+# job delete and is reconciled on every deploy.
+$sessionJobScope = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query id -o tsv 2>$null
+if ($sessionJobScope) {
+    $existingSessionGrant = az role assignment list --assignee $identityPrincipalId --scope $sessionJobScope `
+        --query "[?roleDefinitionName=='Container Apps Jobs Operator'].id" -o tsv 2>$null
+    if ($existingSessionGrant) {
+        Write-Host "Session identity '$identityName' already holds Container Apps Jobs Operator on $jobName."
+    } else {
+        Write-Host "Granting Container Apps Jobs Operator on $jobName to '$identityName'."
+        az role assignment create `
+            --assignee-object-id $identityPrincipalId `
+            --assignee-principal-type ServicePrincipal `
+            --role "Container Apps Jobs Operator" `
+            --scope $sessionJobScope | Out-Null
+    }
+
+    # Remove the old wide grant if a previous deploy left one behind. Narrowing
+    # that only applies to new deployments narrows nothing: every environment
+    # already deployed keeps Contributor forever unless something takes it away.
+    $staleContributor = az role assignment list --assignee $identityPrincipalId --scope $resourceGroupId `
+        --query "[?roleDefinitionName=='Contributor' && scope=='$resourceGroupId'].id" -o tsv 2>$null
+    if ($staleContributor) {
+        Write-Host "Removing the old resource-group Contributor grant from '$identityName'."
+        foreach ($assignmentId in ($staleContributor -split "`n" | Where-Object { $_ })) {
+            az role assignment delete --ids $assignmentId.Trim() 2>$null | Out-Null
+        }
+    }
+} else {
+    Write-Host "Session job '$jobName' not found; skipping the session identity grant."
 }
 
 $outputsPath = Join-Path $repoRoot "deploy.outputs.json"
