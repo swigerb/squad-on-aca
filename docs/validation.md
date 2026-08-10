@@ -89,12 +89,21 @@ The worker uses a git credential helper that re-reads a `0600` token file on eve
 | `worker/tests/test_credentials.sh` | Helper and token file against a local smart-HTTP remote. |
 | `worker/tests/test_token_preflight.sh` | Lifetime versus estimated run duration and live credential probe. |
 | `worker/tests/test_push.sh` | Exit-code propagation and retry-after-refresh path. |
+| `worker/tests/test_credential_withholding.sh` | Partial credential withholding for untrusted `prompt`/`new-project` entrypoints (issue #84): no push credential or working helper while the agent runs, restore before publish, heartbeat never straddles the withhold/restore boundary, and a restore with no withheld token is fatal. |
 
 Run the worker suite on Linux:
 
 ```bash
 bash worker/tests/run-tests.sh
 ```
+
+## Source × mode policy matrix and trust axis (issue #84)
+
+| Suite | What it exercises |
+|---|---|
+| `worker/tests/test_agent_policy.sh` | The `POLICY_MATRIX` built by `buildPolicyMatrix()` agrees, cell by cell, with a freshly resolved policy for every `KNOWN_SOURCES` x `KNOWN_MODES` combination; the trust axis (only `local-cli` trusted) is orthogonal to the attended/autonomous tier and narrows untrusted sources without touching `local-cli`'s effective policy; `UNTRUSTED_INPUT_DENY_TOOLS` never denies bare `git`/`gh`/`npm`/`pip`; space-bearing deny patterns are deliverable on argv/hub-json paths and undeliverable on the `squad watch` path; credential-withholding profiles per source/mode. |
+| `worker/tests/test_dispatch_registry_exhaustiveness.sh` | Scans every production dispatcher (excluding test directories) for literal `SQUAD_DISPATCH_SOURCE=`/`SQUAD_MODE=` assignments and fails if any names a source or mode absent from `agent-policy.js`'s registry — a new dispatcher cannot silently bypass the matrix. |
+| `worker/tests/test_squad_hub.sh` | Trust-conditioned hub policy: untrusted sources' `hub-argv-json` carries the narrowed untrusted deny patterns; `local-cli`'s does not. |
 
 ## CLI contract validation
 
@@ -146,6 +155,9 @@ require_deps node git
 | `test_preflight.sh` | `node` |
 | `test_ralph_dispatch.sh` | `node`, `mktemp`, `date` |
 | `test_run_tests.sh` | `env`, `find` |
+| `test_agent_policy.sh` | `node` |
+| `test_dispatch_registry_exhaustiveness.sh` | `node`, `grep` |
+| `test_credential_withholding.sh` | `node`, `git`, `openssl` |
 
 A missing dependency exits `77` and is counted as a skip:
 

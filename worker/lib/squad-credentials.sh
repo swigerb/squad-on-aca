@@ -202,6 +202,122 @@ squad_credential_refresh_env() {
 }
 
 # ---------------------------------------------------------------------------
+# Issue #84 PI-3: withholding the push credential from an untrusted-input agent
+# ---------------------------------------------------------------------------
+# An issue/comment-sourced prompt is the least trusted input this system
+# takes, and today the agent process that runs it holds the SAME
+# repository-write credential that later pushes the branch and opens the PR.
+# Full separation (a different process identity or execution boundary
+# publishing on the agent's behalf) was evaluated and declined as
+# disproportionate for this iteration -- see docs/architecture.md. What is
+# implemented instead is WITHHOLDING: for the bounded duration of the single
+# `copilot -p` (or `squad-hub oneshot`) call, the credential is not in the
+# environment, not on disk, and not wired into git. It is restored before
+# worker/entrypoint.sh's commit_and_push_if_needed runs, so the session still
+# ends with a branch and a pull request.
+#
+# This is scoped to CREDENTIAL_WITHHOLD_MODES (agent-policy.js: `prompt` and
+# `new-project`) on an UNTRUSTED dispatch source. It is NOT separation: the
+# agent runs under the same uid that performs the push, so nothing here
+# defends against a sufficiently determined process going looking for the
+# token elsewhere. What it removes is the credential being handed to the
+# agent's own environment, file tools, and git wiring for the window in which
+# an attacker-controlled prompt is running -- see resolveCredentialProfile in
+# worker/lib/agent-policy.js for the full rationale.
+#
+# The withheld token lives ONLY in a non-exported shell variable
+# (SQUAD_CREDENTIAL_WITHHELD_TOKEN). A non-exported variable is not copied into
+# any child process's environment, which is the entire point: the agent this
+# code starts AFTER withholding must not inherit it.
+SQUAD_CREDENTIAL_WITHHELD_TOKEN=""
+SQUAD_CREDENTIAL_IS_WITHHELD=0
+
+# Remove the token file from disk. Idempotent; used both by withholding and by
+# anything that wants "no credential on disk" as a precondition.
+squad_credential_remove_token_file() {
+  rm -f "$SQUAD_GIT_TOKEN_FILE" 2>/dev/null || true
+}
+
+# The mirror image of squad_credential_install_helper: remove OUR configured
+# helper entry so git is left with NO helper for this host, rather than one
+# that would answer with nothing (which is indistinguishable, from the
+# agent's shell tools, from "ask git yourself and see"). Idempotent.
+squad_credential_uninstall_helper() {
+  local key="credential.https://${SQUAD_GIT_CREDENTIAL_HOST}"
+  git config --global --unset-all "${key}.helper" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Withhold the credential from everything started after this call returns.
+#
+# ORDERING IS THE CONTROL, not a detail of it -- exactly the same argument as
+# squad_drop_azure_identity above, and for the same reason. The periodic lease
+# heartbeat (squad_lease_heartbeat_loop) is a BACKGROUND CHILD that may already
+# be running by the time an untrusted prompt/new-project session reaches this
+# point: it was forked once, early, right after squad_drop_azure_identity, and
+# it holds whatever GH_TOKEN/GITHUB_TOKEN this shell had exported AT FORK TIME
+# in its own process environment forever after -- unsetting the variable in
+# THIS shell does not reach a process that already exists, and re-reading the
+# token file in its next tick would not remove what it already has. Left
+# running through the withheld window, the heartbeat child would keep the
+# credential legible (via /proc/<pid>/environ) to exactly the agent it is being
+# withheld from. So the heartbeat is stopped BEFORE the credential is touched,
+# and only restarted (squad_credential_restore) once the credential is back --
+# never straddling the withheld window in either direction.
+squad_credential_withhold() {
+  if [[ -n "$SQUAD_LEASE_HEARTBEAT_PID" ]]; then
+    kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    wait "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    SQUAD_LEASE_HEARTBEAT_PID=""
+  fi
+
+  SQUAD_CREDENTIAL_WITHHELD_TOKEN="$(squad_credential_read_token 2>/dev/null || true)"
+  unset GH_TOKEN GITHUB_TOKEN
+  squad_credential_remove_token_file
+  squad_credential_uninstall_helper
+  SQUAD_CREDENTIAL_IS_WITHHELD=1
+}
+
+# Restore the credential after the agent has exited, and before anything
+# publishes. Every step is checked; a restore failure is FATAL (session abort),
+# because "the withholding could not be undone" must never be silently treated
+# as "the session can still push" -- and must never be treated as "the
+# credential can just stay withheld", which would fail the push at the very end
+# after the whole agent run, the exact late-failure shape issue #32 removed.
+squad_credential_restore() {
+  [[ "$SQUAD_CREDENTIAL_IS_WITHHELD" -eq 1 ]] || return 0
+
+  if [[ -z "$SQUAD_CREDENTIAL_WITHHELD_TOKEN" ]]; then
+    squad_credentials_log "FATAL: no withheld credential is available to restore. The session cannot publish its work."
+    exit 78
+  fi
+  if ! squad_credential_write_token "$SQUAD_CREDENTIAL_WITHHELD_TOKEN"; then
+    squad_credentials_log "FATAL: could not rewrite the token file while restoring the withheld credential."
+    exit 78
+  fi
+  if ! squad_credential_install_helper; then
+    squad_credentials_log "FATAL: could not reinstall the git credential helper while restoring the withheld credential."
+    exit 78
+  fi
+  if ! squad_credential_refresh_env; then
+    squad_credentials_log "FATAL: could not refresh GH_TOKEN/GITHUB_TOKEN while restoring the withheld credential."
+    exit 78
+  fi
+  SQUAD_CREDENTIAL_WITHHELD_TOKEN=""
+  SQUAD_CREDENTIAL_IS_WITHHELD=0
+
+  # Restart the heartbeat AFTER the credential is verifiably back, so the new
+  # child forks with the restored token file already in place and never with a
+  # stale or absent one. Only if a lease is actually in play for this session.
+  if [[ -n "${SQUAD_LEASE_KEY:-}" ]] && declare -f squad_lease_heartbeat_loop >/dev/null 2>&1; then
+    squad_lease_heartbeat_loop &
+    SQUAD_LEASE_HEARTBEAT_PID=$!
+  fi
+  squad_credentials_log "Push credential restored after the agent exited."
+}
+
+
+# ---------------------------------------------------------------------------
 # Failure classification
 # ---------------------------------------------------------------------------
 

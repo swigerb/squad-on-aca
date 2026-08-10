@@ -229,6 +229,17 @@ squad_hub_should_supervise() {
   declare -f squad_hub_enabled >/dev/null 2>&1 && squad_hub_enabled
 }
 
+# --- Credential withholding for untrusted-input agent calls (issue #84 PI-3) -
+# Asked immediately before the SAME two modes invoke Copilot (directly, or via
+# Squad Hub's oneshot verb), so the answer is always current:
+# SQUAD_POLICY_RESOLVER is the same resolver squad_policy_resolve already used,
+# asked a different question.
+squad_credential_should_withhold() {
+  local answer
+  answer="$(node "$SQUAD_POLICY_RESOLVER" should-withhold-credential 2>/dev/null)" || answer="0"
+  [[ "$answer" == "1" ]]
+}
+
 # Verified once per session, before anything is published. Called at the top of
 # commit_and_push_if_needed so a governance rewrite can never reach the remote,
 # and at the end of every mode that runs an agent so a non-pushing session still
@@ -521,6 +532,16 @@ NODE
   prompt)
     require SQUAD_PROMPT
     log "Running one-shot Squad prompt."
+    # Issue #84 PI-3: withhold the push credential from the agent for an
+    # untrusted-input session (an issue/comment-sourced prompt), and restore it
+    # BEFORE commit_and_push_if_needed so the session still ends with a branch
+    # and a pull request. A trusted local-cli session is unaffected.
+    __squad_credential_withheld=0
+    if squad_credential_should_withhold; then
+      log "Untrusted-input session (mode '${SQUAD_MODE}', source '${SQUAD_DISPATCH_SOURCE:-<unset>}'): withholding the push credential from the agent. It will be restored after the agent exits and before publishing."
+      squad_credential_withhold
+      __squad_credential_withheld=1
+    fi
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
@@ -532,6 +553,9 @@ NODE
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
         copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
     fi
+    if [[ "$__squad_credential_withheld" -eq 1 ]]; then
+      squad_credential_restore
+    fi
     commit_and_push_if_needed
     ;;
   new-project)
@@ -540,6 +564,16 @@ NODE
     export OUTPUT_BRANCH="${OUTPUT_BRANCH:-squad/bootstrap-${SESSION_NAME}}"
     export PR_TITLE="${PR_TITLE:-Bootstrap project with Squad on ACA}"
     log "Running new-project bootstrap Squad prompt."
+    # Issue #84 PI-3: same withholding as `prompt`. new-project is the OTHER
+    # entrypoint-publishes mode: it always intends to push (PUSH_CHANGES
+    # defaults true above) and can equally be reached with an
+    # attacker-controlled task description on an untrusted dispatch source.
+    __squad_credential_withheld=0
+    if squad_credential_should_withhold; then
+      log "Untrusted-input session (mode '${SQUAD_MODE}', source '${SQUAD_DISPATCH_SOURCE:-<unset>}'): withholding the push credential from the agent. It will be restored after the agent exits and before publishing."
+      squad_credential_withhold
+      __squad_credential_withheld=1
+    fi
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
@@ -550,6 +584,9 @@ NODE
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
         copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+    fi
+    if [[ "$__squad_credential_withheld" -eq 1 ]]; then
+      squad_credential_restore
     fi
     commit_and_push_if_needed
     ;;

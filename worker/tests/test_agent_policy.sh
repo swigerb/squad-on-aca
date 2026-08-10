@@ -280,4 +280,205 @@ echo "-- bad usage --"
 assert_eq "78" "$(policy ralph ralph '' aca-job no-such-mode >/dev/null 2>&1; printf '%s' $?)" \
   "an unknown resolver sub-command exits 78 rather than printing something usable"
 
+# ---------------------------------------------------------------------------
+# 9. Issue #84 PI-1: matrix exhaustiveness / agreement
+# ---------------------------------------------------------------------------
+# "a test asserts the table matches what agent-policy.js composes, and fails
+# if a new source or mode is added without an entry." POLICY_MATRIX is built
+# from KNOWN_SOURCES x KNOWN_MODES, so its row count is a direct function of
+# the registry -- and every row is checked here against a FRESH call to
+# resolvePolicy for the same cell, so the matrix cannot silently drift from the
+# thing it claims to summarise.
+echo "-- PI-1 matrix exhaustiveness/agreement --"
+
+matrix_json="$(node -e "console.log(JSON.stringify(require(process.argv[1]).POLICY_MATRIX))" "$RESOLVER")"
+known_sources_len="$(node -e "console.log(require(process.argv[1]).KNOWN_SOURCES.length)" "$RESOLVER")"
+known_modes_len="$(node -e "console.log(require(process.argv[1]).KNOWN_MODES.length)" "$RESOLVER")"
+expected_rows=$((known_sources_len * known_modes_len))
+
+assert_eq "$expected_rows" "$(node -e "console.log(JSON.parse(process.argv[1]).length)" "$matrix_json")" \
+  "the matrix has exactly one row per KNOWN_SOURCES x KNOWN_MODES cell (${known_sources_len} x ${known_modes_len})"
+
+# MUTATION PROOF M1 target: deleting a row from POLICY_MATRIX (or from
+# KNOWN_SOURCES/KNOWN_MODES so a row is never generated) makes this assertion
+# fail, because the row count contract no longer holds.
+
+# Every cell agrees with a fresh, independent call to resolvePolicy for the
+# SAME (mode, dispatchSource) pair. If POLICY_MATRIX were ever hand-maintained
+# rather than derived, this is what would catch the first cell that drifted.
+disagreements="$(node -e "
+const policyMod = require(process.argv[1]);
+const rows = policyMod.POLICY_MATRIX;
+let bad = 0;
+for (const row of rows) {
+  const fresh = policyMod.resolvePolicy({
+    mode: row.mode,
+    dispatchSource: row.dispatchSource,
+    enableGithubRemote: 'true',
+    extraFlags: '',
+    executionPlane: 'aca-job',
+  });
+  const sameTier = fresh.tier === row.tier;
+  const sameTrust = fresh.trust === row.trust;
+  const sameDeny = JSON.stringify(fresh.denyTools) === JSON.stringify(row.denyTools);
+  const sameFlags = JSON.stringify(fresh.flags) === JSON.stringify(row.flags);
+  const sameCreds = JSON.stringify(fresh.credentialProfile) === JSON.stringify(row.credentialsPresent);
+  if (!(sameTier && sameTrust && sameDeny && sameFlags && sameCreds)) {
+    bad += 1;
+    console.error(\`mismatch: \${row.dispatchSource}/\${row.mode}\`);
+  }
+}
+console.log(bad);
+" "$RESOLVER")"
+assert_eq "0" "$disagreements" "every matrix row agrees with a fresh resolvePolicy() call for the same cell"
+
+# The two known unattended, untrusted dispatch sources both get the narrower
+# credential and tool posture for the credential-withhold modes.
+for src in ralph watch actions; do
+  row_withheld="$(node -e "
+    const rows = require(process.argv[1]).POLICY_MATRIX;
+    const row = rows.find(r => r.dispatchSource === process.argv[2] && r.mode === 'prompt');
+    console.log(row.credentialsPresent.withheld ? '1' : '0');
+  " "$RESOLVER" "$src")"
+  assert_eq "1" "$row_withheld" "matrix: source '${src}' + mode 'prompt' withholds the credential"
+done
+
+row_local_prompt_withheld="$(node -e "
+  const rows = require(process.argv[1]).POLICY_MATRIX;
+  const row = rows.find(r => r.dispatchSource === 'local-cli' && r.mode === 'prompt');
+  console.log(row.credentialsPresent.withheld ? '1' : '0');
+" "$RESOLVER")"
+assert_eq "0" "$row_local_prompt_withheld" "matrix: local-cli + prompt does NOT withhold the credential"
+
+# ---------------------------------------------------------------------------
+# 10. Issue #84 PI-2: the orthogonal trust axis
+# ---------------------------------------------------------------------------
+echo "-- PI-2 trust axis --"
+
+assert_eq "trusted"   "$(policy prompt local-cli '' aca-job trust)" "local-cli is trusted"
+assert_eq "untrusted" "$(policy prompt ralph     '' aca-job trust)" "ralph is untrusted"
+assert_eq "untrusted" "$(policy prompt watch     '' aca-job trust)" "watch is untrusted"
+assert_eq "untrusted" "$(policy prompt actions   '' aca-job trust)" "actions is untrusted"
+assert_eq "untrusted" "$(policy prompt ''        '' aca-job trust)" "an absent dispatch source is untrusted"
+assert_eq "untrusted" "$(policy prompt api       '' aca-job trust)" "an unrecognised dispatch source is untrusted"
+
+# Trust is ORTHOGONAL to tier: an autonomous, untrusted combination and an
+# autonomous, still-untrusted combination for a DIFFERENT mode both land
+# untrusted regardless of what the tier resolves to.
+assert_eq "$(policy ralph ralph '' aca-job tier)"  "autonomous" "sanity: ralph/ralph is autonomous (tier)"
+assert_eq "$(policy ralph ralph '' aca-job trust)" "untrusted"  "ralph/ralph is untrusted (trust) -- independent axis, same source"
+
+# The untrusted deny list is present for EVERY untrusted source, on top of
+# whatever the tier already denied -- and ABSENT for the trusted, attended
+# local-cli path. "Remote is narrower, local is unchanged", both directions.
+local_prompt_flags="$(policy prompt local-cli '' aca-job flags)"
+remote_prompt_flags="$(policy prompt ralph    '' aca-job flags)"
+remote_watch_flags="$(policy prompt watch     '' aca-job flags)"
+remote_actions_flags="$(policy prompt actions '' aca-job flags)"
+
+for pattern in "shell(git push)" "shell(gh pr)" "shell(curl)" "shell(wget)"; do
+  assert_contains     "$remote_prompt_flags"   "$pattern" "untrusted (ralph): denies ${pattern}"
+  assert_contains     "$remote_watch_flags"    "$pattern" "untrusted (watch): denies ${pattern}"
+  assert_contains     "$remote_actions_flags"  "$pattern" "untrusted (actions): denies ${pattern}"
+  assert_not_contains "$local_prompt_flags"    "$pattern" "trusted (local-cli): does NOT deny ${pattern} -- local is unchanged"
+done
+
+# "Do not blanket-deny git/gh/npm/pip or use --no-remote": prove the narrowing
+# is exactly the four patterns above and nothing broader.
+assert_not_contains "$remote_prompt_flags" "--deny-tool shell(git)" "untrusted does not deny bare shell(git)"
+assert_not_contains "$remote_prompt_flags" "--deny-tool shell(gh)" "untrusted does not deny bare shell(gh) (only shell(gh pr))"
+assert_not_contains "$remote_prompt_flags" "shell(npm)" "untrusted does not deny npm"
+assert_not_contains "$remote_prompt_flags" "shell(pip)" "untrusted does not deny pip"
+assert_not_contains "$remote_prompt_flags" "--no-remote" "untrusted narrowing does not force --no-remote"
+assert_contains     "$remote_prompt_flags" "--remote" "the remote flag is governed by ENABLE_GITHUB_REMOTE, unaffected by trust"
+
+# MUTATION PROOF M4 target: removing shell(git push) from
+# UNTRUSTED_INPUT_DENY_TOOLS makes the "untrusted (ralph): denies shell(git
+# push)" assertion above fail.
+# MUTATION PROOF M5 target: moving shell(git push) into COMMON_DENY_TOOLS
+# (rather than UNTRUSTED_INPUT_DENY_TOOLS) makes the "trusted (local-cli): does
+# NOT deny shell(git push)" assertion above fail, because it would then be
+# denied for local-cli too.
+# MUTATION PROOF M6 target: adding 'actions' (or 'ralph'/'watch') to
+# TRUSTED_SOURCES makes "ralph/ralph is untrusted (trust)" (or the
+# corresponding source's assertion) fail.
+
+# Space-bearing untrusted deny patterns go through the SAME undeliverable-via-
+# squad-flags mechanism as shell(git config): whole on the authoritative argv
+# and the hub's JSON channel, dropped (and named) on the squad --copilot-flags
+# path that `squad watch`/`squad loop` use.
+echo "-- PI-2 space-bearing deny patterns: argv/hub vs squad watch --"
+
+untrusted_argv="$(policy watch watch '' aca-job argv)"
+assert_contains "$untrusted_argv" "shell(git push)" "the authoritative argv carries shell(git push) whole"
+assert_contains "$untrusted_argv" "shell(gh pr)"     "the authoritative argv carries shell(gh pr) whole"
+git_push_lines="$(printf '%s\n' "$untrusted_argv" | grep -c '^shell(git push)$')"
+assert_eq "1" "$git_push_lines" "shell(git push) is exactly one argv token, not two"
+
+untrusted_hub_argv="$(policy watch watch '' aca-job hub-argv-json)"
+assert_contains "$untrusted_hub_argv" "shell(git push)" "the hub JSON channel carries shell(git push) whole"
+assert_contains "$untrusted_hub_argv" "shell(gh pr)"    "the hub JSON channel carries shell(gh pr) whole"
+
+untrusted_squad_flags="$(policy watch watch '' aca-job squad-flags)"
+assert_not_contains "$untrusted_squad_flags" "shell(git push)" "squad watch's space-split --copilot-flags cannot carry shell(git push) -- it is dropped, not mangled"
+assert_not_contains "$untrusted_squad_flags" "shell(gh pr)"     "squad watch's space-split --copilot-flags cannot carry shell(gh pr) either"
+assert_contains     "$untrusted_squad_flags" "shell(curl)"      "squad watch's --copilot-flags DOES carry the single-word untrusted patterns"
+assert_contains     "$untrusted_squad_flags" "shell(wget)"      "squad watch's --copilot-flags DOES carry shell(wget)"
+
+untrusted_undeliverable="$(policy watch watch '' aca-job undeliverable)"
+assert_contains "$untrusted_undeliverable" "shell(git push)" "the undeliverable list names shell(git push) so the gap is visible in the session log"
+assert_contains "$untrusted_undeliverable" "shell(gh pr)"     "the undeliverable list names shell(gh pr) too"
+
+# MUTATION PROOF M7 target: if the multi-word deny-pattern filter in
+# resolvePolicy's squadFlags/undeliverable split were removed (or broken so it
+# stops recognising space-bearing patterns), shell(git push)/shell(gh pr)
+# would leak into squad_out mangled into two arguments instead of being
+# cleanly omitted and named -- the "cannot carry ... dropped, not mangled"
+# assertions above would fail.
+
+# ---------------------------------------------------------------------------
+# 11. Issue #84 PI-3: credential profile
+# ---------------------------------------------------------------------------
+echo "-- PI-3 credential profile --"
+
+cred_local_prompt="$(policy prompt local-cli '' aca-job credential-profile)"
+assert_contains "$cred_local_prompt" '"ghTokenEnv":true'        "local-cli/prompt: credential env is present"
+assert_contains "$cred_local_prompt" '"gitTokenFile":true'      "local-cli/prompt: token file is present"
+assert_contains "$cred_local_prompt" '"credentialHelper":true'  "local-cli/prompt: credential helper is wired"
+assert_contains "$cred_local_prompt" '"withheld":false'         "local-cli/prompt: not withheld -- trusted input"
+
+for src in ralph watch actions; do
+  for mode in prompt new-project; do
+    cred="$(policy "$mode" "$src" '' aca-job credential-profile)"
+    assert_contains "$cred" '"ghTokenEnv":false'       "${src}/${mode}: GH_TOKEN/GITHUB_TOKEN withheld from the agent"
+    assert_contains "$cred" '"gitTokenFile":false'     "${src}/${mode}: token file withheld from the agent"
+    assert_contains "$cred" '"credentialHelper":false' "${src}/${mode}: credential helper withheld from the agent"
+    assert_contains "$cred" '"withheld":true'          "${src}/${mode}: withheld flag set"
+  done
+  status="$(policy "$src" "$src" '' aca-job should-withhold-credential 2>/dev/null)"
+done
+
+# MUTATION PROOF M3 target: flipping any one of ghTokenEnv/gitTokenFile/
+# credentialHelper's boolean in resolveCredentialProfile for the withheld case
+# makes the corresponding assertion above fail.
+
+# Not watch/loop/ralph long-lived modes: the credential is NOT withheld for
+# those, even on an untrusted source, per the design review's explicit scope.
+for mode in watch triage loop ralph smoke telemetry-smoke shell; do
+  cred="$(policy "$mode" watch '' aca-job credential-profile)"
+  assert_contains "$cred" '"withheld":false' "mode '${mode}' (untrusted source) is NOT a credential-withhold mode"
+done
+
+# The one mode that keeps the Azure identity is `ralph`, regardless of source,
+# and every other mode drops it -- restated here against the SAME resolver the
+# entrypoint's squad_drop_azure_identity mirrors, so a drift between the two
+# is visible as a failing assertion rather than two independently-maintained
+# 'ralph is special' lists.
+assert_contains "$(policy ralph ralph '' aca-job credential-profile)" '"azureIdentity":true' \
+  "mode 'ralph' keeps the Azure identity"
+assert_contains "$(policy prompt local-cli '' aca-job credential-profile)" '"azureIdentity":false' \
+  "mode 'prompt' does not carry the Azure identity"
+assert_contains "$(policy watch watch '' aca-job credential-profile)" '"azureIdentity":false' \
+  "mode 'watch' does not carry the Azure identity"
+
 test_summary
