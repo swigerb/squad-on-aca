@@ -6,11 +6,11 @@ This project is the Azure Container Apps counterpart to the AKS pattern in `tami
 | --- | --- | --- |
 | AKS cluster | Azure Container Apps environment | Included |
 | Ralph CronJob | Scheduled ACA Job `caj-squad-aca-ralph` with cron `*/5 * * * *`, `parallelism=1`, and a 240-second timeout | Included |
-| `concurrencyPolicy: Forbid` | ACA has no exact flag; Ralph is a short dispatcher that exits after starting session jobs, keeping runtime below the 5-minute cadence | Approximate ACA equivalent |
+| `concurrencyPolicy: Forbid` | ACA has no exact flag; Ralph is a short dispatcher that exits after starting session jobs | Approximate ACA equivalent |
 | Agent pods/jobs | ACA manual job executions from `caj-squad-aca-session`; each execution is a full Squad team session pod | Included |
 | One pod per work session | `caj-squad-aca-session` starts a new execution per `start-session.ps1` call | Included |
 | KEDA scale-to-zero | ACA jobs are zero-cost when idle; watcher app can scale to 0/1 | Included |
-| New project bootstrap | `scripts/new-project.ps1` creates/seeds a GitHub repo and starts `SQUAD_MODE=new-project` | Included |
+| New project bootstrap | `scripts/new-project.ps1` creates and seeds a GitHub repo and starts `SQUAD_MODE=new-project` | Included |
 | ACR image build | `az acr build` from `worker/Dockerfile` | Included |
 | Managed image pull | User-assigned managed identity with `AcrPull` | Included |
 | Kubernetes secrets | ACA secrets | Included |
@@ -45,41 +45,18 @@ Ralph is not a separate container image. The `squad-worker` image contains all r
 | `caj-squad-aca-session` | Manual | One full remote Squad team session per execution |
 | `ca-squad-aca-watch` | Container App, scale 0/1 | Optional long-running watcher |
 
-Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Container Apps Jobs Operator` scoped to the session job — the two calls it makes, against the one job it makes them against. Sessions do not hold the identity at all: it is removed from the environment of every mode except `ralph`. See [runbook.md](runbook.md#identity-and-rbac) and [egress-assessment.md](egress-assessment.md).
+Ralph uses the user-assigned managed identity to call Azure and start ACA job executions. The identity receives `AcrPull` for image pulls and `Container Apps Jobs Operator` scoped to the session job. Sessions do not hold the identity; every mode except `ralph` has identity endpoint variables removed before the agent starts. See [runbook.md](runbook.md#ralph-job-runner).
 
 ## Capability-aware execution
 
-The worker image is fixed and its managed identity is intentionally
-scoped — it does not grant GitHub credentials beyond what's wired in,
-extra binaries, or open network egress. See
-[`docs/capability-manifest.md`](capability-manifest.md) for the capability
-manifest and preflight validation that surface unsupported repository
-requirements (extra SDKs, browsers, databases, private feeds, external
-services) as a fast, actionable failure instead of a mid-task surprise.
-That document also covers the deterministic routing decision the manifest
-produces: run on the default ACA job, run on an approved sandbox class, or fail
-closed.
+The fixed worker image is checked against repository requirements declared in `squad-capabilities.yml`. See [capability-manifest.md](capability-manifest.md) for the manifest schema, preflight validation, and routing decision.
 
 ## ACA Sandboxes execution plane
 
-`squad-aca` can also dispatch a session to **Azure Container Apps Sandboxes**
-instead of an ACA Job. This has no `squad-on-aks` counterpart, so it is listed
-here rather than in the parity table. It is an **opt-in preview**, off by
-default behind `SQUAD_ACA_ENABLE_SANDBOX`, and gated a second time by the
-`provisional` marker in `config/sandbox-classes.json`. ACA Jobs remain the
-unconditional default and the rollback path.
+`squad-aca` can also dispatch a session to Azure Container Apps Sandboxes instead of an ACA Job. This has no `squad-on-aks` counterpart.
 
-The plane adds per-session isolation and default-deny, capability-scoped egress
-— neither of which the ACA Jobs plane provides. On ACA Jobs, `egress[]` entries
-in a manifest stay advisory, and GitHub and Azure access stay a long-lived token
-pair plus one shared user-assigned managed identity.
+The plane is opt-in preview, off by default behind `SQUAD_ACA_ENABLE_SANDBOX`, and gated by the `provisional` marker in `config/sandbox-classes.json`. ACA Jobs remain the default and rollback path.
 
-With the flag on, `squad-aca run` resolves the repository's
-`squad-capabilities.yml` before requesting compute and dispatches to whichever
-plane the decision names. A repository with no manifest, or one the default
-worker image already satisfies, is unaffected. A repository that genuinely needs
-a non-default capability is **refused** when the flag is off, rather than being
-quietly run on the default worker. See
-[sandboxes.md](sandboxes.md),
-[runbook.md](runbook.md#aca-sandboxes-preview-feature-flagged-off), and
-[rollback.md](rollback.md#2-aca-sandboxes-feature-flagged-preview).
+With the flag on, `squad-aca run` resolves the repository's `squad-capabilities.yml` before requesting compute and dispatches to the plane named by the decision. A repository with no manifest, or one the default worker image already satisfies, is unaffected. A repository that needs a non-default capability is refused when the flag is off.
+
+See [sandboxes.md](sandboxes.md), [runbook.md](runbook.md#aca-sandboxes-preview-feature-flagged-off), and [rollback.md](rollback.md#2-aca-sandboxes-feature-flagged-preview).
