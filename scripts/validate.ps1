@@ -6559,6 +6559,112 @@ if ($jobMissingFixtures.Count -eq 0) {
 }
 
 # ---------------------------------------------------------------------------
+# Drift folded into doctor (CV-3, issue #85)
+# ---------------------------------------------------------------------------
+# CV-3's requirement is a MAPPING, not a row: a high-severity live finding must
+# reach the operator as "failed", never as a warning and never as "ok". The
+# golden matrix's 11-doctor case cannot see that mapping -- it pins the
+# fail-closed path, where both children exit 2 and doctor reports "unknown".
+#
+# So this section drives the REAL child checks against a deployment the stub
+# `az` describes as drifted (SQUAD_STUB_DRIFT=1, plus a synthetic
+# deploy.outputs.json in a throwaway mirror of scripts/ -- see
+# New-SquadCliDriftDeployment), and asserts the failed rows twice:
+#
+#   1. at runtime, against a live capture, and
+#   2. against the COMMITTED golden 27-doctor-drift.txt.
+#
+# The second assertion is the one that matters for regeneration: a downgrade to
+# "warning" would be silently absorbed by `verify-cli-golden.ps1 -Update`,
+# because a regenerated golden always matches the code that produced it. Here
+# the expected text is written down independently, so blessing a warning fails
+# this check.
+Write-Section "Drift folded into doctor (CV-3)"
+
+$cv3GoldenPath = Join-Path $RepoRoot "scripts\tests\golden\cli\27-doctor-drift.txt"
+$cv3RbacFailedPattern = 'RBAC drift \(CV-1\)\s+failed\s+2 high-severity finding\(s\): missingAssignment, unexpectedScope'
+$cv3JobFailedPattern = 'Job config drift \(CV-2\)\s+failed\s+2 high-severity finding\(s\): inlinedSecret, unexpectedIdentity'
+# Anything that is not "failed" on either drift row -- "warning" above all, but
+# equally "ok" or "unknown" -- is the regression this check exists to catch.
+$cv3RbacNotFailedPattern = 'RBAC drift \(CV-1\)\s+(?!failed\b)\S+'
+$cv3JobNotFailedPattern = 'Job config drift \(CV-2\)\s+(?!failed\b)\S+'
+
+if (-not (Test-Path -LiteralPath $cv3GoldenPath)) {
+    Add-Fail "scripts/tests/golden/cli/27-doctor-drift.txt is missing; nothing pins that simulated drift reaches the operator as a failure"
+} else {
+    $cv3GoldenText = Get-Content -LiteralPath $cv3GoldenPath -Raw
+    if ($cv3GoldenText -match $cv3RbacFailedPattern -and $cv3GoldenText -match $cv3JobFailedPattern) {
+        Add-Pass "The committed 27-doctor-drift golden reports BOTH drift rows as 'failed' with their high-severity findings, so a regenerated golden cannot quietly downgrade CV-3 to a warning"
+    } else {
+        Add-Fail "The committed 27-doctor-drift golden no longer reports both drift rows as 'failed' with high-severity findings; CV-3 requires simulated drift to be a failure, not a warning"
+    }
+    if ($cv3GoldenText -notmatch $cv3RbacNotFailedPattern -and $cv3GoldenText -notmatch $cv3JobNotFailedPattern) {
+        Add-Pass "No drift row in the 27-doctor-drift golden carries any status other than 'failed'"
+    } else {
+        Add-Fail "A drift row in the 27-doctor-drift golden carries a status other than 'failed' (a warning/ok/unknown downgrade)"
+    }
+
+    # The golden only means something if the capture case that produces it is
+    # actually the drifted one; a case that quietly stopped driving the real
+    # child checks would leave a stale file passing the checks above.
+    $cv3CaseFile = Join-Path $RepoRoot "scripts\tests\cli-capture-cases.ps1"
+    if ((Test-Path -LiteralPath $cv3CaseFile) -and ((Get-Content -LiteralPath $cv3CaseFile -Raw) -match '27-doctor-drift[^\r\n]*Drift\s*=\s*\$true')) {
+        Add-Pass "The 27-doctor-drift capture case still drives the real drift child scripts against the drifted stub deployment"
+    } else {
+        Add-Fail "scripts/tests/cli-capture-cases.ps1 no longer marks 27-doctor-drift as a drift case; the golden would be captured against the fail-closed path instead"
+    }
+}
+
+# The runtime half: the same scenario, captured live rather than read off disk,
+# so a code change that stops mapping exit 1 to "failed" fails here even before
+# the golden gate runs.
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] CV-3 doctor drift scenario requires Windows (.cmd stubs)" -ForegroundColor Yellow
+} elseif (-not (Test-Path -LiteralPath $harness)) {
+    Add-Fail "scripts/tests/cli-stub-harness.ps1 is missing; the CV-3 doctor drift scenario cannot run"
+} else {
+    . $harness
+    $cv3Stub = $null
+    try {
+        $cv3Stub = New-SquadCliStubEnvironment
+        $cv3Cli = New-SquadCliDriftDeployment -Stub $cv3Stub -ScriptsRoot (Join-Path $RepoRoot "scripts")
+        $cv3Run = Invoke-SquadCliCapture -Stub $cv3Stub -ScriptPath $cv3Cli -CliArguments @("doctor") -DriftMode "1"
+
+        if ($cv3Run.StdOut -match $cv3RbacFailedPattern) {
+            Add-Pass "With live RBAC drift simulated end to end, doctor reports 'RBAC drift (CV-1)' as failed with its high-severity findings"
+        } else {
+            Add-Fail "Simulated live RBAC drift did not reach the doctor table as a failure: $($cv3Run.StdOut)"
+        }
+        if ($cv3Run.StdOut -match $cv3JobFailedPattern) {
+            Add-Pass "With live job/environment drift simulated end to end, doctor reports 'Job config drift (CV-2)' as failed with its high-severity findings"
+        } else {
+            Add-Fail "Simulated live job/environment drift did not reach the doctor table as a failure: $($cv3Run.StdOut)"
+        }
+        if ($cv3Run.StdOut -notmatch $cv3RbacNotFailedPattern -and $cv3Run.StdOut -notmatch $cv3JobNotFailedPattern) {
+            Add-Pass "Neither drift row is reported as a warning, ok, or unknown when the deployment is drifted"
+        } else {
+            Add-Fail "A drift row was reported with a status other than 'failed' against a drifted deployment: $($cv3Run.StdOut)"
+        }
+
+        # doctor must stay a child-process caller: the drift reads have to be
+        # the CHILD's az calls, made against the resolved subscription, or the
+        # single-chokepoint claim in each reader stops describing the process
+        # that actually issued them.
+        $cv3DriftCalls = @($cv3Run.AzCalls | Where-Object { $_ -match '^(role assignment list|identity show|acr show)\b' })
+        $cv3Unpinned = @($cv3DriftCalls | Where-Object { $_ -notmatch [regex]::Escape("--subscription") })
+        if ($cv3DriftCalls.Count -ge 6 -and $cv3Unpinned.Count -eq 0) {
+            Add-Pass "The drift reads doctor triggered ($($cv3DriftCalls.Count) call(s)) all pin --subscription, so folding the checks into doctor did not loosen the read contract"
+        } else {
+            Add-Fail "doctor's folded-in drift reads are missing or do not pin --subscription (calls=$($cv3DriftCalls.Count), unpinned=$($cv3Unpinned.Count))"
+        }
+    } catch {
+        Add-Fail "The CV-3 doctor drift scenario threw: $($_.Exception.Message)"
+    } finally {
+        if ($cv3Stub) { Remove-SquadCliStubEnvironment -Stub $cv3Stub }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Section "Summary"
