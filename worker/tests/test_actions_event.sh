@@ -48,7 +48,7 @@ assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "applying the trigger 
 assert_eq "label-applied" "$(printf '%s' "$out" | field reason)" "and says which trigger fired, by name"
 assert_eq "7" "$(printf '%s' "$out" | field issueNumber)" "and carries the issue number the session will work"
 
-comment='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad fix the flaky test","user":{"login":"swigerb","type":"User"}}}'
+comment='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad fix the flaky test","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 out="$(resolve issue_comment "$comment")"
 assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "a comment carrying the command prefix dispatches"
 assert_eq "command-comment" "$(printf '%s' "$out" | field reason)" "named as a command comment"
@@ -74,18 +74,18 @@ assert_eq "actor-is-a-bot" "$(printf '%s' "$out" | field reason)" "and it is ref
 # ---------------------------------------------------------------------------
 # Over-trigger refusals
 # ---------------------------------------------------------------------------
-quoted="$(printf '{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"> /squad fix it\\n\\nI would not do that.","user":{"login":"swigerb","type":"User"}}}')"
+quoted="$(printf '{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"> /squad fix it\\n\\nI would not do that.","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}')"
 out="$(resolve issue_comment "$quoted")"
 assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "QUOTING someone else's command does not run it -- GitHub renders a reply as '> /squad ...', which is the ordinary way an unintended trigger happens"
 assert_eq "comment-carries-no-command" "$(printf '%s' "$out" | field reason)" "the quoted command is treated as no command at all"
 
-midline='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"maybe we should /squad this","user":{"login":"swigerb","type":"User"}}}'
+midline='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"maybe we should /squad this","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 assert_eq "false" "$(resolve issue_comment "$midline" | field dispatch)" "a command mentioned mid-sentence does not dispatch -- it must begin a line"
 
-prefixy='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squadron reporting in","user":{"login":"swigerb","type":"User"}}}'
+prefixy='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squadron reporting in","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 assert_eq "false" "$(resolve issue_comment "$prefixy" | field dispatch)" "a longer word that merely STARTS with the command does not dispatch"
 
-bare='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad","user":{"login":"swigerb","type":"User"}}}'
+bare='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 assert_eq "true" "$(resolve issue_comment "$bare" | field dispatch)" "the bare command with no arguments still dispatches"
 
 wrong_label='{"action":"labeled","label":{"name":"bug"},"issue":{"number":7,"state":"open"},"sender":{"login":"swigerb"}}'
@@ -99,7 +99,7 @@ assert_eq "false" "$(resolve issues "$closed" | field dispatch)" "labelling a CL
 opened='{"action":"opened","issue":{"number":7,"state":"open"},"sender":{"login":"swigerb"}}'
 assert_eq "false" "$(resolve issues "$opened" | field dispatch)" "merely opening an issue does not dispatch -- the label is the consent"
 
-edited='{"action":"edited","issue":{"number":9,"state":"open"},"comment":{"body":"/squad go","user":{"login":"swigerb","type":"User"}}}'
+edited='{"action":"edited","issue":{"number":9,"state":"open"},"comment":{"body":"/squad go","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 assert_eq "false" "$(resolve issue_comment "$edited" | field dispatch)" "EDITING a comment to contain the command does not dispatch -- otherwise editing history replays work"
 
 assert_eq "false" "$(resolve push '{"ref":"refs/heads/main"}' | field dispatch)" "an unrelated event type does not dispatch"
@@ -167,19 +167,19 @@ out="$(resolve issue_comment "$comment")"
 assert_eq "swigerb" "$(printf '%s' "$out" | field requester)" "a command dispatch records the commenter as the requester"
 assert_eq "command" "$(printf '%s' "$out" | field trigger)" "and records WHICH form triggered it"
 
-mention='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane please fix the flaky test","user":{"login":"swigerb","type":"User"}}}'
+mention='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane please fix the flaky test","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 out="$(resolve issue_comment "$mention")"
 assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "@mentioning the App dispatches -- mentioning a bot is what people try first, so supporting only a slash command loses those requests silently"
 assert_eq "mention" "$(printf '%s' "$out" | field trigger)" "the mention form is recorded distinctly from the slash command"
 assert_eq "please fix the flaky test" "$(printf '%s' "$out" | field prompt)" "the mention's prompt excludes the mention itself"
 
-mention_bot='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane[bot] go","user":{"login":"swigerb","type":"User"}}}'
+mention_bot='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane[bot] go","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 assert_eq "true" "$(resolve issue_comment "$mention_bot" | field dispatch)" "the literal '[bot]' suffix GitHub renders is accepted too, since that is what a copy-paste of the rendered name produces"
 
 mention_quoted="$(printf '{\"action\":\"created\",\"issue\":{\"number\":9,\"state\":\"open\"},\"comment\":{\"body\":\"> @squad-on-aca-control-plane go\",\"user\":{\"login\":\"swigerb\",\"type\":\"User\"}}}')"
 assert_eq "false" "$(resolve issue_comment "$mention_quoted" | field dispatch)" "a QUOTED mention does not dispatch -- the mention form is subject to the same line-start rule as the command"
 
-mention_mid='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"I think @squad-on-aca-control-plane could help here","user":{"login":"swigerb","type":"User"}}}'
+mention_mid='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"I think @squad-on-aca-control-plane could help here","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 assert_eq "false" "$(resolve issue_comment "$mention_mid" | field dispatch)" "mentioning the App mid-sentence does NOT dispatch -- talking ABOUT the bot is not asking it to do something, and this is the single most likely accidental trigger"
 
 self_mention='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane retry","user":{"login":"squad-on-aca-control-plane[bot]","type":"Bot"}},"sender":{"login":"squad-on-aca-control-plane[bot]"}}'
@@ -238,16 +238,63 @@ default_prefix="$(node -e "process.stdout.write(require('${MODULE}').DEFAULT_COM
 assert_ne "/squad" "$default_prefix" "the default command prefix is NOT '/squad' -- that names the ordinary Squad coordinator agent in .github/agents/, which does not dispatch to ACA"
 assert_eq "/squad-aca" "$default_prefix" "the default command prefix is '/squad-aca', matching the trigger label so both ways of asking for a remote session use the same word"
 
-plain_squad='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad fix the flaky test","user":{"login":"swigerb","type":"User"}}}'
+plain_squad='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad fix the flaky test","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 printf '%s' "$plain_squad" >"${WORK}/event.json"
 out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
 assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "with the DEFAULT prefix, a bare '/squad' comment does NOT start a billed remote session -- someone asking the ordinary Squad agent for help must not be charged for an ACA container"
 assert_eq "comment-carries-no-command" "$(printf '%s' "$out" | field reason)" "and it is refused for the right reason"
 
-aca_cmd='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad-aca fix the flaky test","user":{"login":"swigerb","type":"User"}}}'
+aca_cmd='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad-aca fix the flaky test","user":{"login":"swigerb","type":"User"},"author_association":"OWNER"}}'
 printf '%s' "$aca_cmd" >"${WORK}/event.json"
 out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
 assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "with the DEFAULT prefix, '/squad-aca' DOES dispatch -- the accepting direction, without which a typo in the default would leave every refusal assertion green while dispatch was dead"
 assert_eq "fix the flaky test" "$(printf '%s' "$out" | field prompt)" "and the prompt excludes the command itself"
+
+# ---------------------------------------------------------------------------
+# Who may start a run
+#
+# This repository is PUBLIC and `issue_comment` workflows run from the default
+# branch WITH access to repository secrets. Without an authorisation check, any
+# GitHub account could comment the command and start a job in the owner's Azure
+# subscription, on their bill, with a token that can write to the repository.
+#
+# `author_association` is reported by GitHub on the comment; it is not
+# something a commenter can set.
+# ---------------------------------------------------------------------------
+for assoc in OWNER MEMBER COLLABORATOR; do
+  permitted="{\"action\":\"created\",\"issue\":{\"number\":9,\"state\":\"open\"},\"comment\":{\"body\":\"/squad-aca fix it\",\"user\":{\"login\":\"someone\",\"type\":\"User\"},\"author_association\":\"${assoc}\"}}"
+  printf '%s' "$permitted" >"${WORK}/event.json"
+  out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
+  assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "a ${assoc} may start a run -- these are the associations that already carry write access"
+done
+
+for assoc in NONE CONTRIBUTOR FIRST_TIME_CONTRIBUTOR FIRST_TIMER MANNEQUIN "" ; do
+  stranger="{\"action\":\"created\",\"issue\":{\"number\":9,\"state\":\"open\"},\"comment\":{\"body\":\"/squad-aca spend the owner's money\",\"user\":{\"login\":\"stranger\",\"type\":\"User\"},\"author_association\":\"${assoc}\"}}"
+  printf '%s' "$stranger" >"${WORK}/event.json"
+  out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
+  assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "'${assoc:-<absent>}' may NOT start a billed job in somebody else's subscription"
+  assert_eq "actor-may-not-dispatch" "$(printf '%s' "$out" | field reason)" "and the refusal says it was an authorisation decision, not a malformed command"
+done
+
+lowercase='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad-aca fix it","user":{"login":"someone","type":"User"},"author_association":"collaborator"}}'
+printf '%s' "$lowercase" >"${WORK}/event.json"
+out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
+assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "the association is matched case-insensitively, so a payload casing change is not a lockout"
+
+# An ordinary comment from a stranger is not an attempted dispatch, and must
+# not be reported as a refused one -- that would fill the log with alarms about
+# people simply talking on an issue.
+chatter='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"thanks, this looks great","user":{"login":"stranger","type":"User"},"author_association":"NONE"}}'
+printf '%s' "$chatter" >"${WORK}/event.json"
+out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
+assert_eq "comment-carries-no-command" "$(printf '%s' "$out" | field reason)" "an ordinary comment from a non-collaborator reads as 'no command', not as a refused attempt"
+
+# The label path needs no check of its own: GitHub already requires triage or
+# write permission to apply a label. Asserting it still dispatches keeps that
+# reasoning honest -- if this ever starts refusing, the gate has been applied
+# to the wrong path.
+printf '%s' "$labeled" >"${WORK}/event.json"
+out="$(resolve issues "$labeled")"
+assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "the label path still dispatches -- applying a label already requires triage or write permission, which GitHub enforces itself"
 
 test_summary

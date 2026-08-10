@@ -68,8 +68,29 @@ const REASON = {
   SKIP_NO_COMMAND: 'comment-carries-no-command',
   SKIP_SELF: 'actor-is-this-app',
   SKIP_BOT: 'actor-is-a-bot',
-  SKIP_CLOSED: 'issue-is-closed'
+  SKIP_CLOSED: 'issue-is-closed',
+  SKIP_NOT_PERMITTED: 'actor-may-not-dispatch'
 };
+
+/**
+ * Who is allowed to start a run.
+ *
+ * GitHub reports the commenter's relationship to the repository on every issue
+ * and comment payload. Only these three mean "has write access here".
+ *
+ * This is the authorisation boundary for the whole trigger, and it has to exist
+ * because of how the two paths differ:
+ *
+ *   - APPLYING A LABEL already requires triage or write permission. GitHub
+ *     enforces that itself, so the label path was never open.
+ *   - COMMENTING requires nothing at all. On a PUBLIC repository, any GitHub
+ *     account can comment on any issue -- and `issue_comment` workflows run
+ *     from the default branch WITH access to repository secrets. Without this
+ *     check, a stranger's comment starts a job in the repository owner's Azure
+ *     subscription, on their bill, with a token that can write to the
+ *     repository.
+ */
+const PERMITTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 
 /**
  * Sanitize a value for use in an ACA job execution / session name.
@@ -178,6 +199,19 @@ function resolveEvent(input) {
   const command = extractCommand(body, commandPrefix, botLogin);
   if (!command.found) {
     return verdict(false, REASON.SKIP_NO_COMMAND, { issueNumber });
+  }
+
+  /**
+   * Checked AFTER the command is found, so an ordinary comment from a stranger
+   * is reported as "no command" rather than as a refused attempt -- and BEFORE
+   * any dispatch, which is the part that matters.
+   *
+   * `author_association` comes from GitHub on the comment itself; it is not
+   * anything the commenter can set.
+   */
+  const association = String((payload.comment && payload.comment.author_association) || '').toUpperCase();
+  if (!PERMITTED_ASSOCIATIONS.has(association)) {
+    return verdict(false, REASON.SKIP_NOT_PERMITTED, { issueNumber, actor, association });
   }
 
   return verdict(true, REASON.DISPATCH_COMMAND, {
