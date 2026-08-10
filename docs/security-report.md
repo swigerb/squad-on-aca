@@ -160,19 +160,6 @@ also fails if any new background child is introduced ahead of the removal.
 
 ---
 
-## Changes made following this review
-
-| Change | Date |
-|---|---|
-| Identity removed before any child process starts | 10 August 2026 |
-| Comment dispatch gated on repository access | 9 August 2026 |
-| Session identity narrowed to a job-scoped role | 9 August 2026 |
-| Identity removed from every non-Ralph session | 9 August 2026 |
-
-Further hardening is tracked in the repository's issues.
-
----
-
 ## Reporting a vulnerability
 
 Please report privately:
