@@ -1,0 +1,35 @@
+{
+  "schema": "squad-aca/rbac-drift-snapshot@1",
+  "capturedAt": "2026-08-10T00:00:00.0000000Z",
+  "_comment": "CV-1 fixture: fully clean deployment, GitHub Actions identity present and holding exactly its expected grant. Identifiers are pre-redacted aliases -- no GUIDs. Compare-RbacDriftSnapshot on this fixture must produce only 'ok' findings and exit 0.",
+  "principals": [
+    {
+      "role": "session",
+      "present": true,
+      "principalAlias": "PRINCIPAL-1",
+      "clientAlias": "CLIENT-1",
+      "assignments": [
+        { "roleName": "AcrPull", "scopeType": "registry", "scopeAlias": "SCOPE-1", "assignmentAlias": "ASSIGN-1" },
+        { "roleName": "Container Apps Jobs Operator", "scopeType": "sessionJob", "scopeAlias": "SCOPE-2", "assignmentAlias": "ASSIGN-2" }
+      ]
+    },
+    {
+      "role": "githubActions",
+      "present": true,
+      "principalAlias": "PRINCIPAL-2",
+      "clientAlias": "CLIENT-2",
+      "assignments": [
+        { "roleName": "Container Apps Jobs Operator", "scopeType": "sessionJob", "scopeAlias": "SCOPE-2", "assignmentAlias": "ASSIGN-3" }
+      ]
+    }
+  ],
+  "scopedAssignments": {
+    "registry": [
+      { "principalAlias": "PRINCIPAL-1", "roleName": "AcrPull", "assignmentAlias": "ASSIGN-1" }
+    ],
+    "sessionJob": [
+      { "principalAlias": "PRINCIPAL-1", "roleName": "Container Apps Jobs Operator", "assignmentAlias": "ASSIGN-2" },
+      { "principalAlias": "PRINCIPAL-2", "roleName": "Container Apps Jobs Operator", "assignmentAlias": "ASSIGN-3" }
+    ]
+  }
+}

@@ -47,6 +47,20 @@
       SQUAD_STUB_EXEC_STUCK  "1" => every `execution show` reports Provisioning
       SQUAD_STUB_SBG_IDENTITY "1" => `az resource show` reports a managed
                              identity on the sandbox group (invariant 4 refusal)
+      SQUAD_STUB_DRIFT       "1" => the fake `az` additionally answers the
+                             LIVE read shapes scripts/lib/rbac-drift-reader
+                             .ps1 (CV-1) and scripts/lib/job-drift-reader.ps1
+                             (CV-2) issue, describing a DRIFTED deployment:
+                             the session identity holds a resource-group
+                             Contributor grant it should not and lacks its
+                             job-scoped grant, and the session job inlines
+                             GITHUB_TOKEN and carries an extra identity. Both
+                             child checks therefore exit 1 with high-severity
+                             findings, which is what makes `doctor` report
+                             them as "failed" (issue #85 CV-3). Unset -- the
+                             default every other capture takes -- leaves the
+                             fake `az` byte-identically unchanged, so golden
+                             11-doctor still pins the "unknown" path.
 
     The fake `aca` (Sprint 5, ACA Sandboxes provider) reads these. It records
     every invocation to SQUAD_STUB_ACA_LOG exactly like the other shims, so a
@@ -247,6 +261,15 @@ function New-SquadCliStubEnvironment {
 { "name": "Stub Subscription", "id": "00000000-0000-0000-0000-000000000000" }
 '@
 
+    # The DRIFTED session job CV-2 reads under SQUAD_STUB_DRIFT=1 (issue #85).
+    # Image and every expected environment variable match intent, so the only
+    # high-severity findings are the two this scenario exists to prove doctor
+    # reports as a failure: GITHUB_TOKEN carries a literal value instead of a
+    # secretRef, and a second, unexpected user-assigned identity is attached.
+    Set-Content -LiteralPath (Join-Path $fixtureDir "drift-job-show.json") -Encoding ascii -Value @'
+{"identity":{"type":"UserAssigned","userAssignedIdentities":{"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uai-squad-aca-acrpull":{"principalId":"22222222-2222-2222-2222-222222222222","clientId":"33333333-3333-3333-3333-333333333333"},"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uai-squad-aca-extra":{"principalId":"44444444-4444-4444-4444-444444444444","clientId":"55555555-5555-5555-5555-555555555555"}}},"properties":{"template":{"containers":[{"image":"acrsquadstub.azurecr.io/squad-worker:stub","env":[{"name":"GITHUB_REPOSITORY","value":"octo/demo"},{"name":"GITHUB_REF","value":"main"},{"name":"GITHUB_BASE_BRANCH","value":"main"},{"name":"GITHUB_TOKEN","value":"INLINED-LITERAL-NOT-A-REAL-TOKEN-0000000000"},{"name":"COPILOT_GITHUB_TOKEN","secretRef":"copilot-github-token"},{"name":"ASPIRE_OTLP_GRPC_ENDPOINT","value":"http://ca-squad-aca-aspire:18889"},{"name":"ASPIRE_OTLP_HTTP_ENDPOINT","value":"http://ca-squad-aca-aspire:18890"},{"name":"OTEL_EXPORTER_OTLP_HEADERS","secretRef":"otlp-headers"},{"name":"SQUAD_DEPLOYMENT_MODE","value":"squad-per-pod"},{"name":"ENABLE_GITHUB_REMOTE","value":"true"},{"name":"SQUAD_COPILOT_FLAGS","value":""},{"name":"SQUAD_HUB_URL","value":"https://hub.stub.invalid"},{"name":"SQUAD_HUB_TOKEN","secretRef":"squad-hub-token"},{"name":"AZURE_SUBSCRIPTION_ID","value":"00000000-0000-0000-0000-000000000000"},{"name":"AZURE_RESOURCE_GROUP","value":"rg-squad-stub"},{"name":"AZURE_CLIENT_ID","value":"33333333-3333-3333-3333-333333333333"},{"name":"ACA_SESSION_JOB_NAME","value":"caj-squad-aca-session"}]}]}}}
+'@
+
     # --- Fixtures returned by the fake `aca` (Sprint 5, ACA Sandboxes) -------
     # A sandbox group with NO managed identity. This is the shape the provider
     # must see before it will run anything (PRD #6 invariant 4): private-registry
@@ -336,9 +359,17 @@ set "A2=%~2"
 set "A3=%~3"
 set "A4=%~4"
 set "Q="
+set "OUT="
+set "NAME="
+set "SCOPE="
+set "ASSIGNEE="
 :sqparse
 if "%~1"=="" goto sqdone
 if "%~1"=="--query" set "Q=%~2"
+if "%~1"=="-o" set "OUT=%~2"
+if "%~1"=="--name" set "NAME=%~2"
+if "%~1"=="--scope" set "SCOPE=%~2"
+if "%~1"=="--assignee" set "ASSIGNEE=%~2"
 shift
 goto sqparse
 :sqdone
@@ -367,6 +398,11 @@ goto sqok
 type "%SQUAD_STUB_FIXTURES%\exec-show.json"
 goto sqok
 :sqjobshow
+rem CV-1 asks for `--query id -o json` and CV-2 for the whole job `-o json`;
+rem doctor's own session-job probe asks for `--query id -o tsv`. The output
+rem format is what separates them, so the drift answers are keyed off it and
+rem are unreachable unless SQUAD_STUB_DRIFT=1.
+if "%SQUAD_STUB_DRIFT%"=="1" if "%OUT%"=="json" goto sqdriftjob
 if "%Q%"=="properties.template.containers[0].env" goto sqtplenv
 if "%Q%"=="properties.template.containers[0]" goto sqtplcontainer
 echo /subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/stub
@@ -391,6 +427,9 @@ echo STUB-START-ACK
 exit /b %SQUAD_STUB_START_RC%
 :sqnotca
 if "%A1%"=="resource" goto sqresource
+if "%A1%"=="identity" goto sqdriftidentity
+if "%A1%"=="role" goto sqdriftrole
+if "%A1%"=="acr" goto sqdriftacr
 if not "%A1%"=="account" goto sqok
 if not "%A2%"=="show" goto sqok
 type "%SQUAD_STUB_FIXTURES%\account-show.json"
@@ -400,6 +439,52 @@ if not "%A2%"=="show" goto sqok
 if "%SQUAD_STUB_SBG_IDENTITY%"=="1" type "%SQUAD_STUB_FIXTURES%\sbg-identity-present.json"
 if not "%SQUAD_STUB_SBG_IDENTITY%"=="1" type "%SQUAD_STUB_FIXTURES%\sbg-identity-none.json"
 exit /b %SQUAD_STUB_SBG_RC%
+rem --- CV-1 / CV-2 live drift reads (issue #85) ---------------------------
+rem Every label below either checks SQUAD_STUB_DRIFT itself or is only
+rem reachable from a branch that already did, so with the flag unset this
+rem whole section is dead code and every existing golden is unaffected.
+rem The deployment described here is the stub deployment the synthetic
+rem ~/.squad-on-aca/config.json already points at (rg-squad-stub, name prefix
+rem squad-aca), DRIFTED in exactly the two ways issue #85 names: the session
+rem identity holds a resource-group Contributor grant that is broader than
+rem intent and is missing its job-scoped grant (CV-1), and the session job
+rem inlines GITHUB_TOKEN and carries an extra user-assigned identity (CV-2).
+:sqdriftjob
+if "%Q%"=="id" goto sqdriftjobid
+type "%SQUAD_STUB_FIXTURES%\drift-job-show.json"
+goto sqok
+:sqdriftjobid
+echo "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/caj-squad-aca-session"
+goto sqok
+:sqdriftidentity
+if not "%SQUAD_STUB_DRIFT%"=="1" goto sqok
+if "%NAME%"=="uai-squad-aca-acrpull" goto sqdriftidsession
+>&2 echo ERROR: (ResourceNotFound) The Resource 'Microsoft.ManagedIdentity/userAssignedIdentities/%NAME%' was not found.
+exit /b 3
+:sqdriftidsession
+if "%Q%"=="id" goto sqdriftidsessionid
+echo {"principalId":"22222222-2222-2222-2222-222222222222","clientId":"33333333-3333-3333-3333-333333333333"}
+goto sqok
+:sqdriftidsessionid
+echo "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uai-squad-aca-acrpull"
+goto sqok
+:sqdriftacr
+if not "%SQUAD_STUB_DRIFT%"=="1" goto sqok
+if not "%A2%"=="show" goto sqok
+echo "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.ContainerRegistry/registries/acrsquadstub"
+goto sqok
+:sqdriftrole
+if not "%SQUAD_STUB_DRIFT%"=="1" goto sqok
+if not "%ASSIGNEE%"=="" goto sqdriftroleassignee
+if "%SCOPE%"=="/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.ContainerRegistry/registries/acrsquadstub" goto sqdriftrolescoperegistry
+echo []
+goto sqok
+:sqdriftroleassignee
+echo [{"roleDefinitionName":"AcrPull","scope":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.ContainerRegistry/registries/acrsquadstub","name":"aaaaaaaa-0000-0000-0000-000000000001","principalId":"22222222-2222-2222-2222-222222222222"},{"roleDefinitionName":"Contributor","scope":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub","name":"aaaaaaaa-0000-0000-0000-000000000002","principalId":"22222222-2222-2222-2222-222222222222"}]
+goto sqok
+:sqdriftrolescoperegistry
+echo [{"roleDefinitionName":"AcrPull","scope":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.ContainerRegistry/registries/acrsquadstub","name":"aaaaaaaa-0000-0000-0000-000000000001","principalId":"22222222-2222-2222-2222-222222222222"}]
+goto sqok
 :sqok
 exit /b 0
 '@
@@ -692,6 +777,63 @@ function Initialize-SquadCliStubRepository {
     return $origin
 }
 
+function New-SquadCliDriftDeployment {
+    <#
+    .SYNOPSIS
+        Mirrors the scripts/ tree under test into the throwaway stub root and
+        drops a synthetic deploy.outputs.json beside it, so `squad-aca doctor`
+        can drive the REAL CV-1/CV-2 drift child scripts (issue #85 CV-3).
+
+    .DESCRIPTION
+        Both drift entrypoints resolve intent from the repo root's
+        deploy.outputs.json, and `doctor` deliberately does not pass a path
+        override -- it invokes them exactly as an operator would. Writing that
+        file into the developer's own checkout to test it would be both
+        destructive and non-hermetic, so the scripts/ tree is mirrored into
+        the stub root instead and the synthetic deployment config is written
+        as ITS repo root. Nothing outside the throwaway stub directory is
+        touched, and the mirror is deleted with the rest of the stub.
+
+        The values match the deployment the fake `az` answers for under
+        SQUAD_STUB_DRIFT=1 and the synthetic ~/.squad-on-aca/config.json:
+        resource group rg-squad-stub, name prefix squad-aca (so the session
+        identity is uai-squad-aca-acrpull and the session job is
+        caj-squad-aca-session), registry acrsquadstub.
+
+        scripts/tests is deliberately NOT mirrored: `doctor` never reads it,
+        and copying it would double the cost of every drift capture.
+
+    .OUTPUTS
+        The path of squad-aca.ps1 inside the mirrored tree.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Stub,
+        [Parameter(Mandatory = $true)][string]$ScriptsRoot
+    )
+
+    $repoRoot = Join-Path $Stub.Root "repo"
+    $scriptsCopy = Join-Path $repoRoot "scripts"
+    New-Item -ItemType Directory -Force -Path $scriptsCopy | Out-Null
+    Get-ChildItem -LiteralPath $ScriptsRoot -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $scriptsCopy -Force
+    }
+    Get-ChildItem -LiteralPath $ScriptsRoot -Directory | Where-Object { $_.Name -ne "tests" } | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $scriptsCopy -Recurse -Force
+    }
+
+    [ordered]@{
+        subscriptionId = "00000000-0000-0000-0000-000000000000"
+        resourceGroup  = "rg-squad-stub"
+        pullIdentity   = "uai-squad-aca-acrpull"
+        acrName        = "acrsquadstub"
+        workerImage    = "acrsquadstub.azurecr.io/squad-worker:stub"
+        sessionJob     = "caj-squad-aca-session"
+    } | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath (Join-Path $repoRoot "deploy.outputs.json") -Encoding utf8
+
+    return (Join-Path $scriptsCopy "squad-aca.ps1")
+}
+
 function Reset-SquadCliStubLog {
     <#
     .SYNOPSIS
@@ -783,6 +925,13 @@ function Invoke-SquadCliCapture {
         Path the fake `aca sandbox fs write` copies the uploaded credential file
         to, so a test can assert exactly what the sandbox would have received.
         Empty (the default) discards it, which is what every golden capture does.
+
+    .PARAMETER DriftMode
+        "1" turns on the fake `az`'s CV-1/CV-2 live drift answers (issue #85),
+        so `doctor` drives the real drift child scripts against a deployment
+        that IS drifted and must report both rows as "failed". Defaults to ""
+        -- every other capture, golden 11-doctor included, is pinned to the
+        unchanged fake `az` and still records the "unknown" rows.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
@@ -800,7 +949,8 @@ function Invoke-SquadCliCapture {
         [string]$GitToken = "ghs-stub-git-token-value",
         [string]$CopilotToken = "",
         [string]$GhAuthToken = "",
-        [string]$CredentialFileCapture = ""
+        [string]$CredentialFileCapture = "",
+        [string]$DriftMode = ""
     )
 
     $hostExe = (Get-Process -Id $PID).Path
@@ -814,7 +964,7 @@ function Invoke-SquadCliCapture {
                   "SQUAD_STUB_FIXTURES",
                   "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC",
                   "SQUAD_STUB_STOP_ERR", "SQUAD_STUB_EXEC_SEQ", "SQUAD_STUB_EXEC_STUCK",
-                  "SQUAD_STUB_SBG_IDENTITY", "SQUAD_STUB_SBG_RC",
+                  "SQUAD_STUB_SBG_IDENTITY", "SQUAD_STUB_SBG_RC", "SQUAD_STUB_DRIFT",
                   "SQUAD_STUB_ACA_RC", "SQUAD_STUB_ACA_ERR",
                   "SQUAD_STUB_ACA_EXEC_RC", "SQUAD_STUB_ACA_EGRESS_RC", "SQUAD_STUB_ACA_EGRESS_ERR",
                   "SQUAD_STUB_ACA_DELETE_RC", "SQUAD_STUB_ACA_DELETE_ERR",
@@ -865,6 +1015,9 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_EXEC_STUCK = ""
         $env:SQUAD_STUB_SBG_IDENTITY = ""
         $env:SQUAD_STUB_SBG_RC = "0"
+        # Pinned like every other stub knob: only a case that explicitly asks
+        # for the drifted deployment sees the CV-1/CV-2 live answers.
+        $env:SQUAD_STUB_DRIFT = $DriftMode
         # The `aca` shim is on PATH for every capture so that any command which
         # ever starts shelling out to it shows up as a capture diff -- and the
         # captures RECORD its calls in an `### ACA CALLS` section, which is what

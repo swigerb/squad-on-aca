@@ -65,6 +65,23 @@ $Cases = @(
     @{ Id = "24-sessions-json";   Args = @("sessions", "--json") }
     @{ Id = "25-status-json";     Args = @("status", "--json") }
     @{ Id = "26-sessions-json-session"; Args = @("sessions", "--json", "--session", "stub-session") }
+    # --- Live drift folded into doctor (issue #85 CV-3) ---------------------
+    # Case 11 above pins the "unknown" path: no deploy.outputs.json is
+    # reachable, so both drift children fail closed with exit 2 and doctor
+    # reports what it does not know. That case cannot see the mapping this one
+    # exists for.
+    #
+    # 27 drives the REAL scripts/rbac-drift-check.ps1 and
+    # scripts/job-drift-check.ps1 as doctor's own child processes, against a
+    # deployment the stubbed `az` describes as DRIFTED and a synthetic
+    # deploy.outputs.json that resolves intent (Drift = $true builds both --
+    # see New-SquadCliDriftDeployment). Both children exit 1 with
+    # Severity = "high" findings, so this golden pins the CV-3 requirement
+    # itself: a high-severity live finding renders as Status "failed", never
+    # "warning" and never "ok". scripts/validate.ps1 asserts the failed rows
+    # of this committed golden directly, so regenerating the goldens cannot
+    # quietly bless a downgrade.
+    @{ Id = "27-doctor-drift";    Args = @("doctor"); Drift = $true }
 )
 
 function Get-NormalizedCapture {
@@ -217,8 +234,20 @@ function Invoke-CaptureSet {
             $startRc = 0
             if ($case.ContainsKey("StartRc")) { $startRc = $case.StartRc }
 
-            $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cli -CliArguments $case.Args `
-                -StopExitCode $stopRc -StartExitCode $startRc
+            # A drift case runs the CLI out of a mirror of the same scripts/
+            # tree inside the throwaway stub root, so the synthetic
+            # deploy.outputs.json the drift children resolve intent from lives
+            # in a repo root that is thrown away with the stub. The developer's
+            # own checkout is never written to.
+            $cliPath = $cli
+            $driftMode = ""
+            if ($case.ContainsKey("Drift") -and $case.Drift) {
+                $cliPath = New-SquadCliDriftDeployment -Stub $stub -ScriptsRoot $ScriptsRoot
+                $driftMode = "1"
+            }
+
+            $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliPath -CliArguments $case.Args `
+                -StopExitCode $stopRc -StartExitCode $startRc -DriftMode $driftMode
 
             $sb = New-Object System.Text.StringBuilder
             [void]$sb.AppendLine("### CASE $($case.Id): squad-aca $($case.Args -join ' ')")

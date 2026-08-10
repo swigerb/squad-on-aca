@@ -1437,6 +1437,67 @@ function Invoke-Doctor {
         $checks += [pscustomobject]@{ Check = "ACA session job"; Status = "failed"; Detail = $_.Exception.Message }
     }
 
+    # CV-1 / CV-2 (issue #85): fold the live RBAC and job/environment drift
+    # checks into doctor so drift is visible during ordinary use, not only
+    # when somebody remembers to run scripts/rbac-drift-check.ps1 or
+    # scripts/job-drift-check.ps1 by hand. Both entrypoints are invoked as
+    # child processes (not dot-sourced) so doctor never becomes a second
+    # az-invoking surface for either check -- the read-only chokepoint claim
+    # in each reader stays true of the actual process that makes the call.
+    # A high-severity finding is reported as "failed", never "warning": drift
+    # is a failure the operator must act on (issue #85 CV-3 requirement).
+    #
+    # Both entrypoints are launched via the actual pwsh executable (not the
+    # `&` call operator on the .ps1 path) so each runs as a genuine separate
+    # process. That matters beyond process isolation: the readers report
+    # fatal intent-resolution errors via [Console]::Error.WriteLine, which
+    # writes straight to the OS-level stderr handle and bypasses PowerShell's
+    # own error stream -- `2>$null` only suppresses that output when it is
+    # redirecting a real child process's stderr, not a same-process nested
+    # script call.
+    $doctorPsExe = (Get-Process -Id $PID).Path
+    $rbacDriftScript = Join-Path $ScriptDir "rbac-drift-check.ps1"
+    if ((Test-Path -LiteralPath $rbacDriftScript) -and $config.resourceGroup -and $config.subscriptionId) {
+        try {
+            $rbacDriftOut = & $doctorPsExe -NoProfile -NonInteractive -File $rbacDriftScript -ResourceGroupName $config.resourceGroup -SubscriptionId $config.subscriptionId -Json 2>$null | Out-String
+            $rbacDriftExit = $LASTEXITCODE
+            if ($rbacDriftExit -eq 0) {
+                $checks += [pscustomobject]@{ Check = "RBAC drift (CV-1)"; Status = "ok"; Detail = "Live role assignments match intent" }
+            } elseif ($rbacDriftExit -eq 1) {
+                $rbacDriftParsed = $rbacDriftOut | ConvertFrom-Json
+                $rbacDriftHighs = @($rbacDriftParsed.findings | Where-Object { $_.Severity -eq "high" })
+                $checks += [pscustomobject]@{ Check = "RBAC drift (CV-1)"; Status = "failed"; Detail = "$($rbacDriftHighs.Count) high-severity finding(s): $(($rbacDriftHighs | ForEach-Object { $_.Status }) -join ', ')" }
+            } else {
+                $checks += [pscustomobject]@{ Check = "RBAC drift (CV-1)"; Status = "unknown"; Detail = "check exited $rbacDriftExit (intent unresolved or a live read failed)" }
+            }
+        } catch {
+            $checks += [pscustomobject]@{ Check = "RBAC drift (CV-1)"; Status = "unknown"; Detail = $_.Exception.Message }
+        }
+    } else {
+        $checks += [pscustomobject]@{ Check = "RBAC drift (CV-1)"; Status = "unknown"; Detail = "not configured (resource group/subscription unknown)" }
+    }
+
+    $jobDriftScript = Join-Path $ScriptDir "job-drift-check.ps1"
+    if ((Test-Path -LiteralPath $jobDriftScript) -and $config.resourceGroup -and $config.subscriptionId) {
+        try {
+            $jobDriftOut = & $doctorPsExe -NoProfile -NonInteractive -File $jobDriftScript -ResourceGroupName $config.resourceGroup -SubscriptionId $config.subscriptionId -Json 2>$null | Out-String
+            $jobDriftExit = $LASTEXITCODE
+            if ($jobDriftExit -eq 0) {
+                $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "ok"; Detail = "Live session job image, secrets and identity match intent" }
+            } elseif ($jobDriftExit -eq 1) {
+                $jobDriftParsed = $jobDriftOut | ConvertFrom-Json
+                $jobDriftHighs = @($jobDriftParsed.findings | Where-Object { $_.Severity -eq "high" })
+                $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "failed"; Detail = "$($jobDriftHighs.Count) high-severity finding(s): $(($jobDriftHighs | ForEach-Object { $_.Status }) -join ', ')" }
+            } else {
+                $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "unknown"; Detail = "check exited $jobDriftExit (intent unresolved, including a missing expected image, or a live read failed)" }
+            }
+        } catch {
+            $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "unknown"; Detail = $_.Exception.Message }
+        }
+    } else {
+        $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "unknown"; Detail = "not configured (resource group/subscription unknown)" }
+    }
+
     if ($config.ralphJob) {
         try {
             az containerapp job show --name $config.ralphJob --resource-group $config.resourceGroup --query id -o tsv 1>$null

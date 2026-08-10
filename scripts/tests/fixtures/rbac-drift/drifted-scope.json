@@ -1,0 +1,30 @@
+{
+  "schema": "squad-aca/rbac-drift-snapshot@1",
+  "capturedAt": "2026-08-10T00:00:00.0000000Z",
+  "_comment": "CV-1 fixture: mirrors the security lead's reported live drift (issue #85 CV-1 contract) -- the session identity's registry pull grant matches intent, it still holds a resource-group-scoped grant broader than intent (unexpectedScope, high), and the job-scoped grant deploy.ps1 now applies is absent (missingAssignment, high). GitHub Actions identity absent (info). Compare-RbacDriftSnapshot on this fixture must exit 1.",
+  "principals": [
+    {
+      "role": "session",
+      "present": true,
+      "principalAlias": "PRINCIPAL-1",
+      "clientAlias": "CLIENT-1",
+      "assignments": [
+        { "roleName": "AcrPull", "scopeType": "registry", "scopeAlias": "SCOPE-1", "assignmentAlias": "ASSIGN-1" },
+        { "roleName": "Contributor", "scopeType": "resourceGroup", "scopeAlias": "SCOPE-3", "assignmentAlias": "ASSIGN-4" }
+      ]
+    },
+    {
+      "role": "githubActions",
+      "present": false,
+      "principalAlias": "",
+      "clientAlias": "",
+      "assignments": []
+    }
+  ],
+  "scopedAssignments": {
+    "registry": [
+      { "principalAlias": "PRINCIPAL-1", "roleName": "AcrPull", "assignmentAlias": "ASSIGN-1" }
+    ],
+    "sessionJob": []
+  }
+}

@@ -5,6 +5,7 @@ account set --subscription 00000000-0000-0000-0000-000000000000
 account show --query {name:name,id:id} -o json
 account set --subscription 00000000-0000-0000-0000-000000000000
 containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
+acr list --resource-group rg-squad-stub --subscription 00000000-0000-0000-0000-000000000000 --query [].name -o json --only-show-errors
 containerapp job show --name caj-squad-aca-ralph --resource-group rg-squad-stub --query id -o tsv
 extension show --name containerapp --only-show-errors -o none
 ### GH CALLS
@@ -16,21 +17,23 @@ api repos/octo/demo --jq .permissions
 ### ACA CALLS
 ### STDOUT
 
-Check           Status  Detail
------           ------  ------
-git             ok      Required for repo and Squad state sync
-gh              ok      Required for GitHub repo/PR/issue access
-az              ok      Required for ACA job control
-squad           ok      Used by init; npx fallback is available
-GitHub repo     ok      octo/demo
-.squad          missing Required for existing-repo dispatch
-GitHub auth     ok      gh auth status succeeded
-GitHub push     ok      octo-stub has push access to octo/demo
-Azure auth      ok      Stub Subscription
-ACA session job ok      rg-squad-stub/caj-squad-aca-session
-Ralph job       ok      caj-squad-aca-ralph
-Logs path       ok      containerapp extension present; logs uses 'az containerapp job logs show'
-Aspire URL      ok      https://aspire.stub.invalid/login
+Check                   Status  Detail
+-----                   ------  ------
+git                     ok      Required for repo and Squad state sync
+gh                      ok      Required for GitHub repo/PR/issue access
+az                      ok      Required for ACA job control
+squad                   ok      Used by init; npx fallback is available
+GitHub repo             ok      octo/demo
+.squad                  missing Required for existing-repo dispatch
+GitHub auth             ok      gh auth status succeeded
+GitHub push             ok      octo-stub has push access to octo/demo
+Azure auth              ok      Stub Subscription
+ACA session job         ok      rg-squad-stub/caj-squad-aca-session
+RBAC drift (CV-1)       unknown check exited 2 (intent unresolved or a live read failed)
+Job config drift (CV-2) unknown check exited 2 (intent unresolved, including a missing expected image, or a live read failed)
+Ralph job               ok      caj-squad-aca-ralph
+Logs path               ok      containerapp extension present; logs uses 'az containerapp job logs show'
+Aspire URL              ok      https://aspire.stub.invalid/login
 
 ### STDERR
 
