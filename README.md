@@ -257,6 +257,23 @@ label an issue  ->  GitHub Actions  ->  OIDC  ->  Azure Container Apps  ->  agen
 
 The workflow comments the execution name back on the issue. It does not wait for the session or poll it. See [docs/actions-trigger.md](docs/actions-trigger.md).
 
+### Who can trigger it
+
+Only people with access to **this repository**:
+
+| Route | Who |
+|---|---|
+| Apply the `squad-aca` label | Collaborators with Triage or above |
+| Comment the command | Owner, organisation member, or collaborator |
+| Run the workflow manually | Collaborators with Write or above |
+
+**To let somebody run it, add them in Settings → Collaborators and teams.** Any
+role works, including Read. Removing them revokes it immediately.
+
+`CONTRIBUTOR` is not a permission and is not accepted — GitHub reports it for
+anyone who has ever had a commit merged, and on a public repository that is
+anybody who once landed a pull request.
+
 ## Agent integration (Microsoft Agent Framework)
 
 Squad on ACA is callable as an agent. `aspire/Squad.Aca.Agents.MAF` exposes the control plane as a Microsoft Agent Framework `AIAgent`.
