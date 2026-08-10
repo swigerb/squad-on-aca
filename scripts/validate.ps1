@@ -5996,6 +5996,569 @@ print(n)
 }
 
 # ---------------------------------------------------------------------------
+# RBAC drift check (CV-1, issue #85)
+# ---------------------------------------------------------------------------
+Write-Section "RBAC drift check (CV-1)"
+
+# CV-1's binding contract (.squad/decisions/inbox/security-cv1-rbac-contract.md)
+# requires a strict reader/pure-comparer split: exactly ONE file may invoke
+# `az`, through a single allowlisted chokepoint, and the comparer that decides
+# pass/fail must be provably free of any Azure CLI call. This section checks
+# both the static shape of that split AND its runtime behaviour: every deny
+# rule actually refuses (observed as a thrown error with zero calls reaching
+# the CLI), every allowed read actually reaches it, a live-mode round trip
+# through a stub `az` reproduces the exact drift security's contract
+# describes, and no raw identifier ever appears in the tool's rendered output.
+$rbacReaderPath = Join-Path $RepoRoot "scripts\lib\rbac-drift-reader.ps1"
+$rbacComparePath = Join-Path $RepoRoot "scripts\lib\rbac-drift-compare.ps1"
+$rbacCheckPath = Join-Path $RepoRoot "scripts\rbac-drift-check.ps1"
+$rbacStubHarnessPath = Join-Path $RepoRoot "scripts\tests\rbac-drift-stub-harness.ps1"
+$rbacFixtureDir = Join-Path $RepoRoot "scripts\tests\fixtures\rbac-drift"
+$rbacRequiredFiles = @(
+    @{ Path = $rbacReaderPath; Label = "scripts/lib/rbac-drift-reader.ps1" },
+    @{ Path = $rbacComparePath; Label = "scripts/lib/rbac-drift-compare.ps1" },
+    @{ Path = $rbacCheckPath; Label = "scripts/rbac-drift-check.ps1" },
+    @{ Path = $rbacStubHarnessPath; Label = "scripts/tests/rbac-drift-stub-harness.ps1" }
+)
+$rbacMissingFiles = @($rbacRequiredFiles | Where-Object { -not (Test-Path -LiteralPath $_.Path) })
+if ($rbacMissingFiles.Count -eq 0) {
+    Add-Pass "All CV-1 source files are present (reader, comparer, entrypoint, stub harness)"
+} else {
+    Add-Fail "CV-1 is missing file(s): $(($rbacMissingFiles | ForEach-Object { $_.Label }) -join ', ')"
+}
+
+$rbacFixtureNames = @("clean-gha-present", "clean-gha-absent", "drifted-scope", "unexpected-principal")
+$rbacFixturePaths = @{}
+foreach ($name in $rbacFixtureNames) { $rbacFixturePaths[$name] = Join-Path $rbacFixtureDir "$name.json" }
+$rbacMissingFixtures = @($rbacFixtureNames | Where-Object { -not (Test-Path -LiteralPath $rbacFixturePaths[$_]) })
+if ($rbacMissingFixtures.Count -eq 0) {
+    Add-Pass "All 4 CV-1 fixtures are present (clean-gha-present, clean-gha-absent, drifted-scope, unexpected-principal)"
+} else {
+    Add-Fail "CV-1 is missing fixture(s): $($rbacMissingFixtures -join ', ')"
+}
+
+if ((Test-Path -LiteralPath $rbacReaderPath) -and (Test-Path -LiteralPath $rbacComparePath) -and (Test-Path -LiteralPath $rbacCheckPath)) {
+    $rbacReaderText = Get-Content -LiteralPath $rbacReaderPath -Raw
+    $rbacCompareText = Get-Content -LiteralPath $rbacComparePath -Raw
+    $rbacCheckText = Get-Content -LiteralPath $rbacCheckPath -Raw
+    # Lowercase, standalone "az" only -- deliberately excludes "Azure",
+    # "AcrPull", "Invoke-AzRead" (capital A) so this does not false-positive
+    # on the many legitimate prose/identifier uses of that substring.
+    $rbacAzTokenPattern = '(?<![A-Za-z0-9_])az(?![A-Za-z0-9_])'
+
+    if ($rbacCompareText -notmatch $rbacAzTokenPattern) {
+        Add-Pass "scripts/lib/rbac-drift-compare.ps1 contains no standalone 'az' token -- the comparer that decides pass/fail cannot itself call Azure"
+    } else {
+        Add-Fail "scripts/lib/rbac-drift-compare.ps1 contains a standalone 'az' token; the pure comparer must never reference the Azure CLI"
+    }
+
+    # The single real chokepoint: Invoke-AzRead's own call to the `az`
+    # executable. Asserting there is exactly one such call site in the reader,
+    # and zero in the comparer/entrypoint, is the direct proof of "one file
+    # invokes az, through one path" rather than an assumption about it.
+    $rbacInvokeSitePattern = '-FilePath\s+"az"'
+    $rbacReaderInvokeSites = @([regex]::Matches($rbacReaderText, $rbacInvokeSitePattern))
+    $rbacCompareInvokeSites = @([regex]::Matches($rbacCompareText, $rbacInvokeSitePattern))
+    $rbacCheckInvokeSites = @([regex]::Matches($rbacCheckText, $rbacInvokeSitePattern))
+    if ($rbacReaderInvokeSites.Count -eq 1 -and $rbacCompareInvokeSites.Count -eq 0 -and $rbacCheckInvokeSites.Count -eq 0) {
+        Add-Pass "Exactly one call site invokes the 'az' executable, and it lives in scripts/lib/rbac-drift-reader.ps1 (not the comparer or entrypoint)"
+    } else {
+        Add-Fail "CV-1's single-chokepoint claim does not hold: reader has $($rbacReaderInvokeSites.Count) az invocation site(s), comparer has $($rbacCompareInvokeSites.Count), entrypoint has $($rbacCheckInvokeSites.Count) (expected 1/0/0)"
+    }
+
+    if ($rbacReaderText -match [regex]::Escape('"--include-inherited"') -and $rbacReaderText -match [regex]::Escape('account set')) {
+        Add-Pass "scripts/lib/rbac-drift-reader.ps1 names both '--include-inherited' and 'account set' as literals -- the two banned operations security's contract (rules 1 and 3) requires the reader to refuse"
+    } else {
+        Add-Fail "scripts/lib/rbac-drift-reader.ps1 does not reference both banned literals ('--include-inherited', 'account set'); the deny checks cannot be verified from source"
+    }
+    if ($rbacCompareText -notmatch [regex]::Escape('--include-inherited')) {
+        Add-Pass "'--include-inherited' never appears in the pure comparer, which has no reason to reference an Azure CLI flag"
+    } else {
+        Add-Fail "'--include-inherited' leaked into the comparer, where it has no reason to appear"
+    }
+}
+
+$rbacPsExe = (Get-Process -Id $PID).Path
+
+# Runtime: every deny rule in Invoke-AzRead must actually refuse -- observed
+# as a thrown error AND zero calls reaching the stub `az`. A rule that merely
+# looks right in source but silently lets a call through would be invisible
+# to every check above. The stub is a .cmd shim, so this (like the existing
+# CLI regression suite) requires Windows.
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] CV-1 stub-driven Invoke-AzRead deny/allow checks require Windows (.cmd stub)" -ForegroundColor Yellow
+} elseif ((Test-Path -LiteralPath $rbacReaderPath) -and (Test-Path -LiteralPath $rbacStubHarnessPath)) {
+    . $rbacReaderPath
+    . $rbacStubHarnessPath
+    $rbacStub = $null
+    $rbacPrevPath = $env:PATH
+    $rbacPrevLog = $env:SQUAD_RBAC_STUB_LOG
+    try {
+        $rbacStub = New-RbacDriftStubEnvironment
+        $env:PATH = "$($rbacStub.BinDir);$rbacPrevPath"
+        $env:SQUAD_RBAC_STUB_LOG = $rbacStub.AzLog
+
+        $rbacDenyCases = @(
+            @{ Name = "a mutating 'create' verb"; Args = @("role", "assignment", "create", "--assignee", "x", "--role", "Contributor", "--scope", "y", "--subscription", $script:RbacDriftStubSubscriptionId) },
+            @{ Name = "a mutating 'delete' verb"; Args = @("role", "assignment", "delete", "--ids", "x", "--subscription", $script:RbacDriftStubSubscriptionId) },
+            @{ Name = "'az account set'"; Args = @("account", "set", "--subscription", $script:RbacDriftStubSubscriptionId) },
+            @{ Name = "'--include-inherited'"; Args = @("role", "assignment", "list", "--scope", "y", "--include-inherited", "--subscription", $script:RbacDriftStubSubscriptionId) },
+            @{ Name = "a call with no --subscription"; Args = @("identity", "show", "--name", "x", "--resource-group", "y") },
+            @{ Name = "an unlisted command shape"; Args = @("storage", "account", "list", "--subscription", $script:RbacDriftStubSubscriptionId) }
+        )
+        $rbacDenyFailures = @()
+        foreach ($case in $rbacDenyCases) {
+            Reset-RbacDriftStubLog -Stub $rbacStub
+            $threw = $false
+            try { Invoke-AzRead -AzArgs $case.Args | Out-Null } catch { $threw = $true }
+            $callsMade = @(Get-RbacDriftStubCalls -Stub $rbacStub)
+            if (-not $threw -or $callsMade.Count -ne 0) {
+                $rbacDenyFailures += "$($case.Name) (threw=$threw, calls reaching az=$($callsMade.Count))"
+            }
+        }
+        if ($rbacDenyFailures.Count -eq 0) {
+            Add-Pass "Invoke-AzRead refuses all $($rbacDenyCases.Count) denied shapes (mutating verbs, --include-inherited, account set, missing --subscription, an unlisted command) with zero calls ever reaching az"
+        } else {
+            Add-Fail "Invoke-AzRead let a denied shape through: $($rbacDenyFailures -join '; ')"
+        }
+
+        Reset-RbacDriftStubLog -Stub $rbacStub
+        $rbacAllowResult = $null
+        $rbacAllowThrew = $false
+        try {
+            $rbacAllowResult = Invoke-AzRead -AzArgs @("account", "show", "--subscription", $script:RbacDriftStubSubscriptionId, "-o", "json")
+        } catch { $rbacAllowThrew = $true }
+        $rbacAllowCalls = @(Get-RbacDriftStubCalls -Stub $rbacStub)
+        if (-not $rbacAllowThrew -and $rbacAllowResult.ExitCode -eq 0 -and $rbacAllowCalls.Count -eq 1) {
+            Add-Pass "Invoke-AzRead allows a properly-shaped, subscription-pinned read through to az (proves the chokepoint denies by rule, not by refusing everything)"
+        } else {
+            Add-Fail "Invoke-AzRead did not allow a legitimate read through as expected (threw=$rbacAllowThrew, calls=$($rbacAllowCalls.Count))"
+        }
+    } finally {
+        $env:PATH = $rbacPrevPath
+        if ($null -eq $rbacPrevLog) { Remove-Item Env:SQUAD_RBAC_STUB_LOG -ErrorAction SilentlyContinue } else { $env:SQUAD_RBAC_STUB_LOG = $rbacPrevLog }
+        if ($rbacStub) { Remove-RbacDriftStubEnvironment -Stub $rbacStub }
+    }
+} else {
+    Add-Fail "Cannot exercise Invoke-AzRead's deny/allow rules; reader or stub harness is missing"
+}
+
+# Runtime, child-process observed exit codes: each committed fixture must
+# drive the REAL process exit code security's contract keys everything off
+# of -- not just the in-process $LASTEXITCODE convention, but what a caller
+# (a human, or a future CI gate) actually observes.
+if ((Test-Path -LiteralPath $rbacCheckPath) -and $rbacMissingFixtures.Count -eq 0) {
+    $rbacFixtureExpectedExit = @{
+        "clean-gha-present"    = 0
+        "clean-gha-absent"     = 0
+        "drifted-scope"        = 1
+        "unexpected-principal" = 1
+    }
+    $rbacFixtureFailures = @()
+    $rbacFixtureGuidLeaks = @()
+    $rbacGuidPattern = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    foreach ($name in $rbacFixtureNames) {
+        $fixturePath = $rbacFixturePaths[$name]
+        $procOut = & $rbacPsExe -NoProfile -NonInteractive -File $rbacCheckPath -Fixture $fixturePath -Json 2>&1 | Out-String
+        $observedExit = $LASTEXITCODE
+        if ($observedExit -ne $rbacFixtureExpectedExit[$name]) {
+            $rbacFixtureFailures += "$name`: exit $observedExit, expected $($rbacFixtureExpectedExit[$name])"
+        }
+        if ($procOut -match $rbacGuidPattern) {
+            $rbacFixtureGuidLeaks += $name
+        }
+    }
+    if ($rbacFixtureFailures.Count -eq 0) {
+        Add-Pass "All 4 committed fixtures drive the real child-process exit code security's contract keys off of (clean=0, clean-absent=0, drifted-scope=1, unexpected-principal=1)"
+    } else {
+        Add-Fail "A fixture's observed child-process exit code did not match the contract: $($rbacFixtureFailures -join '; ')"
+    }
+    if ($rbacFixtureGuidLeaks.Count -eq 0) {
+        Add-Pass "Rendered JSON output for all 4 fixtures contains no GUID-shaped identifier"
+    } else {
+        Add-Fail "Rendered JSON output leaked a GUID-shaped identifier for fixture(s): $($rbacFixtureGuidLeaks -join ', ')"
+    }
+} else {
+    Add-Fail "Cannot run fixture-driven child-process checks; entrypoint or a fixture is missing"
+}
+
+# Runtime, stub-harness-driven live round trip: the strongest proof available
+# without touching real Azure. The stub's `az.cmd` answers with the EXACT
+# shape security's contract reports the real deployment holds today (session
+# identity keeps a stale Contributor grant, lacks the job-scoped grant,
+# GitHub Actions identity absent) and the fully-clean counterpart. This
+# proves the reader's live capture path -- discovery, redaction, scope
+# classification -- end to end, not just the comparer against a canned
+# fixture. Requires Windows (.cmd stub), like the deny/allow checks above.
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] CV-1 stub-driven live-mode round trip requires Windows (.cmd stub)" -ForegroundColor Yellow
+} elseif ((Test-Path -LiteralPath $rbacCheckPath) -and (Test-Path -LiteralPath $rbacStubHarnessPath)) {
+    . $rbacStubHarnessPath
+    $rbacStub2 = $null
+    try {
+        $rbacStub2 = New-RbacDriftStubEnvironment
+        $rbacGuidPattern2 = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+
+        $rbacDrifted = Invoke-RbacDriftCliCapture -Stub $rbacStub2 -ScriptPath $rbacCheckPath
+        $rbacDriftedOk = ($rbacDrifted.ExitCode -eq 1) -and
+            ($rbacDrifted.StdOut -match "missingAssignment") -and
+            ($rbacDrifted.StdOut -match "unexpectedScope") -and
+            ($rbacDrifted.StdOut -match "absentOptionalPrincipal") -and
+            ($rbacDrifted.StdOut -notmatch "unexpectedPrincipal")
+        if ($rbacDriftedOk) {
+            Add-Pass "Live-mode round trip via the stub reproduces the exact drift security's contract reports today (Contributor unexpectedScope + missing job-scope grant + absent GitHub Actions identity) and exits 1"
+        } else {
+            Add-Fail "Live-mode drifted round trip did not match the expected shape (exit=$($rbacDrifted.ExitCode)): $($rbacDrifted.StdOut)"
+        }
+
+        $rbacDriftedCallChecks = @()
+        foreach ($call in $rbacDrifted.AzCalls) {
+            if ($call -notmatch [regex]::Escape("--subscription")) { $rbacDriftedCallChecks += "call missing --subscription: $call" }
+            if ($call -match [regex]::Escape("--include-inherited")) { $rbacDriftedCallChecks += "call used --include-inherited: $call" }
+            if ($call -match "^account set\b") { $rbacDriftedCallChecks += "call was 'account set': $call" }
+        }
+        if ($rbacDrifted.AzCalls.Count -gt 0 -and $rbacDriftedCallChecks.Count -eq 0) {
+            Add-Pass "Every one of the $($rbacDrifted.AzCalls.Count) az call(s) the live round trip issued pins --subscription, and none used --include-inherited or 'account set'"
+        } else {
+            Add-Fail "The live round trip's az call log violates a read-only invariant: $($rbacDriftedCallChecks -join '; ')"
+        }
+        if ($rbacDrifted.StdOut -notmatch $rbacGuidPattern2) {
+            Add-Pass "Live-mode drifted round trip's rendered output contains no GUID-shaped identifier, even though the stub's underlying data is GUID-shaped"
+        } else {
+            Add-Fail "Live-mode drifted round trip leaked a GUID-shaped identifier into rendered output"
+        }
+
+        $rbacClean = Invoke-RbacDriftCliCapture -Stub $rbacStub2 -ScriptPath $rbacCheckPath -Clean
+        $rbacCleanOk = ($rbacClean.ExitCode -eq 0) -and
+            ($rbacClean.StdOut -notmatch "missingAssignment") -and
+            ($rbacClean.StdOut -notmatch "unexpectedScope") -and
+            ($rbacClean.StdOut -notmatch "unexpectedPrincipal")
+        if ($rbacCleanOk) {
+            Add-Pass "Live-mode round trip via the stub's fully-clean deployment shape exits 0 with no high-severity finding"
+        } else {
+            Add-Fail "Live-mode clean round trip did not exit 0 / had a high-severity finding (exit=$($rbacClean.ExitCode)): $($rbacClean.StdOut)"
+        }
+        if ($rbacClean.StdOut -notmatch $rbacGuidPattern2) {
+            Add-Pass "Live-mode clean round trip's rendered output contains no GUID-shaped identifier"
+        } else {
+            Add-Fail "Live-mode clean round trip leaked a GUID-shaped identifier into rendered output"
+        }
+
+        # Registry discovery: omitting -AcrName must still resolve the one
+        # registry the stub's resource group holds and reproduce the same
+        # drifted result, proving the "unambiguous discovery" fallback path
+        # (not just the explicit-AcrName path every other case above uses).
+        $rbacDiscovery = Invoke-RbacDriftCliCapture -Stub $rbacStub2 -ScriptPath $rbacCheckPath -CliArguments @()
+        if ($rbacDiscovery.ExitCode -eq 1 -and $rbacDiscovery.StdOut -match "missingAssignment") {
+            Add-Pass "Omitting -AcrName still resolves the registry via unambiguous single-registry discovery and reproduces the drifted result"
+        } else {
+            Add-Fail "Registry discovery path did not reproduce the expected drifted result (exit=$($rbacDiscovery.ExitCode))"
+        }
+    } finally {
+        if ($rbacStub2) { Remove-RbacDriftStubEnvironment -Stub $rbacStub2 }
+    }
+} else {
+    Add-Fail "Cannot run the stub-harness-driven live round trip; entrypoint or stub harness is missing"
+}
+
+# Fail-closed intent resolution: with no explicit parameters and no reachable
+# deploy.outputs.json, the check must exit 2 -- never guess, never fall back
+# to an ambient subscription. -DeployOutputsPath points at a guaranteed-absent
+# path so this is deterministic regardless of what a developer's own machine
+# happens to have on disk.
+if (Test-Path -LiteralPath $rbacCheckPath) {
+    $rbacAbsentOutputs = Join-Path $RepoRoot "scripts\tests\fixtures\rbac-drift\.does-not-exist.json"
+    & $rbacPsExe -NoProfile -NonInteractive -File $rbacCheckPath -DeployOutputsPath $rbacAbsentOutputs 2>&1 | Out-Null
+    $rbacFailClosedExit = $LASTEXITCODE
+    if ($rbacFailClosedExit -eq 2) {
+        Add-Pass "With no explicit parameters and no reachable deploy.outputs.json, the check exits 2 (fails closed instead of guessing a subscription)"
+    } else {
+        Add-Fail "Unresolved intent did not exit 2 as the fail-closed contract requires (observed exit $rbacFailClosedExit)"
+    }
+} else {
+    Add-Fail "Cannot exercise fail-closed intent resolution; entrypoint is missing"
+}
+
+# Redaction: the 4 committed fixtures are themselves the evidence a reviewer
+# would attach to a PR. None may carry a real GUID -- if one did, redaction
+# would have to be trusted rather than checked.
+if ($rbacMissingFixtures.Count -eq 0) {
+    $rbacGuidPattern3 = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    $rbacFixtureLeaks = @()
+    foreach ($name in $rbacFixtureNames) {
+        $text = Get-Content -LiteralPath $rbacFixturePaths[$name] -Raw
+        if ($text -match $rbacGuidPattern3) { $rbacFixtureLeaks += $name }
+    }
+    if ($rbacFixtureLeaks.Count -eq 0) {
+        Add-Pass "None of the 4 committed CV-1 fixtures contain a GUID-shaped identifier"
+    } else {
+        Add-Fail "Fixture(s) contain a GUID-shaped identifier: $($rbacFixtureLeaks -join ', ')"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Job / environment drift check (CV-2, issue #85)
+# ---------------------------------------------------------------------------
+Write-Section "Job/environment drift check (CV-2)"
+
+# CV-2 mirrors CV-1's reader/pure-comparer split: exactly ONE file may invoke
+# `az`, through a single allowlisted chokepoint, and the comparer that decides
+# pass/fail must be provably free of any Azure CLI call. This section checks
+# both the static shape of that split AND its runtime behaviour: every deny
+# rule actually refuses, a live-mode round trip through a stub `az` reproduces
+# an inlined secret and an unexpected identity (the two drifted cases issue
+# #85 CV-2 names explicitly), and the fully-clean counterpart passes.
+$jobReaderPath = Join-Path $RepoRoot "scripts\lib\job-drift-reader.ps1"
+$jobComparePath = Join-Path $RepoRoot "scripts\lib\job-drift-compare.ps1"
+$jobCheckPath = Join-Path $RepoRoot "scripts\job-drift-check.ps1"
+$jobStubHarnessPath = Join-Path $RepoRoot "scripts\tests\job-drift-stub-harness.ps1"
+$jobFixtureDir = Join-Path $RepoRoot "scripts\tests\fixtures\job-drift"
+$jobRequiredFiles = @(
+    @{ Path = $jobReaderPath; Label = "scripts/lib/job-drift-reader.ps1" },
+    @{ Path = $jobComparePath; Label = "scripts/lib/job-drift-compare.ps1" },
+    @{ Path = $jobCheckPath; Label = "scripts/job-drift-check.ps1" },
+    @{ Path = $jobStubHarnessPath; Label = "scripts/tests/job-drift-stub-harness.ps1" }
+)
+$jobMissingFiles = @($jobRequiredFiles | Where-Object { -not (Test-Path -LiteralPath $_.Path) })
+if ($jobMissingFiles.Count -eq 0) {
+    Add-Pass "All CV-2 source files are present (reader, comparer, entrypoint, stub harness)"
+} else {
+    Add-Fail "CV-2 is missing file(s): $(($jobMissingFiles | ForEach-Object { $_.Label }) -join ', ')"
+}
+
+$jobFixtureNames = @("clean-hub-present", "clean-hub-absent", "extra-identity", "inlined-secret")
+$jobFixturePaths = @{}
+foreach ($name in $jobFixtureNames) { $jobFixturePaths[$name] = Join-Path $jobFixtureDir "$name.json" }
+$jobMissingFixtures = @($jobFixtureNames | Where-Object { -not (Test-Path -LiteralPath $jobFixturePaths[$_]) })
+if ($jobMissingFixtures.Count -eq 0) {
+    Add-Pass "All 4 CV-2 fixtures are present (clean-hub-present, clean-hub-absent, extra-identity, inlined-secret)"
+} else {
+    Add-Fail "CV-2 is missing fixture(s): $($jobMissingFixtures -join ', ')"
+}
+
+if ((Test-Path -LiteralPath $jobReaderPath) -and (Test-Path -LiteralPath $jobComparePath) -and (Test-Path -LiteralPath $jobCheckPath)) {
+    $jobReaderText = Get-Content -LiteralPath $jobReaderPath -Raw
+    $jobCompareText = Get-Content -LiteralPath $jobComparePath -Raw
+    $jobCheckText = Get-Content -LiteralPath $jobCheckPath -Raw
+    $jobAzTokenPattern = '(?<![A-Za-z0-9_])az(?![A-Za-z0-9_])'
+
+    if ($jobCompareText -notmatch $jobAzTokenPattern) {
+        Add-Pass "scripts/lib/job-drift-compare.ps1 contains no standalone 'az' token -- the comparer that decides pass/fail cannot itself call Azure"
+    } else {
+        Add-Fail "scripts/lib/job-drift-compare.ps1 contains a standalone 'az' token; the pure comparer must never reference the Azure CLI"
+    }
+
+    $jobInvokeSitePattern = '-FilePath\s+"az"'
+    $jobReaderInvokeSites = @([regex]::Matches($jobReaderText, $jobInvokeSitePattern))
+    $jobCompareInvokeSites = @([regex]::Matches($jobCompareText, $jobInvokeSitePattern))
+    $jobCheckInvokeSites = @([regex]::Matches($jobCheckText, $jobInvokeSitePattern))
+    if ($jobReaderInvokeSites.Count -eq 1 -and $jobCompareInvokeSites.Count -eq 0 -and $jobCheckInvokeSites.Count -eq 0) {
+        Add-Pass "Exactly one call site invokes the 'az' executable, and it lives in scripts/lib/job-drift-reader.ps1 (not the comparer or entrypoint)"
+    } else {
+        Add-Fail "CV-2's single-chokepoint claim does not hold: reader has $($jobReaderInvokeSites.Count) az invocation site(s), comparer has $($jobCompareInvokeSites.Count), entrypoint has $($jobCheckInvokeSites.Count) (expected 1/0/0)"
+    }
+}
+
+$jobPsExe = (Get-Process -Id $PID).Path
+
+# Runtime: every deny rule in Invoke-JobAzRead must actually refuse -- observed
+# as a thrown error AND zero calls reaching the stub `az`.
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] CV-2 stub-driven Invoke-JobAzRead deny/allow checks require Windows (.cmd stub)" -ForegroundColor Yellow
+} elseif ((Test-Path -LiteralPath $jobReaderPath) -and (Test-Path -LiteralPath $jobStubHarnessPath)) {
+    . $jobReaderPath
+    . $jobStubHarnessPath
+    $jobStub = $null
+    $jobPrevPath = $env:PATH
+    $jobPrevLog = $env:SQUAD_JOB_DRIFT_AZ_LOG
+    try {
+        $jobStub = New-JobDriftStubEnvironment
+        $env:PATH = "$($jobStub.BinDir);$jobPrevPath"
+        $env:SQUAD_JOB_DRIFT_AZ_LOG = $jobStub.AzLog
+
+        $jobDenyCases = @(
+            @{ Name = "a mutating 'create' verb"; Args = @("containerapp", "job", "create", "--name", "x", "--resource-group", "y", "--subscription", $script:JobDriftStubSubscriptionId) },
+            @{ Name = "a mutating 'update' verb"; Args = @("containerapp", "job", "update", "--name", "x", "--resource-group", "y", "--subscription", $script:JobDriftStubSubscriptionId) },
+            @{ Name = "'az account set'"; Args = @("account", "set", "--subscription", $script:JobDriftStubSubscriptionId) },
+            @{ Name = "a secret-reading verb"; Args = @("containerapp", "job", "secret", "show", "--name", "x", "--resource-group", "y", "--subscription", $script:JobDriftStubSubscriptionId) },
+            @{ Name = "a call with no --subscription"; Args = @("containerapp", "job", "show", "--name", "x", "--resource-group", "y") },
+            @{ Name = "an unlisted command shape"; Args = @("storage", "account", "list", "--subscription", $script:JobDriftStubSubscriptionId) }
+        )
+        $jobDenyFailures = @()
+        foreach ($case in $jobDenyCases) {
+            Reset-JobDriftStubLog -Stub $jobStub
+            $threw = $false
+            try { Invoke-JobAzRead -AzArgs $case.Args | Out-Null } catch { $threw = $true }
+            $callsMade = @(Get-JobDriftStubCalls -Stub $jobStub)
+            if (-not $threw -or $callsMade.Count -ne 0) {
+                $jobDenyFailures += "$($case.Name) (threw=$threw, calls reaching az=$($callsMade.Count))"
+            }
+        }
+        if ($jobDenyFailures.Count -eq 0) {
+            Add-Pass "Invoke-JobAzRead refuses all $($jobDenyCases.Count) denied shapes (mutating verbs, account set, a secret-reading verb, missing --subscription, an unlisted command) with zero calls ever reaching az"
+        } else {
+            Add-Fail "Invoke-JobAzRead let a denied shape through: $($jobDenyFailures -join '; ')"
+        }
+
+        Reset-JobDriftStubLog -Stub $jobStub
+        $jobAllowResult = $null
+        $jobAllowThrew = $false
+        try {
+            $jobAllowResult = Invoke-JobAzRead -AzArgs @("account", "show", "--subscription", $script:JobDriftStubSubscriptionId, "-o", "json")
+        } catch { $jobAllowThrew = $true }
+        $jobAllowCalls = @(Get-JobDriftStubCalls -Stub $jobStub)
+        if (-not $jobAllowThrew -and $jobAllowResult.ExitCode -eq 0 -and $jobAllowCalls.Count -eq 1) {
+            Add-Pass "Invoke-JobAzRead allows a properly-shaped, subscription-pinned read through to az (proves the chokepoint denies by rule, not by refusing everything)"
+        } else {
+            Add-Fail "Invoke-JobAzRead did not allow a legitimate read through as expected (threw=$jobAllowThrew, calls=$($jobAllowCalls.Count))"
+        }
+    } finally {
+        $env:PATH = $jobPrevPath
+        if ($null -eq $jobPrevLog) { Remove-Item Env:SQUAD_JOB_DRIFT_AZ_LOG -ErrorAction SilentlyContinue } else { $env:SQUAD_JOB_DRIFT_AZ_LOG = $jobPrevLog }
+        if ($jobStub) { Remove-JobDriftStubEnvironment -Stub $jobStub }
+    }
+} else {
+    Add-Fail "Cannot exercise Invoke-JobAzRead's deny/allow rules; reader or stub harness is missing"
+}
+
+# Runtime, child-process observed exit codes: each committed fixture must
+# drive the REAL process exit code -- not just the in-process $LASTEXITCODE
+# convention, but what a caller actually observes.
+if ((Test-Path -LiteralPath $jobCheckPath) -and $jobMissingFixtures.Count -eq 0) {
+    $jobFixtureExpectedExit = @{
+        "clean-hub-present" = 0
+        "clean-hub-absent"  = 0
+        "extra-identity"    = 1
+        "inlined-secret"    = 1
+    }
+    $jobFixtureFailures = @()
+    $jobFixtureGuidLeaks = @()
+    $jobGuidPattern = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    foreach ($name in $jobFixtureNames) {
+        $fixturePath = $jobFixturePaths[$name]
+        $procOut = & $jobPsExe -NoProfile -NonInteractive -File $jobCheckPath -Fixture $fixturePath -Json 2>&1 | Out-String
+        $observedExit = $LASTEXITCODE
+        if ($observedExit -ne $jobFixtureExpectedExit[$name]) {
+            $jobFixtureFailures += "$name`: exit $observedExit, expected $($jobFixtureExpectedExit[$name])"
+        }
+        if ($procOut -match $jobGuidPattern) {
+            $jobFixtureGuidLeaks += $name
+        }
+    }
+    if ($jobFixtureFailures.Count -eq 0) {
+        Add-Pass "All 4 committed fixtures drive the real child-process exit code the CV-2 contract keys off of (clean-hub-present=0, clean-hub-absent=0, extra-identity=1, inlined-secret=1)"
+    } else {
+        Add-Fail "A fixture's observed child-process exit code did not match the contract: $($jobFixtureFailures -join '; ')"
+    }
+    if ($jobFixtureGuidLeaks.Count -eq 0) {
+        Add-Pass "Rendered JSON output for all 4 CV-2 fixtures contains no GUID-shaped identifier"
+    } else {
+        Add-Fail "Rendered JSON output leaked a GUID-shaped identifier for fixture(s): $($jobFixtureGuidLeaks -join ', ')"
+    }
+} else {
+    Add-Fail "Cannot run fixture-driven child-process checks; entrypoint or a fixture is missing"
+}
+
+# Runtime, stub-harness-driven live round trip: the strongest proof available
+# without touching real Azure. The stub's `az.cmd` answers with an inlined
+# GITHUB_TOKEN and an extra user-assigned identity for the drifted case, and
+# the fully-clean counterpart, proving the reader's live capture path end to
+# end -- not just the comparer against a canned fixture.
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] CV-2 stub-driven live-mode round trip requires Windows (.cmd stub)" -ForegroundColor Yellow
+} elseif ((Test-Path -LiteralPath $jobCheckPath) -and (Test-Path -LiteralPath $jobStubHarnessPath)) {
+    . $jobStubHarnessPath
+    $jobStub2 = $null
+    try {
+        $jobStub2 = New-JobDriftStubEnvironment
+        $jobGuidPattern2 = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+
+        $jobDrifted = Invoke-JobDriftCliCapture -Stub $jobStub2 -ScriptPath $jobCheckPath -CliArguments @("-Json")
+        $jobDriftedOk = ($jobDrifted.ExitCode -eq 1) -and
+            ($jobDrifted.StdOut -match "inlinedSecret") -and
+            ($jobDrifted.StdOut -match "unexpectedIdentity") -and
+            ($jobDrifted.StdOut -notmatch "missingIdentity") -and
+            ($jobDrifted.StdOut -notmatch "unexpectedImage")
+        if ($jobDriftedOk) {
+            Add-Pass "Live-mode round trip via the stub reproduces an inlined GITHUB_TOKEN and an unexpected identity (the two CV-2 drifted cases issue #85 names) and exits 1"
+        } else {
+            Add-Fail "Live-mode drifted round trip did not match the expected shape (exit=$($jobDrifted.ExitCode)): $($jobDrifted.StdOut)"
+        }
+
+        $jobDriftedCallChecks = @()
+        foreach ($call in $jobDrifted.AzCalls) {
+            if ($call -notmatch [regex]::Escape("--subscription")) { $jobDriftedCallChecks += "call missing --subscription: $call" }
+            if ($call -match "^account set\b") { $jobDriftedCallChecks += "call was 'account set': $call" }
+        }
+        if ($jobDrifted.AzCalls.Count -gt 0 -and $jobDriftedCallChecks.Count -eq 0) {
+            Add-Pass "Every one of the $($jobDrifted.AzCalls.Count) az call(s) the live round trip issued pins --subscription, and none was 'account set'"
+        } else {
+            Add-Fail "The live round trip's az call log violates a read-only invariant: $($jobDriftedCallChecks -join '; ')"
+        }
+        if ($jobDrifted.StdOut -notmatch $jobGuidPattern2) {
+            Add-Pass "Live-mode drifted round trip's rendered output contains no GUID-shaped identifier, even though the stub's underlying identity resource ids are GUID-bearing"
+        } else {
+            Add-Fail "Live-mode drifted round trip leaked a GUID-shaped identifier into rendered output"
+        }
+
+        $jobClean = Invoke-JobDriftCliCapture -Stub $jobStub2 -ScriptPath $jobCheckPath -Clean -CliArguments @("-Json")
+        $jobCleanOk = ($jobClean.ExitCode -eq 0) -and
+            ($jobClean.StdOut -notmatch "inlinedSecret") -and
+            ($jobClean.StdOut -notmatch "unexpectedIdentity") -and
+            ($jobClean.StdOut -notmatch "missingIdentity") -and
+            ($jobClean.StdOut -notmatch "unexpectedImage") -and
+            ($jobClean.StdOut -notmatch "missingEnvVar")
+        if ($jobCleanOk) {
+            Add-Pass "Live-mode round trip via the stub's fully-clean job configuration exits 0 with no high-severity finding"
+        } else {
+            Add-Fail "Live-mode clean round trip did not exit 0 / had a high-severity finding (exit=$($jobClean.ExitCode)): $($jobClean.StdOut)"
+        }
+        if ($jobClean.StdOut -notmatch $jobGuidPattern2) {
+            Add-Pass "Live-mode clean round trip's rendered output contains no GUID-shaped identifier"
+        } else {
+            Add-Fail "Live-mode clean round trip leaked a GUID-shaped identifier into rendered output"
+        }
+    } finally {
+        if ($jobStub2) { Remove-JobDriftStubEnvironment -Stub $jobStub2 }
+    }
+} else {
+    Add-Fail "Cannot run the stub-harness-driven live round trip; entrypoint or stub harness is missing"
+}
+
+# Fail-closed intent resolution: with no explicit parameters and no reachable
+# deploy.outputs.json, the check must exit 2 -- never guess an image or a
+# subscription. -DeployOutputsPath points at a guaranteed-absent path so this
+# is deterministic regardless of what a developer's own machine has on disk.
+if (Test-Path -LiteralPath $jobCheckPath) {
+    $jobAbsentOutputs = Join-Path $RepoRoot "scripts\tests\fixtures\job-drift\.does-not-exist.json"
+    & $jobPsExe -NoProfile -NonInteractive -File $jobCheckPath -DeployOutputsPath $jobAbsentOutputs 2>&1 | Out-Null
+    $jobFailClosedExit = $LASTEXITCODE
+    if ($jobFailClosedExit -eq 2) {
+        Add-Pass "With no explicit parameters and no reachable deploy.outputs.json, the CV-2 check exits 2 (fails closed instead of guessing a subscription or image)"
+    } else {
+        Add-Fail "Unresolved CV-2 intent did not exit 2 as the fail-closed contract requires (observed exit $jobFailClosedExit)"
+    }
+} else {
+    Add-Fail "Cannot exercise CV-2 fail-closed intent resolution; entrypoint is missing"
+}
+
+# Redaction: the 4 committed fixtures are themselves the evidence a reviewer
+# would attach to a PR. None may carry a real GUID.
+if ($jobMissingFixtures.Count -eq 0) {
+    $jobGuidPattern3 = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    $jobFixtureLeaks = @()
+    foreach ($name in $jobFixtureNames) {
+        $text = Get-Content -LiteralPath $jobFixturePaths[$name] -Raw
+        if ($text -match $jobGuidPattern3) { $jobFixtureLeaks += $name }
+    }
+    if ($jobFixtureLeaks.Count -eq 0) {
+        Add-Pass "None of the 4 committed CV-2 fixtures contain a GUID-shaped identifier"
+    } else {
+        Add-Fail "Fixture(s) contain a GUID-shaped identifier: $($jobFixtureLeaks -join ', ')"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 Write-Section "Summary"

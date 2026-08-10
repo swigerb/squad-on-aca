@@ -1,0 +1,32 @@
+{
+  "_comment": "CV-2 fixture: fully clean session job, Squad Hub supervision NOT configured. SQUAD_HUB_TOKEN is present as an intentionally empty literal (no value, no secretRef) -- deploy.ps1's documented behaviour when no hub token is passed. This must NOT be reported as inlinedSecret, and the run must still exit 0.",
+  "expectedImage": "acrcv2stub.azurecr.io/squad-worker:clean",
+  "snapshot": {
+    "schema": "squad-aca/job-drift-snapshot@1",
+    "capturedAt": "2026-08-10T00:00:00.0000000Z",
+    "image": "acrcv2stub.azurecr.io/squad-worker:clean",
+    "envVars": [
+      { "name": "GITHUB_REPOSITORY", "hasValue": true, "hasSecretRef": false },
+      { "name": "GITHUB_REF", "hasValue": true, "hasSecretRef": false },
+      { "name": "GITHUB_BASE_BRANCH", "hasValue": true, "hasSecretRef": false },
+      { "name": "GITHUB_TOKEN", "hasValue": false, "hasSecretRef": true },
+      { "name": "COPILOT_GITHUB_TOKEN", "hasValue": false, "hasSecretRef": true },
+      { "name": "ASPIRE_OTLP_GRPC_ENDPOINT", "hasValue": true, "hasSecretRef": false },
+      { "name": "ASPIRE_OTLP_HTTP_ENDPOINT", "hasValue": true, "hasSecretRef": false },
+      { "name": "OTEL_EXPORTER_OTLP_HEADERS", "hasValue": false, "hasSecretRef": true },
+      { "name": "SQUAD_DEPLOYMENT_MODE", "hasValue": true, "hasSecretRef": false },
+      { "name": "ENABLE_GITHUB_REMOTE", "hasValue": true, "hasSecretRef": false },
+      { "name": "SQUAD_COPILOT_FLAGS", "hasValue": false, "hasSecretRef": false },
+      { "name": "SQUAD_HUB_URL", "hasValue": false, "hasSecretRef": false },
+      { "name": "SQUAD_HUB_TOKEN", "hasValue": false, "hasSecretRef": false },
+      { "name": "AZURE_SUBSCRIPTION_ID", "hasValue": true, "hasSecretRef": false },
+      { "name": "AZURE_RESOURCE_GROUP", "hasValue": true, "hasSecretRef": false },
+      { "name": "AZURE_CLIENT_ID", "hasValue": true, "hasSecretRef": false },
+      { "name": "ACA_SESSION_JOB_NAME", "hasValue": true, "hasSecretRef": false }
+    ],
+    "identities": [
+      { "alias": "IDENTITY-1", "isExpectedSession": true }
+    ],
+    "systemAssignedEnabled": false
+  }
+}

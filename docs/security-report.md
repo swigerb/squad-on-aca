@@ -64,6 +64,39 @@ Any role works, including Read. Removing them revokes it immediately.
 | Older grants | A resource-group `Contributor` assignment is removed on deploy if one is found |
 | Reconciliation | Resource-scoped assignments are dropped by a job delete, so `deploy.ps1` re-applies them on every run |
 | Regression guard | `validate.ps1` fails the build if the deploy script grants `Contributor`, stops granting the job-scoped role, or stops removing the old one |
+| Live drift check | `scripts/rbac-drift-check.ps1` reads the deployed identity's actual role assignments back from Azure and fails if anything is broader than intent — an unexpected role, scope, or principal — rather than trusting that what `deploy.ps1` last applied is still what is there |
+
+### The deployed state is checked, not only the deploy script
+
+`deploy.ps1` asserts what it applies, and `validate.ps1` asserts what the
+script contains. Neither one reads the deployed state back and compares it
+with intent, which is how a resource-group `Contributor` assignment can
+survive after the script has stopped granting it — the same class of drift
+that applies to job configuration and the identities attached to a session
+job.
+
+Two read-only checks close that gap by querying Azure directly:
+
+| Check | Reads | Fails on |
+|---|---|---|
+| `scripts/rbac-drift-check.ps1` (CV-1) | The deployed identity's live role assignments | An unexpected role, an unexpected scope (for example, a resource-group-scoped grant), or an unexpected principal |
+| `scripts/job-drift-check.ps1` (CV-2) | The live session job and its environment | The wrong image, a secret referenced by literal value instead of `secretRef`, a missing expected environment variable, or an identity attached to the job beyond the one session identity |
+
+Both are read-only: each has exactly one call site that invokes the Azure CLI
+(enforced by a static check in `scripts/validate.ps1`), that call site refuses
+any mutating verb or unlisted command shape, and the comparer that decides
+pass or fail has no reference to the Azure CLI at all — a mutating command
+cannot reach Azure through either check even if the intent-resolution or
+comparison logic is wrong.
+
+Both are folded into `squad-aca doctor` (CV-3), so drift is visible during
+ordinary use rather than only when somebody remembers to run the script by
+hand, and a finding is reported as a failure, never a warning — drift is
+something to act on, not merely note.
+
+Every fixture proving a specific drift (a resource-group-scoped role
+assignment, an extra identity, an inlined secret) is asserted to make the
+check fail; a check that cannot fail proves nothing.
 
 ### The identity is not present in a session
 
@@ -145,9 +178,21 @@ destination differs from that.
 
 ## How these controls are verified
 
-`scripts/validate.ps1` — **414 checks, 0 failing.** It asserts behaviour rather
+`scripts/validate.ps1` — **455 checks, 0 failing.** It asserts behaviour rather
 than structure: where a control is claimed, the check drives the code that
 enforces it.
+
+The live role-assignment and job-configuration drift checks (CV-1/CV-2) are
+proven two ways: against a stubbed Azure CLI in `validate.ps1`, driving every
+committed fixture to the exit code the check's contract keys off, and
+read-only against a real deployed environment. Run there, CV-2 passed clean.
+CV-1 found a stale resource-group `Contributor` grant on that environment —
+exactly the drift class this report describes `deploy.ps1` removing on
+redeploy, on an environment that has not been redeployed since. Azure access
+for this verification is strictly read-only, so the grant was reported and
+left in place rather than removed; redeploying (or removing it by hand)
+closes that specific instance, and CV-1 running as part of `squad-aca doctor`
+is what catches the next one.
 
 The worker capability suites run on Linux in CI. A suite whose dependencies are
 missing reports `SKIP`, and **a skip fails the job** rather than passing

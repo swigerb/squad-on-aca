@@ -1,0 +1,36 @@
+{
+  "schema": "squad-aca/rbac-drift-snapshot@1",
+  "capturedAt": "2026-08-10T00:00:00.0000000Z",
+  "_comment": "CV-1 fixture: the session and GitHub Actions identities both hold exactly what intent expects, but a THIRD principal (not one of the deployment's own) holds a grant at the session job scope. Layer 2 (scope-anchored, --include-inherited deliberately absent) must catch this as unexpectedPrincipal (high) even though Layer 1 (principal-anchored) sees nothing wrong with the deployment's own two principals. Compare-RbacDriftSnapshot on this fixture must exit 1.",
+  "principals": [
+    {
+      "role": "session",
+      "present": true,
+      "principalAlias": "PRINCIPAL-1",
+      "clientAlias": "CLIENT-1",
+      "assignments": [
+        { "roleName": "AcrPull", "scopeType": "registry", "scopeAlias": "SCOPE-1", "assignmentAlias": "ASSIGN-1" },
+        { "roleName": "Container Apps Jobs Operator", "scopeType": "sessionJob", "scopeAlias": "SCOPE-2", "assignmentAlias": "ASSIGN-2" }
+      ]
+    },
+    {
+      "role": "githubActions",
+      "present": true,
+      "principalAlias": "PRINCIPAL-2",
+      "clientAlias": "CLIENT-2",
+      "assignments": [
+        { "roleName": "Container Apps Jobs Operator", "scopeType": "sessionJob", "scopeAlias": "SCOPE-2", "assignmentAlias": "ASSIGN-3" }
+      ]
+    }
+  ],
+  "scopedAssignments": {
+    "registry": [
+      { "principalAlias": "PRINCIPAL-1", "roleName": "AcrPull", "assignmentAlias": "ASSIGN-1" }
+    ],
+    "sessionJob": [
+      { "principalAlias": "PRINCIPAL-1", "roleName": "Container Apps Jobs Operator", "assignmentAlias": "ASSIGN-2" },
+      { "principalAlias": "PRINCIPAL-2", "roleName": "Container Apps Jobs Operator", "assignmentAlias": "ASSIGN-3" },
+      { "principalAlias": "PRINCIPAL-9", "roleName": "Container Apps Jobs Operator", "assignmentAlias": "ASSIGN-9" }
+    ]
+  }
+}
