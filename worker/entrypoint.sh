@@ -302,6 +302,56 @@ squad_lease_finish() {
   return "$code"
 }
 
+# Take the Azure identity away from every mode that does not need it.
+#
+# Container Apps injects a managed identity into the container as
+# IDENTITY_ENDPOINT plus IDENTITY_HEADER (its own scheme; there is no
+# 169.254.169.254 here). Any process in the container can exchange those for an
+# ARM access token with a single HTTP call -- `curl` is enough, and `curl` is
+# not on the deny list, so blocking `az` blocks a command and not the
+# capability.
+#
+# The thing running in this container is an agent executing a prompt, and a
+# prompt is attacker-influenced input: an issue body, a comment, a file in a
+# repository. So the identity is removed from the environment for every mode
+# that has no business using it, which is every mode except `ralph`. Only Ralph
+# calls Azure (`containerapp job show`/`start`), and it is the only mode that
+# runs `az login --identity`.
+#
+# THIS MUST RUN BEFORE ANY CHILD PROCESS IS STARTED, and that is why it sits
+# here rather than next to the mode dispatch below.
+#
+# `unset` changes THIS shell. A process already spawned keeps the copy of the
+# environment it was given, and on Linux any process running as the same user
+# can read it out of /proc/<pid>/environ. The lease heartbeat below is a
+# long-lived background child that runs for the whole session, so dropping the
+# identity after starting it left the credential legible to exactly the agent it
+# was being taken away from. Found in review, and the reason the order here is
+# load-bearing rather than tidy.
+#
+# The heartbeat itself only talks to GitHub, so it loses nothing by starting
+# without the Azure identity.
+squad_drop_azure_identity() {
+  if [[ -z "${IDENTITY_ENDPOINT:-}${IDENTITY_HEADER:-}${MSI_ENDPOINT:-}${MSI_SECRET:-}" ]]; then
+    return 0
+  fi
+  unset IDENTITY_ENDPOINT IDENTITY_HEADER MSI_ENDPOINT MSI_SECRET IMDS_ENDPOINT
+  # AZURE_CLIENT_ID alone is not a credential -- it names an identity, it does
+  # not authenticate as one -- but leaving it behind invites a library into a
+  # retry loop against an endpoint that is deliberately gone.
+  unset AZURE_CLIENT_ID
+  log "Azure identity removed from this session's environment (mode '${SQUAD_MODE}' does not call Azure)."
+}
+
+case "${SQUAD_MODE:-smoke}" in
+  ralph)
+    : # Ralph is the one mode that calls Azure; it keeps its identity.
+    ;;
+  *)
+    squad_drop_azure_identity
+    ;;
+esac
+
 if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
   squad_lease_report heartbeat
   squad_lease_heartbeat_loop &
@@ -363,47 +413,6 @@ commit_and_push_if_needed() {
     gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}" || true
   fi
 }
-
-# Take the Azure identity away from every mode that does not need it.
-#
-# Container Apps injects a managed identity into the container as
-# IDENTITY_ENDPOINT plus IDENTITY_HEADER (its own scheme; there is no
-# 169.254.169.254 here). Any process in the container can exchange those for an
-# ARM access token with a single HTTP call -- `curl` is enough, and `curl` is
-# not on the deny list, so blocking `az` blocks a command and not the
-# capability.
-#
-# The thing running in this container is an agent executing a prompt, and a
-# prompt is attacker-influenced input: an issue body, a comment, a file in a
-# repository. So the identity is removed from the environment for every mode
-# that has no business using it, which is every mode except `ralph`. Only Ralph
-# calls Azure (`containerapp job show`/`start`), and it is the only mode that
-# runs `az login --identity`.
-#
-# This is a real boundary rather than a discouragement: the endpoint address and
-# its header are the whole credential, and a process that never receives them
-# cannot ask for a token. It costs nothing when it is not needed and it holds
-# even if the deny list is misconfigured.
-squad_drop_azure_identity() {
-  if [[ -z "${IDENTITY_ENDPOINT:-}${IDENTITY_HEADER:-}${MSI_ENDPOINT:-}${MSI_SECRET:-}" ]]; then
-    return 0
-  fi
-  unset IDENTITY_ENDPOINT IDENTITY_HEADER MSI_ENDPOINT MSI_SECRET IMDS_ENDPOINT
-  # AZURE_CLIENT_ID alone is not a credential -- it names an identity, it does
-  # not authenticate as one -- but leaving it behind invites a library into a
-  # retry loop against an endpoint that is deliberately gone.
-  unset AZURE_CLIENT_ID
-  log "Azure identity removed from this session's environment (mode '${SQUAD_MODE}' does not call Azure)."
-}
-
-case "${SQUAD_MODE:-smoke}" in
-  ralph)
-    : # Ralph is the one mode that calls Azure; it keeps its identity.
-    ;;
-  *)
-    squad_drop_azure_identity
-    ;;
-esac
 
 case "${SQUAD_MODE:-smoke}" in
   smoke)
