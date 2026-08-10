@@ -57,6 +57,23 @@ The label and command prefix are configurable through repository variables `SQUA
 
 Use `squad-aca` as the default label. Keep Ralph's `RALPH_LABELS` aligned with `SQUAD_TRIGGER_LABEL` so all dispatchers use the same lease key and marker label.
 
+## Who may trigger a run
+
+| Route | Who |
+|---|---|
+| Applying the label | Anyone with triage or write permission. GitHub enforces this. |
+| Commenting the command | Repository owners, organisation members, and collaborators. |
+| `workflow_dispatch` | Anyone who can run workflows in the repository. |
+
+A command comment from anyone else is refused with `actor-may-not-dispatch`. An
+ordinary comment carrying no command is ignored rather than refused.
+
+This matters on a public repository. `issue_comment` workflows run from the
+default branch with access to repository secrets, so without this check any
+GitHub account could start a job in your subscription. The check reads
+`author_association`, which GitHub sets on the comment and a commenter cannot
+change.
+
 ## Issue response
 
 The trigger comments on the issue with:
