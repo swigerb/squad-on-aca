@@ -719,6 +719,33 @@ gh auth switch --user <account-with-write-access>
 
 `squad-aca doctor` reports both `GitHub auth` and `GitHub push`.
 
+## Who can run Squad on ACA
+
+A run costs money and executes an agent with a token that can write to the
+repository, so every route is gated on repository access.
+
+| Route | Who can use it |
+|---|---|
+| Apply the `squad-aca` label to an issue | Collaborators with **Triage** or above |
+| Comment `/squad-aca <instruction>` or `@squad-on-aca-control-plane <instruction>` | **Owner, organisation member, or collaborator** |
+| Run the workflow manually | Collaborators with **Write** or above |
+| Ralph's poll | Only picks up issues that already carry the label |
+
+**To let somebody run it: add them in Settings → Collaborators and teams.** Any
+role works, including Read. Removing them revokes it immediately.
+
+`CONTRIBUTOR` is **not** a permission and is **not** accepted. GitHub reports it
+for anyone who has ever had a commit merged, which on a public repository is
+anybody who once landed a pull request; they have no access. The thing you grant
+is a **collaborator**.
+
+Squad Hub grants nothing here. Its **Start a new ACA job…** action writes a
+GitHub URL and opens it; the request is created by the person's own GitHub
+account, and this repository decides whether it runs. Someone added to Squad Hub
+cannot run jobs here unless you also add them to this repository.
+
+Full detail: [actions-trigger.md](actions-trigger.md#who-may-trigger-a-run).
+
 ## Operational safeguards
 
 - Use separate GitHub and Copilot tokens when your policy requires separation.

@@ -59,20 +59,70 @@ Use `squad-aca` as the default label. Keep Ralph's `RALPH_LABELS` aligned with `
 
 ## Who may trigger a run
 
-| Route | Who |
-|---|---|
-| Applying the label | Anyone with triage or write permission. GitHub enforces this. |
-| Commenting the command | Repository owners, organisation members, and collaborators. |
-| `workflow_dispatch` | Anyone who can run workflows in the repository. |
+Every route into Squad on ACA is gated. A run costs money and executes an agent
+with a token that can write to the repository, so nothing dispatches for someone
+who has not been given access to that repository.
+
+| Route | Who can use it | Enforced by |
+|---|---|---|
+| Apply the `squad-aca` label | Collaborators with **Triage** or above | GitHub — the label control is not shown to anyone else |
+| Comment `/squad-aca <instruction>` | **Owner, organisation member, or collaborator** | Squad on ACA, from `author_association` |
+| Comment `@squad-on-aca-control-plane <instruction>` | Same as above | Same as above |
+| Run the workflow manually | Collaborators with **Write** or above | GitHub — `workflow_dispatch` requires write |
+| Ralph's five-minute poll | Picks up issues that already carry the label | Whoever applied the label, above |
 
 A command comment from anyone else is refused with `actor-may-not-dispatch`. An
-ordinary comment carrying no command is ignored rather than refused.
+ordinary comment that carries no command is ignored, not refused, so people can
+talk on an issue without filling the log with alarms.
 
-This matters on a public repository. `issue_comment` workflows run from the
-default branch with access to repository secrets, so without this check any
-GitHub account could start a job in your subscription. The check reads
-`author_association`, which GitHub sets on the comment and a commenter cannot
-change.
+### Granting someone access
+
+**Settings → Collaborators and teams → Add people.** That is the whole
+mechanism. From then on they can comment `/squad-aca …` and it runs in your
+Azure subscription.
+
+Any role works, **including Read**. Choose the role by what else you want them
+to do:
+
+| Role | Can comment the command | Can apply the label | Can push |
+|---|---|---|---|
+| Read | yes | no | no |
+| Triage | yes | yes | no |
+| Write | yes | yes | yes |
+
+Removing them from the repository removes their access to dispatch, the same
+minute.
+
+### `CONTRIBUTOR` is not a permission
+
+GitHub reports `CONTRIBUTOR` for anyone who has ever had a commit merged here.
+On a public repository that is anybody who once landed a pull request, and they
+have **no access to anything**. Sampled live on a large public repository,
+`CONTRIBUTOR` accounted for 29 of 100 comments.
+
+So `CONTRIBUTOR` is deliberately **not** permitted, and there is no such thing as
+"adding someone as a contributor". The thing you add is a **collaborator**, and
+GitHub reports those as `COLLABORATOR`.
+
+| `author_association` | Means | May dispatch |
+|---|---|---|
+| `OWNER` | Owns the repository | **yes** |
+| `MEMBER` | In the organisation that owns it | **yes** |
+| `COLLABORATOR` | You invited them to the repository | **yes** |
+| `CONTRIBUTOR` | Has had a commit merged. No access. | no |
+| `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER` | Has not committed here before | no |
+| `MANNEQUIN` | Placeholder for an unclaimed user | no |
+| `NONE` | No relationship to the repository | no |
+
+`author_association` is set by GitHub on the comment. A commenter cannot change
+it.
+
+### Why this is needed
+
+`issue_comment` workflows run from the repository's **default branch, with
+access to repository secrets**. On a public repository, without this check, any
+GitHub account could comment the command and start a job in your subscription,
+on your bill, running an agent with a token that can write to your repository.
 
 ## Issue response
 

@@ -281,6 +281,22 @@ printf '%s' "$lowercase" >"${WORK}/event.json"
 out="$(node "$MODULE" --event-name issue_comment --event-path "${WORK}/event.json")"
 assert_eq "true" "$(printf '%s' "$out" | field dispatch)" "the association is matched case-insensitively, so a payload casing change is not a lockout"
 
+# The @mention form is the one people try first, so it must be gated too --
+# a check that covered only the slash command would leave the friendlier
+# spelling wide open.
+mention_stranger='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"@squad-on-aca-control-plane spend the owner s money","user":{"login":"stranger","type":"User"},"author_association":"CONTRIBUTOR"}}'
+out="$(resolve issue_comment "$mention_stranger")"
+assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "the @mention form is gated exactly like the slash command"
+assert_eq "actor-may-not-dispatch" "$(printf '%s' "$out" | field reason)" "and refused for the same reason"
+
+# CONTRIBUTOR is the trap. It does NOT mean "has access": GitHub gives it to
+# anyone who has ever had a commit merged, which on a public repository is
+# anybody who once landed a pull request. Sampled live on a large public repo,
+# it was 29 of 100 comments -- none of those people can push.
+contributor='{"action":"created","issue":{"number":9,"state":"open"},"comment":{"body":"/squad-aca fix it","user":{"login":"past-contributor","type":"User"},"author_association":"CONTRIBUTOR"}}'
+out="$(resolve issue_comment "$contributor")"
+assert_eq "false" "$(printf '%s' "$out" | field dispatch)" "CONTRIBUTOR means 'has committed here before', NOT 'has access' -- on a public repo that is anyone who ever landed a PR, and they must not be able to start a billed job"
+
 # An ordinary comment from a stranger is not an attempted dispatch, and must
 # not be reported as a refused one -- that would fill the log with alarms about
 # people simply talking on an issue.
