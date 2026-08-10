@@ -308,6 +308,8 @@ dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
 | If you want to | Read |
 |---|---|
 | Deploy it and run a session | [docs/runbook.md](docs/runbook.md) |
+| Control who can start a run | [docs/security.md](docs/security.md) |
+| See the security controls and how each is verified | [docs/security-report.md](docs/security-report.md) |
 | Trigger sessions from GitHub issues | [docs/actions-trigger.md](docs/actions-trigger.md) |
 | Declare what your repository needs | [docs/capability-manifest.md](docs/capability-manifest.md) |
 | Use the second execution plane | [docs/sandboxes.md](docs/sandboxes.md) |
