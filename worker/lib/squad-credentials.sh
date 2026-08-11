@@ -316,7 +316,18 @@ squad_credential_uninstall_helper() {
 # never straddling the withheld window in either direction.
 squad_credential_withhold() {
   if [[ -n "$SQUAD_LEASE_HEARTBEAT_PID" ]]; then
-    kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    # Issue #92-shaped leak: squad_lease_heartbeat_loop's own `while true; do
+    # sleep N; done` forks a grandchild (the sleep) that is not
+    # $SQUAD_LEASE_HEARTBEAT_PID itself. Signalling only that PID can leave the
+    # sleep orphaned and running for a full tick, still holding whatever it
+    # inherited at fork time -- the same shape run-tests.sh's own containment
+    # fix (this same issue) exists to close. Because the heartbeat is forked
+    # with job control on (see squad_credential_restore / entrypoint.sh), its
+    # PID is also its own process group id, so signalling the group takes the
+    # sleep down with it; falling back to the bare PID keeps this correct even
+    # for a heartbeat that, for whatever reason, was not its own group leader.
+    kill -TERM -- "-$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null \
+      || kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
     wait "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
     SQUAD_LEASE_HEARTBEAT_PID=""
   fi
@@ -402,8 +413,14 @@ squad_credential_restore() {
   # what squad_lease_heartbeat_loop's own body does. Redirected here AND
   # inside the function itself (belt and braces; see worker/entrypoint.sh).
   if [[ -n "${SQUAD_LEASE_KEY:-}" ]] && declare -f squad_lease_heartbeat_loop >/dev/null 2>&1; then
+    # `set -m` gives this backgrounded job its own process group (pgid == its
+    # own pid), so squad_credential_withhold can signal the whole group and
+    # take its sleep-loop grandchild down with it too -- see the comment
+    # there and worker/entrypoint.sh's initial fork, which does the same.
+    set -m
     squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &
     SQUAD_LEASE_HEARTBEAT_PID=$!
+    set +m
   fi
   squad_credentials_log "Push credential restored after the agent exited."
 }

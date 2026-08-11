@@ -335,7 +335,14 @@ squad_lease_finish() {
   # Stop the ticker first, so it cannot resurrect the lease to `running` after
   # the terminal state has been written.
   if [[ -n "$SQUAD_LEASE_HEARTBEAT_PID" ]]; then
-    kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    # Issue #92-shaped leak (see squad_credential_withhold in
+    # worker/lib/squad-credentials.sh for the full explanation): the
+    # heartbeat's own `while true; do sleep N; done` forks a grandchild that
+    # survives a signal aimed only at $SQUAD_LEASE_HEARTBEAT_PID. Because the
+    # heartbeat is forked with job control on below, its PID is also its own
+    # process group id, so signalling the group takes the sleep down with it.
+    kill -TERM -- "-$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null \
+      || kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
     wait "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
     SQUAD_LEASE_HEARTBEAT_PID=""
   fi
@@ -401,9 +408,14 @@ if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
   squad_lease_report heartbeat
   # Redirected here too, in addition to inside squad_lease_heartbeat_loop
   # itself (issue #92) -- belt and braces, so this call site is correct even
-  # if the function body is ever refactored.
+  # if the function body is ever refactored. `set -m` also gives this
+  # backgrounded job its own process group (pgid == its own pid), so
+  # squad_lease_finish / squad_credential_withhold can signal the whole group
+  # and take the loop's sleep grandchild down with it instead of orphaning it.
+  set -m
   squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &
   SQUAD_LEASE_HEARTBEAT_PID=$!
+  set +m
   trap squad_lease_finish EXIT
 fi
 
