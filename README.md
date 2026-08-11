@@ -318,3 +318,8 @@ dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
 | Understand how it fits together | [docs/architecture.md](docs/architecture.md) |
 | Turn something off | [docs/rollback.md](docs/rollback.md) |
 | Verify a change | [docs/validation.md](docs/validation.md) |
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
