@@ -44,7 +44,7 @@ $script:JobDriftSecretBackedEnvVarNames = @(
 function New-JobDriftFinding {
     param(
         [Parameter(Mandatory = $true)][string]$Status,
-        [Parameter(Mandatory = $true)][ValidateSet("info", "high")][string]$Severity,
+        [Parameter(Mandatory = $true)][ValidateSet("info", "medium", "high")][string]$Severity,
         [string]$Subject = "",
         [string]$Detail = ""
     )
@@ -54,6 +54,36 @@ function New-JobDriftFinding {
         Subject  = $Subject
         Detail   = $Detail
     }
+}
+
+function ConvertTo-JobDriftInstant {
+    <#
+    .SYNOPSIS
+        Parses an ISO 8601 registry timestamp for comparison, or returns
+        $null for anything absent or unparsable. Never throws: a malformed
+        or missing timestamp is "no evidence", not an error.
+    #>
+    param([string]$Value)
+    if (-not $Value) { return $null }
+    try {
+        return [datetimeoffset]::Parse($Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal)
+    } catch {
+        return $null
+    }
+}
+
+function Get-JobDriftSnapshotProperty {
+    <#
+    .SYNOPSIS
+        Safe optional-property read: fixtures and older snapshots may not
+        carry a given field at all (e.g. imageLastUpdated), which must read
+        as "no evidence" rather than a PowerShell property-not-found error.
+    #>
+    param([object]$Snapshot, [string]$Name)
+    if ($Snapshot -and ($Snapshot.PSObject.Properties.Name -contains $Name)) {
+        return [string]$Snapshot.$Name
+    }
+    return ""
 }
 
 function Compare-JobDriftSnapshot {
@@ -68,12 +98,25 @@ function Compare-JobDriftSnapshot {
     .PARAMETER Snapshot
         A [pscustomobject] with .image, .envVars (array of {name, hasValue,
         hasSecretRef}), .identities (array of {alias, isExpectedSession}), and
-        .systemAssignedEnabled (bool).
+        .systemAssignedEnabled (bool). May optionally carry .imageLastUpdated
+        (an ISO 8601 registry timestamp for .image) when an image mismatch's
+        staleness has already been evaluated -- see -ExpectedImageLastUpdated.
 
     .PARAMETER ExpectedImage
         The image deploy.ps1 intends for this job right now (deploy.outputs
         .json's workerImage, or an explicit override). Required: comparing
         against nothing would let an image drift pass silently.
+
+    .PARAMETER ExpectedImageLastUpdated
+        Issue #90 finding 1: the registry last-update timestamp for
+        -ExpectedImage, when known. When BOTH this and Snapshot
+        .imageLastUpdated are present and the live image is newer than the
+        expected one, an image mismatch is reported as "the local intent
+        record is stale" (medium severity, not high) instead of "the live
+        job drifted" (high). Absent either timestamp, a mismatch is always
+        reported as genuine drift (high) -- this never guesses staleness it
+        cannot prove, which is also why every existing fixture (none of which
+        carries a timestamp) is completely unaffected.
 
     .OUTPUTS
         [pscustomobject[]] findings, each with Status / Severity / Subject /
@@ -82,14 +125,23 @@ function Compare-JobDriftSnapshot {
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Snapshot,
-        [Parameter(Mandatory = $true)][string]$ExpectedImage
+        [Parameter(Mandatory = $true)][string]$ExpectedImage,
+        [string]$ExpectedImageLastUpdated = ""
     )
 
     $findings = @()
 
     if ($Snapshot.image -ne $ExpectedImage) {
-        $findings += New-JobDriftFinding -Status "unexpectedImage" -Severity "high" -Subject "image" `
-            -Detail "job runs '$($Snapshot.image)', expected '$ExpectedImage'"
+        $liveUpdated = ConvertTo-JobDriftInstant (Get-JobDriftSnapshotProperty -Snapshot $Snapshot -Name "imageLastUpdated")
+        $expectedUpdated = ConvertTo-JobDriftInstant $ExpectedImageLastUpdated
+        if ($liveUpdated -and $expectedUpdated -and ($liveUpdated -gt $expectedUpdated)) {
+            $liveStamp = Get-JobDriftSnapshotProperty -Snapshot $Snapshot -Name "imageLastUpdated"
+            $findings += New-JobDriftFinding -Status "staleLocalRecord" -Severity "medium" -Subject "image" `
+                -Detail "job runs '$($Snapshot.image)' (registry-updated $liveStamp); the local intent record expects '$ExpectedImage' (registry-updated $ExpectedImageLastUpdated), which is OLDER than the live image. This is a stale local record, not drift on the live job -- refresh deploy.outputs.json (redeploy, or re-run scripts/deploy.ps1) rather than treating the deployment as compromised."
+        } else {
+            $findings += New-JobDriftFinding -Status "unexpectedImage" -Severity "high" -Subject "image" `
+                -Detail "job runs '$($Snapshot.image)', expected '$ExpectedImage'"
+        }
     } else {
         $findings += New-JobDriftFinding -Status "ok" -Severity "info" -Subject "image" -Detail "matches intent"
     }

@@ -472,3 +472,65 @@ function Get-AcaLogPathStatus {
     }
     return [pscustomobject]@{ Status = "failed"; Detail = "neither the containerapp nor the log-analytics extension is installed; run 'az extension add --name log-analytics'" }
 }
+
+function Test-AcaAspireReachability {
+    <#
+    .SYNOPSIS
+        Classify whether a configured Aspire dashboard URL is actually
+        reachable (issue #90 finding 3): "ok" here always means a live probe
+        proved the endpoint answers, never merely that a URL string exists in
+        config.
+
+    .DESCRIPTION
+        Reachability is probed with `curl`, the same "one external binary is
+        the whole test seam" shape Invoke-CliSafe/Invoke-AzPromptSafe already
+        use for `az` -- a test puts a stub `curl` ahead of PATH and returns a
+        canned exit code, with no network-stack fake and no dependency on a
+        real hostname's behaviour.
+
+        Both --connect-timeout and --max-time are set so neither DNS
+        resolution nor a slow/black-holed response can hang doctor past
+        $TimeoutSeconds: a stuck endpoint is reported "unknown", never "ok"
+        and never an indefinite wait.
+
+        curl's own documented exit codes classify the result:
+          0            the endpoint answered -- ANY HTTP status (even 401 or
+                       404) proves DNS resolved, TCP connected, and something
+                       is listening, which is what "reachable" means here.
+          28           OPERATION_TIMEDOUT: slow or black-holed -> "unknown".
+          6, 7, other  COULDNT_RESOLVE_HOST / COULDNT_CONNECT / any other
+                       transport failure -> "failed" (unreachable), never
+                       "ok". Dead DNS is explicitly in this bucket.
+
+    .OUTPUTS
+        [pscustomobject] with Status ("ok" | "failed" | "unknown") and Detail.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutSeconds = 5
+    )
+
+    if (-not (Get-Command curl -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{ Status = "unknown"; Detail = "curl is not on PATH; cannot check whether '$Url' is reachable" }
+    }
+
+    $result = Invoke-CliSafe -FilePath "curl" -Arguments @(
+        "--connect-timeout", ([string]$TimeoutSeconds),
+        "--max-time", ([string]$TimeoutSeconds),
+        "--silent",
+        "--show-error",
+        "--head",
+        $Url
+    )
+
+    if ($result.ExitCode -eq 0) {
+        return [pscustomobject]@{ Status = "ok"; Detail = $Url }
+    }
+    if ($result.ExitCode -eq 28) {
+        return [pscustomobject]@{ Status = "unknown"; Detail = "Aspire URL '$Url' did not respond within ${TimeoutSeconds}s (slow or unreachable); rerun 'squad-aca doctor', or check the deployment if this persists" }
+    }
+
+    $reason = Get-AzErrorText -Result $result -Fallback "curl exited $($result.ExitCode)"
+    return [pscustomobject]@{ Status = "failed"; Detail = "Aspire URL '$Url' is not reachable ($reason); redeploy, or run 'squad-aca configure --dashboard-url' with a working URL" }
+}
+

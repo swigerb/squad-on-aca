@@ -98,6 +98,33 @@ Every fixture proving a specific drift (a resource-group-scoped role
 assignment, an extra identity, an inlined secret) is asserted to make the
 check fail; a check that cannot fail proves nothing.
 
+#### CV-2 distinguishes a stale local record from a genuine image change
+
+`job-drift-check.ps1`'s intent for the running image comes from
+`deploy.outputs.json`, which is local and gitignored. That file can go stale —
+a machine that redeployed five days ago but never re-ran `deploy.ps1` again
+still holds the old image tag as "expected" — while the **live job is
+correct**. Reporting that as `unexpectedImage`/high is a false positive
+serious enough that it teaches operators to ignore the check.
+
+CV-2 now reads the registry's `lastUpdateTime` for both the live and expected
+image tags (one extra, read-only `az acr repository show` call, made only
+when the image tags differ — a clean, matching deployment issues zero extra
+calls) and reports two distinct outcomes:
+
+| Live image vs. recorded intent | Status | Severity |
+|---|---|---|
+| Newer than the recorded expectation | `staleLocalRecord` | `medium` (does not fail the check) |
+| Older than, or no timestamp evidence available | `unexpectedImage` | `high` (fails the check, as before) |
+
+A `medium` finding never trips the check's exit code — a stale **local**
+record is not itself a security failure — but it is still surfaced in
+`squad-aca doctor`'s CV-2 row as a `warning`, with guidance to redeploy or
+refresh the recorded image, rather than being silently absorbed into a flat
+`ok`. Both directions are proven by dedicated fixtures
+(`stale-local-record.json`, `genuine-image-drift.json`); the four pre-existing
+CV-2 fixtures are unchanged and still pass.
+
 ### The identity is not present in a session
 
 Container Apps supplies the managed identity to the container as
@@ -300,6 +327,42 @@ kernel property live (same-uid child readable, cross-UID child denied) --
 it skips explicitly, never silently, when that is unavailable.
 
 ---
+
+### `doctor`'s Aspire URL check probes reachability, not string presence
+
+Before this fix, `doctor` reported `Aspire URL: ok` whenever
+`aspireLoginUrl` was a non-empty string in config — including a URL left over
+from a prior deployment whose hostname no longer resolves at all. A string
+being present was reported as the dashboard being healthy.
+
+`Test-AcaAspireReachability` (`scripts/lib/aca-logs.ps1`) now issues a
+bounded, read-only `curl --head` probe (`--connect-timeout`/`--max-time`, so a
+black-holed or slow endpoint cannot hang `doctor`) and classifies the result
+into the three facts an operator actually needs:
+
+| State | Status |
+|---|---|
+| No `aspireLoginUrl` configured | `missing` |
+| Configured, but curl cannot resolve/connect | `failed` |
+| Configured and curl times out | `unknown` |
+| Configured and curl gets any HTTP response | `ok` |
+
+`curl` is stubbed on `PATH` in the offline CLI test harness (exactly like
+`az`/`gh`), so all four states — including dead DNS and a timeout — are
+exercised deterministically without a real network dependency, and a named
+test fails if the reachability call is ever reverted to a bare
+string-presence check.
+
+### `configure` clears derived URLs it can no longer vouch for
+
+`aspireLoginUrl` bakes in the container apps environment's own randomly
+generated default-domain hash and dashboard token — values that belong to one
+specific subscription/resource-group pair and cannot be re-derived from a new
+one. `squad-aca configure` now clears `aspireLoginUrl` whenever the
+subscription or resource group changes (unless the same call passes an
+explicit `--dashboard-url`, which always wins), and leaves it untouched when
+neither changes — a missing value is preferred to one that may point at a
+deployment, or subscription, that no longer exists.
 
 ## Reaching Azure from GitHub
 

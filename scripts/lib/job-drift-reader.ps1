@@ -38,6 +38,12 @@ $script:JobDriftAllowedShapes = @(
     , @("containerapp", "job", "show")
     , @("identity", "show")
     , @("account", "show")
+    # Issue #90 finding 1: reading a registry tag's last-update timestamp is
+    # how a stale local intent record is told apart from genuine live drift.
+    # Only reached when Compare-JobDriftSnapshot's caller already knows the
+    # live and expected images differ (see job-drift-check.ps1) -- a clean,
+    # matching deployment never issues this call.
+    , @("acr", "repository", "show")
 )
 
 $script:JobDriftDeniedTokens = @(
@@ -189,6 +195,48 @@ function Get-JobDriftJson {
     } catch {
         return [pscustomobject]@{ Value = $null; Failed = $true; Result = $result }
     }
+}
+
+function Get-JobDriftImageLastUpdated {
+    <#
+    .SYNOPSIS
+        Best-effort registry last-update timestamp for one image reference
+        ("<registry>.azurecr.io/<repo>:<tag>"). Issue #90 finding 1: this is
+        the evidence that separates "the local intent record is stale" from
+        "the live resource genuinely drifted".
+
+    .DESCRIPTION
+        Deliberately best-effort and non-throwing: staleness detection is
+        never allowed to turn an otherwise-working drift check into a hard
+        failure. Callers ask for this ONLY once they already know the live
+        and expected images differ (see job-drift-check.ps1) -- a matching
+        deployment never issues this call, so this adds no new `az` traffic
+        to the common path.
+
+    .OUTPUTS
+        An ISO 8601 timestamp string, or $null when the reference cannot be
+        parsed as an ACR image or the read fails for any reason. $null means
+        "no staleness evidence available", which the comparer treats as
+        genuine drift -- it never invents a "stale" verdict it cannot support.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ImageRef,
+        [Parameter(Mandatory = $true)][string]$SubscriptionId
+    )
+
+    if (-not $ImageRef -or $ImageRef -notmatch '^(?<registry>[^./]+)\.azurecr\.io/(?<repoTag>.+)$') {
+        return $null
+    }
+    $registry = $Matches["registry"]
+    $repoTag = $Matches["repoTag"]
+    if (-not $SubscriptionId) { return $null }
+
+    $shown = Get-JobDriftJson -AzArgs @("acr", "repository", "show", "--name", $registry, "--image", $repoTag, "--subscription", $SubscriptionId, "-o", "json")
+    if ($shown.Failed -or -not $shown.Value) { return $null }
+    if ($shown.Value.PSObject.Properties.Name -notcontains "lastUpdateTime") { return $null }
+    $stamp = [string]$shown.Value.lastUpdateTime
+    if (-not $stamp) { return $null }
+    return $stamp
 }
 
 function Resolve-JobDriftIntent {
