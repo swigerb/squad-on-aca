@@ -43,8 +43,13 @@ SERVER_PID=""
 HEARTBEAT_PID=""
 cleanup() {
   [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
-  [[ -n "$HEARTBEAT_PID" ]] && kill "$HEARTBEAT_PID" 2>/dev/null
-  [[ -n "${SQUAD_LEASE_HEARTBEAT_PID:-}" ]] && kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null
+  # The heartbeat is forked with job control on (see start_fake_heartbeat /
+  # squad_credential_restore), so its own PID is also its own process group
+  # id -- kill the whole group so its `sleep`-loop grandchild does not
+  # outlive this suite in a group run-tests.sh's own pgid-scoped orphan sweep
+  # cannot see (issue #92 shape; see squad_credential_withhold's comment).
+  [[ -n "$HEARTBEAT_PID" ]] && { kill -TERM -- "-$HEARTBEAT_PID" 2>/dev/null || kill "$HEARTBEAT_PID" 2>/dev/null; }
+  [[ -n "${SQUAD_LEASE_HEARTBEAT_PID:-}" ]] && { kill -TERM -- "-$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null; }
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -135,8 +140,14 @@ SQUAD_LEASE_KEY="test-lease"
 start_fake_heartbeat() {
   local snapshot_file="$1"
   export SQUAD_TEST_HEARTBEAT_SNAPSHOT="$snapshot_file"
+  # `set -m` gives this its own process group (pgid == its own pid), exactly
+  # as squad_credential_restore/entrypoint.sh's real fork sites do, so a
+  # kill of this PID (in cleanup, or squad_credential_withhold) can signal
+  # the whole group and take its `sleep`-loop grandchild down with it too.
+  set -m
   squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &
   SQUAD_LEASE_HEARTBEAT_PID=$!
+  set +m
   # give the child a moment to snapshot its environment and start sleeping
   for _ in $(seq 1 50); do
     [[ -s "$snapshot_file" ]] && break
@@ -326,7 +337,7 @@ assert_eq "1" "$([[ -n "$heartbeat_kill_line" && -n "$remove_file_line" && "$hea
   "ORDERING (internal): squad_credential_withhold kills the heartbeat BEFORE removing the token file"
 
 refresh_env_line="$(printf '%s\n' "$RESTORE_BODY" | grep -n 'squad_credential_refresh_env' | head -1 | cut -d: -f1)"
-heartbeat_restart_line="$(printf '%s\n' "$RESTORE_BODY" | grep -n 'squad_lease_heartbeat_loop &$' | head -1 | cut -d: -f1)"
+heartbeat_restart_line="$(printf '%s\n' "$RESTORE_BODY" | grep -n 'squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &$' | head -1 | cut -d: -f1)"
 _m11_restore_ordered="$([[ -n "$refresh_env_line" && -n "$heartbeat_restart_line" && "$refresh_env_line" -lt "$heartbeat_restart_line" ]] && echo 1 || echo 0)"
 
 assert_eq "1" "$_m11_restore_ordered" \

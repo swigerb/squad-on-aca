@@ -14,6 +14,11 @@
 
 set -uo pipefail
 
+# Issue #92 sprint 3: announce before any check runs (raw write(), not
+# buffered stdio), so an interrupted/cancelled job names the test it stopped
+# in rather than showing nothing.
+echo "== identity drop (issue #83) =="
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTRYPOINT="$SCRIPT_DIR/../entrypoint.sh"
 

@@ -179,6 +179,66 @@ assert_contains "$out" "ran test_ok.sh" "default discovery: ran the co-located p
 assert_contains "$out" "Suites: 1 passed, 1 failed, 0 skipped." "default discovery: counts match the co-located suites"
 rm -rf "$dir"
 
+# --- issue #92: a hanging suite must fail, and fail fast, not idle ---------
+
+# 15a. A suite that hangs (never exits) must be killed and counted as a
+#      FAILURE, named by suite, once it exceeds its budget — not left to hang
+#      the whole runner/job. SQUAD_ACA_TEST_SUITE_TIMEOUT overrides the real
+#      120s default so this proves the mechanism in under two seconds.
+#      Duration is asserted with BOTH an upper bound (killed near budget, not
+#      left to the old 10-minute/6-hour backstop) and a lower bound (it did
+#      not report success/failure suspiciously fast, which would mean the
+#      hang was never actually exercised) — a pass/fail-only check would let
+#      a six-hour timeout falsely pass.
+dir="$(make_fixture_dir)"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'echo "ran test_hangs.sh"\n'
+  printf 'sleep 9999\n'
+} > "${dir}/test_hangs.sh"
+chmod +x "${dir}/test_hangs.sh"
+hang_start=$(date +%s)
+out="$(SQUAD_ACA_TEST_DIR="$dir" SQUAD_ACA_TEST_SUITE_TIMEOUT=1 SQUAD_ACA_TEST_SUITE_KILL_GRACE=1 bash "$RUNNER" 2>&1)"
+rc=$?
+hang_end=$(date +%s)
+hang_duration=$((hang_end - hang_start))
+assert_eq "1" "$rc" "hanging suite: runner exits non-zero rather than hanging forever"
+assert_contains "$out" "ran test_hangs.sh" "hanging suite: the suite's own output before it hung is still visible"
+assert_contains "$out" "FAIL: test_hangs.sh did not finish within 1s and was killed" "hanging suite: names the suite that hung, not a generic timeout"
+assert_contains "$out" "Suites: 0 passed, 1 failed, 0 skipped." "hanging suite: counted as a failure, not silently dropped"
+assert_not_contains "$out" "$PASS_BANNER" "hanging suite: no success banner"
+if (( hang_duration < 1 )); then
+  echo "FAIL: hanging suite: took ${hang_duration}s, suspiciously fast — the hang may never have actually been exercised (expected >= 1s)"
+  TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+  echo "ok - hanging suite: took at least as long as the configured timeout (${hang_duration}s >= 1s), proving it genuinely hung before being caught"
+  TESTS_RUN=$((TESTS_RUN + 1))
+fi
+if (( hang_duration > 15 )); then
+  echo "FAIL: hanging suite: took ${hang_duration}s -- nowhere near the configured 1s+1s bound; a six-hour timeout would also 'pass' a status-only check like this one (expected <= 15s)"
+  TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+else
+  echo "ok - hanging suite: finished in ${hang_duration}s, close to its configured bound rather than a coarse multi-minute/hour backstop"
+  TESTS_RUN=$((TESTS_RUN + 1))
+fi
+rm -rf "$dir"
+
+# 15b. A hang must not mask a later suite's own real result — the runner keeps
+#      going past a killed suite rather than stopping.
+dir="$(make_fixture_dir)"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'sleep 9999\n'
+} > "${dir}/test_a_hangs.sh"
+chmod +x "${dir}/test_a_hangs.sh"
+make_suite "$dir" "test_b_ok.sh" 0
+out="$(SQUAD_ACA_TEST_DIR="$dir" SQUAD_ACA_TEST_SUITE_TIMEOUT=1 bash "$RUNNER" 2>&1)"
+rc=$?
+assert_eq "1" "$rc" "hang then pass: runner still exits non-zero overall"
+assert_contains "$out" "ran test_b_ok.sh" "hang then pass: the suite after the hang still runs"
+assert_contains "$out" "Suites: 1 passed, 1 failed, 0 skipped." "hang then pass: both outcomes are counted correctly"
+rm -rf "$dir"
+
 # --- lib/deps.sh contract ---------------------------------------------------
 
 # 11. A missing dependency produces a visible SKIP line and the skip exit code.

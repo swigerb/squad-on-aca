@@ -48,8 +48,20 @@ WORK="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/squad-credentials-test.XXXXXXXXXXX
   exit 1
 }
 SERVER_PID=""
+# Issue #92: every background child this suite starts must be accounted for
+# by the SAME cleanup path that runs on ANY exit (normal, failure, signal) --
+# not just the happy-path manual `kill` further down, which never runs if the
+# script exits before reaching it. DECOY_PID/SLOW_PID/PUSH_PID are declared
+# here, before anything can background them, so the trap is safe under `set -u`
+# no matter how early it fires.
+DECOY_PID=""
+SLOW_PID=""
+PUSH_PID=""
 cleanup() {
   [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
+  [[ -n "$DECOY_PID" ]] && kill "$DECOY_PID" 2>/dev/null
+  [[ -n "$SLOW_PID" ]] && kill "$SLOW_PID" 2>/dev/null
+  [[ -n "$PUSH_PID" ]] && kill "$PUSH_PID" 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -273,7 +285,7 @@ if [[ -r /proc/self/cmdline ]]; then
   # `; :` defeats bash's exec optimisation for a single simple command; without
   # it bash would exec `sleep` and REPLACE its own argv, and the control would
   # silently stop being a control.
-  bash -c 'sleep 6; :' "--token=${DECOY}" &
+  bash -c 'sleep 6; :' "--token=${DECOY}" >/dev/null 2>&1 </dev/null &
   DECOY_PID=$!
   sleep 0.3
 
@@ -311,12 +323,17 @@ if [[ -r /proc/self/cmdline ]]; then
       sleep 0.1
     done
     wait "$PUSH_PID" 2>/dev/null
+    PUSH_PID=""
 
     assert_eq "0" "$control_seen" "POSITIVE CONTROL: the /proc argv scan does find a decoy token that IS in a process's argv, so the absence assertion below is a real observation"
     assert_eq "1" "$token_seen" "no process held the live token in its argv while a push was in flight — the token reaches git through the helper's stdout, never through a command line"
   fi
   kill "$DECOY_PID" 2>/dev/null
+  wait "$DECOY_PID" 2>/dev/null
+  DECOY_PID=""
   kill "$SLOW_PID" 2>/dev/null
+  wait "$SLOW_PID" 2>/dev/null
+  SLOW_PID=""
   # Restore the scoping the rest of the suite expects.
   SQUAD_GIT_CREDENTIAL_HOST="$CRED_HOST"
   export SQUAD_GIT_CREDENTIAL_HOST

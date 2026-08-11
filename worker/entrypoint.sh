@@ -371,11 +371,25 @@ squad_lease_report() {
     --lease-key "$SQUAD_LEASE_KEY" "$@" >/dev/null 2>&1 || true
 }
 
+# Issue #92 (root cause of the intermittent CI hang, verified against the
+# heartbeat stop/restart behaviour #91 introduced in squad_credential_restore):
+# a step -- a GitHub Actions step, or any shell that pipes its output somewhere
+# -- ends when its OUTPUT PIPE CLOSES, not when the foreground script exits. A
+# background child that inherits stdout/stderr keeps that pipe open for as long
+# as the child lives, even after every visible command has finished. This loop
+# is exactly such a child: it is forked with `&` and, before this fix, wrote to
+# whatever stdout/stderr it was forked with -- the entrypoint's at session
+# start, and (via squad_credential_restore) the SAME inherited descriptors
+# again on every restart after a credential-withholding window. It never exits
+# on its own (`while true`), so any stdout it inherited stays open forever.
+# Redirecting INSIDE the function -- rather than trusting every call site to
+# remember to redirect -- means a future restart (there is already one, and
+# #91 shows there can be more) can never reintroduce this by omission.
 squad_lease_heartbeat_loop() {
   while true; do
     sleep "$SQUAD_LEASE_HEARTBEAT_SECONDS"
     squad_lease_report heartbeat
-  done
+  done >/dev/null 2>&1 </dev/null
 }
 
 squad_lease_finish() {
@@ -383,7 +397,14 @@ squad_lease_finish() {
   # Stop the ticker first, so it cannot resurrect the lease to `running` after
   # the terminal state has been written.
   if [[ -n "$SQUAD_LEASE_HEARTBEAT_PID" ]]; then
-    kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    # Issue #92-shaped leak (see squad_credential_withhold in
+    # worker/lib/squad-credentials.sh for the full explanation): the
+    # heartbeat's own `while true; do sleep N; done` forks a grandchild that
+    # survives a signal aimed only at $SQUAD_LEASE_HEARTBEAT_PID. Because the
+    # heartbeat is forked with job control on below, its PID is also its own
+    # process group id, so signalling the group takes the sleep down with it.
+    kill -TERM -- "-$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null \
+      || kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
     wait "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
     SQUAD_LEASE_HEARTBEAT_PID=""
   fi
@@ -478,8 +499,16 @@ fi
 
 if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
   squad_lease_report heartbeat
-  squad_lease_heartbeat_loop &
+  # Redirected here too, in addition to inside squad_lease_heartbeat_loop
+  # itself (issue #92) -- belt and braces, so this call site is correct even
+  # if the function body is ever refactored. `set -m` also gives this
+  # backgrounded job its own process group (pgid == its own pid), so
+  # squad_lease_finish / squad_credential_withhold can signal the whole group
+  # and take the loop's sleep grandchild down with it instead of orphaning it.
+  set -m
+  squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &
   SQUAD_LEASE_HEARTBEAT_PID=$!
+  set +m
   trap squad_lease_finish EXIT
 fi
 
