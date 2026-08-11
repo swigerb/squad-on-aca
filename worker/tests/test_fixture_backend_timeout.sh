@@ -32,6 +32,8 @@ need node
 need openssl
 need git
 
+echo "== fixture git server: a stuck backend must not hang the client (issue #96) =="
+
 WORK="$(mktemp -d -t squad-fixture-timeout.XXXXXXXXXXXX)"
 cleanup() {
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null

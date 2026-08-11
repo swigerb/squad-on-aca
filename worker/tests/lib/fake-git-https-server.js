@@ -80,6 +80,29 @@ const BACKEND = argValue('--backend', '/usr/lib/git-core/git-http-backend');
  */
 const BACKEND_TIMEOUT_MS = Number(argValue('--backend-timeout-ms', '20000')) || 20000;
 
+/**
+ * Every backend still running, so none can outlive this server.
+ *
+ * `detached` is what lets the timeout above signal the whole GROUP, but it
+ * also takes the backend OUT of this fixture's process group -- which means a
+ * runner that kills the suite's group would no longer reach it. An escaped
+ * backend is exactly the leak this file is being fixed for, so the escape has
+ * to be closed at the other end: when this server goes away, so does every
+ * backend it started.
+ */
+const LIVE_BACKENDS = new Set();
+function killAllBackends() {
+  for (const c of LIVE_BACKENDS) {
+    try { process.kill(-c.pid, 'SIGKILL'); } catch { /* group already gone */ }
+    try { c.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+  LIVE_BACKENDS.clear();
+}
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => { killAllBackends(); process.exit(0); });
+}
+process.on('exit', killAllBackends);
+
 if (!ROOT || !CERT || !KEY || !TOKEN_FILE) {
   process.stderr.write('fake-git-https-server: --root, --cert, --key and --token-file are required\n');
   process.exit(64);
@@ -145,6 +168,8 @@ function runBackend(req, res, user) {
   // git-http-backend's own children alive holding the pipes -- the same
   // mistake this timeout exists to stop.
   const child = spawn(BACKEND, [], { env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+  LIVE_BACKENDS.add(child);
+  child.once('close', () => LIVE_BACKENDS.delete(child));
   req.pipe(child.stdin);
 
   /**
