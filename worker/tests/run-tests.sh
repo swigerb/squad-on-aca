@@ -18,6 +18,18 @@ set -uo pipefail
 # runs the suites that live next to this script.
 TEST_DIR="${SQUAD_ACA_TEST_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
+# Issue #92 sprint 1/2: "a hang must fail, not idle." The observed incident was
+# a single suite (`Run worker capability tests`) sitting with no output for
+# 40+ minutes; the workflow's own step-level timeout (see worker-tests.yml) is
+# a backstop for the WHOLE step, but it cannot say which suite hung. Wrapping
+# each suite individually in `timeout` means a hang is caught, and named,
+# within seconds of exceeding its own budget rather than the whole job's.
+# 120s is generous headroom over every suite's real runtime (the slowest
+# observed locally is single-digit seconds); overridable for local debugging
+# of a suite that is legitimately slow.
+SUITE_TIMEOUT_SECONDS="${SQUAD_ACA_TEST_SUITE_TIMEOUT:-120}"
+TIMEOUT_EXIT_CODE=124
+
 SKIP_EXIT_CODE=77
 overall_rc=0
 passed=0
@@ -30,9 +42,16 @@ for test_file in "${TEST_DIR}"/test_*.sh; do
   suite="$(basename "$test_file")"
   echo ""
   echo "### Running ${suite}"
-  bash "$test_file"
+  # --kill-after: if the suite ignores the initial TERM (e.g. a runaway
+  # background child holding stdout, exactly issue #92's mechanism), force a
+  # KILL 10s later rather than waiting on it forever.
+  timeout --kill-after=10s "${SUITE_TIMEOUT_SECONDS}s" bash "$test_file"
   rc=$?
-  if [[ "$rc" -eq 0 ]]; then
+  if [[ "$rc" -eq "$TIMEOUT_EXIT_CODE" ]]; then
+    echo "FAIL: ${suite} did not finish within ${SUITE_TIMEOUT_SECONDS}s and was killed — a hang must fail, not idle (issue #92)."
+    failed=$((failed + 1))
+    overall_rc=1
+  elif [[ "$rc" -eq 0 ]]; then
     passed=$((passed + 1))
   elif [[ "$rc" -eq "$SKIP_EXIT_CODE" ]]; then
     skipped=$((skipped + 1))

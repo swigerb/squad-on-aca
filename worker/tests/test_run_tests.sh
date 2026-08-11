@@ -179,6 +179,44 @@ assert_contains "$out" "ran test_ok.sh" "default discovery: ran the co-located p
 assert_contains "$out" "Suites: 1 passed, 1 failed, 0 skipped." "default discovery: counts match the co-located suites"
 rm -rf "$dir"
 
+# --- issue #92: a hanging suite must fail, and fail fast, not idle ---------
+
+# 15a. A suite that hangs (never exits) must be killed and counted as a
+#      FAILURE, named by suite, once it exceeds its budget — not left to hang
+#      the whole runner/job. SQUAD_ACA_TEST_SUITE_TIMEOUT overrides the real
+#      120s default so this proves the mechanism in under two seconds.
+dir="$(make_fixture_dir)"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'echo "ran test_hangs.sh"\n'
+  printf 'sleep 9999\n'
+} > "${dir}/test_hangs.sh"
+chmod +x "${dir}/test_hangs.sh"
+out="$(SQUAD_ACA_TEST_DIR="$dir" SQUAD_ACA_TEST_SUITE_TIMEOUT=1 bash "$RUNNER" 2>&1)"
+rc=$?
+assert_eq "1" "$rc" "hanging suite: runner exits non-zero rather than hanging forever"
+assert_contains "$out" "ran test_hangs.sh" "hanging suite: the suite's own output before it hung is still visible"
+assert_contains "$out" "FAIL: test_hangs.sh did not finish within 1s and was killed" "hanging suite: names the suite that hung, not a generic timeout"
+assert_contains "$out" "Suites: 0 passed, 1 failed, 0 skipped." "hanging suite: counted as a failure, not silently dropped"
+assert_not_contains "$out" "$PASS_BANNER" "hanging suite: no success banner"
+rm -rf "$dir"
+
+# 15b. A hang must not mask a later suite's own real result — the runner keeps
+#      going past a killed suite rather than stopping.
+dir="$(make_fixture_dir)"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'sleep 9999\n'
+} > "${dir}/test_a_hangs.sh"
+chmod +x "${dir}/test_a_hangs.sh"
+make_suite "$dir" "test_b_ok.sh" 0
+out="$(SQUAD_ACA_TEST_DIR="$dir" SQUAD_ACA_TEST_SUITE_TIMEOUT=1 bash "$RUNNER" 2>&1)"
+rc=$?
+assert_eq "1" "$rc" "hang then pass: runner still exits non-zero overall"
+assert_contains "$out" "ran test_b_ok.sh" "hang then pass: the suite after the hang still runs"
+assert_contains "$out" "Suites: 1 passed, 1 failed, 0 skipped." "hang then pass: both outcomes are counted correctly"
+rm -rf "$dir"
+
 # --- lib/deps.sh contract ---------------------------------------------------
 
 # 11. A missing dependency produces a visible SKIP line and the skip exit code.

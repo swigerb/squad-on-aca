@@ -309,11 +309,25 @@ squad_lease_report() {
     --lease-key "$SQUAD_LEASE_KEY" "$@" >/dev/null 2>&1 || true
 }
 
+# Issue #92 (root cause of the intermittent CI hang, verified against the
+# heartbeat stop/restart behaviour #91 introduced in squad_credential_restore):
+# a step -- a GitHub Actions step, or any shell that pipes its output somewhere
+# -- ends when its OUTPUT PIPE CLOSES, not when the foreground script exits. A
+# background child that inherits stdout/stderr keeps that pipe open for as long
+# as the child lives, even after every visible command has finished. This loop
+# is exactly such a child: it is forked with `&` and, before this fix, wrote to
+# whatever stdout/stderr it was forked with -- the entrypoint's at session
+# start, and (via squad_credential_restore) the SAME inherited descriptors
+# again on every restart after a credential-withholding window. It never exits
+# on its own (`while true`), so any stdout it inherited stays open forever.
+# Redirecting INSIDE the function -- rather than trusting every call site to
+# remember to redirect -- means a future restart (there is already one, and
+# #91 shows there can be more) can never reintroduce this by omission.
 squad_lease_heartbeat_loop() {
   while true; do
     sleep "$SQUAD_LEASE_HEARTBEAT_SECONDS"
     squad_lease_report heartbeat
-  done
+  done >/dev/null 2>&1 </dev/null
 }
 
 squad_lease_finish() {
@@ -385,7 +399,10 @@ esac
 
 if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
   squad_lease_report heartbeat
-  squad_lease_heartbeat_loop &
+  # Redirected here too, in addition to inside squad_lease_heartbeat_loop
+  # itself (issue #92) -- belt and braces, so this call site is correct even
+  # if the function body is ever refactored.
+  squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &
   SQUAD_LEASE_HEARTBEAT_PID=$!
   trap squad_lease_finish EXIT
 fi

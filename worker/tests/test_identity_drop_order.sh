@@ -18,6 +18,12 @@
 
 set -uo pipefail
 
+# Issue #92 sprint 3: a cancelled/interrupted job with no self-announcing
+# tests gives no way to tell which suite it stopped in. This line is written
+# with `echo` (a raw write(), never libc stdio buffering) before any check
+# runs, so it is the first thing to appear even if the job is killed mid-suite.
+echo "== identity drop ORDER (issue #85 / #92) =="
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTRYPOINT="$SCRIPT_DIR/../entrypoint.sh"
 
@@ -37,7 +43,11 @@ line_of() { grep -n "$1" "$ENTRYPOINT" | head -1 | cut -d: -f1; }
 # --- the ordering, read out of the script ------------------------------------
 
 drop_call="$(line_of '^    squad_drop_azure_identity$')"
-heartbeat="$(line_of 'squad_lease_heartbeat_loop &')"
+# issue #92 added a stdio redirect to this call site
+# (`squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &`), so the exact
+# substring this used to match no longer appears; match the call regardless
+# of what redirects follow it, the same way test_no_orphan_children.sh does.
+heartbeat="$(line_of 'squad_lease_heartbeat_loop.*&$')"
 
 check "the identity is dropped BEFORE the lease heartbeat is spawned (drop @${drop_call:-?}, heartbeat @${heartbeat:-?})" \
   bash -c "[[ -n '${drop_call}' && -n '${heartbeat}' && ${drop_call:-0} -lt ${heartbeat:-0} ]]"
@@ -58,14 +68,15 @@ if [[ -r /proc/self/environ ]]; then
   IDENTITY_ENDPOINT='http://localhost:42356/msi/token' \
   IDENTITY_HEADER='SECRET-HEADER-VALUE' \
   bash -c '
-    sleep 30 &
+    sleep 30 >/dev/null 2>&1 </dev/null &
     early=$!
     unset IDENTITY_ENDPOINT IDENTITY_HEADER
-    sleep 30 &
+    sleep 30 >/dev/null 2>&1 </dev/null &
     late=$!
     tr "\0" "\n" < /proc/$early/environ | grep -c "^IDENTITY_HEADER=" > '"$probe"'/early || true
     tr "\0" "\n" < /proc/$late/environ  | grep -c "^IDENTITY_HEADER=" > '"$probe"'/late  || true
     kill $early $late 2>/dev/null
+    wait $early $late 2>/dev/null
   ' 2>/dev/null
 
   check "a child spawned BEFORE the unset still holds the credential (this is the bug)" \

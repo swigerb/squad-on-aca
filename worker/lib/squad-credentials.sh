@@ -394,8 +394,15 @@ squad_credential_restore() {
   # Restart the heartbeat AFTER the credential is verifiably back, so the new
   # child forks with the restored token file already in place and never with a
   # stale or absent one. Only if a lease is actually in play for this session.
+  #
+  # Issue #92: this restart is a SECOND opportunity for the background child
+  # to inherit whatever stdout/stderr this shell has at the moment -- the
+  # entrypoint's first fork is not the only one, and every fork of a
+  # `while true` loop that never exits must be redirected independently of
+  # what squad_lease_heartbeat_loop's own body does. Redirected here AND
+  # inside the function itself (belt and braces; see worker/entrypoint.sh).
   if [[ -n "${SQUAD_LEASE_KEY:-}" ]] && declare -f squad_lease_heartbeat_loop >/dev/null 2>&1; then
-    squad_lease_heartbeat_loop &
+    squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &
     SQUAD_LEASE_HEARTBEAT_PID=$!
   fi
   squad_credentials_log "Push credential restored after the agent exited."
