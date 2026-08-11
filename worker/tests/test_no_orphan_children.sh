@@ -47,9 +47,24 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/squad-no-orphan-test.XXXXXXXXXXXX")" || {
   exit 1
 }
 PROBE_PID=""
+# Recursively kill a process and every descendant (children, grandchildren,
+# ...). This suite forks driver scripts that themselves fork further
+# processes (e.g. a `sleep`, or a `cat` reading a FIFO); killing only the
+# PID this suite recorded (the immediate child) leaves those grandchildren
+# as orphans -- the exact bug class issue #92 is about. Best-effort: PIDs
+# that already exited are silently ignored.
+kill_tree() {
+  local pid="$1"
+  [[ -z "$pid" ]] && return 0
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    kill_tree "$child"
+  done
+  kill -KILL "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+}
 cleanup() {
-  [[ -n "$PROBE_PID" ]] && kill "$PROBE_PID" 2>/dev/null
-  [[ -n "$PROBE_PID" ]] && wait "$PROBE_PID" 2>/dev/null
+  [[ -n "$PROBE_PID" ]] && kill_tree "$PROBE_PID"
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -150,8 +165,7 @@ assert_eq "1" "$READER_FINISHED" \
   "the step's output pipe (a FIFO standing in for a GitHub Actions step's stdout) reaches EOF within a few seconds of the driver script returning, proving the REAL, redirected squad_lease_heartbeat_loop does not hold it open"
 assert_contains "$(cat "$READER_OUT" 2>/dev/null || true)" "driver done" \
   "the driver's own output made it through the pipe before it closed"
-kill "$READER_PID" 2>/dev/null
-wait "$READER_PID" 2>/dev/null
+kill_tree "$READER_PID"
 
 LOOP_PID="$(cat "${WORK}/loop.pid" 2>/dev/null || true)"
 assert_ne "" "$LOOP_PID" "the loop's PID was recorded"
@@ -191,8 +205,8 @@ assert_eq "0" "$BAD_READER_FINISHED" \
   "MUTATION PROOF (M-92-1): a heartbeat-shaped loop that does NOT redirect its stdio DOES keep the pipe open past the driver's own exit (the reader never reaches EOF within 5s) -- confirming the fix above is the thing actually preventing the hang, not an artifact of the harness"
 
 BAD_LOOP_PID="$(cat "${WORK}/bad-loop.pid" 2>/dev/null || true)"
-kill "$BAD_READER_PID" "$BAD_LOOP_PID" 2>/dev/null
-wait "$BAD_READER_PID" "$BAD_LOOP_PID" 2>/dev/null
+kill_tree "$BAD_READER_PID"
+kill_tree "$BAD_LOOP_PID"
 
 # ===========================================================================
 # 4. This suite itself leaves no orphan behind. The only child it started
@@ -202,12 +216,29 @@ wait "$BAD_READER_PID" "$BAD_LOOP_PID" 2>/dev/null
 #    by inspection, not just by accident of an empty `jobs -p`.
 # ===========================================================================
 if [[ -n "$PROBE_PID" ]]; then
-  kill "$PROBE_PID" 2>/dev/null
-  wait "$PROBE_PID" 2>/dev/null
+  kill_tree "$PROBE_PID"
   PROBE_PID=""
 fi
 remaining_jobs="$(jobs -p)"
 assert_eq "" "$remaining_jobs" \
   "no background job of this suite's own shell remains after explicit cleanup (expected: none; the heartbeat-loop probe and its synthetic mutation twin are the only children this suite ever starts, and both are reaped above)"
+
+# Direct process-table check, not just this shell's own job list: the
+# mutation-proof driver above forks a GRANDCHILD (`sleep 9999`, a
+# descendant of BAD_LOOP_PID, not a direct job of this shell), which
+# `jobs -p` alone would never see. WORK is a unique per-run temp path, so
+# grepping the process table for it catches anything -- reader, loop, or a
+# further descendant -- still alive under it.
+sleep 0.2
+leftover="$(pgrep -f "$WORK" 2>/dev/null | grep -v "^$$\$" || true)"
+assert_eq "" "$leftover" \
+  "no process (of any generation) referencing this suite's own temp directory survives cleanup — a survivor here is exactly the orphan tee/cat/sleep shape from issue #92's rejected proof run"
+# The mutation-proof's grandchild (`sleep 9999`, forked from a bash function
+# body rather than exec'd from a script) does not carry $WORK in its own
+# argv, so it needs its own explicit check independent of the path-based one
+# above.
+leftover_sleep="$(pgrep -f 'sleep 9999' 2>/dev/null || true)"
+assert_eq "" "$leftover_sleep" \
+  "no lingering 'sleep 9999' grandchild (the mutation-proof's unredirected_loop descendant) survives cleanup"
 
 test_summary
