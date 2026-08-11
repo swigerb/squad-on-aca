@@ -24,6 +24,8 @@
 
 set -uo pipefail
 
+echo "== UID separation between ralph and agent-running modes (PC-2 / issue #86) =="
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DOCKERFILE="$WORKER_DIR/Dockerfile"

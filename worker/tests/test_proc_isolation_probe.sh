@@ -7,6 +7,8 @@
 # assertion below.
 set -uo pipefail
 
+echo "== process isolation probe (PC-1 / issue #86) =="
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROBE="$SCRIPT_DIR/../lib/proc-isolation-probe.sh"
 
