@@ -361,6 +361,151 @@ assert_contains "$fatal_restore_out" "FATAL: no withheld credential is available
   "the fatal restore path names the specific failure, not a generic error"
 
 # ===========================================================================
+# 5b. Security follow-up (issue #84 blocker): the Copilot credential plane
+#     (COPILOT_GITHUB_TOKEN) is covered by withholding whenever it carries the
+#     SAME push-capable value as the git token -- not just GH_TOKEN/GITHUB_TOKEN.
+#     Withholding GH_TOKEN alone left a differently-named, equally
+#     push-capable credential visible to the agent; these assertions prove it
+#     no longer does, and that a genuinely SEPARATE Copilot credential is
+#     left untouched.
+# ===========================================================================
+echo "-- Security follow-up: Copilot token withholding --"
+
+COPILOT_SHARED_TOKEN="$LIVE_TOKEN"
+COPILOT_DISTINCT_TOKEN="copilot-only-token-distinct-zzzzzzzzzz"
+
+# 5b-i. Derived/shared case: COPILOT_GITHUB_TOKEN equals the git token.
+export COPILOT_GITHUB_TOKEN="$COPILOT_SHARED_TOKEN"
+export SQUAD_COPILOT_TOKEN_PROVENANCE="derived"
+unset SQUAD_ALLOW_SHARED_COPILOT_TOKEN
+squad_credential_withhold
+assert_eq "" "${COPILOT_GITHUB_TOKEN:-}" \
+  "withheld (shared/derived): COPILOT_GITHUB_TOKEN is unset in the shell an agent process would inherit"
+# MUTATION PROOF M12 target: removing the Copilot-token unset from
+# squad_credential_withhold makes the assertion above fail -- COPILOT_GITHUB_TOKEN
+# would still equal the withheld push token in the agent's environment.
+squad_credential_restore
+assert_eq "$COPILOT_SHARED_TOKEN" "${COPILOT_GITHUB_TOKEN:-}" \
+  "restored (shared/derived): COPILOT_GITHUB_TOKEN is back to the withheld value"
+# MUTATION PROOF M15 target: removing the Copilot-token restore block from
+# squad_credential_restore makes the assertion above fail -- COPILOT_GITHUB_TOKEN
+# would remain empty/unrestored after restore() returns.
+
+# 5b-ii. Explicit, distinct Copilot credential: never touched by withholding.
+export COPILOT_GITHUB_TOKEN="$COPILOT_DISTINCT_TOKEN"
+export SQUAD_COPILOT_TOKEN_PROVENANCE="explicit"
+unset SQUAD_ALLOW_SHARED_COPILOT_TOKEN
+squad_credential_withhold
+assert_eq "$COPILOT_DISTINCT_TOKEN" "${COPILOT_GITHUB_TOKEN:-}" \
+  "withheld (explicit, distinct): COPILOT_GITHUB_TOKEN is preserved -- it is not the git push credential"
+# MUTATION PROOF M13 target: inverting the equality check in
+# squad_copilot_token_is_shared (== -> !=) makes THIS assertion fail (the
+# distinct token would be wrongly withheld here) while ALSO making the 5b-i
+# "COPILOT_GITHUB_TOKEN is unset" assertion above fail in the other direction
+# (the shared token would no longer be withheld) -- flipping the equality
+# breaks both cases at once, in opposite directions.
+squad_credential_restore
+assert_eq "$COPILOT_DISTINCT_TOKEN" "${COPILOT_GITHUB_TOKEN:-}" \
+  "restored (explicit, distinct): COPILOT_GITHUB_TOKEN is unchanged -- restore is a no-op for a token that was never withheld"
+
+# 5b-iii. Escape hatch: explicit, logged acceptance of a weakened boundary.
+export COPILOT_GITHUB_TOKEN="$COPILOT_SHARED_TOKEN"
+export SQUAD_COPILOT_TOKEN_PROVENANCE="derived"
+export SQUAD_ALLOW_SHARED_COPILOT_TOKEN="true"
+squad_credential_withhold
+assert_eq "$COPILOT_SHARED_TOKEN" "${COPILOT_GITHUB_TOKEN:-}" \
+  "withheld (escape hatch): a shared Copilot token stays exported when SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true"
+squad_credential_restore
+unset SQUAD_ALLOW_SHARED_COPILOT_TOKEN
+
+# 5b-iv. Value-scan the FULL exported environment: whatever the assertions
+# above claim individually, no exported variable may equal the withheld push
+# token during the withheld window -- Security's blocker was exactly that a
+# DIFFERENTLY-NAMED variable held the same value. Scanned generically rather
+# than by name, so a future variable carrying the same credential would also
+# be caught.
+export COPILOT_GITHUB_TOKEN="$COPILOT_SHARED_TOKEN"
+export SQUAD_COPILOT_TOKEN_PROVENANCE="derived"
+unset SQUAD_ALLOW_SHARED_COPILOT_TOKEN
+squad_credential_withhold
+leak_vars="$(env | awk -F= -v tok="$COPILOT_SHARED_TOKEN" '$0 ~ ("=" tok "$") { print $1 }')"
+assert_eq "" "$leak_vars" \
+  "withheld (value-scan): no exported environment variable equals the withheld push token"
+squad_credential_restore
+
+echo "-- Security follow-up: fail-closed gate before the agent starts --"
+
+# run_gate <gh-token> <copilot-token> <provenance> [allow]
+#
+# Mirrors what worker/entrypoint.sh does: the gate is asked BEFORE
+# squad_credential_withhold is ever called. Run in a subshell with EXIT/INT/
+# TERM traps stripped (same pattern as the fatal-restore probe above) so the
+# gate's own `exit 78` doesn't tear down this test process.
+run_gate() {
+  local gh_token="$1" copilot_token="$2" provenance="$3" allow="${4:-}"
+  (
+    trap - EXIT INT TERM
+    export GH_TOKEN="$gh_token"
+    export COPILOT_GITHUB_TOKEN="$copilot_token"
+    export SQUAD_COPILOT_TOKEN_PROVENANCE="$provenance"
+    if [[ -n "$allow" ]]; then
+      export SQUAD_ALLOW_SHARED_COPILOT_TOKEN="$allow"
+    else
+      unset SQUAD_ALLOW_SHARED_COPILOT_TOKEN
+    fi
+    squad_copilot_shared_token_gate
+    echo "GATE_PASSED"
+  ) 2>&1
+}
+
+gate_shared_no_escape="$(run_gate "$LIVE_TOKEN" "$LIVE_TOKEN" "derived")"
+gate_shared_no_escape_rc=$?
+assert_ne "0" "$gate_shared_no_escape_rc" \
+  "gate: a shared/derived Copilot token with no escape hatch fails closed (non-zero) BEFORE the agent starts"
+assert_eq "78" "$gate_shared_no_escape_rc" \
+  "gate: the fail-closed exit code matches the entrypoint's other config-fault exits (78)"
+assert_contains "$gate_shared_no_escape" "FATAL" "gate: the fail-closed path names the failure as FATAL"
+assert_contains "$gate_shared_no_escape" "separately scoped" \
+  "gate: the fatal message names the need for a separately scoped Copilot credential"
+assert_not_contains "$gate_shared_no_escape" "GATE_PASSED" \
+  "gate: execution never reaches past the gate for a shared token with no escape hatch"
+# MUTATION PROOF M14 target: removing the `exit 78` (or the whole fatal
+# branch) from squad_copilot_shared_token_gate makes gate_shared_no_escape_rc
+# 0 and prints GATE_PASSED, failing the assertions immediately above.
+
+gate_shared_false_string="$(run_gate "$LIVE_TOKEN" "$LIVE_TOKEN" "derived" "false")"
+gate_shared_false_rc=$?
+assert_eq "78" "$gate_shared_false_rc" \
+  "gate: SQUAD_ALLOW_SHARED_COPILOT_TOKEN=false does NOT enable the escape hatch -- only the literal string 'true' does"
+
+gate_shared_unset="$(run_gate "$LIVE_TOKEN" "$LIVE_TOKEN" "derived" "")"
+gate_shared_unset_rc=$?
+assert_eq "78" "$gate_shared_unset_rc" \
+  "gate: an UNSET SQUAD_ALLOW_SHARED_COPILOT_TOKEN fails closed -- the escape hatch is never the default"
+# MUTATION PROOF M16 target: changing squad_copilot_shared_token_gate's escape
+# hatch check from `[[ "${SQUAD_ALLOW_SHARED_COPILOT_TOKEN:-}" == "true" ]]`
+# to a form that defaults to enabled when unset (e.g. `!= "false"`) makes
+# gate_shared_unset_rc 0 instead of 78, failing the assertion above.
+
+gate_shared_escape="$(run_gate "$LIVE_TOKEN" "$LIVE_TOKEN" "derived" "true")"
+gate_shared_escape_rc=$?
+assert_eq "0" "$gate_shared_escape_rc" \
+  "gate: SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true proceeds (the explicit, documented escape hatch)"
+assert_contains "$gate_shared_escape" "WARNING" \
+  "gate: the escape hatch path is logged as a WARNING, never silent"
+assert_contains "$gate_shared_escape" "GATE_PASSED" \
+  "gate: execution reaches past the gate once the escape hatch is explicitly set"
+
+gate_distinct="$(run_gate "$LIVE_TOKEN" "$COPILOT_DISTINCT_TOKEN" "explicit")"
+gate_distinct_rc=$?
+assert_eq "0" "$gate_distinct_rc" \
+  "gate: an explicit, distinct Copilot credential never trips the gate -- it is not the git push credential"
+assert_contains "$gate_distinct" "GATE_PASSED" \
+  "gate: execution reaches past the gate for a genuinely distinct Copilot credential"
+
+unset COPILOT_GITHUB_TOKEN SQUAD_COPILOT_TOKEN_PROVENANCE SQUAD_ALLOW_SHARED_COPILOT_TOKEN
+
+# ===========================================================================
 # 6. entrypoint.sh wiring: withhold/restore are actually called, in order,
 #    around the agent invocation, and restore precedes commit_and_push_if_needed.
 # ===========================================================================
@@ -377,16 +522,21 @@ for block_name in "prompt:${PROMPT_BLOCK}" "new-project:${NEWPROJ_BLOCK}"; do
     "${name} mode checks whether the credential should be withheld"
   assert_contains "$block" "squad_credential_withhold"        "${name} mode calls squad_credential_withhold"
   assert_contains "$block" "squad_credential_restore"         "${name} mode calls squad_credential_restore"
+  assert_contains "$block" "squad_copilot_shared_token_gate"  "${name} mode calls squad_copilot_shared_token_gate"
 
-  # ORDERING, read directly from the file: withhold before the agent call,
-  # restore after it, and restore before commit_and_push_if_needed. Grepping
-  # line numbers rather than trusting prose, exactly as test_identity_drop.sh
-  # already does for squad_drop_azure_identity vs the first agent invocation.
+  # ORDERING, read directly from the file: the shared-token gate before
+  # withhold, withhold before the agent call, restore after it, and restore
+  # before commit_and_push_if_needed. Grepping line numbers rather than
+  # trusting prose, exactly as test_identity_drop.sh already does for
+  # squad_drop_azure_identity vs the first agent invocation.
+  gate_line="$(printf '%s\n' "$block" | grep -n 'squad_copilot_shared_token_gate$' | head -1 | cut -d: -f1)"
   withhold_line="$(printf '%s\n' "$block" | grep -n 'squad_credential_withhold$' | head -1 | cut -d: -f1)"
   restore_line="$(printf '%s\n' "$block" | grep -n 'squad_credential_restore$' | head -1 | cut -d: -f1)"
   agent_line="$(printf '%s\n' "$block" | grep -n 'squad_hub_run\|copilot -p' | head -1 | cut -d: -f1)"
   publish_line="$(printf '%s\n' "$block" | grep -n '^ *commit_and_push_if_needed$' | head -1 | cut -d: -f1)"
 
+  assert_eq "1" "$([[ -n "$gate_line" && -n "$withhold_line" && "$gate_line" -lt "$withhold_line" ]] && echo 1 || echo 0)" \
+    "${name} mode: the shared-token gate runs BEFORE withholding (and therefore before the agent)"
   assert_eq "1" "$([[ -n "$withhold_line" && -n "$agent_line" && "$withhold_line" -lt "$agent_line" ]] && echo 1 || echo 0)" \
     "${name} mode: withhold happens BEFORE the agent is invoked"
   assert_eq "1" "$([[ -n "$agent_line" && -n "$restore_line" && "$agent_line" -lt "$restore_line" ]] && echo 1 || echo 0)" \

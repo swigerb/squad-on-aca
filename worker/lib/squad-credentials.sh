@@ -232,6 +232,56 @@ squad_credential_refresh_env() {
 SQUAD_CREDENTIAL_WITHHELD_TOKEN=""
 SQUAD_CREDENTIAL_IS_WITHHELD=0
 
+# Security follow-up (issue #84 blocker): withholding GH_TOKEN/GITHUB_TOKEN
+# alone left COPILOT_GITHUB_TOKEN visible to the agent whenever
+# worker/entrypoint.sh had defaulted it from GH_TOKEN (the default deployment
+# shape -- see docs/security-report.md's "Open finding"). A push-capable
+# credential under a different variable name is still a push-capable
+# credential. squad_credential_withhold now also caches and unsets
+# COPILOT_GITHUB_TOKEN whenever its value equals the git token being
+# withheld -- the SAME non-exported-variable technique, so it never reaches a
+# child process either. A COPILOT_GITHUB_TOKEN that is a genuinely DIFFERENT,
+# separately scoped credential (an explicit, distinct value) is left alone:
+# it is not the credential this control exists to hide.
+SQUAD_CREDENTIAL_WITHHELD_COPILOT_TOKEN=""
+SQUAD_CREDENTIAL_COPILOT_IS_WITHHELD=0
+
+# True when COPILOT_GITHUB_TOKEN's CURRENT value is identical to GH_TOKEN's.
+# This is a plain value comparison, not a re-derivation of
+# SQUAD_COPILOT_TOKEN_PROVENANCE: a token recorded as "explicit" at
+# entrypoint startup (worker/entrypoint.sh) can still happen to equal the git
+# token, and R2 requires that case to be withheld too -- provenance alone
+# would let it slip through.
+squad_copilot_token_is_shared() {
+  [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]] || return 1
+  [[ -n "${GH_TOKEN:-}" ]] || return 1
+  [[ "$COPILOT_GITHUB_TOKEN" == "$GH_TOKEN" ]]
+}
+
+# Fail closed BEFORE the agent starts when an untrusted-input session's
+# COPILOT_GITHUB_TOKEN is the same value as the git push token about to be
+# withheld. Withholding GH_TOKEN/GITHUB_TOKEN alone does not close the
+# exposure Security flagged if the agent can still read an equally
+# push-capable token out of COPILOT_GITHUB_TOKEN. Called only from the
+# `squad_credential_should_withhold` branches in worker/entrypoint.sh, i.e.
+# only for the untrusted prompt/new-project sessions this control applies to.
+#
+# The ONE escape hatch is SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true, and it is
+# deliberately not a silent downgrade: it is logged as a WARNING here, and
+# `resolveCredentialProfile` in worker/lib/agent-policy.js reports
+# `copilotTokenSharedAllowed: true` / a weakened `reason` string in the
+# credential profile so the policy report never claims an unqualified
+# `withheld: true` while a shared Copilot token stays exported.
+squad_copilot_shared_token_gate() {
+  squad_copilot_token_is_shared || return 0
+  if [[ "${SQUAD_ALLOW_SHARED_COPILOT_TOKEN:-}" == "true" ]]; then
+    squad_credentials_log "WARNING: COPILOT_GITHUB_TOKEN carries the same push-capable value as the git token for this untrusted-input session (provenance: ${SQUAD_COPILOT_TOKEN_PROVENANCE:-unknown}), and SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true was set. Proceeding with a WEAKENED credential boundary: the Copilot plane keeps a push-capable token exported to the agent."
+    return 0
+  fi
+  squad_credentials_log "FATAL: this untrusted-input session's COPILOT_GITHUB_TOKEN carries the same push-capable value as the git token (provenance: ${SQUAD_COPILOT_TOKEN_PROVENANCE:-unknown}). Withholding the git credential alone would not close this exposure. Supply a separately scoped Copilot credential (a fine-grained PAT distinct from the git push token) via COPILOT_GITHUB_TOKEN, or set SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true to proceed anyway with that documented, weakened boundary. Refusing to start the agent."
+  exit 78
+}
+
 # Remove the token file from disk. Idempotent; used both by withholding and by
 # anything that wants "no credential on disk" as a precondition.
 squad_credential_remove_token_file() {
@@ -272,6 +322,23 @@ squad_credential_withhold() {
   fi
 
   SQUAD_CREDENTIAL_WITHHELD_TOKEN="$(squad_credential_read_token 2>/dev/null || true)"
+
+  # Security follow-up (issue #84 blocker): COPILOT_GITHUB_TOKEN must be
+  # withheld too whenever it carries the same value as the git token --
+  # checked (and cached) BEFORE GH_TOKEN is unset below, since the comparison
+  # needs both values live. A genuinely distinct Copilot credential is left
+  # untouched. `squad_copilot_shared_token_gate` has already refused to reach
+  # this point for a shared token with no escape hatch, so the
+  # SQUAD_ALLOW_SHARED_COPILOT_TOKEN check here is defense in depth, not the
+  # only gate -- it is what keeps this function correct even if called
+  # directly.
+  SQUAD_CREDENTIAL_COPILOT_IS_WITHHELD=0
+  if squad_copilot_token_is_shared && [[ "${SQUAD_ALLOW_SHARED_COPILOT_TOKEN:-}" != "true" ]]; then
+    SQUAD_CREDENTIAL_WITHHELD_COPILOT_TOKEN="$COPILOT_GITHUB_TOKEN"
+    unset COPILOT_GITHUB_TOKEN
+    SQUAD_CREDENTIAL_COPILOT_IS_WITHHELD=1
+  fi
+
   unset GH_TOKEN GITHUB_TOKEN
   squad_credential_remove_token_file
   squad_credential_uninstall_helper
@@ -303,6 +370,24 @@ squad_credential_restore() {
     squad_credentials_log "FATAL: could not refresh GH_TOKEN/GITHUB_TOKEN while restoring the withheld credential."
     exit 78
   fi
+
+  # Security follow-up (issue #84 blocker): restore COPILOT_GITHUB_TOKEN
+  # symmetrically with the git token above -- same fatal-on-failure shape, so
+  # a restore that cannot bring the Copilot credential back is never silently
+  # treated as "close enough" (the agent has already exited by this point, so
+  # there is no more agent-visibility reason to keep it withheld; staying
+  # withheld here would only reproduce issue #32's late-failure shape for
+  # whatever downstream step needs it next).
+  if [[ "$SQUAD_CREDENTIAL_COPILOT_IS_WITHHELD" -eq 1 ]]; then
+    if [[ -z "$SQUAD_CREDENTIAL_WITHHELD_COPILOT_TOKEN" ]]; then
+      squad_credentials_log "FATAL: no withheld Copilot credential is available to restore."
+      exit 78
+    fi
+    export COPILOT_GITHUB_TOKEN="$SQUAD_CREDENTIAL_WITHHELD_COPILOT_TOKEN"
+    SQUAD_CREDENTIAL_WITHHELD_COPILOT_TOKEN=""
+    SQUAD_CREDENTIAL_COPILOT_IS_WITHHELD=0
+  fi
+
   SQUAD_CREDENTIAL_WITHHELD_TOKEN=""
   SQUAD_CREDENTIAL_IS_WITHHELD=0
 

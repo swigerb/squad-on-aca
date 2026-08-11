@@ -89,7 +89,7 @@ The worker uses a git credential helper that re-reads a `0600` token file on eve
 | `worker/tests/test_credentials.sh` | Helper and token file against a local smart-HTTP remote. |
 | `worker/tests/test_token_preflight.sh` | Lifetime versus estimated run duration and live credential probe. |
 | `worker/tests/test_push.sh` | Exit-code propagation and retry-after-refresh path. |
-| `worker/tests/test_credential_withholding.sh` | Partial credential withholding for untrusted `prompt`/`new-project` entrypoints (issue #84): no push credential or working helper while the agent runs, restore before publish, heartbeat never straddles the withhold/restore boundary, and a restore with no withheld token is fatal. |
+| `worker/tests/test_credential_withholding.sh` | Partial credential withholding for untrusted `prompt`/`new-project` entrypoints (issue #84): no push credential or working helper while the agent runs, restore before publish, heartbeat never straddles the withhold/restore boundary, and a restore with no withheld token is fatal. Also covers the shared-`COPILOT_GITHUB_TOKEN` follow-up (see below): the token is withheld only when it equals the git push token, restored symmetrically and fatally, an explicit-distinct value is preserved, a full-environment value-scan finds no exported variable equal to the withheld push token, and `squad_copilot_shared_token_gate` fails closed before the agent starts unless `SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true`. |
 
 Run the worker suite on Linux:
 
@@ -101,7 +101,24 @@ bash worker/tests/run-tests.sh
 
 | Suite | What it exercises |
 |---|---|
-| `worker/tests/test_agent_policy.sh` | The `POLICY_MATRIX` built by `buildPolicyMatrix()` agrees, cell by cell, with a freshly resolved policy for every `KNOWN_SOURCES` x `KNOWN_MODES` combination; the trust axis (only `local-cli` trusted) is orthogonal to the attended/autonomous tier and narrows untrusted sources without touching `local-cli`'s effective policy; `UNTRUSTED_INPUT_DENY_TOOLS` never denies bare `git`/`gh`/`npm`/`pip`; space-bearing deny patterns are deliverable on argv/hub-json paths and undeliverable on the `squad watch` path; credential-withholding profiles per source/mode. |
+| `worker/tests/test_agent_policy.sh` | The `POLICY_MATRIX` built by `buildPolicyMatrix()` agrees, cell by cell, with a freshly resolved policy for every `KNOWN_SOURCES` x `KNOWN_MODES` combination; the trust axis (only `local-cli` trusted) is orthogonal to the attended/autonomous tier and narrows untrusted sources without touching `local-cli`'s effective policy; `UNTRUSTED_INPUT_DENY_TOOLS` never denies bare `git`/`gh`/`npm`/`pip`; space-bearing deny patterns are deliverable on argv/hub-json paths and undeliverable on the `squad watch` path; credential-withholding profiles per source/mode; the `copilotTokenEnv`/`copilotTokenShared`/`copilotTokenSharedAllowed` credential-profile fields across the matrix (derived/explicit-equal/explicit-distinct/escape-hatch cases resolved from a live environment via `resolvePolicyFromEnv`), and a matrix-wide invariant that `withheld:true` never co-occurs with an unqualified exported shared Copilot token. |
+
+## Closing the Copilot-token gap in partial withholding (issue #84 follow-up)
+
+The default deployment shape sets `COPILOT_GITHUB_TOKEN` to `GH_TOKEN` when no distinct value is supplied, so the original withholding above (which only cleared `GH_TOKEN`/`GITHUB_TOKEN`) left that shared, push-capable value exported under `COPILOT_GITHUB_TOKEN` while an untrusted agent ran. This is closed by provenance recording in `worker/entrypoint.sh`, symmetric withhold/restore of `COPILOT_GITHUB_TOKEN` in `worker/lib/squad-credentials.sh`, a fail-closed `squad_copilot_shared_token_gate` ahead of `squad_credential_withhold` in the `prompt`/`new-project` entrypoint blocks (bypassable only via `SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true`), and the new `agent-policy.js` credential-profile fields above. See `docs/architecture.md`'s "Closing the Copilot-token gap in partial withholding" section for the design.
+
+Mutation-proof targets covered by `worker/tests/test_credential_withholding.sh` (each fails a named, distinct assertion if the mutation were applied — restored in tests with explicit backups, never `git checkout`):
+
+| Target | Mutation | Assertion that fails |
+|---|---|---|
+| M12 | Drop the Copilot-token unset from `squad_credential_withhold()` | The full-environment value-scan finds `COPILOT_GITHUB_TOKEN` still equal to the withheld push token while the agent runs. |
+| M13 | Invert the shared/distinct equality check | An explicit-distinct `COPILOT_GITHUB_TOKEN` gets withheld (it should survive), or a derived/equal one is left exported (it should not). |
+| M14 | Remove the fail-closed gate | `squad_copilot_shared_token_gate` no longer exits 78 for an untrusted `prompt`/`new-project` session with a shared token and no escape hatch. |
+| M15 | Skip the Copilot token restore step | Post-agent, `COPILOT_GITHUB_TOKEN` remains unset/absent instead of being restored before publish. |
+| M16 | Default the escape hatch to on | `SQUAD_ALLOW_SHARED_COPILOT_TOKEN` unset/empty/`false` no longer fails closed; the gate test asserts only the literal string `true` bypasses it. |
+
+The pre-existing M1–M11 mutation-proof targets and their assertions in `test_credential_withholding.sh` and `test_agent_policy.sh` are unchanged by this work.
+
 | `worker/tests/test_dispatch_registry_exhaustiveness.sh` | Scans every production dispatcher (excluding test directories) for literal `SQUAD_DISPATCH_SOURCE=`/`SQUAD_MODE=` assignments and fails if any names a source or mode absent from `agent-policy.js`'s registry — a new dispatcher cannot silently bypass the matrix. |
 | `worker/tests/test_squad_hub.sh` | Trust-conditioned hub policy: untrusted sources' `hub-argv-json` carries the narrowed untrusted deny patterns; `local-cli`'s does not. |
 

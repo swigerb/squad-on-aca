@@ -252,12 +252,32 @@ function resolveTrust(dispatchSource) {
  *                     for `ralph`, matching squad_drop_azure_identity in
  *                     worker/entrypoint.sh, which removes it for every other
  *                     mode before any child process starts.
+ *   copilotTokenShared     COPILOT_GITHUB_TOKEN carries the SAME push-capable
+ *                          value as the git token, rather than a separately
+ *                          scoped Copilot credential. Computed from the live
+ *                          environment by `resolvePolicyFromEnv`; a caller
+ *                          (including the static matrix) that omits it gets
+ *                          the honest worst-case default (`true`) rather than
+ *                          an optimistic guess.
+ *   copilotTokenSharedAllowed  the escape hatch (SQUAD_ALLOW_SHARED_COPILOT_TOKEN
+ *                          =true) was used to explicitly accept running with a
+ *                          shared Copilot token still exported. Never true
+ *                          unless the session is both withheld and shared --
+ *                          it is not a general "escape hatch was set" flag.
+ *   copilotTokenEnv        COPILOT_GITHUB_TOKEN is present in the agent's own
+ *                          environment for this call.
  *
- * For an UNTRUSTED session in a CREDENTIAL_WITHHOLD_MODES mode, the first
- * three are all false FOR THE DURATION OF THE AGENT CALL ONLY: entrypoint.sh
- * restores them before commit_and_push_if_needed runs, which is why a session
- * still ends with a branch and a pull request. See squad_credential_withhold /
- * squad_credential_restore in worker/lib/squad-credentials.sh.
+ * For an UNTRUSTED session in a CREDENTIAL_WITHHOLD_MODES mode, ghTokenEnv/
+ * gitTokenFile/credentialHelper are all false FOR THE DURATION OF THE AGENT
+ * CALL ONLY: entrypoint.sh restores them before commit_and_push_if_needed
+ * runs, which is why a session still ends with a branch and a pull request.
+ * See squad_credential_withhold / squad_credential_restore in
+ * worker/lib/squad-credentials.sh. copilotTokenEnv follows the SAME rule
+ * whenever the Copilot token is the shared/derived value (Security's blocker:
+ * a push-capable COPILOT_GITHUB_TOKEN must not remain visible just because
+ * withholding only touched GH_TOKEN/GITHUB_TOKEN) -- `withheld: true` is never
+ * reported while a shared Copilot token is still exported to the agent; see
+ * `copilotTokenSharedAllowed` for the one explicit, logged exception.
  *
  * This is withholding, not separation: the agent runs under the same uid that
  * later performs the push, so a sufficiently determined agent process could
@@ -275,17 +295,65 @@ function resolveCredentialProfile(input) {
   const mode = normalize(opts.mode);
   const { trust } = resolveTrust(opts.dispatchSource);
   const withheld = trust === TRUST_UNTRUSTED && CREDENTIAL_WITHHOLD_MODES.includes(mode);
+
+  // Issue #84 follow-up (Security blocker): whether COPILOT_GITHUB_TOKEN
+  // carries the SAME push-capable value as the git token, rather than a
+  // separately scoped Copilot credential. `worker/entrypoint.sh` defaults
+  // COPILOT_GITHUB_TOKEN from GH_TOKEN when no distinct value is supplied
+  // (recorded there as SQUAD_COPILOT_TOKEN_PROVENANCE), so the DEFAULT
+  // deployment shape is shared. This function stays a pure function of its
+  // input object (see the file-level "DETERMINISM IS THE CONTRACT" note): it
+  // never reads the environment itself. `resolvePolicyFromEnv` is what
+  // computes this from the live GH_TOKEN/COPILOT_GITHUB_TOKEN values; callers
+  // that omit it (the static matrix included) get the honest worst-case
+  // default rather than a silently optimistic one.
+  const copilotTokenShared = opts.copilotTokenShared === undefined ? true : !!opts.copilotTokenShared;
+
+  // Whether the escape hatch (SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true) was used
+  // to explicitly accept running an untrusted-input session with a shared
+  // Copilot token still exported. Never defaults to true -- an unset/absent
+  // value is "not allowed", matching the fail-closed shape everywhere else in
+  // this file.
+  const copilotTokenSharedAllowed = withheld && copilotTokenShared && !!opts.copilotTokenSharedAllowed;
+
+  // Whether COPILOT_GITHUB_TOKEN is present in the agent's own environment
+  // during the agent call. Withholding now covers the Copilot plane too when
+  // it carries the shared/derived value (see squad_credential_withhold in
+  // worker/lib/squad-credentials.sh), so it is NOT exported while withheld --
+  // unless the escape hatch explicitly kept it, which is reported here rather
+  // than silently folded into "withheld".  A token that is a genuinely
+  // DIFFERENT, separately scoped credential is never touched by withholding
+  // and stays present regardless of `withheld`.
+  const copilotTokenEnv = !(withheld && copilotTokenShared && !copilotTokenSharedAllowed);
+
+  let reason;
+  if (withheld && copilotTokenShared && copilotTokenSharedAllowed) {
+    reason =
+      `mode '${mode}' runs an untrusted-input prompt to completion before publishing; the git push ` +
+      'credential is withheld, but SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true keeps the shared/derived ' +
+      'COPILOT_GITHUB_TOKEN exported to the agent -- a documented, explicitly-accepted WEAKENED ' +
+      'credential boundary, not full withholding';
+  } else if (withheld) {
+    reason =
+      `mode '${mode}' runs an untrusted-input prompt to completion before publishing; the push ` +
+      'credential (including a shared/derived COPILOT_GITHUB_TOKEN, when present) is withheld from ' +
+      'the agent and restored before the push';
+  } else if (mode === 'ralph') {
+    reason = `mode '${mode}' is the only mode that calls Azure and keeps its identity`;
+  } else {
+    reason = 'credential wiring is unchanged for this mode/source';
+  }
+
   return {
     ghTokenEnv: !withheld,
     gitTokenFile: !withheld,
     credentialHelper: !withheld,
+    copilotTokenEnv,
+    copilotTokenShared,
+    copilotTokenSharedAllowed,
     azureIdentity: mode === 'ralph',
     withheld,
-    reason: withheld
-      ? `mode '${mode}' runs an untrusted-input prompt to completion before publishing; the push credential is withheld from the agent and restored before the push`
-      : mode === 'ralph'
-        ? `mode '${mode}' is the only mode that calls Azure and keeps its identity`
-        : 'credential wiring is unchanged for this mode/source',
+    reason,
   };
 }
 
@@ -541,6 +609,12 @@ function validateExtraFlags(tokens) {
  * @param {string} input.enableGithubRemote ENABLE_GITHUB_REMOTE ("true"/"false")
  * @param {string} input.extraFlags        SQUAD_COPILOT_FLAGS
  * @param {string} input.executionPlane    SQUAD_EXECUTION_MODE ("sandbox" or "")
+ * @param {boolean} [input.copilotTokenShared]        whether COPILOT_GITHUB_TOKEN
+ *   equals the git token. Omit to get the honest worst-case default (`true`);
+ *   see resolveCredentialProfile.
+ * @param {boolean} [input.copilotTokenSharedAllowed] whether
+ *   SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true was set to explicitly accept a
+ *   shared Copilot token remaining exported.
  */
 function resolvePolicy(input) {
   const opts = input || {};
@@ -549,6 +623,8 @@ function resolvePolicy(input) {
   const credentialProfile = resolveCredentialProfile({
     mode: opts.mode,
     dispatchSource: opts.dispatchSource,
+    copilotTokenShared: opts.copilotTokenShared,
+    copilotTokenSharedAllowed: opts.copilotTokenSharedAllowed,
   });
 
   const denyTools = COMMON_DENY_TOOLS.slice();
@@ -657,15 +733,35 @@ function resolvePolicy(input) {
 /**
  * Read the same policy out of a process environment map. Kept separate from
  * resolvePolicy so the pure function stays pure and testable.
+ *
+ * Issue #84 follow-up: this is the ONE place that turns the live
+ * GH_TOKEN/COPILOT_GITHUB_TOKEN values into the `copilotTokenShared` fact
+ * resolveCredentialProfile needs -- resolvePolicy itself never reads the
+ * environment (see "DETERMINISM IS THE CONTRACT" above). A provenance of
+ * `derived` (worker/entrypoint.sh defaulted COPILOT_GITHUB_TOKEN from
+ * GH_TOKEN) is shared by construction even if the two values were since
+ * mutated independently; otherwise shared-ness is a plain value comparison.
+ * Neither token being present is NOT "not shared" -- it falls through to
+ * resolveCredentialProfile's own honest-worst-case default.
  */
 function resolvePolicyFromEnv(env) {
   const e = env || {};
+  const gitToken = e.GH_TOKEN || e.GITHUB_TOKEN;
+  const copilotToken = e.COPILOT_GITHUB_TOKEN;
+  let copilotTokenShared;
+  if (e.SQUAD_COPILOT_TOKEN_PROVENANCE === 'derived') {
+    copilotTokenShared = true;
+  } else if (copilotToken !== undefined && gitToken !== undefined) {
+    copilotTokenShared = copilotToken === gitToken;
+  }
   return resolvePolicy({
     mode: e.SQUAD_MODE,
     dispatchSource: e.SQUAD_DISPATCH_SOURCE,
     enableGithubRemote: e.ENABLE_GITHUB_REMOTE,
     extraFlags: e.SQUAD_COPILOT_FLAGS,
     executionPlane: e.SQUAD_EXECUTION_MODE,
+    copilotTokenShared,
+    copilotTokenSharedAllowed: normalize(e.SQUAD_ALLOW_SHARED_COPILOT_TOKEN) === 'true',
   });
 }
 
@@ -679,7 +775,10 @@ function resolvePolicyFromEnv(env) {
  * enableGithubRemote/extraFlags/executionPlane are held at neutral defaults
  * ('true' / '' / 'aca-job') for every cell: this table is about what varies by
  * MODE and SOURCE, and holding the other inputs constant is what makes every
- * row comparable to every other row.
+ * row comparable to every other row. copilotTokenShared is likewise held at
+ * its honest worst-case default (`true`, the documented default deployment
+ * shape) rather than an optimistic guess, so the matrix never UNDERSTATES the
+ * credential exposure of a withheld cell.
  */
 function buildPolicyMatrix() {
   const rows = [];
@@ -691,6 +790,8 @@ function buildPolicyMatrix() {
         enableGithubRemote: 'true',
         extraFlags: '',
         executionPlane: 'aca-job',
+        copilotTokenShared: true,
+        copilotTokenSharedAllowed: false,
       });
       rows.push({
         dispatchSource,
@@ -832,6 +933,15 @@ function main(argv) {
     case 'should-withhold-credential':
       process.stdout.write(policy.credentialProfile.withheld ? '1\n' : '0\n');
       return 0;
+    // Issue #84 follow-up (Security blocker): whether COPILOT_GITHUB_TOKEN, as
+    // provisioned in THIS environment, carries the git push token's value.
+    // Read by worker/entrypoint.sh's fail-closed gate for logging/diagnostics
+    // only -- the gate's actual decision uses the same direct env comparison
+    // squad-credentials.sh's squad_credential_withhold acts on, so a resolver
+    // failure here can never suppress the gate.
+    case 'copilot-token-shared':
+      process.stdout.write(policy.credentialProfile.copilotTokenShared ? '1\n' : '0\n');
+      return 0;
     // Issue #84 PI-1: the resolved source x mode table, as JSON. Not read by
     // any shell script -- it exists for the exhaustiveness test and for an
     // operator who wants the whole matrix in one call rather than one cell.
@@ -841,7 +951,7 @@ function main(argv) {
     default:
       process.stderr.write(
         'Usage: agent-policy.js [json|flags|argv|squad-flags|hub-argv-json|undeliverable|tier|reason|' +
-          'trust|trust-reason|credential-profile|should-withhold-credential|matrix|' +
+          'trust|trust-reason|credential-profile|should-withhold-credential|copilot-token-shared|matrix|' +
           'governance-paths|mutable-governance-patterns|classify-governance-path <path>]\n'
       );
       return 78;

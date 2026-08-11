@@ -30,11 +30,31 @@ export OTEL_METRIC_EXPORT_INTERVAL_MILLIS="${OTEL_METRIC_EXPORT_INTERVAL_MILLIS:
 if [[ -n "${GITHUB_TOKEN:-}" && -z "${GH_TOKEN:-}" ]]; then
   export GH_TOKEN="$GITHUB_TOKEN"
 fi
+# Issue #84 follow-up (Security blocker): record WHERE COPILOT_GITHUB_TOKEN
+# came from at the moment it is established, rather than leaving every later
+# consumer to infer it from a value comparison against GH_TOKEN. A value
+# comparison alone cannot distinguish "the operator supplied a distinct
+# Copilot credential that happens to equal the git token" from "this was
+# defaulted from GH_TOKEN" -- and worker/lib/squad-credentials.sh's
+# withholding needs the ACTUAL current value to decide what to hide, while a
+# gate deciding whether to require a distinct credential wants to know the
+# provenance too. Both are recorded; neither is inferred from the other later
+# only.
+#   explicit  the caller supplied COPILOT_GITHUB_TOKEN itself.
+#   derived   no COPILOT_GITHUB_TOKEN was supplied, so it was defaulted from
+#             GH_TOKEN -- this is the documented default deployment shape
+#             (docs/security-report.md) and is shared with the git token BY
+#             CONSTRUCTION.
+#   none      neither was set; this session has no Copilot credential at all.
+SQUAD_COPILOT_TOKEN_PROVENANCE="none"
 if [[ -n "${COPILOT_GITHUB_TOKEN:-}" ]]; then
   export COPILOT_GITHUB_TOKEN
+  SQUAD_COPILOT_TOKEN_PROVENANCE="explicit"
 elif [[ -n "${GH_TOKEN:-}" ]]; then
   export COPILOT_GITHUB_TOKEN="$GH_TOKEN"
+  SQUAD_COPILOT_TOKEN_PROVENANCE="derived"
 fi
+export SQUAD_COPILOT_TOKEN_PROVENANCE
 
 require GITHUB_REPOSITORY
 
@@ -538,6 +558,10 @@ NODE
     # and a pull request. A trusted local-cli session is unaffected.
     __squad_credential_withheld=0
     if squad_credential_should_withhold; then
+      # Security follow-up (issue #84 blocker): fail closed BEFORE the agent
+      # starts if COPILOT_GITHUB_TOKEN is shared with the git token -- see
+      # squad_copilot_shared_token_gate in worker/lib/squad-credentials.sh.
+      squad_copilot_shared_token_gate
       log "Untrusted-input session (mode '${SQUAD_MODE}', source '${SQUAD_DISPATCH_SOURCE:-<unset>}'): withholding the push credential from the agent. It will be restored after the agent exits and before publishing."
       squad_credential_withhold
       __squad_credential_withheld=1
@@ -570,6 +594,9 @@ NODE
     # attacker-controlled task description on an untrusted dispatch source.
     __squad_credential_withheld=0
     if squad_credential_should_withhold; then
+      # Security follow-up (issue #84 blocker): same fail-closed gate as
+      # `prompt` above.
+      squad_copilot_shared_token_gate
       log "Untrusted-input session (mode '${SQUAD_MODE}', source '${SQUAD_DISPATCH_SOURCE:-<unset>}'): withholding the push credential from the agent. It will be restored after the agent exits and before publishing."
       squad_credential_withhold
       __squad_credential_withheld=1

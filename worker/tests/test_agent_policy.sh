@@ -25,10 +25,18 @@ require_deps node
 echo "== agent-policy.js =="
 
 # policy <mode> <dispatch-source> <extra-flags> <plane> <resolver args...>
+#
+# GH_TOKEN/GITHUB_TOKEN/COPILOT_GITHUB_TOKEN/SQUAD_COPILOT_TOKEN_PROVENANCE/
+# SQUAD_ALLOW_SHARED_COPILOT_TOKEN are explicitly unset so every existing call
+# site stays deterministic regardless of what happens to be exported in the
+# CI/dev shell running this suite -- resolvePolicyFromEnv now reads those
+# variables (issue #84 follow-up: copilotTokenShared/copilotTokenSharedAllowed).
 policy() {
   local mode="$1" source="$2" extra="$3" plane="$4"
   shift 4
   env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+      -u GH_TOKEN -u GITHUB_TOKEN -u COPILOT_GITHUB_TOKEN \
+      -u SQUAD_COPILOT_TOKEN_PROVENANCE -u SQUAD_ALLOW_SHARED_COPILOT_TOKEN \
     SQUAD_MODE="$mode" \
     SQUAD_DISPATCH_SOURCE="$source" \
     SQUAD_COPILOT_FLAGS="$extra" \
@@ -39,6 +47,26 @@ policy() {
 policy_status() {
   policy "$@" >/dev/null 2>&1
   printf '%s' "$?"
+}
+
+# policy_tokens <mode> <dispatch-source> <gh-token> <copilot-token> [allow-shared]
+#
+# Issue #84 follow-up: exercises resolvePolicyFromEnv's live GH_TOKEN /
+# COPILOT_GITHUB_TOKEN comparison directly (the credential-profile CLI path),
+# rather than the design-level neutral matrix.
+policy_tokens() {
+  local mode="$1" source="$2" gh_token="$3" copilot_token="$4" allow="${5:-}"
+  env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+      -u GH_TOKEN -u GITHUB_TOKEN -u COPILOT_GITHUB_TOKEN \
+      -u SQUAD_COPILOT_TOKEN_PROVENANCE -u SQUAD_ALLOW_SHARED_COPILOT_TOKEN \
+    SQUAD_MODE="$mode" \
+    SQUAD_DISPATCH_SOURCE="$source" \
+    SQUAD_COPILOT_FLAGS="" \
+    SQUAD_EXECUTION_MODE="aca-job" \
+    GH_TOKEN="$gh_token" \
+    COPILOT_GITHUB_TOKEN="$copilot_token" \
+    SQUAD_ALLOW_SHARED_COPILOT_TOKEN="$allow" \
+    node "$RESOLVER" credential-profile 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -480,5 +508,87 @@ assert_contains "$(policy prompt local-cli '' aca-job credential-profile)" '"azu
   "mode 'prompt' does not carry the Azure identity"
 assert_contains "$(policy watch watch '' aca-job credential-profile)" '"azureIdentity":false' \
   "mode 'watch' does not carry the Azure identity"
+
+# ---------------------------------------------------------------------------
+# 12. Security follow-up (issue #84 blocker): copilotTokenEnv/copilotTokenShared
+# ---------------------------------------------------------------------------
+# Withholding GH_TOKEN/GITHUB_TOKEN alone left COPILOT_GITHUB_TOKEN visible to
+# the agent whenever it was the default-deployment shared/derived value. These
+# assertions prove the matrix and the live-env resolution both stay honest
+# about that: `withheld: true` must never coexist with a shared Copilot token
+# still exported.
+echo "-- Security follow-up: copilotTokenEnv / copilotTokenShared --"
+
+# The static matrix holds copilotTokenShared at its honest worst-case default
+# (true -- the documented default deployment shape), so a withheld cell must
+# ALSO show the Copilot plane withheld.
+for src in ralph watch actions; do
+  for mode in prompt new-project; do
+    cred="$(policy "$mode" "$src" '' aca-job credential-profile)"
+    assert_contains "$cred" '"copilotTokenShared":true'  "${src}/${mode}: matrix assumes the honest worst case (shared)"
+    assert_contains "$cred" '"copilotTokenEnv":false'    "${src}/${mode}: shared Copilot token is ALSO withheld from the agent"
+  done
+done
+
+# MUTATION PROOF M12 target: dropping the Copilot-token unset from
+# squad_credential_withhold (worker/lib/squad-credentials.sh) does not change
+# this JS-level assertion directly, but see test_credential_withholding.sh's
+# M12 case, which scans the actual exported environment for the live value.
+
+# A trusted local-cli session is never withheld, so its Copilot token (shared
+# or not) is left alone -- consistent with "local is unchanged" everywhere
+# else in this trust axis.
+cred_local="$(policy prompt local-cli '' aca-job credential-profile)"
+assert_contains "$cred_local" '"copilotTokenEnv":true' "local-cli/prompt: Copilot token is present -- trusted input, nothing withheld"
+
+# Live-environment resolution (resolvePolicyFromEnv, exercised via
+# `credential-profile`): derived, explicit-equal, explicit-distinct, and the
+# escape hatch.
+derived="$(policy_tokens prompt ralph 'shared-token-aaaa' 'shared-token-aaaa')"
+assert_contains "$derived" '"copilotTokenShared":true'   "derived/equal-value token: reported shared"
+assert_contains "$derived" '"copilotTokenEnv":false'     "derived/equal-value token: withheld along with the git token"
+
+distinct="$(policy_tokens prompt ralph 'git-token-aaaa' 'copilot-token-bbbb')"
+assert_contains "$distinct" '"copilotTokenShared":false' "explicit, distinct Copilot token: reported NOT shared"
+assert_contains "$distinct" '"copilotTokenEnv":true'      "explicit, distinct Copilot token: preserved -- not the git push credential"
+
+# MUTATION PROOF M13 target: inverting the equality check in
+# squad_copilot_token_is_shared / the copilotTokenShared comparison (`==` ->
+# `!=`) would flip these two cases: the shared case would report
+# copilotTokenEnv:true (still visible) and the distinct case would report
+# copilotTokenEnv:false (wrongly withheld). Either flip fails one of the four
+# assertions immediately above.
+
+escape="$(policy_tokens prompt ralph 'shared-token-cccc' 'shared-token-cccc' 'true')"
+assert_contains "$escape" '"copilotTokenSharedAllowed":true' "escape hatch: reported as an explicit, weakened acceptance"
+assert_contains "$escape" '"copilotTokenEnv":true'           "escape hatch: shared Copilot token stays exported (documented, not silent)"
+assert_contains "$escape" '"withheld":true'                  "escape hatch: the git push credential is still withheld"
+
+no_escape_by_default="$(policy_tokens prompt ralph 'shared-token-dddd' 'shared-token-dddd' '')"
+assert_contains "$no_escape_by_default" '"copilotTokenSharedAllowed":false' "escape hatch is NOT the default -- must be explicitly 'true'"
+assert_contains "$no_escape_by_default" '"copilotTokenEnv":false'           "without the escape hatch, a shared token is withheld"
+
+# MUTATION PROOF M16 target: changing the escape-hatch default in
+# resolveCredentialProfile/resolvePolicyFromEnv (or in
+# squad_copilot_shared_token_gate) from "only true when explicitly 'true'" to
+# "true unless explicitly 'false'" makes the "escape hatch is NOT the default"
+# assertion above fail.
+
+# Invariant across the WHOLE matrix (worst-case default inputs): never claim
+# withheld while a shared Copilot token remains exported.
+invariant_violations="$(node -e "
+const policyMod = require(process.argv[1]);
+let bad = 0;
+for (const row of policyMod.POLICY_MATRIX) {
+  const c = row.credentialsPresent;
+  if (c.withheld && c.copilotTokenShared && c.copilotTokenEnv && !c.copilotTokenSharedAllowed) {
+    bad += 1;
+    console.error(\`unqualified withheld claim while shared Copilot token exported: \${row.dispatchSource}/\${row.mode}\`);
+  }
+}
+console.log(bad);
+" "$RESOLVER")"
+assert_eq "0" "$invariant_violations" \
+  "no matrix row claims withheld:true while a shared, non-escape-hatched Copilot token stays exported"
 
 test_summary
