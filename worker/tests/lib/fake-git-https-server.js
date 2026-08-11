@@ -83,17 +83,14 @@ const BACKEND_TIMEOUT_MS = Number(argValue('--backend-timeout-ms', '20000')) || 
 /**
  * Every backend still running, so none can outlive this server.
  *
- * `detached` is what lets the timeout above signal the whole GROUP, but it
- * also takes the backend OUT of this fixture's process group -- which means a
- * runner that kills the suite's group would no longer reach it. An escaped
- * backend is exactly the leak this file is being fixed for, so the escape has
- * to be closed at the other end: when this server goes away, so does every
- * backend it started.
+ * The backends stay in this fixture's process group -- see the spawn below --
+ * so the suite runner's own group sweep already reaches them. This is the
+ * belt to that braces: if the server is asked to stop, it does not leave a
+ * backend behind for the sweep to have to catch.
  */
 const LIVE_BACKENDS = new Set();
 function killAllBackends() {
   for (const c of LIVE_BACKENDS) {
-    try { process.kill(-c.pid, 'SIGKILL'); } catch { /* group already gone */ }
     try { c.kill('SIGKILL'); } catch { /* already gone */ }
   }
   LIVE_BACKENDS.clear();
@@ -163,11 +160,14 @@ function runBackend(req, res, user) {
   }
   if (req.headers['content-length']) env.CONTENT_LENGTH = String(req.headers['content-length']);
 
-  // `detached` puts the backend in its own process group, so the timeout below
-  // can signal the GROUP. Killing the direct child alone would leave
-  // git-http-backend's own children alive holding the pipes -- the same
-  // mistake this timeout exists to stop.
-  const child = spawn(BACKEND, [], { env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+  // NOT detached. Detaching would let the timeout below signal a whole
+  // process group, but it also takes the backend OUT of the suite's process
+  // group -- and `worker/tests/run-tests.sh` terminates that group to clean up
+  // after a suite. A backend that escapes it outlives the suite, which is the
+  // very leak this file is being fixed for. Staying in the group means the
+  // runner's own sweep reaches every descendant, so the timeout only has to
+  // deal with the direct child.
+  const child = spawn(BACKEND, [], { env, stdio: ['pipe', 'pipe', 'pipe'] });
   LIVE_BACKENDS.add(child);
   child.once('close', () => LIVE_BACKENDS.delete(child));
   req.pipe(child.stdin);
@@ -201,7 +201,6 @@ function runBackend(req, res, user) {
   };
   const deadline = setTimeout(() => {
     append(REQUEST_LOG, `backend-timeout ${req.method} ${url.pathname} after ${BACKEND_TIMEOUT_MS}ms`);
-    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
     try { child.kill('SIGKILL'); } catch { /* already gone */ }
     reply(504, { 'Content-Type': 'text/plain' },
       `fixture: ${BACKEND} did not finish within ${BACKEND_TIMEOUT_MS}ms\n`);
