@@ -36,6 +36,7 @@ Use this guide before pushing and after deployment changes. Static checks run of
 | CLI golden gate wiring | Verifies capture cases and committed goldens under `scripts/tests/golden/cli/`. |
 | Worker capability tests | Run separately with `bash worker/tests/run-tests.sh`; CI runs them on Linux. |
 | Egress honesty | Confirms ACA Jobs report egress as advisory and do not echo manifest host text. |
+| Process-isolation report (PC-1) | Confirms `scripts/proc-isolation-report.ps1`'s reader/parser split: exactly one `az` call site, all mutating/exec shapes refused, and yes/no/unknown/not-yet-observed classification against committed fixtures. |
 
 The capability manifest contract is documented in [capability-manifest.md](capability-manifest.md).
 
@@ -324,6 +325,80 @@ body="$(printf '%s\n\n%s\n' \
   'A heading' \
   '| a | table |')"
 ```
+
+## Process isolation report (PC-1, issue #86)
+
+`scripts/proc-isolation-report.ps1` is a read-only harvester: it lists recent
+executions of the session job and scans their already-written console logs
+for `worker/lib/proc-isolation-probe.sh`'s single output line. It never
+starts, deploys, or execs into anything.
+
+```powershell
+# Offline, from a saved log excerpt (no Azure call at all):
+pwsh -NoProfile -File .\scripts\proc-isolation-report.ps1 -Fixture .\path\to\log.txt
+
+# Live, read-only (lists executions, reads their logs):
+pwsh -NoProfile -File .\scripts\proc-isolation-report.ps1 -ResourceGroupName <rg> -NamePrefix <prefix> -SubscriptionId <sub>
+```
+
+Reported `sameUidEnvironReadable` values:
+
+| Value | Meaning |
+| --- | --- |
+| `yes` | A scanned execution's log shows the probe found the child's `/proc/<pid>/environ` readable by the same-uid parent. |
+| `no` | A scanned execution's log shows the probe found it unreadable. |
+| `unknown` | The probe ran but could not classify readability. |
+| `not-yet-observed` | No execution log scanned contains the probe's line at all — most commonly because the worker image has not been redeployed since the probe was added. This is the expected result until the next operator deploy. |
+
+A "live read unavailable" failure (exit 2) is distinct from `not-yet-observed`
+(exit 0): the former means the read itself could not be attempted or
+completed (unreachable subscription, missing extension); the latter means the
+read succeeded and simply found no evidence yet. See
+[security-report.md](security-report.md) for the full mechanism, ordering
+guarantee, and the explicit PC-2 decision.
+
+### The wire-shape contract (R1–R4, security revision on issue #86)
+
+An earlier revision's live `not-yet-observed` result was not actually
+evidence: `worker/entrypoint.sh` decorated the probe's line through its own
+`log()` helper (a fixed `"[squad-on-aca] "` prefix), and the reader never
+pinned a log format, leaving Azure's `text` default in effect (which prepends
+its own ISO-8601 timestamp to every line). The parser's match was fully
+anchored (`^SQUAD-PROC-ISO v1 ...`), so neither shape could ever match — the
+prior "not yet observed" answer only proved the parser could not see what was
+there, not that the probe hadn't run. See
+[security-report.md](security-report.md#process-isolation-inside-the-container-pc-1-issue-86)'s
+retraction section for the full account. This revision fixes both halves and
+pins the contract between them:
+
+* **R1 — no log decoration.** `worker/entrypoint.sh` calls the probe
+  library's raw `squad_proc_iso_run` directly (not routed through `log()`),
+  so the probe library alone owns the exact bytes it emits.
+* **R2 — the parser's unwrap order.** `scripts/lib/proc-isolation-parser.ps1`
+  reduces each scanned line to content in a fixed order before the strict,
+  full-line-anchored v1 match: (a) if the line is valid JSON, unwrap
+  `Log`/`log`/`Message`/`message` (first string match wins) — JSON with none
+  of those fields is treated as unrelated and never matched; (b) strip **at
+  most one** leading ISO-8601 timestamp; (c) strip **at most one** literal
+  `"[squad-on-aca] "` prefix, kept only for backward compatibility with logs
+  captured before this fix shipped. There is no permissive `.*` anywhere in
+  this file — every strip is a fixed, bounded shape, which is why
+  mid-sentence prose, a truncated line, a future `v2` schema line, and
+  unrelated JSON all correctly fail to match (see the `negative-*` fixtures
+  under `scripts/tests/fixtures/proc-isolation/`).
+* **R3 — the reader pins `--format json`.** `scripts/lib/proc-isolation-reader.ps1`
+  explicitly passes `--format json` on the one `containerapp job logs show`
+  call site, so it actually requests the wire shape (`{"Log": ..., "TimeStamp": ...}`
+  per line) the parser is built to unwrap, rather than depending on the
+  command's own default.
+* **R4 — an end-to-end contract test.** `scripts/validate.ps1`'s "Process-isolation
+  R4 end-to-end contract" section runs the *shipped* `worker/lib/proc-isolation-probe.sh`
+  under a real `bash`, then feeds its exact emitted bytes into the *shipped*
+  `scripts/lib/proc-isolation-parser.ps1` three ways — raw, wrapped in a JSON
+  envelope, and legacy-prefixed — asserting `Observed` and every field each
+  time. This is a `[SKIP]` (never a silent pass) when `bash` is not on `PATH`,
+  matching the honesty rule `worker/tests/lib/deps.sh` already established
+  for the worker suite.
 
 ## Shipped image layout
 
