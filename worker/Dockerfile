@@ -73,8 +73,32 @@ RUN apt-get update \
              || (echo "FATAL: squad-hub '$SQUAD_HUB_SPEC' has no 'oneshot' verb, which worker/lib/squad-hub.sh requires. Install a version that has it, or build with SQUAD_HUB_SPEC=none to leave hub supervision out." >&2; exit 1)); \
        fi \
     && useradd -m -s /bin/bash squad \
+    # PC-2 (issue #86): a second, distinct, unprivileged user for the ONE mode
+    # that ever holds the Azure managed identity (`ralph`; see
+    # worker/entrypoint.sh's squad_drop_azure_identity). PC-1's live ACA
+    # diagnostic (docs/security-report.md) measured this platform's same-uid
+    # /proc/<pid>/environ read as POSSIBLE, so the identity-drop ordering is
+    # no longer the only control: a Linux ptrace/DAC check on
+    # /proc/<pid>/environ denies a cross-UID read regardless of hidepid, so
+    # giving the identity-bearing process a UID distinct from every mode that
+    # runs an agent against attacker-influenced input closes that gap. Not a
+    # member of the `squad` group, and does not get one -- membership would
+    # recreate exactly the same-UID-equivalent access this exists to remove.
+    && useradd -m -s /bin/bash squad-identity \
+    # /workspace is the one thing BOTH users must reach: every mode, including
+    # ralph, unconditionally clones the repository into it near the top of
+    # entrypoint.sh, before any mode dispatch. A shared group with the setgid
+    # bit gives both users write access to that one shared, secret-free
+    # directory tree without putting either user in the other's own group --
+    # $HOME for each user (below) stays exclusive to that user alone.
+    && groupadd squad-workers \
+    && usermod -aG squad-workers squad \
+    && usermod -aG squad-workers squad-identity \
     && mkdir -p /workspace \
-    && chown -R squad:squad /workspace /home/squad \
+    && chown root:squad-workers /workspace \
+    && chmod 2775 /workspace \
+    && chown -R squad:squad /home/squad \
+    && chown -R squad-identity:squad-identity /home/squad-identity \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -104,6 +128,14 @@ COPY --chown=squad:squad worker/lib/squad-capability-preflight.sh worker/lib/squ
 RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-credentials.sh /usr/local/lib/squad-on-aca/squad-push.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh /usr/local/lib/squad-on-aca/squad-hub.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh \
     && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh
 
-USER squad
+# PC-2 (issue #86): this image's default runtime user is intentionally left
+# as root (no trailing USER instruction). worker/entrypoint.sh's own FIRST
+# executable action -- before any credential, any child process, or any line
+# of user-influenced input is ever touched -- drops to the correct
+# unprivileged user for the mode that is about to run (`squad-identity` for
+# `ralph`, `squad` for everything else) via `exec runuser`, which replaces
+# this process outright. Nothing after that point, in any mode, ever runs as
+# root. worker/tests/test_uid_separation.sh asserts the drop happens, and
+# that it happens first.
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/squad-on-aca"]

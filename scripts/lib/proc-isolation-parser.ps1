@@ -29,10 +29,11 @@
 #      as non-matching, never as a crash and never as a false match.
 #   3. Legacy-prefixed. Before this revision, worker/entrypoint.sh routed the
 #      probe's line through its own log() helper, which prepends a fixed
-#      "[squad-on-aca] " literal, and the reader's previous unpinned default
-#      logs-show format (text) prepends an ISO-8601 timestamp to every
-#      line. Already-captured logs from before this fix can still carry
-#      either or both of those, so this parser strips AT MOST ONE optional
+#      "[squad-on-aca] " literal, and a log capture taken with
+#      `--format text` (the format an operator may still choose; it is NOT
+#      the CLI's default, which is json) prepends an ISO-8601 timestamp to
+#      every line. Already-captured logs can therefore still carry either or
+#      both of those, so this parser strips AT MOST ONE optional
 #      leading ISO-8601 timestamp, then AT MOST ONE optional literal
 #      "[squad-on-aca] " prefix -- in that order, since that is the order the
 #      platform and the old log() helper actually applied them in -- before
@@ -48,8 +49,9 @@
 # prose containing the probe's text, a truncated partial line, a future
 # schema version (SQUAD-PROC-ISO v2 ...), or unrelated JSON must all fail to
 # match -- this is the T12 negative-fixture contract, exercised in
-# scripts/validate.ps1's PC-1 section and by
-# worker/tests/test_proc_isolation_contract.sh's end-to-end pass (R4).
+# scripts/validate.ps1's PC-1 section (fixture classification plus the R4
+# end-to-end pass, which runs the shipped bash probe and feeds its exact
+# emitted bytes through this parser).
 #
 # T11/T12 (issue #86): this file's job is entirely mechanical --
 #   * no matching line anywhere in the scanned logs -> "not-yet-observed"

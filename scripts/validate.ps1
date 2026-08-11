@@ -6726,16 +6726,87 @@ if ((Test-Path -LiteralPath $procIsoReaderPath) -and (Test-Path -LiteralPath $pr
         Add-Fail "scripts/lib/proc-isolation-parser.ps1 contains a standalone 'az' token; the pure parser must never reference the Azure CLI"
     }
 
-    # R2/R6 (issue #86 security revision): the parser must never contain a
-    # permissive `.*` anywhere in its own regex definitions -- every strip
-    # (timestamp, legacy prefix) and the strict v1 match itself must be a
-    # fixed, bounded shape. This is the static half of the anti-drift
-    # guarantee: a mutation that widens a strip to `.*` is caught here even
-    # before the negative-fixture runtime checks (R7 mutation (d)).
-    if ($procIsoParserText -notmatch [regex]::Escape('.*')) {
-        Add-Pass "R2/R6: scripts/lib/proc-isolation-parser.ps1 contains no permissive '.*' anywhere -- every strip and the strict match are bounded, fixed shapes"
+    # L6 (issue #86, third revision): the parser's regex literals must each be
+    # anchored and bounded. The previous revision asserted this by scanning
+    # the WHOLE FILE for the two characters ".*" -- which is not a check on
+    # the patterns at all: it fails on a comment or a doc string that happens
+    # to contain those characters, and it says nothing about whether the
+    # patterns are anchored. This checks the NAMED pattern literals
+    # themselves: every $script:ProcIso*Pattern assignment must exist, be
+    # anchored at ^, and contain no unbounded wildcard construct.
+    $procIsoNamedPatternAssignments = @([regex]::Matches($procIsoParserText, '(?m)^\$script:(ProcIso\w*Pattern)\s*=\s*''([^'']*)''\s*$'))
+    $procIsoExpectedPatternNames = @("ProcIsoLinePattern", "ProcIsoTimestampPrefixPattern", "ProcIsoLegacyPrefixPattern")
+    $procIsoFoundPatternNames = @($procIsoNamedPatternAssignments | ForEach-Object { $_.Groups[1].Value })
+    $procIsoUnboundedConstructs = @('.*', '.+', '[\s\S]', '(?s)')
+    $procIsoPatternProblems = @()
+    foreach ($expected in $procIsoExpectedPatternNames) {
+        if ($procIsoFoundPatternNames -notcontains $expected) {
+            $procIsoPatternProblems += "$expected is not defined as a single-quoted literal"
+        }
+    }
+    foreach ($assignment in $procIsoNamedPatternAssignments) {
+        $patternName = $assignment.Groups[1].Value
+        $patternValue = $assignment.Groups[2].Value
+        if (-not $patternValue.StartsWith('^')) {
+            $procIsoPatternProblems += "$patternName is not anchored at the start of the line"
+        }
+        foreach ($construct in $procIsoUnboundedConstructs) {
+            if ($patternValue.Contains($construct)) {
+                $procIsoPatternProblems += "$patternName contains the unbounded construct '$construct'"
+            }
+        }
+    }
+    if ($procIsoPatternProblems.Count -eq 0 -and $procIsoFoundPatternNames.Count -eq $procIsoExpectedPatternNames.Count) {
+        Add-Pass "L6: all $($procIsoFoundPatternNames.Count) named regex literals in scripts/lib/proc-isolation-parser.ps1 ($($procIsoFoundPatternNames -join ', ')) are anchored at ^ and free of any unbounded wildcard ('.*', '.+', '[\s\S]', '(?s)') -- checked as patterns, not as a file-wide character scan"
     } else {
-        Add-Fail "R2/R6: scripts/lib/proc-isolation-parser.ps1 contains a permissive '.*'; this is the exact widening that would let a legacy-prefix or timestamp strip swallow embedded prose"
+        Add-Fail "L6: the PC-1 parser's named regex literals are not all anchored/bounded (found: $($procIsoFoundPatternNames -join ', ')): $($procIsoPatternProblems -join '; ')"
+    }
+
+    # L1: the --tail default and bound are pinned in BOTH the reader and the
+    # CLI entrypoint. `az containerapp job logs show --tail` accepts 0-300;
+    # the prior revisions' 500 was rejected by the CLI on every single live
+    # read, and that rejection was then reported as "not-yet-observed".
+    $procIsoTailProblems = @()
+    if ($procIsoReaderText -notmatch '(?m)^\$script:ProcIsoMaxTailLines\s*=\s*300\s*$') { $procIsoTailProblems += "the reader does not pin ProcIsoMaxTailLines = 300" }
+    if ($procIsoReaderText -notmatch '(?m)^\$script:ProcIsoDefaultTailLines\s*=\s*300\s*$') { $procIsoTailProblems += "the reader does not pin ProcIsoDefaultTailLines = 300" }
+    if ($procIsoReaderText -notmatch '\[int\]\$TailLines\s*=\s*300') { $procIsoTailProblems += "Get-ProcIsoLiveObservation's TailLines default is not 300" }
+    if ($procIsoReportText -notmatch '\[int\]\$TailLines\s*=\s*300') { $procIsoTailProblems += "proc-isolation-report.ps1's -TailLines default is not 300" }
+    if ($procIsoReaderText -notmatch 'function\s+Assert-ProcIsoTailLines') { $procIsoTailProblems += "the reader defines no Assert-ProcIsoTailLines range check" }
+    if ($procIsoTailProblems.Count -eq 0) {
+        Add-Pass "L1: --tail defaults to 300 and is bounded to 0..300 in both scripts/lib/proc-isolation-reader.ps1 and scripts/proc-isolation-report.ps1 (the range the CLI actually accepts)"
+    } else {
+        Add-Fail "L1: the --tail default/bound is not pinned as required: $($procIsoTailProblems -join '; ')"
+    }
+
+    # L3: the container name is resolved from the LIVE job template through
+    # the same allowlisted chokepoint, not assumed to equal the job name.
+    $procIsoContainerProblems = @()
+    if ($procIsoReaderText -notmatch 'function\s+Resolve-ProcIsoContainerName') { $procIsoContainerProblems += "the reader defines no Resolve-ProcIsoContainerName" }
+    if ($procIsoReaderText -notmatch [regex]::Escape('properties.template.containers[0].name')) { $procIsoContainerProblems += "the reader never queries properties.template.containers[0].name" }
+    if ($procIsoReaderText -notmatch '"containerapp",\s*"job",\s*"show"') { $procIsoContainerProblems += "'containerapp job show' is not on the reader's allowlist/call sites" }
+    if ($procIsoReaderText -match '"--container",\s*\$Intent\.JobName') { $procIsoContainerProblems += "the logs-show call still hard-codes the JOB name as the container name" }
+    if ($procIsoReportText -notmatch '\[string\]\$ContainerName\s*=\s*""') { $procIsoContainerProblems += "proc-isolation-report.ps1 exposes no -ContainerName parameter" }
+    if ($procIsoContainerProblems.Count -eq 0) {
+        Add-Pass "L3: the container name is resolved from the live job template ('containerapp job show --query properties.template.containers[0].name'), overridable with -ContainerName, and is never hard-coded to the job name"
+    } else {
+        Add-Fail "L3: container-name resolution is not wired as required: $($procIsoContainerProblems -join '; ')"
+    }
+
+    # L2: a per-execution log-read failure must be RECORDED, never silently
+    # skipped. The silent `continue` is how a run in which every log read was
+    # rejected still reported the reassuring "not-yet-observed".
+    $procIsoFailureAccountingProblems = @()
+    foreach ($field in @("ExecutionsScanned", "ExecutionsRead", "Failures")) {
+        if ($procIsoReaderText -notmatch "$field\s*=") { $procIsoFailureAccountingProblems += "the reader's live result carries no $field field" }
+    }
+    if ($procIsoReaderText -notmatch '\$failures\s*\+=') { $procIsoFailureAccountingProblems += "the reader never records a per-execution read failure" }
+    foreach ($field in @("executionsScanned", "executionsRead", "failures")) {
+        if ($procIsoReportText -notmatch "$field\s+=") { $procIsoFailureAccountingProblems += "the report's JSON carries no $field field" }
+    }
+    if ($procIsoFailureAccountingProblems.Count -eq 0) {
+        Add-Pass "L2: the reader accounts for ExecutionsScanned/ExecutionsRead/Failures explicitly and the report surfaces executionsScanned/executionsRead/failures in its JSON -- a failed log read can never be silently skipped"
+    } else {
+        Add-Fail "L2: explicit read-failure accounting is missing: $($procIsoFailureAccountingProblems -join '; ')"
     }
 
     # R3 (issue #86 security revision): the reader must explicitly pin
@@ -6874,6 +6945,49 @@ if (-not $IsWindowsHost) {
                 Add-Pass "T11: a live read with no SQUAD-PROC-ISO line anywhere in scanned logs classifies as 'not-yet-observed', not a fabricated yes/no"
             } else {
                 Add-Fail "T11: an absent probe line did not classify as not-yet-observed (exit=$($procIsoAbsent.ExitCode)): $($procIsoAbsent.StdOut) $($procIsoAbsent.StdErr)"
+            }
+
+            # L2: one of two scanned executions fails to read. Absence of the
+            # probe line cannot be concluded from a partial read, so this must
+            # exit 3 (inconclusive-partial-read), never 0.
+            $procIsoFailOne = Invoke-ProcIsoCliCapture -Stub $procIsoStub -ScriptPath $procIsoReportPath -Mode "fail-one" -CliArguments @("-Json")
+            if ($procIsoFailOne.ExitCode -eq 3 -and $procIsoFailOne.StdOut -match '"status":\s*"inconclusive-partial-read"' -and $procIsoFailOne.StdOut -match '"executionsScanned":\s*2' -and $procIsoFailOne.StdOut -match '"executionsRead":\s*1') {
+                Add-Pass "L2: a partial read (1 of 2 scanned executions fails) exits 3 / inconclusive-partial-read, never 0"
+            } else {
+                Add-Fail "L2: a partial read did not exit 3 / inconclusive-partial-read as required (exit=$($procIsoFailOne.ExitCode)): $($procIsoFailOne.StdOut) $($procIsoFailOne.StdErr)"
+            }
+
+            # L2: both scanned executions fail to read. Nothing was read, so
+            # nothing is known -- this must exit 2 (live read unavailable),
+            # never 0 / not-yet-observed.
+            $procIsoFailAll = Invoke-ProcIsoCliCapture -Stub $procIsoStub -ScriptPath $procIsoReportPath -Mode "fail-all" -CliArguments @("-Json")
+            if ($procIsoFailAll.ExitCode -eq 2 -and $procIsoFailAll.StdErr -match "live read unavailable" -and $procIsoFailAll.StdOut -notmatch '"observed"') {
+                Add-Pass "L2: a total read failure (0 of 2 scanned executions readable) exits 2 / live read unavailable, never 0 / not-yet-observed"
+            } else {
+                Add-Fail "L2: a total read failure did not exit 2 / live read unavailable as required (exit=$($procIsoFailAll.ExitCode)): $($procIsoFailAll.StdOut) $($procIsoFailAll.StdErr)"
+            }
+
+            # L3: the job template read itself fails, so the container name
+            # cannot be resolved and must fall back to the job name as an
+            # EXPLICITLY REPORTED assumption -- the read must still succeed
+            # (the stub accepts the job name as --container in this mode).
+            $procIsoShowFails = Invoke-ProcIsoCliCapture -Stub $procIsoStub -ScriptPath $procIsoReportPath -Mode "show-fails" -CliArguments @("-Json")
+            if ($procIsoShowFails.ExitCode -eq 0 -and $procIsoShowFails.StdOut -match '"containerSource":\s*"assumed"' -and $procIsoShowFails.StdOut -match '"container":\s*"caj-pc1stub-session"') {
+                Add-Pass "L3: when the live job template cannot be read, the container name falls back to the job name and the fallback is reported as an explicit assumption, not silently presented as fact"
+            } else {
+                Add-Fail "L3: the container-name assumption fallback did not behave/report as required (exit=$($procIsoShowFails.ExitCode)): $($procIsoShowFails.StdOut) $($procIsoShowFails.StdErr)"
+            }
+
+            # L1: an out-of-range -TailLines must fail closed BEFORE any `az`
+            # call is made -- never silently clamped, never sent to the CLI
+            # (which would reject it as a usage error and be swallowed into a
+            # false not-yet-observed, exactly as the prior revisions' 500
+            # default was).
+            $procIsoOutOfRangeTail = Invoke-ProcIsoCliCapture -Stub $procIsoStub -ScriptPath $procIsoReportPath -Mode "" -CliArguments @("-Json", "-TailLines", "500")
+            if ($procIsoOutOfRangeTail.ExitCode -eq 2 -and $procIsoOutOfRangeTail.AzCalls.Count -eq 0) {
+                Add-Pass "L1: -TailLines 500 (out of the CLI's 0-300 range) exits 2 with zero az calls made -- rejected before Azure is ever contacted"
+            } else {
+                Add-Fail "L1: an out-of-range -TailLines did not fail closed before contacting az (exit=$($procIsoOutOfRangeTail.ExitCode), azCalls=$($procIsoOutOfRangeTail.AzCalls.Count)): $($procIsoOutOfRangeTail.StdOut) $($procIsoOutOfRangeTail.StdErr)"
             }
         } else {
             Add-Fail "Cannot run the stub-harness-driven live round trip; scripts/proc-isolation-report.ps1 is missing"
@@ -7062,49 +7176,129 @@ if ($procIsoMissingFixtures.Count -eq 0) {
 }
 
 # T13: docs/security-report.md must state the PC-1 mechanism, ordering, and
-# PENDING status honestly -- it must NEVER claim a concrete observed result
-# (the live PC-1 answer is genuinely unknown as of this writing), and it must
-# explicitly record why PC-2 was declined.
+# the ACTUAL observed live result honestly -- it must record the real
+# same-uid-environ-readable answer this platform gave, the live diagnostic
+# evidence behind it, and that PC-2 was implemented (not declined) as a
+# result, per this issue's reversal trigger.
 $procIsoSecurityReportPath = Join-Path $RepoRoot "docs\security-report.md"
 if (Test-Path -LiteralPath $procIsoSecurityReportPath) {
     $procIsoDocsText = Get-Content -LiteralPath $procIsoSecurityReportPath -Raw
 
     $procIsoRequiredPhrases = @(
-        "not yet observed in ACA",
-        "pending next operator deploy",
-        "same-uid-environ-readable=yes"
+        "observed live in ACA",
+        "same-uid-environ-readable=yes",
+        "uid=1001 user=squad",
+        "uid=1002 user=squad-identity"
     )
     $procIsoDocsMissingPhrases = @($procIsoRequiredPhrases | Where-Object { $procIsoDocsText -notmatch [regex]::Escape($_) })
     if ($procIsoDocsMissingPhrases.Count -eq 0) {
-        Add-Pass "docs/security-report.md states PC-1's pending status honestly (all 3 required phrases present)"
+        Add-Pass "docs/security-report.md states PC-1's observed live result and PC-2's live dual-uid proof honestly (all $($procIsoRequiredPhrases.Count) required phrases present)"
     } else {
-        Add-Fail "docs/security-report.md is missing required PC-1 honesty phrase(s): $($procIsoDocsMissingPhrases -join '; ')"
+        Add-Fail "docs/security-report.md is missing required PC-1/PC-2 evidence phrase(s): $($procIsoDocsMissingPhrases -join '; ')"
     }
 
-    # T13: a fabricated concrete claim would look like a definite yes/no
-    # stated as the environment's ACTUAL result, e.g. "confirmed unreadable"
-    # or "the result was". Neither may appear anywhere in the report.
-    $procIsoForbiddenClaims = @("confirmed unreadable", "confirmed readable", "the result was", "PC-1 found that")
-    $procIsoDocsFabrications = @($procIsoForbiddenClaims | Where-Object { $procIsoDocsText -match [regex]::Escape($_) })
-    if ($procIsoDocsFabrications.Count -eq 0) {
-        Add-Pass "T13: docs/security-report.md does not fabricate a concrete PC-1 result"
+    # T13: the report must not still describe the answer as pending/unknown
+    # now that a real result has been observed and recorded above.
+    $procIsoStaleClaims = @("genuinely pending", "genuinely unknown", "not yet observed in ACA")
+    $procIsoDocsStale = @($procIsoStaleClaims | Where-Object { $procIsoDocsText -match [regex]::Escape($_) })
+    if ($procIsoDocsStale.Count -eq 0) {
+        Add-Pass "T13: docs/security-report.md does not still describe PC-1's answer as pending/unknown now that a live result has been recorded"
     } else {
-        Add-Fail "T13: docs/security-report.md contains a fabricated-result phrase: $($procIsoDocsFabrications -join '; ')"
+        Add-Fail "T13: docs/security-report.md contains stale pending/unknown language despite recording a live result: $($procIsoDocsStale -join '; ')"
     }
 
-    if ($procIsoDocsText -match [regex]::Escape("PC-2") -and $procIsoDocsText -match [regex]::Escape("declined")) {
-        Add-Pass "docs/security-report.md records that PC-2 was explicitly declined (not silently omitted)"
+    if ($procIsoDocsText -match [regex]::Escape("PC-2") -and $procIsoDocsText -match [regex]::Escape("reversal trigger has fired") -and $procIsoDocsText -match [regex]::Escape("implemented")) {
+        Add-Pass "docs/security-report.md records that PC-2's reversal trigger fired and PC-2 was implemented (not silently left declined)"
     } else {
-        Add-Fail "docs/security-report.md does not record PC-2's explicit decline"
+        Add-Fail "docs/security-report.md does not record that PC-2 was implemented following its reversal trigger"
     }
 } else {
     Add-Fail "docs/security-report.md is missing; PC-1's honesty requirements cannot be checked"
 }
 
 # ---------------------------------------------------------------------------
-# Summary
+# PC-2 (issue #86): a second, kernel-enforced UID boundary for the identity-
+# holding mode, implemented because PC-1's live result was "yes". Mirrors the
+# PC-1 static-check style above: grep-based, mutation-testable assertions
+# against worker/Dockerfile and worker/entrypoint.sh, plus the same test
+# suite (worker/tests/test_uid_separation.sh) run via worker/tests/run-tests.sh
+# elsewhere in this pipeline.
 # ---------------------------------------------------------------------------
-Write-Section "Summary"
+Write-Section "PC-2: separate UID for the identity-holding mode (issue #86)"
+
+$pc2DockerfilePath = Join-Path $RepoRoot "worker\Dockerfile"
+$pc2EntrypointPath = Join-Path $RepoRoot "worker\entrypoint.sh"
+$pc2TestPath = Join-Path $RepoRoot "worker\tests\test_uid_separation.sh"
+
+if ((Test-Path -LiteralPath $pc2DockerfilePath) -and (Test-Path -LiteralPath $pc2EntrypointPath)) {
+    $pc2DockerfileText = Get-Content -LiteralPath $pc2DockerfilePath -Raw
+    $pc2EntrypointText = Get-Content -LiteralPath $pc2EntrypointPath -Raw
+
+    if ($pc2DockerfileText -match [regex]::Escape('useradd -m -s /bin/bash squad ') -and $pc2DockerfileText -match [regex]::Escape('useradd -m -s /bin/bash squad-identity ')) {
+        Add-Pass "PC-2: worker/Dockerfile creates two distinct users, 'squad' and 'squad-identity'"
+    } else {
+        Add-Fail "PC-2: worker/Dockerfile does not create both the 'squad' and 'squad-identity' users"
+    }
+
+    if ($pc2DockerfileText -notmatch '(?m)^USER squad$') {
+        Add-Pass "PC-2: worker/Dockerfile no longer pins the default runtime user to 'squad' (no trailing 'USER squad'); the entrypoint chooses per SQUAD_MODE"
+    } else {
+        Add-Fail "PC-2: worker/Dockerfile still pins a trailing 'USER squad', which would defeat entrypoint.sh's per-mode privilege drop"
+    }
+
+    if ($pc2DockerfileText -match [regex]::Escape('chmod 2775 /workspace')) {
+        Add-Pass "PC-2: /workspace is shared via a setgid group directory (chmod 2775), not made world-writable, so both UIDs can still clone the repo"
+    } else {
+        Add-Fail "PC-2: worker/Dockerfile does not set up /workspace as a setgid-shared directory (chmod 2775) for both UIDs"
+    }
+
+    $pc2DropMatch = [regex]::Match($pc2EntrypointText, '(?ms)if \[\[ "\$\(id -u\)" -eq 0 \]\]; then.*?^fi$')
+    if ($pc2DropMatch.Success) {
+        $pc2DropText = $pc2DropMatch.Value
+        Add-Pass "PC-2: worker/entrypoint.sh contains the root-gated privilege-drop block"
+
+        if ($pc2DropText -match [regex]::Escape('SQUAD_RUNTIME_USER="squad"') -and $pc2DropText -match '"\$\{SQUAD_MODE:-smoke\}"\s*==\s*"ralph"' -and $pc2DropText -match [regex]::Escape('SQUAD_RUNTIME_USER="squad-identity"')) {
+            Add-Pass "PC-2: the drop selects 'squad-identity' only for SQUAD_MODE=ralph, and 'squad' otherwise"
+        } else {
+            Add-Fail "PC-2: the drop does not select 'squad-identity' specifically (and only) for SQUAD_MODE=ralph"
+        }
+
+        if ($pc2DropText -match [regex]::Escape('exec env -u HOME runuser -p -u "$SQUAD_RUNTIME_USER"')) {
+            Add-Pass "PC-2: the drop execs 'env -u HOME runuser -p' -- replaces the process (no root parent left), preserves the ACA-injected environment, and clears the stale root HOME before the switch"
+        } else {
+            Add-Fail "PC-2: the drop does not exec 'env -u HOME runuser -p -u \"\$SQUAD_RUNTIME_USER\"' as expected"
+        }
+    } else {
+        Add-Fail "PC-2: worker/entrypoint.sh is missing the root-gated privilege-drop block entirely"
+    }
+
+    if ($pc2EntrypointText -match '(?m)^export HOME="\$\{HOME:-/home/squad\}"$') {
+        Add-Fail "PC-2: worker/entrypoint.sh's HOME fallback is still hard-coded to /home/squad, which would break the squad-identity user PC-2 introduces"
+    } else {
+        Add-Pass "PC-2: worker/entrypoint.sh's HOME fallback is resolved from the actual current user (not hard-coded to /home/squad)"
+    }
+
+    # Ordering: the drop must happen before the identity-drop mode dispatch
+    # (the same anchor test_identity_drop_order.sh uses) -- otherwise a
+    # session or ralph process could start real work before its UID is set.
+    $pc2DropLineMatch = [regex]::Match($pc2EntrypointText, '(?m)^if \[\[ "\$\(id -u\)" -eq 0 \]\]; then$')
+    $pc2CaseLineMatch = [regex]::Match($pc2EntrypointText, '(?m)^case "\$\{SQUAD_MODE:-smoke\}" in$')
+    if ($pc2DropLineMatch.Success -and $pc2CaseLineMatch.Success -and $pc2DropLineMatch.Index -lt $pc2CaseLineMatch.Index) {
+        Add-Pass "PC-2: the privilege-drop block appears before the identity-drop mode dispatch in worker/entrypoint.sh"
+    } else {
+        Add-Fail "PC-2: the privilege-drop block does not appear before the identity-drop mode dispatch in worker/entrypoint.sh"
+    }
+} else {
+    Add-Fail "PC-2: worker/Dockerfile or worker/entrypoint.sh is missing; PC-2 checks cannot run"
+}
+
+if (Test-Path -LiteralPath $pc2TestPath) {
+    Add-Pass "PC-2: worker/tests/test_uid_separation.sh (the named test for this control) is present"
+} else {
+    Add-Fail "PC-2: worker/tests/test_uid_separation.sh is missing; PC-2 has no named test"
+}
+
+
 Write-Host ("  Passed: {0}" -f $script:Passes.Count) -ForegroundColor Green
 Write-Host ("  Failed: {0}" -f $script:Failures.Count) -ForegroundColor ($(if ($script:Failures.Count -gt 0) { 'Red' } else { 'Green' }))
 Write-Host ("  Skipped: {0}" -f $script:Skips.Count) -ForegroundColor ($(if ($script:Skips.Count -gt 0) { 'Yellow' } else { 'Green' }))

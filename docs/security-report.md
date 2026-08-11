@@ -139,18 +139,56 @@ This mirrors the identity-drop control's own ordering rule rather than
 introducing a second one: nothing in the entrypoint starts any child, real or
 diagnostic, before the probe has run.
 
-**Status: not yet observed in ACA; pending next operator deploy.** The
-mechanism is proven on an ordinary Linux filesystem in CI —
+**Status: observed live in ACA. Result: `same-uid-environ-readable=yes`.**
+The mechanism is proven on an ordinary Linux filesystem in CI —
 `worker/tests/test_proc_isolation_probe.sh` reproduces every classification
 (`yes`, `no`, `unknown`) against real and fabricated `/proc`-shaped inputs,
 and `worker/tests/test_identity_drop_order.sh` asserts the probe call's
-position relative to the identity drop and the lease heartbeat. What has
-**not** happened is a deployed session or Ralph poll actually emitting the
-`SQUAD-PROC-ISO` line where it can be read back — the worker image carrying
-this probe has not yet been redeployed. `scripts/proc-isolation-report.ps1`
-(below) will report `not-yet-observed` until that redeploy happens and a
-session runs; **this report does not claim a result it has not seen**, and no
-value here should be read as an implicit answer either way.
+position relative to the identity drop and the lease heartbeat. That CI
+proof was then followed by an actual, one-time, authorized live diagnostic
+against the deployed environment, because the currently-deployed worker
+image (`squad-worker:npm-0.3.0`, resource group `rg-squad-demo-eus-001`,
+Container Apps environment `cae-squad-aca`) predates this revision's probe
+entirely and could never have emitted the line on its own.
+
+**The live diagnostic, exactly what was done.** This one exception to the
+otherwise read-only Azure posture was explicit and narrowly scoped, per this
+issue's own instruction that PC-1 requires a real answer, not an assumption:
+
+1. Built a diagnostic image directly from this branch's `worker/` code via
+   `az acr build -r acrsquadacazpoq5nml -t squad-worker:pc1-diag-86 -f worker/Dockerfile .`
+   (a remote ACR build; no local Docker or credential material involved),
+   pushed to the existing ACR `acrsquadacazpoq5nml.azurecr.io`.
+2. Started one execution of the existing `caj-squad-aca-session` job with
+   `az containerapp job start`, overriding only `--image` (the diagnostic
+   tag) and `--env-vars` (kept `SQUAD_MODE=smoke`, the job's own existing
+   safe default). `GH_TOKEN` / `COPILOT_GITHUB_TOKEN` / `SQUAD_HUB_TOKEN`
+   were deliberately **omitted** and `ENABLE_GITHUB_REMOTE=false` set, so no
+   real GitHub side effect (label creation, issue dispatch, PR creation)
+   could occur — the probe and identity-drop ordering both run before any
+   GitHub network call regardless.
+3. Read the execution's console output via
+   `az monitor log-analytics query` against the `ContainerAppConsoleLogs_CL`
+   table in the workspace already wired to this environment, filtering on
+   `ContainerGroupName_s`. This is a **local-environment workaround, not a
+   platform limitation**: the local `az` CLI here bundles a 32-bit Python
+   that cannot build the `containerapp` extension's `cryptography`
+   dependency, so the KQL query substitutes for
+   `az containerapp job logs show`, which is what
+   `scripts/proc-isolation-report.ps1` uses and is expected to work
+   unmodified on an operator machine with a working extension install.
+4. Observed line, verbatim:
+   `SQUAD-PROC-ISO v1 same-uid-environ-readable=yes proc-mounted=yes hidepid=0 uid=1001 user=squad`
+5. Confirmed the job's persistent template was never mutated
+   (`az containerapp job show` still reported `squad-worker:npm-0.3.0`
+   afterward — only the one execution's override was ever applied), then
+   deleted the diagnostic tag
+   (`az acr repository delete -n acrsquadacazpoq5nml --image squad-worker:pc1-diag-86 --yes`)
+   so no diagnostic artifact remains in the registry.
+
+**This report does not claim a result it has not seen** — the line above was
+read back from the platform, not inferred, and is recorded exactly as
+observed.
 
 **Retraction: the prior "not-yet-observed" live run was never evidence.**
 The initial version of this feature ran a real, read-only harvester pass
@@ -184,44 +222,82 @@ exact emitted bytes — raw, JSON-enveloped, and legacy-prefixed — through the
 shipped parser, asserting every field, so this class of "silently
 unobservable" defect cannot recur without failing that check.
 
-**The live PC-1 answer remains genuinely pending**, exactly as before this
-fix: nothing above changes the fact that no redeploy has happened under the
-read-only constraint this work was produced under, so no session has yet run
-with a parser that is actually capable of observing its output. What changed
-is that the *next* operator deploy's `not-yet-observed`-or-otherwise result
-will, for the first time, mean what it says.
+**The live PC-1 answer is now established: `yes`.** The read-only-Azure
+constraint that had left the answer unobserved at the time this section
+was first written was, per this issue's explicit instruction, lifted for
+exactly the one diagnostic sequence described above (a temporary image, one
+job execution override, one log read) — nothing else in this codebase or
+deployment was touched, and the diagnostic artifact was removed immediately
+after the answer was read back.
 
-**The blocker, exactly.** This work was produced under a hard read-only Azure
-constraint: no deploy, no job start, no exec into a container, no image
-build/push, and no mutation of any Azure resource. Establishing the live
-answer requires a redeploy of the worker image and a session (or a Ralph
-poll) actually running in ACA — both of which are deploy/execute actions
-outside that boundary. The live PC-1 answer is therefore genuinely unknown as
-of this writing, and is not fabricated or inferred here.
+**Reading the result going forward.** `scripts/proc-isolation-report.ps1`
+remains read-only for ordinary operator use: it lists existing job
+executions and reads their already-written console logs (never starts one,
+never execs into a container, never deploys), through the same
+single-chokepoint/allowlist pattern as `rbac-drift-check.ps1` (CV-1) and
+`job-drift-check.ps1` (CV-2). It reports one of `yes`, `no`, `unknown`, or
+`not-yet-observed` — and, distinctly, "live read unavailable" when the
+question could not even be asked (unreachable subscription, missing CLI
+extension), which is never conflated with `not-yet-observed`. The one-time
+diagnostic above used `az containerapp job start`/`az acr build` instead,
+because no prior execution existed yet with a parser-observable line; those
+are not part of the shipped, ongoing read-only reporting path.
 
-**Reading the result once it exists.** `scripts/proc-isolation-report.ps1` is
-read-only: it lists existing job executions and reads their already-written
-console logs (never starts one, never execs into a container, never
-deploys), through the same single-chokepoint/allowlist pattern as
-`rbac-drift-check.ps1` (CV-1) and `job-drift-check.ps1` (CV-2). It reports one
-of `yes`, `no`, `unknown`, or `not-yet-observed` — and, distinctly, "live read
-unavailable" when the question could not even be asked (unreachable
-subscription, missing CLI extension), which is never conflated with
-`not-yet-observed`.
+**PC-2 (a second boundary): the reversal trigger has fired, and PC-2 is now
+implemented.** The issue's own sprint plan made PC-2 conditional exactly on
+this answer: "add a second boundary only if PC-1 says it is needed." PC-1
+now says exactly that — `same-uid-environ-readable=yes` on the real deployed
+platform means the identity-drop ordering (above) is not the *only* control
+between a session and the Azure identity; a same-uid neighbour really can
+read another process's environment out of `/proc` here, independent of
+`hidepid` (which reported `0` in the observed line).
 
-**PC-2 (a second boundary) is explicitly declined for now, unchanged by this
-revision.** The issue's own sprint plan makes PC-2 conditional on PC-1's
-answer: "add a second boundary only if PC-1 says it is needed." Implementing
-PC-2 — running identity-bearing helpers under a separate uid — would change
-the highest-privilege path in this container (the one holding the Azure
-identity) on the basis of a platform property that has not been confirmed on
-this platform. That change cannot itself be verified under the same
-read-only constraint that prevents observing PC-1's answer, so it is not
-attempted now. **Reversal trigger:** if `scripts/proc-isolation-report.ps1`
-(or a future live observation) ever reports `same-uid-environ-readable=yes`,
-PC-2 is reopened as required rather than optional, because that answer means
-the identity-drop ordering is the *only* control and a same-uid read is
-genuinely possible.
+*Design.* Only `ralph` mode ever holds the identity (it is the only mode
+that calls `az login --identity`); every other mode runs an agent against
+attacker-influenced input. PC-2 gives `ralph`'s process a Linux UID that is
+never the same as the UID any agent-running mode uses. This works
+independently of `hidepid` because the kernel's ptrace/DAC check on
+`/proc/<pid>/environ` is gated on a **real UID match** (or
+`CAP_SYS_PTRACE`) — a genuine cross-UID boundary denies the read
+regardless of what `hidepid` is set to.
+
+*Implementation.* `worker/Dockerfile` now creates two distinct, unprivileged
+Linux users at build time: `squad` (every mode except `ralph`) and
+`squad-identity` (`ralph` only). Neither is a member of the other's group;
+both are members of a separate, `chmod 2775`, setgid `squad-workers` group
+solely so both can write into the one thing they must share — `/workspace`,
+which every mode, including `ralph`, unconditionally clones the repository
+into. The image's container-default user is now root (no trailing `USER`
+line), solely so `worker/entrypoint.sh`'s very first executable action —
+before `HOME`, before any credential, before a single byte of
+attacker-influenced input is touched — can `exec env -u HOME runuser -p -u
+squad|squad-identity -- "$0" "$@"`, selecting `squad-identity` only when
+`SQUAD_MODE=ralph`. `exec` replaces the process outright, so no root parent
+is ever left running in any mode. (`env -u HOME` clears a stale
+`HOME=/root` that `runuser -p`'s environment-preservation would otherwise
+carry across the UID switch, which the HOME fallback a few lines later —
+now resolved from `getent passwd "$(id -un)"`, never hard-coded to
+`/home/squad` — needs to see cleared to resolve per-user correctly.)
+
+*Live proof.* Reusing the same diagnostic-image/job-start-override/
+Log Analytics workflow described above (again without real GH tokens), two
+separate executions were run against the PC-2-carrying image:
+
+- `SQUAD_MODE=smoke` → `SQUAD-PROC-ISO v1 ... uid=1001 user=squad`
+- `SQUAD_MODE=ralph` → `SQUAD-PROC-ISO v1 ... uid=1002 user=squad-identity`
+
+Both executions cloned the repository into `/workspace` successfully (the
+shared-group write worked for both users), and each resolved its own
+`$HOME` correctly (`/home/squad` vs. `/home/squad-identity`). The job's
+persistent template was, again, confirmed unmutated afterward, and the
+diagnostic tag was deleted. `worker/tests/test_uid_separation.sh` asserts
+the static shape of this control (the two distinct users, the shared-group
+setup, the drop's ordering and target selection, `exec`, environment
+preservation, and the `HOME` fix) so a future regression fails a named test
+rather than silently reopening the gap; where the CI host can create an
+unprivileged Linux user namespace, it additionally reproduces the underlying
+kernel property live (same-uid child readable, cross-UID child denied) --
+it skips explicitly, never silently, when that is unavailable.
 
 ---
 

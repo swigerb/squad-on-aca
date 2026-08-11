@@ -16,8 +16,35 @@
       "observed-yes"   -- the most recent execution's log contains the
                           probe's line reporting same-uid-environ-readable=yes.
       "observed-no"    -- same, reporting =no.
+      "fail-one"       -- L2: two executions are listed; the first one's log
+                          read fails (exit 9), the second reads cleanly with
+                          no probe line. A partial read must exit 3
+                          (inconclusive-partial-read), never 0.
+      "fail-all"       -- L2: two executions are listed and BOTH log reads
+                          fail. Nothing was read, so nothing is known: this
+                          must exit 2 (live read unavailable), never 0 /
+                          not-yet-observed.
+      "show-fails"     -- L3: `containerapp job show` fails, so the container
+                          name cannot be resolved from the live template and
+                          the reader must fall back to the job name as an
+                          explicitly-reported assumption. The stub then
+                          accepts the job name as --container.
       unset / anything else -- the execution's log contains ordinary lines
                           but no SQUAD-PROC-ISO line at all (not-yet-observed).
+
+    The stub also enforces the WIRE SHAPE of every logs-show call, exactly as
+    the live CLI does, so a regression is caught here rather than being
+    discovered as an unexplained empty read against a real deployment:
+
+      * `--format json` must be present (the parser's unwrap step depends on
+        the NDJSON envelope; a default is not a contract).
+      * `--tail` must be present and within 0-300; anything larger is what
+        the real CLI rejects as a usage error, and is what both prior
+        revisions silently sent.
+      * `--container` must name the container the stub's own job template
+        reports (`squad-probe`) -- not the job name -- unless the template
+        read itself failed ("show-fails"), in which case the job name is the
+        documented assumption.
 
     Every invocation is appended to SQUAD_PROC_ISO_STUB_LOG (raw argv, one
     call per line) so a test can assert the exact sequence of `az` calls this
@@ -48,12 +75,16 @@ function New-ProcIsoStubEnvironment {
 
     Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
 @echo off
+setlocal enabledelayedexpansion
 if not "%SQUAD_PROC_ISO_STUB_LOG%"=="" (>>"%SQUAD_PROC_ISO_STUB_LOG%" echo %*)
 set "A1=%~1"
 set "A2=%~2"
 set "A3=%~3"
 set "A4=%~4"
+set "EXPECTED_CONTAINER=squad-probe"
+if "%SQUAD_PROC_ISO_STUB_MODE%"=="show-fails" set "EXPECTED_CONTAINER=caj-pc1stub-session"
 if "%A1%"=="account" goto piaccount
+if "%A1%"=="containerapp" if "%A2%"=="job" if "%A3%"=="show" goto pishow
 if "%A1%"=="containerapp" if "%A2%"=="job" if "%A3%"=="execution" if "%A4%"=="list" goto pilist
 if "%A1%"=="containerapp" if "%A2%"=="job" if "%A3%"=="logs" if "%A4%"=="show" goto pilogs
 >&2 echo ERROR: unhandled stub command: %*
@@ -63,20 +94,67 @@ exit /b 9
 echo {"id":"aaaaaaaa-1111-1111-1111-111111111111","name":"PC1 Stub Subscription"}
 exit /b 0
 
+:pishow
+rem L3: the job template is what names the container. In "show-fails" mode
+rem this read is refused, so the reader must fall back to the job name AND
+rem say out loud that it assumed it.
+if "%SQUAD_PROC_ISO_STUB_MODE%"=="show-fails" goto pishowfail
+echo squad-probe
+exit /b 0
+:pishowfail
+>&2 echo ERROR: stub refuses 'containerapp job show' in show-fails mode
+exit /b 9
+
 :pilist
+if "%SQUAD_PROC_ISO_STUB_MODE%"=="fail-one" goto pilisttwo
+if "%SQUAD_PROC_ISO_STUB_MODE%"=="fail-all" goto pilisttwo
 echo ["caj-pc1stub-session-stub01"]
+exit /b 0
+:pilisttwo
+echo ["caj-pc1stub-session-stub01","caj-pc1stub-session-stub02"]
 exit /b 0
 
 :pilogs
-rem R3 (issue #86 security revision): the reader must explicitly pin
-rem --format json. This stub enforces that as a wire-shape assertion: any
-rem call missing it is treated as an unhandled shape, exactly like a call to
-rem an unlisted command.
+rem Wire-shape enforcement, mirroring what the real CLI accepts.
 echo %*|findstr /C:"--format json" >nul
 if errorlevel 1 (
     >&2 echo ERROR: stub requires --format json on 'containerapp job logs show', got: %*
     exit /b 9
 )
+echo %*|findstr /C:"--container %EXPECTED_CONTAINER% " >nul
+if errorlevel 1 (
+    >&2 echo ERROR: stub requires --container %EXPECTED_CONTAINER% -- the name the job template reports -- got: %*
+    exit /b 9
+)
+set "TAILV="
+set "PREV="
+for %%A in (%*) do (
+    if "!PREV!"=="--tail" set "TAILV=%%A"
+    set "PREV=%%A"
+)
+if not defined TAILV (
+    >&2 echo ERROR: stub requires an explicit --tail on 'containerapp job logs show', got: %*
+    exit /b 9
+)
+if !TAILV! GTR 300 (
+    >&2 echo ERROR: argument --tail: invalid value !TAILV!: the value must be between 0 and 300
+    exit /b 9
+)
+if !TAILV! LSS 0 (
+    >&2 echo ERROR: argument --tail: invalid value !TAILV!: the value must be between 0 and 300
+    exit /b 9
+)
+if "%SQUAD_PROC_ISO_STUB_MODE%"=="fail-all" goto pilogsfail
+if not "%SQUAD_PROC_ISO_STUB_MODE%"=="fail-one" goto pilogsok
+echo %*|findstr /C:"stub01" >nul
+if errorlevel 1 goto pilogsok
+goto pilogsfail
+
+:pilogsfail
+>&2 echo ERROR: (ContainerAppExecutionLogsNotAvailable) logs for this execution could not be read
+exit /b 9
+
+:pilogsok
 echo {"Log":"ordinary startup line","TimeStamp":"2026-08-11T00:00:00.000000Z"}
 if "%SQUAD_PROC_ISO_STUB_MODE%"=="observed-yes" (
     echo {"Log":"SQUAD-PROC-ISO v1 same-uid-environ-readable=yes proc-mounted=yes hidepid=0 uid=1000 user=squad","TimeStamp":"2026-08-11T00:00:01.000000Z"}

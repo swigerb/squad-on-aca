@@ -20,10 +20,10 @@
 # Rules this file exists to enforce, mirroring CV-1/CV-2's contract:
 #
 #   1. Invoke-ProcIsoAzRead validates argv against a READ-VERB ALLOWLIST
-#      (account show; containerapp job execution list; containerapp job logs
-#      show) and throws on anything else -- a mutating verb, an
-#      unrecognised command shape, or a call missing an explicit
-#      --subscription.
+#      (account show; containerapp job show; containerapp job execution
+#      list; containerapp job logs show) and throws on anything else -- a
+#      mutating verb, an unrecognised command shape, or a call missing an
+#      explicit --subscription.
 #   2. `az account set` is banned alongside every mutating verb.
 #   3. Intent (resource group, name prefix, subscription, job name) fails
 #      CLOSED, reusing the same defaults and resolution order as
@@ -39,9 +39,22 @@
 
 $script:ProcIsoAllowedShapes = @(
     , @("account", "show")
+    , @("containerapp", "job", "show")
     , @("containerapp", "job", "execution", "list")
     , @("containerapp", "job", "logs", "show")
 )
+
+# L1 (issue #86, third revision): `az containerapp job logs show --tail` is
+# documented as accepting 0-300 and REJECTS anything outside that range as a
+# usage error. The prior revisions' default was 500, so every live log read
+# they ever made was rejected by the CLI before it reached Azure -- and the
+# reader then swallowed that non-zero exit and reported the honest-sounding
+# "not-yet-observed". The bound is enforced here, in the reader, and again in
+# scripts/proc-isolation-report.ps1 -- in both cases BEFORE any `az` process
+# is started, so an out-of-range request fails closed rather than being
+# discovered as a silent empty read.
+$script:ProcIsoMaxTailLines = 300
+$script:ProcIsoDefaultTailLines = 300
 
 $script:ProcIsoDeniedTokens = @(
     "create", "update", "delete", "remove", "set", "assign", "grant", "revoke",
@@ -84,7 +97,7 @@ function Invoke-ProcIsoAzRead {
         }
     }
     if (-not $matchedShape) {
-        throw "Invoke-ProcIsoAzRead refuses argv '$($AzArgs -join ' ')': it does not match any entry on the read-verb allowlist (account show; containerapp job execution list; containerapp job logs show). This call was not attempted."
+        throw "Invoke-ProcIsoAzRead refuses argv '$($AzArgs -join ' ')': it does not match any entry on the read-verb allowlist (account show; containerapp job show; containerapp job execution list; containerapp job logs show). This call was not attempted."
     }
 
     if (($AzArgs -notcontains "--subscription")) {
@@ -210,21 +223,115 @@ function Resolve-ProcIsoIntent {
     }
 }
 
+function Assert-ProcIsoTailLines {
+    <#
+    .SYNOPSIS
+        L1: fail closed on an out-of-range --tail BEFORE any `az` process is
+        started. `az containerapp job logs show --tail` accepts 0-300; a
+        value outside that range is rejected by the CLI as a usage error,
+        which the prior revisions swallowed into a silent empty read.
+    #>
+    param([Parameter(Mandatory = $true)][int]$TailLines)
+
+    if ($TailLines -lt 0 -or $TailLines -gt $script:ProcIsoMaxTailLines) {
+        throw "TailLines must be between 0 and $($script:ProcIsoMaxTailLines) (the range 'az containerapp job logs show --tail' accepts); got $TailLines. No Azure call was attempted -- an out-of-range request is rejected by the CLI as a usage error, and a rejected read must never be reported as 'not-yet-observed'."
+    }
+}
+
+function Resolve-ProcIsoContainerName {
+    <#
+    .SYNOPSIS
+        L3: resolve the container name `az containerapp job logs show
+        --container` needs, from the LIVE job's own template, through the
+        same allowlisted chokepoint.
+
+    .DESCRIPTION
+        `--container` is required and must name a container in the job's
+        template. Both prior revisions passed the JOB's name, which is only
+        correct if the template happens to name its container after the job
+        -- otherwise every log read fails, and (before L2) failed silently.
+
+        The live template is authoritative:
+          az containerapp job show --query properties.template.containers[0].name
+        If that read fails (permissions, extension missing, drift), this
+        falls back to the job name -- but records Source = "assumed" so the
+        caller can state the assumption explicitly in its output rather than
+        presenting a guess as fact.
+
+    .OUTPUTS
+        [pscustomobject] with Name, Source ("explicit"|"resolved"|"assumed")
+        and Detail (why, when assumed).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Intent,
+        [string]$ContainerName = ""
+    )
+
+    if ($ContainerName) {
+        return [pscustomobject]@{
+            Name   = $ContainerName
+            Source = "explicit"
+            Detail = "supplied by the caller via -ContainerName"
+        }
+    }
+
+    $showResult = Invoke-ProcIsoAzRead -AzArgs @(
+        "containerapp", "job", "show",
+        "--name", $Intent.JobName,
+        "--resource-group", $Intent.ResourceGroup,
+        "--subscription", $Intent.SubscriptionId,
+        "--query", "properties.template.containers[0].name",
+        "--only-show-errors",
+        "-o", "tsv"
+    )
+    $resolved = ""
+    if ($showResult.ExitCode -eq 0) {
+        $resolved = ((@($showResult.StdOut) -join "`n").Trim() -split "`n" | Where-Object { $_ -ne "" } | Select-Object -First 1)
+        if ($null -eq $resolved) { $resolved = "" }
+        $resolved = ([string]$resolved).Trim().Trim('"')
+    }
+
+    if ($resolved) {
+        return [pscustomobject]@{
+            Name   = $resolved
+            Source = "resolved"
+            Detail = "read from the live job template (properties.template.containers[0].name)"
+        }
+    }
+
+    $why = if ($showResult.ExitCode -ne 0) {
+        "'az containerapp job show' failed, exit $($showResult.ExitCode): $((@($showResult.StdErr) + @($showResult.StdOut)) -join ' ')"
+    } else {
+        "'az containerapp job show' returned no container name"
+    }
+    return [pscustomobject]@{
+        Name   = $Intent.JobName
+        Source = "assumed"
+        Detail = "the job template could not be read ($why), so the container name is ASSUMED to equal the job name '$($Intent.JobName)'. If the template names its container differently, every log read below will fail -- and will be reported as a failure, never as 'not-yet-observed'."
+    }
+}
+
 function Get-ProcIsoLiveObservation {
     <#
     .SYNOPSIS
         Reads recent executions of the given job and returns log lines in
         most-recent-first order, ready for
-        scripts/lib/proc-isolation-parser.ps1's Get-ProcIsoObservation.
+        scripts/lib/proc-isolation-parser.ps1's Get-ProcIsoObservation --
+        together with an explicit account of what was scanned, what was
+        actually read, and what failed.
 
     .DESCRIPTION
         Read-only: lists existing executions (never starts one) and reads
         their already-written console logs (never execs into a container).
-        A failure anywhere -- unreachable subscription, missing containerapp
-        extension, no executions at all -- is reported by throwing, so the
-        caller can distinguish "read failed / unavailable" from "read
-        succeeded, nothing observed" (the latter is PC-1's honest
-        not-yet-observed state, the former must never be reported as that).
+
+        L2 (issue #86, third revision): a failure is never swallowed.
+        * A failure of the account or execution-list read aborts by throwing
+          -- the question could not be asked at all.
+        * A per-execution log read failure is RECORDED in Failures and
+          counted (ExecutionsScanned vs ExecutionsRead) rather than being
+          silently `continue`d past. That silent continue is exactly how a
+          run in which every single log read was rejected still reported the
+          reassuring "not-yet-observed".
 
     .PARAMETER Intent
         The object returned by Resolve-ProcIsoIntent.
@@ -234,17 +341,28 @@ function Get-ProcIsoLiveObservation {
         purpose: this is a diagnostic read, not a log archive export.
 
     .PARAMETER TailLines
-        How many trailing console lines to read per execution.
+        How many trailing console lines to read per execution. 0-300 (L1).
+
+    .PARAMETER ContainerName
+        Overrides container resolution (L3). Empty means: resolve from the
+        live job template, falling back to the job name as an explicitly
+        reported assumption.
 
     .OUTPUTS
-        [pscustomobject] with ExecutionsScanned (int) and Lines (string[],
-        most-recent execution first).
+        [pscustomobject] with ExecutionsScanned (int), ExecutionsRead (int),
+        Failures (string[]), ContainerName, ContainerNameSource,
+        ContainerNameDetail, and Lines (string[], most-recent execution
+        first).
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Intent,
         [int]$ExecutionLimit = 5,
-        [int]$TailLines = 500
+        [int]$TailLines = 300,
+        [string]$ContainerName = ""
     )
+
+    # L1: before ANY az process is started.
+    Assert-ProcIsoTailLines -TailLines $TailLines
 
     $sub = $Intent.SubscriptionId
 
@@ -252,6 +370,8 @@ function Get-ProcIsoLiveObservation {
     if ($accountShown.ExitCode -ne 0) {
         throw "Could not confirm the target subscription is reachable ('az account show --subscription <id>' failed, exit $($accountShown.ExitCode)): $((@($accountShown.StdErr) + @($accountShown.StdOut)) -join ' ')"
     }
+
+    $container = Resolve-ProcIsoContainerName -Intent $Intent -ContainerName $ContainerName
 
     $listResult = Invoke-ProcIsoAzRead -AzArgs @(
         "containerapp", "job", "execution", "list",
@@ -278,34 +398,33 @@ function Get-ProcIsoLiveObservation {
     }
 
     $lines = @()
+    $failures = @()
+    $read = 0
     foreach ($name in $names) {
-        # R3 (issue #86 security revision): pin `--format json` explicitly.
-        # This command's default (unpinned) format is `text`, which prepends
-        # an ISO-8601 timestamp to every line rather than the NDJSON
-        # {"Log":"...","TimeStamp":"..."} envelope
-        # scripts/lib/proc-isolation-parser.ps1's JSON-unwrap step expects.
-        # Leaving this unpinned is exactly how the prior revision's "not yet
-        # observed" live result was never actually evidence: the reader was
-        # never asking for the wire shape its own parser could recognise.
+        # `--format json` is pinned explicitly rather than left to the
+        # command's own default. It happens to match today's documented
+        # default, and that is precisely why it is pinned: the parser's
+        # unwrap step depends on the NDJSON {"Log":...} envelope, and a
+        # default is not a contract.
         $logsResult = Invoke-ProcIsoAzRead -AzArgs @(
             "containerapp", "job", "logs", "show",
             "--name", $Intent.JobName,
             "--resource-group", $Intent.ResourceGroup,
             "--execution", $name,
-            "--container", $Intent.JobName,
+            "--container", $container.Name,
             "--tail", ([string]$TailLines),
             "--subscription", $sub,
             "--format", "json",
             "--only-show-errors"
         )
         if ($logsResult.ExitCode -ne 0) {
-            # A single execution's logs being unreadable (rotated away, the
-            # containerapp extension genuinely missing) does not abort the
-            # whole read -- it is simply not a source of an observation.
-            # Reported per-execution so a caller can tell "found nothing" from
-            # "could not read some/all of what was scanned" if needed.
+            # L2: recorded, never silently skipped. An execution whose logs
+            # could not be read is NOT evidence of absence -- it is an
+            # unread execution, and the caller must be able to say so.
+            $failures += "execution '$name': 'az containerapp job logs show' failed, exit $($logsResult.ExitCode): $(((@($logsResult.StdErr) + @($logsResult.StdOut)) -join ' ').Trim())"
             continue
         }
+        $read++
         # Most-recent occurrence within THIS execution first.
         $execLines = @($logsResult.StdOut)
         [array]::Reverse($execLines)
@@ -313,7 +432,12 @@ function Get-ProcIsoLiveObservation {
     }
 
     return [pscustomobject]@{
-        ExecutionsScanned = $names.Count
-        Lines             = $lines
+        ExecutionsScanned   = $names.Count
+        ExecutionsRead      = $read
+        Failures            = $failures
+        ContainerName       = $container.Name
+        ContainerNameSource = $container.Source
+        ContainerNameDetail = $container.Detail
+        Lines               = $lines
     }
 }

@@ -28,11 +28,14 @@
                              and a session or Ralph poll actually runs
 
     THIS SCRIPT NEVER FABRICATES OR INFERS A RESULT. A live read failure
-    (unreachable subscription, missing az/containerapp extension, no
-    executions to scan) is reported as "live read unavailable", explicitly
-    distinct from "not-yet-observed" -- the former means the question was
-    never actually asked, the latter means it was asked and answered
-    silence.
+    (unreachable subscription, missing az/containerapp extension, an
+    out-of-range --tail, or every scanned execution's logs failing to read)
+    is reported as "live read unavailable" (exit 2), explicitly distinct from
+    "not-yet-observed" -- the former means the question was never actually
+    answered, the latter means it was asked, every scanned execution was
+    genuinely read, and the answer was silence. A read that succeeded for
+    some executions and failed for others is neither, and is reported as
+    "inconclusive-partial-read" (exit 3).
 
 .PARAMETER ResourceGroupName
     Overrides intent resolution for the resource group.
@@ -51,7 +54,18 @@
     How many of the most recent executions to scan (default 5).
 
 .PARAMETER TailLines
-    How many trailing console lines to read per execution (default 500).
+    How many trailing console lines to read per execution (default 300).
+    Must be 0-300: that is the range `az containerapp job logs show --tail`
+    accepts, and a value outside it is rejected by the CLI as a usage error
+    before Azure is ever contacted. Validated here BEFORE any `az` call, and
+    again inside the reader; out of range exits 2 with zero Azure calls made.
+
+.PARAMETER ContainerName
+    The container in the job's template whose logs are read. Omitted (the
+    default), it is resolved from the live job template via
+    `az containerapp job show --query properties.template.containers[0].name`.
+    If that read fails, the job name is used as an explicitly-reported
+    ASSUMPTION -- printed in the output, never presented as fact.
 
 .PARAMETER Fixture
     Path to a text file of already-captured log lines (one per line). When
@@ -67,12 +81,19 @@
     Emit the finding as JSON instead of a human-readable line.
 
 .OUTPUTS
-    Exit 0: the read succeeded (or a fixture was used), regardless of what
-            was observed -- including "not-yet-observed", which is an
-            expected, non-error outcome.
-    Exit 2: intent could not be resolved, or a live read failed outright
-            (the platform question was never actually asked). Never mutates
-            Azure and never guesses across a subscription boundary.
+    Exit 0: every execution that was scanned was also actually read, and the
+            result is what those logs say -- an observation (yes/no/unknown)
+            or a GENUINE not-yet-observed (the probe's line is absent from
+            logs that were successfully read end to end).
+    Exit 2: the question was never actually asked. Intent could not be
+            resolved, -TailLines was out of range (no Azure call attempted),
+            the account or execution-list read failed, or EVERY log read of
+            every scanned execution failed. Reported as "live read
+            unavailable" and never as not-yet-observed.
+    Exit 3: inconclusive-partial-read. Some, but not all, of the scanned
+            executions could be read. Whatever the read part says, absence of
+            the probe line cannot be concluded from a partial read, so this
+            is neither a clean observation nor a clean absence.
 #>
 [CmdletBinding()]
 param(
@@ -81,7 +102,8 @@ param(
     [string]$SubscriptionId = "",
     [string]$JobName = "",
     [int]$ExecutionLimit = 5,
-    [int]$TailLines = 500,
+    [int]$TailLines = 300,
+    [string]$ContainerName = "",
     [string]$Fixture = "",
     [string]$DeployOutputsPath = "",
     [switch]$Json
@@ -116,26 +138,66 @@ function Write-ProcIsoFatal {
 }
 
 function Write-ProcIsoFinding {
-    param([object]$Observation, [string]$Source, [switch]$AsJson)
+    param(
+        [object]$Observation,
+        [string]$Source,
+        [string]$Status = "complete-read",
+        [int]$ExecutionsScanned = 0,
+        [int]$ExecutionsRead = 0,
+        [string[]]$Failures = @(),
+        [string]$ContainerName = "",
+        [string]$ContainerNameSource = "",
+        [string]$ContainerNameDetail = "",
+        [switch]$AsJson
+    )
     if ($AsJson) {
         [pscustomobject]@{
-            schema                 = "squad-aca/proc-isolation-report@1"
+            schema                 = "squad-aca/proc-isolation-report@2"
             source                 = $Source
+            status                 = $Status
             observed               = $Observation.Observed
             sameUidEnvironReadable = $Observation.SameUidEnvironReadable
             procMounted            = $Observation.ProcMounted
             hidepid                = $Observation.Hidepid
+            executionsScanned      = $ExecutionsScanned
+            executionsRead         = $ExecutionsRead
+            failures               = @($Failures)
+            container              = $ContainerName
+            containerSource        = $ContainerNameSource
+            containerAssumption    = $ContainerNameDetail
         } | ConvertTo-Json -Depth 4 | Write-Output
         return
     }
     Write-Output "PC-1 process-isolation report (source: $Source)"
+    Write-Output "  status                    : $Status"
     Write-Output "  same-uid-environ-readable : $($Observation.SameUidEnvironReadable)"
     if ($Observation.Observed) {
         Write-Output "  proc-mounted              : $($Observation.ProcMounted)"
         Write-Output "  hidepid                   : $($Observation.Hidepid)"
-    } else {
-        Write-Output "  (no SQUAD-PROC-ISO line was found in what was read; this is 'not yet observed', not a failure)"
+    } elseif ($Status -eq "complete-read") {
+        Write-Output "  (no SQUAD-PROC-ISO line was found in logs that were read end to end; this is a genuine 'not yet observed', not a failure)"
     }
+    if ($ContainerName) {
+        Write-Output "  container                 : $ContainerName ($ContainerNameSource)"
+        if ($ContainerNameSource -eq "assumed") {
+            Write-Output "  ASSUMPTION                : $ContainerNameDetail"
+        }
+    }
+    Write-Output "  executions scanned/read   : $ExecutionsScanned/$ExecutionsRead"
+    if (@($Failures).Count -gt 0) {
+        Write-Output "  log reads that FAILED     : $(@($Failures).Count)"
+        foreach ($failure in @($Failures)) { Write-Output "    - $failure" }
+    }
+}
+
+# L1: the --tail bound is enforced before anything else happens -- before
+# intent resolution, before the reader is entered, and therefore before any
+# `az` process could be started. `az containerapp job logs show --tail`
+# accepts 0-300 and rejects anything else as a usage error; both prior
+# revisions defaulted to 500, so every live log read they made was rejected
+# by the CLI and then reported as an honest-sounding "not-yet-observed".
+if ($TailLines -lt 0 -or $TailLines -gt 300) {
+    Write-ProcIsoFatal "PC-1: -TailLines must be between 0 and 300 (the range 'az containerapp job logs show --tail' accepts); got $TailLines. No Azure call was attempted. An out-of-range value is rejected by the CLI as a usage error, and a rejected read must never be reported as 'not-yet-observed'."
 }
 
 if ($Fixture) {
@@ -144,7 +206,7 @@ if ($Fixture) {
     }
     $fixtureLines = @(Get-Content -LiteralPath $Fixture)
     $observation = Get-ProcIsoObservation -Lines $fixtureLines
-    Write-ProcIsoFinding -Observation $observation -Source "fixture:$Fixture" -AsJson:$Json
+    Write-ProcIsoFinding -Observation $observation -Source "fixture:$Fixture" -Status "fixture" -AsJson:$Json
     exit 0
 }
 
@@ -163,11 +225,47 @@ if ($intent.Missing.Count -gt 0) {
 }
 
 try {
-    $live = Get-ProcIsoLiveObservation -Intent $intent -ExecutionLimit $ExecutionLimit -TailLines $TailLines
+    $live = Get-ProcIsoLiveObservation -Intent $intent -ExecutionLimit $ExecutionLimit -TailLines $TailLines -ContainerName $ContainerName
 } catch {
     Write-ProcIsoFatal "PC-1 live read unavailable: $($_.Exception.Message). The platform question was never actually asked -- this is NOT the same as 'not-yet-observed', and no result is reported."
 }
 
 $observation = Get-ProcIsoObservation -Lines $live.Lines
-Write-ProcIsoFinding -Observation $observation -Source "live:$($intent.JobName) ($($live.ExecutionsScanned) execution(s) scanned)" -AsJson:$Json
+
+# L2: what the exit code is allowed to mean.
+#
+#   * Every scanned execution actually read -> exit 0. Only then is an
+#     absence of the probe's line a GENUINE not-yet-observed.
+#   * Some read, some failed -> exit 3, inconclusive-partial-read. Absence
+#     cannot be concluded from logs that were never read.
+#   * Every log read failed (or there was nothing readable at all) -> exit 2,
+#     live read unavailable: the question was asked and never answered.
+$scanned = [int]$live.ExecutionsScanned
+$read = [int]$live.ExecutionsRead
+$failures = @($live.Failures)
+
+if ($scanned -gt 0 -and $read -eq 0) {
+    Write-ProcIsoFatal ("PC-1 live read unavailable: all $scanned scanned execution(s) of job '$($intent.JobName)' failed to read (container '$($live.ContainerName)', source $($live.ContainerNameSource)). " +
+        "$($failures -join ' | ') " +
+        "Nothing was read, so nothing is known -- this is NOT 'not-yet-observed'.")
+}
+
+$status = if ($failures.Count -gt 0) { "inconclusive-partial-read" } else { "complete-read" }
+
+Write-ProcIsoFinding `
+    -Observation $observation `
+    -Source "live:$($intent.JobName)" `
+    -Status $status `
+    -ExecutionsScanned $scanned `
+    -ExecutionsRead $read `
+    -Failures $failures `
+    -ContainerName $live.ContainerName `
+    -ContainerNameSource $live.ContainerNameSource `
+    -ContainerNameDetail $live.ContainerNameDetail `
+    -AsJson:$Json
+
+if ($failures.Count -gt 0) {
+    [Console]::Error.WriteLine("PC-1 inconclusive-partial-read: $($failures.Count) of $scanned scanned execution(s) could not be read. Absence of the probe's line cannot be concluded from a partial read.")
+    exit 3
+}
 exit 0

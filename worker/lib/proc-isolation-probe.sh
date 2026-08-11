@@ -25,8 +25,10 @@
 #   * It always reaps the child it starts, on every exit path.
 #   * It exits 0 unconditionally, including when every check inside it fails,
 #     so a probe failure can never fail a session or a deploy.
-#   * The cost is one very short sleep (default 0.3s); there is no retry loop
-#     and no polling.
+#   * The cost is bounded and small: the child is killed as soon as the answer
+#     is in, and the fork/exec settle loop (L4, below) re-polls at most 30
+#     times 0.01s apart -- 0.3s worst case, and typically one or two polls.
+#     There is no unbounded wait and no open-ended polling.
 #
 # TESTABILITY
 # -----------
@@ -37,12 +39,28 @@
 # classifications without depending on a specific host's actual /proc
 # restrictions:
 #
+#   squad_proc_iso_classify_environ_detail <path> <var-name>
+#     Pure classifier, the SINGLE implementation of what an environ-shaped
+#     path says: "present", "absent", "unreadable", "empty" or "missing".
+#     Distinguishing "absent" (readable, non-empty, the name is genuinely not
+#     there) from "unreadable" is what makes the L4 settle loop below
+#     possible: only the shapes that a not-yet-exec'd child produces are worth
+#     re-polling, and an unreadable path never is.
+#
 #   squad_proc_iso_classify_environ_readable <path> <var-name>
-#     Pure classifier: given a path (real or fabricated) and a variable NAME
-#     to look for, returns "yes" (found), "no" (path exists but is unreadable,
-#     or is readable and does not contain the name), or "unknown" (path does
-#     not exist, or is readable but empty). Never reads the variable's value
-#     into anything returned or printed.
+#     The reported three-value classification, mapped from the detail above:
+#     "yes" (found), "no" (path exists but is unreadable, or is readable and
+#     does not contain the name), or "unknown" (path does not exist, or is
+#     readable but empty). Never reads the variable's value into anything
+#     returned or printed.
+#
+#   squad_proc_iso_classify_environ_readable_settled <path> <var-name>
+#     L4 (issue #86, third revision): the same classification, but tolerant of
+#     the fork/exec race described at squad_proc_iso_check_same_uid_readable.
+#     Bounded: at most SQUAD_PROC_ISO_SETTLE_ATTEMPTS (30) re-polls,
+#     SQUAD_PROC_ISO_SETTLE_INTERVAL (0.01s) apart -- 0.3s worst case, no
+#     unbounded wait, and it never turns a genuine "no" into a "yes": only a
+#     readable-but-not-yet-populated shape is re-polled.
 #
 #   squad_proc_iso_parse_hidepid <mount-line>
 #     Pure classifier: given a line as it would appear in /proc/mounts for the
@@ -53,7 +71,17 @@
 # behaviour and the test that targets it -- there is no parallel
 # reimplementation to drift.
 
-SQUAD_PROC_ISO_SLEEP_SECONDS="${SQUAD_PROC_ISO_SLEEP_SECONDS:-0.3}"
+SQUAD_PROC_ISO_SLEEP_SECONDS="${SQUAD_PROC_ISO_SLEEP_SECONDS:-2}"
+
+# L4 (issue #86, third revision): the bounded settle window for the fork/exec
+# race. At most 30 re-polls, 0.01s apart -- 0.3s worst case. The child's own
+# nominal lifetime (SQUAD_PROC_ISO_SLEEP_SECONDS, above) is deliberately far
+# larger than this window so the child cannot exit underneath a re-poll and
+# turn a real answer into "unknown"; the child is killed as soon as
+# classification finishes, so that nominal lifetime is never actually waited
+# out.
+SQUAD_PROC_ISO_SETTLE_ATTEMPTS="${SQUAD_PROC_ISO_SETTLE_ATTEMPTS:-30}"
+SQUAD_PROC_ISO_SETTLE_INTERVAL="${SQUAD_PROC_ISO_SETTLE_INTERVAL:-0.01}"
 
 squad_proc_iso_uid() {
   id -u 2>/dev/null || printf 'unknown'
@@ -104,9 +132,44 @@ squad_proc_iso_hidepid() {
   squad_proc_iso_parse_hidepid "$mount_line"
 }
 
-# Pure classifier. NEVER prints, compares, or returns the variable's VALUE --
-# only whether its NAME is present in the given (real or fabricated) environ
-# file.
+# Pure classifier, the single implementation. NEVER prints, compares, or
+# returns the variable's VALUE -- only what the given (real or fabricated)
+# environ file says about the presence of its NAME:
+#
+#   "present"    readable, non-empty, contains a line "<var-name>=..."
+#   "absent"     readable, non-empty, does NOT contain the variable name
+#   "unreadable" the path exists but could not be read
+#   "empty"      the path is readable but has no content at all
+#   "missing"    the path does not exist
+squad_proc_iso_classify_environ_detail() {
+  local environ_path="$1"
+  local var_name="$2"
+
+  if [[ ! -e "$environ_path" ]]; then
+    printf 'missing'
+    return 0
+  fi
+  if [[ ! -r "$environ_path" ]]; then
+    printf 'unreadable'
+    return 0
+  fi
+
+  local content
+  content="$(tr '\0' '\n' < "$environ_path" 2>/dev/null)"
+  if [[ -z "$content" ]]; then
+    printf 'empty'
+    return 0
+  fi
+
+  if printf '%s\n' "$content" | grep -q "^${var_name}="; then
+    printf 'present'
+  else
+    printf 'absent'
+  fi
+}
+
+# The reported three-value classification, mapped from the detail above so
+# there is exactly one implementation of what an environ file says.
 #
 #   "yes"     the path is readable and contains a line "<var-name>=..."
 #   "no"      the path exists but could not be read, or was read and does not
@@ -114,30 +177,51 @@ squad_proc_iso_hidepid() {
 #   "unknown" the path does not exist, or is readable but empty (nothing this
 #             script can conclude either way)
 squad_proc_iso_classify_environ_readable() {
+  local detail
+  detail="$(squad_proc_iso_classify_environ_detail "$1" "$2")"
+  case "$detail" in
+    present) printf 'yes' ;;
+    absent | unreadable) printf 'no' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# L4 (issue #86, third revision): the same classification, made immune to the
+# fork/exec race.
+#
+# `env VAR=v sleep N &` returns the child's pid the instant the FORK
+# completes, which is before the child has exec'd `env`. In that window
+# /proc/<pid>/environ is readable and carries the *parent's* environment --
+# which does not contain the sentinel -- or is momentarily empty. Classifying
+# once, right then, reports "no": the same answer a platform that genuinely
+# forbids the read would produce. That is the most dangerous possible defect
+# in this probe, because "no" is the reassuring answer.
+#
+# So: a readable-but-not-yet-populated shape ("absent"/"empty") is re-polled,
+# BOUNDED at SQUAD_PROC_ISO_SETTLE_ATTEMPTS tries SQUAD_PROC_ISO_SETTLE_INTERVAL
+# apart (30 x 0.01s = 0.3s worst case), and nothing else is. "unreadable" is
+# a real platform answer and returns immediately; "missing" means the process
+# is gone and returns immediately. The loop can only ever turn a transient
+# "no"/"unknown" into the "yes" that was true all along -- it can never
+# manufacture a "yes" from a path that never contains the name.
+squad_proc_iso_classify_environ_readable_settled() {
   local environ_path="$1"
   local var_name="$2"
+  local attempts=0
+  local detail
 
-  if [[ ! -e "$environ_path" ]]; then
-    printf 'unknown'
-    return 0
-  fi
-  if [[ ! -r "$environ_path" ]]; then
-    printf 'no'
-    return 0
-  fi
+  detail="$(squad_proc_iso_classify_environ_detail "$environ_path" "$var_name")"
+  while [[ "$detail" == "absent" || "$detail" == "empty" ]] && [[ "$attempts" -lt "$SQUAD_PROC_ISO_SETTLE_ATTEMPTS" ]]; do
+    sleep "$SQUAD_PROC_ISO_SETTLE_INTERVAL" 2>/dev/null || true
+    attempts=$((attempts + 1))
+    detail="$(squad_proc_iso_classify_environ_detail "$environ_path" "$var_name")"
+  done
 
-  local content
-  content="$(tr '\0' '\n' < "$environ_path" 2>/dev/null)"
-  if [[ -z "$content" ]]; then
-    printf 'unknown'
-    return 0
-  fi
-
-  if printf '%s\n' "$content" | grep -q "^${var_name}="; then
-    printf 'yes'
-  else
-    printf 'no'
-  fi
+  case "$detail" in
+    present) printf 'yes' ;;
+    absent | unreadable) printf 'no' ;;
+    *) printf 'unknown' ;;
+  esac
 }
 
 # The mechanism, using a real child. Spawns a short-lived process carrying only
@@ -159,7 +243,9 @@ squad_proc_iso_check_same_uid_readable() {
   env "${sentinel_name}=${sentinel_value}" sleep "$SQUAD_PROC_ISO_SLEEP_SECONDS" &
   child_pid=$!
 
-  result="$(squad_proc_iso_classify_environ_readable "/proc/${child_pid}/environ" "$sentinel_name")"
+  # L4: settle across the fork/exec race rather than classifying once, the
+  # instant after the fork, when the child has not exec'd yet.
+  result="$(squad_proc_iso_classify_environ_readable_settled "/proc/${child_pid}/environ" "$sentinel_name")"
 
   # Always reap, regardless of what classification returned.
   kill "$child_pid" >/dev/null 2>&1 || true
