@@ -232,6 +232,17 @@ squad_credential_refresh_env() {
 SQUAD_CREDENTIAL_WITHHELD_TOKEN=""
 SQUAD_CREDENTIAL_IS_WITHHELD=0
 
+# How long to let the lease heartbeat stop politely, in tenths of a second,
+# before it is killed outright (issue #96).
+#
+# The heartbeat is a `while true; do sleep N; done` loop, so a TERM normally
+# ends it at once. Normally is not always: it was reproduced surviving the
+# TERM while this shell sat in `wait` for it, and an unbounded wait on a
+# process that did not die is a session that stops with no explanation. Two
+# seconds is far longer than a loop takes to notice a signal and short enough
+# that nobody is left wondering whether it is stuck.
+: "${SQUAD_HEARTBEAT_STOP_GRACE_DECIS:=20}"
+
 # Security follow-up (issue #84 blocker): withholding GH_TOKEN/GITHUB_TOKEN
 # alone left COPILOT_GITHUB_TOKEN visible to the agent whenever
 # worker/entrypoint.sh had defaulted it from GH_TOKEN (the default deployment
@@ -326,8 +337,40 @@ squad_credential_withhold() {
     # PID is also its own process group id, so signalling the group takes the
     # sleep down with it; falling back to the bare PID keeps this correct even
     # for a heartbeat that, for whatever reason, was not its own group leader.
-    kill -TERM -- "-$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null \
-      || kill "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    # Signal the GROUP first: squad_lease_heartbeat_loop's own `while true; do
+    # sleep N; done` forks a `sleep` grandchild that is not
+    # $SQUAD_LEASE_HEARTBEAT_PID, and signalling only that PID can leave the
+    # sleep orphaned and running, still holding whatever it inherited at fork
+    # time. The heartbeat is forked with job control on (see
+    # squad_credential_restore / entrypoint.sh) so its PID is its own process
+    # group id; the bare-PID fallback keeps this correct for a heartbeat that,
+    # for whatever reason, was not its own group leader.
+    #
+    # THEN ESCALATE, AND NEVER WAIT UNBOUNDED (issue #96). A plain
+    # `wait "$PID"` after a TERM assumes the TERM was both delivered and
+    # fatal. When it is not -- and in practice it sometimes is not -- the
+    # session blocks here forever with the heartbeat still alive. That was
+    # reproduced: 1 hang in 6 runs, then 1 in 10, then 1 in 35, always with
+    # the heartbeat present and this shell parked in `wait`. The hang cost a
+    # day of CI archaeology because it presents as the whole suite stopping,
+    # with nothing to say which process is holding it.
+    #
+    # A stop that cannot complete must fail, not idle -- exactly what this
+    # repository already concluded about hanging test suites.
+    kill -TERM -- "-$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    kill -TERM "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+    local _hb_waited=0
+    while kill -0 "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null; do
+      if [[ "$_hb_waited" -ge "$SQUAD_HEARTBEAT_STOP_GRACE_DECIS" ]]; then
+        kill -KILL -- "-$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+        kill -KILL "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
+        break
+      fi
+      sleep 0.1
+      _hb_waited=$((_hb_waited + 1))
+    done
+    # Reap it. By now it is dead or unkillable, so this cannot block the way
+    # an unbounded wait on a live process did.
     wait "$SQUAD_LEASE_HEARTBEAT_PID" 2>/dev/null || true
     SQUAD_LEASE_HEARTBEAT_PID=""
   fi
