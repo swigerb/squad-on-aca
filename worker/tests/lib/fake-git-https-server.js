@@ -107,6 +107,24 @@ function killAllBackends() {
 // in the suite's process group, which the runner sweeps anyway.
 process.on('exit', killAllBackends);
 
+/**
+ * A fixture that dies silently is worse than one that never started.
+ *
+ * If this server throws, every subsequent git operation in the suite blocks
+ * against a port with nothing behind it -- which presents as the SUITE
+ * hanging, with no indication that the fixture is the thing that broke. That
+ * cost a full day of chasing the wrong process (issue #96), so an unexpected
+ * throw now says so loudly, in the request log the suite keeps, and the
+ * process stays up rather than taking the suite down with it.
+ */
+process.on('uncaughtException', (err) => {
+  append(REQUEST_LOG, `fixture-uncaught ${err && err.stack ? err.stack.split('\n')[0] : err}`);
+  process.stderr.write(`fake-git-https-server: uncaught ${err && err.message}\n`);
+});
+process.on('unhandledRejection', (err) => {
+  append(REQUEST_LOG, `fixture-unhandled-rejection ${err && err.message ? err.message : err}`);
+});
+
 if (!ROOT || !CERT || !KEY || !TOKEN_FILE) {
   process.stderr.write('fake-git-https-server: --root, --cert, --key and --token-file are required\n');
   process.exit(64);
@@ -199,12 +217,31 @@ function runBackend(req, res, user) {
    * happened.
    */
   let replied = false;
+  /**
+   * Answer once, and never on a response the client has already abandoned.
+   *
+   * `git` closes connections routinely -- it aborts `info/refs` the moment it
+   * has what it needs. Writing to a response whose socket is gone THROWS, and
+   * an uncaught throw here takes the whole fixture server down. Every later
+   * git operation in the suite then blocks against a port with nothing behind
+   * it, which reads as the suite hanging.
+   *
+   * The original code got away with writing unguarded because it only ever
+   * wrote from `child.on('close')`, at a moment the client was usually still
+   * there. Introducing a timeout added a second, much later moment -- long
+   * after an aborted client has gone -- so the guard has to exist now.
+   */
   const reply = (status, headers, body) => {
     if (replied) return;
     replied = true;
     clearTimeout(deadline);
-    res.writeHead(status, headers);
-    res.end(body);
+    if (res.writableEnded || res.destroyed || res.headersSent) return;
+    try {
+      res.writeHead(status, headers);
+      res.end(body);
+    } catch (e) {
+      append(REQUEST_LOG, `reply-failed ${req.method} ${url.pathname}: ${e.message}`);
+    }
   };
   const deadline = setTimeout(() => {
     append(REQUEST_LOG, `backend-timeout ${req.method} ${url.pathname} after ${BACKEND_TIMEOUT_MS}ms`);
@@ -212,6 +249,21 @@ function runBackend(req, res, user) {
     reply(504, { 'Content-Type': 'text/plain' },
       `fixture: ${BACKEND} did not finish within ${BACKEND_TIMEOUT_MS}ms\n`);
   }, BACKEND_TIMEOUT_MS);
+
+  // An aborted client leaves the backend with nowhere to write and its stdin
+  // half of the pipe broken. Both raise errors that are fatal if unhandled --
+  // EPIPE on the stdin pipe, and the abort itself -- so both are handled, and
+  // the backend is stopped rather than left running for a client that has
+  // gone. This is the same leak the timeout exists for, arriving by a
+  // different route.
+  child.stdin.on('error', () => { /* EPIPE: the backend closed stdin first */ });
+  req.on('aborted', () => {
+    append(REQUEST_LOG, `client-aborted ${req.method} ${url.pathname}`);
+    clearTimeout(deadline);
+    replied = true;
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+  });
+  res.on('error', () => { /* the client went away mid-write */ });
 
   const chunks = [];
   child.stdout.on('data', (chunk) => chunks.push(chunk));
