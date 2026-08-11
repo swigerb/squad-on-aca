@@ -328,7 +328,7 @@ assert_eq "withhold,agent-start,agent-end,restore,publish," "$order_seq" \
 WITHHOLD_BODY="$(sed -n '/^squad_credential_withhold() {/,/^}/p' "${WORK}/lib/squad-credentials.sh")"
 RESTORE_BODY="$(sed -n '/^squad_credential_restore() {/,/^}/p' "${WORK}/lib/squad-credentials.sh")"
 
-heartbeat_kill_line="$(printf '%s\n' "$WITHHOLD_BODY" | grep -n 'kill "\$SQUAD_LEASE_HEARTBEAT_PID"' | head -1 | cut -d: -f1)"
+heartbeat_kill_line="$(printf '%s\n' "$WITHHOLD_BODY" | grep -n 'kill .*\$SQUAD_LEASE_HEARTBEAT_PID' | head -1 | cut -d: -f1)"
 unset_token_line="$(printf '%s\n' "$WITHHOLD_BODY" | grep -n '^ *unset GH_TOKEN GITHUB_TOKEN$' | head -1 | cut -d: -f1)"
 remove_file_line="$(printf '%s\n' "$WITHHOLD_BODY" | grep -n '^ *squad_credential_remove_token_file$' | head -1 | cut -d: -f1)"
 
