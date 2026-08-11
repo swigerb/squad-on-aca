@@ -141,6 +141,7 @@ function New-SquadCliStubEnvironment {
     $ghLog = Join-Path $Root "gh-calls.log"
     $squadLog = Join-Path $Root "squad-calls.log"
     $acaLog = Join-Path $Root "aca-calls.log"
+    $curlLog = Join-Path $Root "curl-calls.log"
     # Shared, ordered, cross-tool call log. `az` and the lease store both append
     # to it, so a test can assert that the lease write precedes the compute
     # request BY INDEX. It is deliberately NOT part of the golden capture: the
@@ -148,6 +149,7 @@ function New-SquadCliStubEnvironment {
     $callLog = Join-Path $Root "dispatch-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $ghLog -Value "" -NoNewline -Encoding ascii
+    Set-Content -LiteralPath $curlLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $squadLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $acaLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $callLog -Value "" -NoNewline -Encoding ascii
@@ -545,6 +547,25 @@ echo STUB-SQUAD-ACK
 exit /b 0
 '@
 
+    # --- Fake `curl` (issue #90 finding 3, doctor's Aspire URL reachability) -
+    # Test-AcaAspireReachability (scripts/lib/aca-logs.ps1) shells out to
+    # `curl` exactly like every az/gh call goes through Invoke-CliSafe -- one
+    # external binary is the whole test seam. Stubbing it here means a golden
+    # capture never depends on whether "aspire.stub.invalid" (an RFC 2606
+    # reserved, guaranteed-unresolvable name) can actually be looked up by
+    # whatever DNS resolver the test happens to run behind.
+    #
+    # SQUAD_STUB_CURL_RC selects curl's own exit code: 0 = reachable (every
+    # golden capture's default), 6 = COULDNT_RESOLVE_HOST (dead DNS), 28 =
+    # OPERATION_TIMEDOUT (slow/unreachable). Any value is accepted so a test
+    # can reproduce curl's full, real classification space without touching
+    # a network.
+    Set-Content -LiteralPath (Join-Path $binDir "curl.cmd") -Encoding ascii -Value @'
+@echo off
+if not "%SQUAD_STUB_CURL_LOG%"=="" (>>"%SQUAD_STUB_CURL_LOG%" echo %*)
+exit /b %SQUAD_STUB_CURL_RC%
+'@
+
     # --- Fake `aca` (Sprint 5, ACA Sandboxes) -------------------------------
     # ACA Sandboxes are driven by a standalone `aca` binary, not by an `az`
     # extension, so this is a separate shim with its own log. The log is what
@@ -734,6 +755,7 @@ exit /b 0
         GhLog      = $ghLog
         SquadLog   = $squadLog
         AcaLog     = $acaLog
+        CurlLog    = $curlLog
         LeaseDir   = $leaseDir
         CallLog    = $callLog
         FakeGhPath = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "worker\tests\lib\fake-gh.js")
@@ -844,6 +866,7 @@ function Reset-SquadCliStubLog {
     Set-Content -LiteralPath $Stub.GhLog -Value "" -NoNewline -Encoding ascii
     if ($Stub.SquadLog) { Set-Content -LiteralPath $Stub.SquadLog -Value "" -NoNewline -Encoding ascii }
     if ($Stub.AcaLog) { Set-Content -LiteralPath $Stub.AcaLog -Value "" -NoNewline -Encoding ascii }
+    if ($Stub.CurlLog) { Set-Content -LiteralPath $Stub.CurlLog -Value "" -NoNewline -Encoding ascii }
 }
 
 function Get-SquadCliStubCall {
@@ -860,12 +883,13 @@ function Get-SquadCliStubCall {
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
-        [ValidateSet("az", "gh", "squad", "aca")][string]$Tool = "az"
+        [ValidateSet("az", "gh", "squad", "aca", "curl")][string]$Tool = "az"
     )
     $path = switch ($Tool) {
         "gh"    { $Stub.GhLog }
         "squad" { $Stub.SquadLog }
         "aca"   { $Stub.AcaLog }
+        "curl"  { $Stub.CurlLog }
         default { $Stub.AzLog }
     }
     if (-not $path -or -not (Test-Path $path)) { return @() }
@@ -932,6 +956,12 @@ function Invoke-SquadCliCapture {
         that IS drifted and must report both rows as "failed". Defaults to ""
         -- every other capture, golden 11-doctor included, is pinned to the
         unchanged fake `az` and still records the "unknown" rows.
+
+    .PARAMETER CurlExitCode
+        The fake `curl`'s exit code (issue #90 finding 3): 0 = reachable
+        (every golden capture's default, so "Aspire URL ok <url>" stays
+        byte-identical to before this feature existed), 6 = dead DNS, 28 =
+        timeout. See Test-AcaAspireReachability in scripts/lib/aca-logs.ps1.
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
@@ -950,7 +980,8 @@ function Invoke-SquadCliCapture {
         [string]$CopilotToken = "",
         [string]$GhAuthToken = "",
         [string]$CredentialFileCapture = "",
-        [string]$DriftMode = ""
+        [string]$DriftMode = "",
+        [int]$CurlExitCode = 0
     )
 
     $hostExe = (Get-Process -Id $PID).Path
@@ -961,6 +992,7 @@ function Invoke-SquadCliCapture {
                   "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT",
                   "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
                   "SQUAD_STUB_ACA_LOG",
+                  "SQUAD_STUB_CURL_LOG", "SQUAD_STUB_CURL_RC",
                   "SQUAD_STUB_FIXTURES",
                   "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC",
                   "SQUAD_STUB_STOP_ERR", "SQUAD_STUB_EXEC_SEQ", "SQUAD_STUB_EXEC_STUCK",
@@ -1000,6 +1032,8 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_STUB_AZ_LOG = $Stub.AzLog
         $env:SQUAD_STUB_GH_LOG = $Stub.GhLog
         $env:SQUAD_STUB_SQUAD_LOG = $Stub.SquadLog
+        $env:SQUAD_STUB_CURL_LOG = $Stub.CurlLog
+        $env:SQUAD_STUB_CURL_RC = "$CurlExitCode"
         $env:SQUAD_STUB_FIXTURES = $Stub.FixtureDir
         # Dates and numbers otherwise render under the host's locale, so a
         # capture taken on an en-US box would not match one taken on a de-DE
@@ -1127,6 +1161,7 @@ function Invoke-SquadCliCapture {
         GhCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool gh)
         SquadCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool squad)
         AcaCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool aca)
+        CurlCalls  = @(Get-SquadCliStubCall -Stub $Stub -Tool curl)
     }
 }
 

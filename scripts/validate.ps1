@@ -6326,12 +6326,12 @@ if ($jobMissingFiles.Count -eq 0) {
     Add-Fail "CV-2 is missing file(s): $(($jobMissingFiles | ForEach-Object { $_.Label }) -join ', ')"
 }
 
-$jobFixtureNames = @("clean-hub-present", "clean-hub-absent", "extra-identity", "inlined-secret")
+$jobFixtureNames = @("clean-hub-present", "clean-hub-absent", "extra-identity", "inlined-secret", "stale-local-record", "genuine-image-drift")
 $jobFixturePaths = @{}
 foreach ($name in $jobFixtureNames) { $jobFixturePaths[$name] = Join-Path $jobFixtureDir "$name.json" }
 $jobMissingFixtures = @($jobFixtureNames | Where-Object { -not (Test-Path -LiteralPath $jobFixturePaths[$_]) })
 if ($jobMissingFixtures.Count -eq 0) {
-    Add-Pass "All 4 CV-2 fixtures are present (clean-hub-present, clean-hub-absent, extra-identity, inlined-secret)"
+    Add-Pass "All 6 CV-2 fixtures are present (clean-hub-present, clean-hub-absent, extra-identity, inlined-secret, stale-local-record, genuine-image-drift)"
 } else {
     Add-Fail "CV-2 is missing fixture(s): $($jobMissingFixtures -join ', ')"
 }
@@ -6426,18 +6426,22 @@ if (-not $IsWindowsHost) {
 # convention, but what a caller actually observes.
 if ((Test-Path -LiteralPath $jobCheckPath) -and $jobMissingFixtures.Count -eq 0) {
     $jobFixtureExpectedExit = @{
-        "clean-hub-present" = 0
-        "clean-hub-absent"  = 0
-        "extra-identity"    = 1
-        "inlined-secret"    = 1
+        "clean-hub-present"    = 0
+        "clean-hub-absent"     = 0
+        "extra-identity"       = 1
+        "inlined-secret"       = 1
+        "stale-local-record"   = 0
+        "genuine-image-drift"  = 1
     }
     $jobFixtureFailures = @()
     $jobFixtureGuidLeaks = @()
+    $jobFixtureOutputs = @{}
     $jobGuidPattern = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
     foreach ($name in $jobFixtureNames) {
         $fixturePath = $jobFixturePaths[$name]
         $procOut = & $jobPsExe -NoProfile -NonInteractive -File $jobCheckPath -Fixture $fixturePath -Json 2>&1 | Out-String
         $observedExit = $LASTEXITCODE
+        $jobFixtureOutputs[$name] = $procOut
         if ($observedExit -ne $jobFixtureExpectedExit[$name]) {
             $jobFixtureFailures += "$name`: exit $observedExit, expected $($jobFixtureExpectedExit[$name])"
         }
@@ -6446,14 +6450,34 @@ if ((Test-Path -LiteralPath $jobCheckPath) -and $jobMissingFixtures.Count -eq 0)
         }
     }
     if ($jobFixtureFailures.Count -eq 0) {
-        Add-Pass "All 4 committed fixtures drive the real child-process exit code the CV-2 contract keys off of (clean-hub-present=0, clean-hub-absent=0, extra-identity=1, inlined-secret=1)"
+        Add-Pass "All 6 committed fixtures drive the real child-process exit code the CV-2 contract keys off of (clean-hub-present=0, clean-hub-absent=0, extra-identity=1, inlined-secret=1, stale-local-record=0, genuine-image-drift=1)"
     } else {
         Add-Fail "A fixture's observed child-process exit code did not match the contract: $($jobFixtureFailures -join '; ')"
     }
     if ($jobFixtureGuidLeaks.Count -eq 0) {
-        Add-Pass "Rendered JSON output for all 4 CV-2 fixtures contains no GUID-shaped identifier"
+        Add-Pass "Rendered JSON output for all 6 CV-2 fixtures contains no GUID-shaped identifier"
     } else {
         Add-Fail "Rendered JSON output leaked a GUID-shaped identifier for fixture(s): $($jobFixtureGuidLeaks -join ', ')"
+    }
+
+    # Issue #90 finding 1, named test: a stale local record must be reported
+    # with its OWN status and a NON-high severity (so it does not trip
+    # doctor's fail-closed exit code), while a genuine drift with a current
+    # record must still be "unexpectedImage"/high. Removing/breaking the
+    # staleness comparison in Compare-JobDriftSnapshot (e.g. deleting the
+    # timestamp check) collapses BOTH fixtures back to "unexpectedImage"/high,
+    # which this assertion catches.
+    $staleOut = $jobFixtureOutputs["stale-local-record"]
+    if ($staleOut -match '"[Ss]tatus"\s*:\s*"staleLocalRecord"' -and $staleOut -match '"[Ss]everity"\s*:\s*"medium"' -and $staleOut -notmatch '"[Ss]tatus"\s*:\s*"unexpectedImage"') {
+        Add-Pass "stale-local-record fixture (live image newer than the recorded expectation) reports 'staleLocalRecord' at 'medium' severity, not 'unexpectedImage'/high"
+    } else {
+        Add-Fail "stale-local-record fixture did not report the distinct staleLocalRecord/medium finding expected for issue #90 finding 1: $staleOut"
+    }
+    $genuineOut = $jobFixtureOutputs["genuine-image-drift"]
+    if ($genuineOut -match '"[Ss]tatus"\s*:\s*"unexpectedImage"' -and $genuineOut -match '"[Ss]everity"\s*:\s*"high"' -and $genuineOut -notmatch '"[Ss]tatus"\s*:\s*"staleLocalRecord"') {
+        Add-Pass "genuine-image-drift fixture (live image older than a CURRENT recorded expectation) still reports 'unexpectedImage' at 'high' severity -- the stale-record path never downgrades real drift"
+    } else {
+        Add-Fail "genuine-image-drift fixture did not report unexpectedImage/high as required: $genuineOut"
     }
 } else {
     Add-Fail "Cannot run fixture-driven child-process checks; entrypoint or a fixture is missing"
@@ -6662,6 +6686,201 @@ if (-not $IsWindowsHost) {
     } finally {
         if ($cv3Stub) { Remove-SquadCliStubEnvironment -Stub $cv3Stub }
     }
+}
+
+# ---------------------------------------------------------------------------
+# `configure` clears stale derived URLs (issue #90 finding 2)
+# ---------------------------------------------------------------------------
+# aspireLoginUrl bakes in the CURRENT container apps environment's own
+# randomly-generated default-domain hash and dashboard token. Neither a
+# subscription id nor a resource group name can re-derive it, so it must be
+# cleared -- not silently carried forward -- the moment either changes.
+# Unchanged, it must survive; an explicit --dashboard-url on the SAME call
+# must always win regardless of what else changed.
+Write-Section "'configure' clears stale derived URLs (issue #90 finding 2)"
+
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] configure/aspireLoginUrl scenario requires Windows (.cmd stubs)" -ForegroundColor Yellow
+} elseif (-not (Test-Path -LiteralPath $harness)) {
+    Add-Fail "scripts/tests/cli-stub-harness.ps1 is missing; the configure/aspireLoginUrl scenario cannot run"
+} else {
+    . $harness
+    $cfgStub = $null
+    try {
+        $cfgStub = New-SquadCliStubEnvironment
+        $cfgConfigPath = Join-Path $cfgStub.HomeDir ".squad-on-aca\config.json"
+        $cfgCli = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+        $cfgOriginalUrl = "https://aspire.stub.invalid/login"
+
+        # Baseline: the stub's synthetic config already carries aspireLoginUrl.
+        $cfgBaseline = Get-Content -LiteralPath $cfgConfigPath -Raw | ConvertFrom-Json
+        if ($cfgBaseline.aspireLoginUrl -eq $cfgOriginalUrl) {
+            Add-Pass "Stub baseline config carries the expected aspireLoginUrl before any 'configure' call runs"
+        } else {
+            Add-Fail "Stub baseline config did not carry the expected aspireLoginUrl (got '$($cfgBaseline.aspireLoginUrl)')"
+        }
+
+        # (a) Neither subscription nor resource group changes -> preserved.
+        $cfgUnchanged = Invoke-SquadCliCapture -Stub $cfgStub -ScriptPath $cfgCli -CliArguments @(
+            "configure", "--resource-group", "rg-squad-stub", "--session-job", "caj-squad-aca-session"
+        )
+        $cfgAfterUnchanged = Get-Content -LiteralPath $cfgConfigPath -Raw | ConvertFrom-Json
+        if ($cfgUnchanged.ExitCode -eq 0 -and $cfgAfterUnchanged.aspireLoginUrl -eq $cfgOriginalUrl) {
+            Add-Pass "configure with neither subscription nor resource group changed PRESERVES the existing aspireLoginUrl"
+        } else {
+            Add-Fail "configure with no subscription/resource-group change did not preserve aspireLoginUrl (exit=$($cfgUnchanged.ExitCode), url='$($cfgAfterUnchanged.aspireLoginUrl)')"
+        }
+
+        # (b) Resource group changes -> cleared (named test: 'clears on RG change').
+        $cfgRgChanged = Invoke-SquadCliCapture -Stub $cfgStub -ScriptPath $cfgCli -CliArguments @(
+            "configure", "--resource-group", "rg-squad-stub-2", "--session-job", "caj-squad-aca-session"
+        )
+        $cfgAfterRgChanged = Get-Content -LiteralPath $cfgConfigPath -Raw | ConvertFrom-Json
+        if ($cfgRgChanged.ExitCode -eq 0 -and [string]::IsNullOrEmpty($cfgAfterRgChanged.aspireLoginUrl)) {
+            Add-Pass "configure with a CHANGED resource group CLEARS the stale aspireLoginUrl (named test: clears-on-rg-change)"
+        } else {
+            Add-Fail "configure with a changed resource group did not clear aspireLoginUrl (exit=$($cfgRgChanged.ExitCode), url='$($cfgAfterRgChanged.aspireLoginUrl)')"
+        }
+
+        # Reset the stub config back to baseline before the next scenario.
+        $cfgBaseline | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cfgConfigPath -Encoding utf8
+
+        # (c) Subscription changes -> cleared (named test: 'clears on subscription change').
+        $cfgSubChanged = Invoke-SquadCliCapture -Stub $cfgStub -ScriptPath $cfgCli -CliArguments @(
+            "configure", "--subscription", "99999999-9999-9999-9999-999999999999",
+            "--resource-group", "rg-squad-stub", "--session-job", "caj-squad-aca-session"
+        )
+        $cfgAfterSubChanged = Get-Content -LiteralPath $cfgConfigPath -Raw | ConvertFrom-Json
+        if ($cfgSubChanged.ExitCode -eq 0 -and [string]::IsNullOrEmpty($cfgAfterSubChanged.aspireLoginUrl)) {
+            Add-Pass "configure with a CHANGED subscription CLEARS the stale aspireLoginUrl (named test: clears-on-subscription-change)"
+        } else {
+            Add-Fail "configure with a changed subscription did not clear aspireLoginUrl (exit=$($cfgSubChanged.ExitCode), url='$($cfgAfterSubChanged.aspireLoginUrl)')"
+        }
+        if ($cfgSubChanged.StdOut -match "Cleared the previous Aspire dashboard URL") {
+            Add-Pass "configure prints an informational message explaining why the Aspire URL was cleared"
+        } else {
+            Add-Fail "configure did not print the expected clear-URL explanation: $($cfgSubChanged.StdOut)"
+        }
+
+        # Reset the stub config back to baseline before the next scenario.
+        $cfgBaseline | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cfgConfigPath -Encoding utf8
+
+        # (d) An explicit --dashboard-url on the SAME call always wins, even
+        # though the subscription also changed on that call.
+        $cfgExplicit = Invoke-SquadCliCapture -Stub $cfgStub -ScriptPath $cfgCli -CliArguments @(
+            "configure", "--subscription", "88888888-8888-8888-8888-888888888888",
+            "--resource-group", "rg-squad-stub", "--session-job", "caj-squad-aca-session",
+            "--dashboard-url", "https://explicit.stub.invalid/login"
+        )
+        $cfgAfterExplicit = Get-Content -LiteralPath $cfgConfigPath -Raw | ConvertFrom-Json
+        if ($cfgExplicit.ExitCode -eq 0 -and $cfgAfterExplicit.aspireLoginUrl -eq "https://explicit.stub.invalid/login") {
+            Add-Pass "An explicit --dashboard-url on the same call always wins over the clear-on-change rule"
+        } else {
+            Add-Fail "An explicit --dashboard-url did not win (exit=$($cfgExplicit.ExitCode), url='$($cfgAfterExplicit.aspireLoginUrl)')"
+        }
+    } catch {
+        Add-Fail "The configure/aspireLoginUrl scenario threw: $($_.Exception.Message)"
+    } finally {
+        if ($cfgStub) { Remove-SquadCliStubEnvironment -Stub $cfgStub }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# `doctor` Aspire URL reachability (issue #90 finding 3)
+# ---------------------------------------------------------------------------
+# A configured aspireLoginUrl string is not proof the dashboard is reachable.
+# doctor must distinguish not-configured ("missing") from configured (probed:
+# "ok" | "failed" | "unknown"), dead DNS must never render "ok", and a
+# slow/black-holed endpoint must time out as "unknown", never hang doctor.
+Write-Section "'doctor' Aspire URL reachability (issue #90 finding 3)"
+
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] doctor Aspire URL reachability scenario requires Windows (.cmd stubs)" -ForegroundColor Yellow
+} elseif (-not (Test-Path -LiteralPath $harness)) {
+    Add-Fail "scripts/tests/cli-stub-harness.ps1 is missing; the doctor Aspire URL reachability scenario cannot run"
+} else {
+    . $harness
+    $reachStub = $null
+    try {
+        $reachStub = New-SquadCliStubEnvironment
+        $reachCli = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+        $reachOkPattern = 'Aspire URL\s+ok\s+https://aspire\.stub\.invalid/login'
+        $reachFailedPattern = 'Aspire URL\s+failed\s+'
+        $reachUnknownPattern = 'Aspire URL\s+unknown\s+'
+        $reachMissingPattern = 'Aspire URL\s+missing\s+'
+
+        # curl exit 0 -> "ok" with the URL, byte-shape-identical to the
+        # committed golden 11-doctor.txt/27-doctor-drift.txt rows.
+        $reachOk = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 0
+        if ($reachOk.StdOut -match $reachOkPattern) {
+            Add-Pass "doctor reports 'Aspire URL ok <url>' when curl (probing reachability) exits 0"
+        } else {
+            Add-Fail "doctor did not report Aspire URL as ok for curl exit 0: $($reachOk.StdOut)"
+        }
+        if ($reachOk.CurlCalls.Count -ge 1) {
+            Add-Pass "doctor actually invoked curl to check Aspire URL reachability ($($reachOk.CurlCalls.Count) call(s))"
+        } else {
+            Add-Fail "doctor's Aspire URL check made zero curl calls; a configured URL cannot be classified as reachable without a live probe"
+        }
+
+        # curl exit 6 (COULDNT_RESOLVE_HOST, i.e. dead DNS) -> "failed", never "ok".
+        $reachFailed = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 6
+        if ($reachFailed.StdOut -match $reachFailedPattern -and $reachFailed.StdOut -notmatch $reachOkPattern) {
+            Add-Pass "doctor reports 'Aspire URL failed' (never 'ok') when curl reports dead DNS (exit 6)"
+        } else {
+            Add-Fail "Dead DNS (curl exit 6) did not render as failed / rendered as ok: $($reachFailed.StdOut)"
+        }
+
+        # curl exit 28 (OPERATION_TIMEDOUT, i.e. slow/unreachable) -> "unknown", never a hang.
+        $reachUnknown = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 28
+        if ($reachUnknown.StdOut -match $reachUnknownPattern -and $reachUnknown.StdOut -notmatch $reachOkPattern) {
+            Add-Pass "doctor reports 'Aspire URL unknown' (never 'ok') when curl times out (exit 28), bounded rather than hanging"
+        } else {
+            Add-Fail "A curl timeout (exit 28) did not render as unknown / rendered as ok: $($reachUnknown.StdOut)"
+        }
+
+        # No aspireLoginUrl configured at all -> "missing", and curl is never invoked.
+        $reachConfigPath = Join-Path $reachStub.HomeDir ".squad-on-aca\config.json"
+        $reachConfig = Get-Content -LiteralPath $reachConfigPath -Raw | ConvertFrom-Json
+        $reachConfig.aspireLoginUrl = ""
+        $reachConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reachConfigPath -Encoding utf8
+        Reset-SquadCliStubLog -Stub $reachStub
+        $reachMissing = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 0
+        if ($reachMissing.StdOut -match $reachMissingPattern -and $reachMissing.CurlCalls.Count -eq 0) {
+            Add-Pass "doctor reports 'Aspire URL missing' (not configured) and never calls curl when no URL is configured"
+        } else {
+            Add-Fail "doctor did not report missing correctly, or called curl with no URL configured: $($reachMissing.StdOut), curl calls=$($reachMissing.CurlCalls.Count)"
+        }
+    } catch {
+        Add-Fail "The doctor Aspire URL reachability scenario threw: $($_.Exception.Message)"
+    } finally {
+        if ($reachStub) { Remove-SquadCliStubEnvironment -Stub $reachStub }
+    }
+}
+
+# Named test, mutation-provable: doctor's Aspire URL row must come from an
+# actual reachability probe (Test-AcaAspireReachability), not merely from
+# whether the config string is non-empty. This asserts the WIRING statically:
+# removing the call and reverting to the old string-presence check would make
+# this fail even before any stub is involved.
+Write-Section "doctor wires Test-AcaAspireReachability (named test, issue #90 finding 3)"
+$acaLogsLibPath = Join-Path $RepoRoot "scripts\lib\aca-logs.ps1"
+$squadAcaCliPath = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+if ((Test-Path -LiteralPath $acaLogsLibPath) -and (Test-Path -LiteralPath $squadAcaCliPath)) {
+    $acaLogsLibText = Get-Content -LiteralPath $acaLogsLibPath -Raw
+    $squadAcaCliText = Get-Content -LiteralPath $squadAcaCliPath -Raw
+    if ($acaLogsLibText -match 'function\s+Test-AcaAspireReachability') {
+        Add-Pass "scripts/lib/aca-logs.ps1 defines Test-AcaAspireReachability"
+    } else {
+        Add-Fail "scripts/lib/aca-logs.ps1 no longer defines Test-AcaAspireReachability"
+    }
+    if ($squadAcaCliText -match 'Test-AcaAspireReachability\s+-Url\s+\$config\.aspireLoginUrl') {
+        Add-Pass "Invoke-Doctor's Aspire URL check calls Test-AcaAspireReachability against the configured URL (not a bare string-presence check)"
+    } else {
+        Add-Fail "Invoke-Doctor's Aspire URL check no longer calls Test-AcaAspireReachability; it may have regressed to a string-presence-only check"
+    }
+} else {
+    Add-Fail "Cannot statically verify the Test-AcaAspireReachability wiring; a required file is missing"
 }
 
 # ---------------------------------------------------------------------------

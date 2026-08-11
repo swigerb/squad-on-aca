@@ -354,14 +354,29 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$shim" %*
 function Invoke-Configure {
     param([string[]]$Items)
     $existing = Get-AcaConfig
+    $newSubscriptionId = Get-OptionValue $Items @("--subscription", "-SubscriptionId") $existing.subscriptionId
+    $newResourceGroup = Get-OptionValue $Items @("--resource-group", "-ResourceGroupName") $existing.resourceGroup
+
+    # Issue #90 finding 2: aspireLoginUrl bakes in THIS container apps
+    # environment's own randomly-generated default-domain hash and a
+    # dashboard token -- it is not something a subscription/resource-group
+    # name can re-derive, so it must never be carried across a change to
+    # either. An explicit --dashboard-url on THIS call always wins; absent
+    # that, changing the subscription or resource group clears the old URL
+    # (a missing value beats a wrong one) rather than pointing at a
+    # deployment that may not even exist anymore. Nothing changing keeps
+    # what it had.
+    $subscriptionOrGroupChanged = ($newSubscriptionId -ne $existing.subscriptionId) -or ($newResourceGroup -ne $existing.resourceGroup)
+    $aspireLoginUrlDefault = if ($subscriptionOrGroupChanged) { "" } else { $existing.aspireLoginUrl }
+
     $config = [ordered]@{
-        subscriptionId = Get-OptionValue $Items @("--subscription", "-SubscriptionId") $existing.subscriptionId
-        resourceGroup = Get-OptionValue $Items @("--resource-group", "-ResourceGroupName") $existing.resourceGroup
+        subscriptionId = $newSubscriptionId
+        resourceGroup = $newResourceGroup
         sessionJob = Get-OptionValue $Items @("--session-job", "-SessionJob") $existing.sessionJob
         ralphJob = Get-OptionValue $Items @("--ralph-job", "-RalphJob") $existing.ralphJob
         watchApp = Get-OptionValue $Items @("--watch-app", "-WatchApp") $existing.watchApp
         aspireApp = Get-OptionValue $Items @("--aspire-app", "-AspireApp") $existing.aspireApp
-        aspireLoginUrl = Get-OptionValue $Items @("--dashboard-url", "-DashboardUrl") $existing.aspireLoginUrl
+        aspireLoginUrl = Get-OptionValue $Items @("--dashboard-url", "-DashboardUrl") $aspireLoginUrlDefault
         logAnalyticsWorkspace = Get-OptionValue $Items @("--log-analytics-workspace", "-LogAnalyticsWorkspace") $existing.logAnalyticsWorkspace
     }
     if (-not $config.resourceGroup -or -not $config.sessionJob) {
@@ -369,6 +384,9 @@ function Invoke-Configure {
     }
     Save-AcaConfig ([pscustomobject]$config)
     Assert-AcaConfigured | Out-Null
+    if ($subscriptionOrGroupChanged -and -not $config.aspireLoginUrl -and $existing.aspireLoginUrl) {
+        Write-Output "Cleared the previous Aspire dashboard URL: the subscription or resource group changed, so the old URL cannot be assumed to still be valid. Pass --dashboard-url, or redeploy, to set a new one."
+    }
     Write-Output "Configured Squad on ACA."
 }
 
@@ -1483,7 +1501,20 @@ function Invoke-Doctor {
             $jobDriftOut = & $doctorPsExe -NoProfile -NonInteractive -File $jobDriftScript -ResourceGroupName $config.resourceGroup -SubscriptionId $config.subscriptionId -Json 2>$null | Out-String
             $jobDriftExit = $LASTEXITCODE
             if ($jobDriftExit -eq 0) {
-                $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "ok"; Detail = "Live session job image, secrets and identity match intent" }
+                # Issue #90 finding 1: exit 0 means nothing HIGH-severity, but a
+                # "medium" staleLocalRecord finding is still worth surfacing --
+                # silently folding it into a flat "ok" would hide exactly the
+                # signal this feature exists to show (the recorded intent is
+                # behind the live image, refresh the record). It is reported as
+                # "warning", never "failed": a stale LOCAL record is not itself
+                # a security failure (see Get-JobDriftExitCode, unchanged).
+                $jobDriftParsedOk = $jobDriftOut | ConvertFrom-Json
+                $jobDriftMediums = @($jobDriftParsedOk.findings | Where-Object { $_.Severity -eq "medium" })
+                if ($jobDriftMediums.Count -gt 0) {
+                    $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "warning"; Detail = "$($jobDriftMediums.Count) stale local record finding(s): $(($jobDriftMediums | ForEach-Object { $_.Status }) -join ', '); run squad-aca deploy or refresh the recorded image" }
+                } else {
+                    $checks += [pscustomobject]@{ Check = "Job config drift (CV-2)"; Status = "ok"; Detail = "Live session job image, secrets and identity match intent" }
+                }
             } elseif ($jobDriftExit -eq 1) {
                 $jobDriftParsed = $jobDriftOut | ConvertFrom-Json
                 $jobDriftHighs = @($jobDriftParsed.findings | Where-Object { $_.Severity -eq "high" })
@@ -1509,7 +1540,19 @@ function Invoke-Doctor {
 
     $logPath = Get-AcaLogPathStatus -WorkspaceName $config.logAnalyticsWorkspace
     $checks += [pscustomobject]@{ Check = "Logs path"; Status = $logPath.Status; Detail = $logPath.Detail }
-    $checks += [pscustomobject]@{ Check = "Aspire URL"; Status = if ($config.aspireLoginUrl) { "ok" } else { "missing" }; Detail = if ($config.aspireLoginUrl) { $config.aspireLoginUrl } else { "Run deploy or squad-aca configure --dashboard-url" } }
+    # Issue #90 finding 3: a non-empty aspireLoginUrl string used to be
+    # reported as "ok" outright -- that answered "is a string set", not "is
+    # the dashboard reachable". Test-AcaAspireReachability actually probes the
+    # URL (bounded by a timeout so a dead/slow endpoint reports "unknown"
+    # rather than hanging doctor), giving three distinct facts: not
+    # configured ("missing"), configured but unreachable ("failed"), and
+    # reachable ("ok").
+    if ($config.aspireLoginUrl) {
+        $aspireReachability = Test-AcaAspireReachability -Url $config.aspireLoginUrl
+        $checks += [pscustomobject]@{ Check = "Aspire URL"; Status = $aspireReachability.Status; Detail = $aspireReachability.Detail }
+    } else {
+        $checks += [pscustomobject]@{ Check = "Aspire URL"; Status = "missing"; Detail = "Run deploy or squad-aca configure --dashboard-url" }
+    }
     # Same width rule as `sessions`: Detail carries free-form text (an Aspire
     # login URL, a resource-group/job pair) that runs well past a narrow
     # console, and Format-Table drops trailing columns that do not fit.

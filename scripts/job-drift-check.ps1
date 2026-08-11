@@ -107,6 +107,7 @@ function Write-JobDriftFindings {
 
 $snapshot = $null
 $expectedImageForCompare = $ExpectedImage
+$expectedImageLastUpdatedForCompare = ""
 
 if ($Fixture) {
     $fixtureData = Read-JobDriftJsonFile -Path $Fixture
@@ -117,6 +118,12 @@ if ($Fixture) {
     if (-not $expectedImageForCompare) { $expectedImageForCompare = [string]$fixtureData.expectedImage }
     if (-not $expectedImageForCompare) {
         Write-JobDriftFatal "CV-2: fixture '$Fixture' does not carry an expectedImage and none was passed via -ExpectedImage."
+    }
+    # Issue #90 finding 1: a fixture proving the stale-record path carries its
+    # own canned registry timestamp for the expected image -- no live call is
+    # ever made while reading a fixture.
+    if ($fixtureData.PSObject.Properties.Name -contains "expectedImageLastUpdated") {
+        $expectedImageLastUpdatedForCompare = [string]$fixtureData.expectedImageLastUpdated
     }
 } else {
     $deployOutputsFile = if ($DeployOutputsPath) { $DeployOutputsPath } else { Join-Path $RepoRoot "deploy.outputs.json" }
@@ -139,8 +146,23 @@ if ($Fixture) {
         Write-JobDriftFatal "CV-2 could not capture a live snapshot: $($_.Exception.Message)"
     }
     $expectedImageForCompare = $intent.ExpectedImage
+
+    # Issue #90 finding 1: only reached when the live and expected images
+    # actually differ, so a clean/matching deployment (the overwhelming
+    # majority of runs, including every existing capture) issues NO new `az`
+    # calls at all. Both reads are best-effort (Get-JobDriftImageLastUpdated
+    # never throws); a failure here just means the mismatch is reported as
+    # genuine drift, same as before this feature existed.
+    if ($snapshot.image -and $expectedImageForCompare -and ($snapshot.image -ne $expectedImageForCompare)) {
+        $liveImageLastUpdated = Get-JobDriftImageLastUpdated -ImageRef $snapshot.image -SubscriptionId $intent.SubscriptionId
+        $expectedImageLastUpdatedForCompare = Get-JobDriftImageLastUpdated -ImageRef $expectedImageForCompare -SubscriptionId $intent.SubscriptionId
+        if ($liveImageLastUpdated) {
+            $snapshot = $snapshot | Add-Member -NotePropertyName imageLastUpdated -NotePropertyValue $liveImageLastUpdated -PassThru -Force
+        }
+    }
 }
 
-$findings = @(Compare-JobDriftSnapshot -Snapshot $snapshot -ExpectedImage $expectedImageForCompare)
+$findings = @(Compare-JobDriftSnapshot -Snapshot $snapshot -ExpectedImage $expectedImageForCompare -ExpectedImageLastUpdated $expectedImageLastUpdatedForCompare)
 Write-JobDriftFindings -Findings $findings -AsJson:$Json
 exit (Get-JobDriftExitCode -Findings $findings)
+
