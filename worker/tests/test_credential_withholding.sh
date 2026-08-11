@@ -21,6 +21,12 @@
 #      never a silent "stay withheld and let the push fail later".
 set -uo pipefail
 
+# TEMPORARY DIAGNOSTIC (issue #96): trace every command with its line number,
+# so a run killed by the per-suite timeout names the exact line it stopped on
+# instead of leaving us to guess. Removed once the hang is understood.
+export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+set -x
+
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKER_DIR="$(cd "${TEST_DIR}/.." && pwd)"
 CRED_LIB_SRC="${WORKER_DIR}/lib/squad-credentials.sh"
