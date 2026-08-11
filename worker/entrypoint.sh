@@ -412,8 +412,19 @@ esac
 # before the identity is out of the shell's own environment) and before ANY
 # background child, so it cannot itself become the same category of leak the
 # identity-drop ordering exists to close.
-if declare -F squad_proc_iso_line >/dev/null 2>&1; then
-  log "$(squad_proc_iso_line 2>/dev/null || printf 'SQUAD-PROC-ISO v1 same-uid-environ-readable=unknown proc-mounted=unknown hidepid=unknown uid=%s user=%s' "$(id -u 2>/dev/null || echo unknown)" "$(id -un 2>/dev/null || echo unknown)")"
+#
+# R1 (issue #86 security revision): call the RAW squad_proc_iso_run, never
+# route its output through this file's log() wrapper. log() prepends a fixed
+# "[squad-on-aca] " literal to whatever it is given
+# (worker/entrypoint.sh:log()), which decorates the probe's one documented
+# line and changes exactly what a downstream reader would have to expect on
+# the wire. squad_proc_iso_probe.sh already owns emitting exactly one safe
+# line to stdout and exits 0 unconditionally (squad_proc_iso_run's own
+# internal fallback covers a failure inside the probe itself) -- there is
+# nothing left for this file to add, and doing so would mean the probe
+# library no longer solely owns its own emitted line.
+if declare -F squad_proc_iso_run >/dev/null 2>&1; then
+  squad_proc_iso_run
 fi
 
 if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then

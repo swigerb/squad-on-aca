@@ -9,6 +9,48 @@
 #
 #   SQUAD-PROC-ISO v1 same-uid-environ-readable=yes|no|unknown proc-mounted=yes|no hidepid=0|1|2|unknown uid=<n> user=<name>
 #
+# R2 (issue #86 security revision): a scanned log line can reach this parser
+# in any of THREE shapes, depending on how it was captured, and this parser
+# must reduce each of them to the same content before the strict match is
+# attempted:
+#
+#   1. Raw. worker/entrypoint.sh now calls the probe library's raw
+#      squad_proc_iso_run directly (R1) -- no decoration at all. This is
+#      what the reader's Azure CLI logs-show call with `--format json`'s Log
+#      field actually carries once the fix ships.
+#   2. JSON envelope. scripts/lib/proc-isolation-reader.ps1 (R3) requests
+#      `--format json`, whose wire shape is one JSON object per scanned line,
+#      e.g. {"Log":"...","TimeStamp":"..."}. This parser unwraps exactly one
+#      such envelope layer, reading Log/log/Message/message (in that order,
+#      first string match wins) as the actual content -- and ONLY when that
+#      field's value is itself a string. A line that parses as JSON but
+#      carries none of those fields (unrelated JSON, e.g. some other
+#      structured log emitted by another part of the container) is treated
+#      as non-matching, never as a crash and never as a false match.
+#   3. Legacy-prefixed. Before this revision, worker/entrypoint.sh routed the
+#      probe's line through its own log() helper, which prepends a fixed
+#      "[squad-on-aca] " literal, and the reader's previous unpinned default
+#      logs-show format (text) prepends an ISO-8601 timestamp to every
+#      line. Already-captured logs from before this fix can still carry
+#      either or both of those, so this parser strips AT MOST ONE optional
+#      leading ISO-8601 timestamp, then AT MOST ONE optional literal
+#      "[squad-on-aca] " prefix -- in that order, since that is the order the
+#      platform and the old log() helper actually applied them in -- before
+#      attempting the match. Backward compatibility only: new output is
+#      raw (case 1) and needs neither strip to match.
+#
+# After those reductions, the SAME full-line-anchored (^...$) strict v1
+# pattern is applied as before. There is no permissive dot-star wildcard
+# anywhere in this
+# file: the timestamp-strip and legacy-prefix-strip patterns each match a
+# fixed, bounded shape (a real ISO-8601 timestamp; the exact literal prefix),
+# never an unbounded "anything before/after". A line that is mid-sentence
+# prose containing the probe's text, a truncated partial line, a future
+# schema version (SQUAD-PROC-ISO v2 ...), or unrelated JSON must all fail to
+# match -- this is the T12 negative-fixture contract, exercised in
+# scripts/validate.ps1's PC-1 section and by
+# worker/tests/test_proc_isolation_contract.sh's end-to-end pass (R4).
+#
 # T11/T12 (issue #86): this file's job is entirely mechanical --
 #   * no matching line anywhere in the scanned logs -> "not-yet-observed"
 #     (T11): the probe has never actually run in the environment these logs
@@ -22,6 +64,79 @@
 # matching every other dot-sourced lib in this repo.
 
 $script:ProcIsoLinePattern = '^SQUAD-PROC-ISO v1 same-uid-environ-readable=(yes|no|unknown) proc-mounted=(yes|no|unknown) hidepid=(0|1|2|unknown) uid=(\S+) user=(\S+)\s*$'
+
+# Fixed-shape, bounded strips only -- never a permissive dot-star wildcard.
+# Applied at most
+# once each, in this fixed order (timestamp first, legacy prefix second),
+# matching the order the platform / old log() helper actually produced them.
+$script:ProcIsoTimestampPrefixPattern = '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?[ \t]+'
+$script:ProcIsoLegacyPrefixPattern = '^\[squad-on-aca\] '
+
+function Get-ProcIsoUnwrappedContent {
+    <#
+    .SYNOPSIS
+        Reduces ONE scanned log line (raw, JSON-enveloped, or
+        legacy-prefixed) to the content the strict v1 pattern should be
+        matched against. Never throws; a line this cannot make sense of is
+        returned unchanged so the caller's strict match simply fails to find
+        it -- there is no "permissive" fallback that could false-match.
+
+    .OUTPUTS
+        A [pscustomobject] with:
+          Content   the reduced string to match the strict pattern against
+          Skip      $true when this line was recognisably JSON but carried
+                    none of Log/log/Message/message as a string -- i.e.
+                    unrelated JSON that must never be matched against, even
+                    accidentally, by the raw fields of its own structure.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Trimmed)
+
+    $content = $Trimmed
+    $skip = $false
+
+    if ($Trimmed.StartsWith("{") -and $Trimmed.EndsWith("}")) {
+        $parsed = $null
+        try {
+            $parsed = ConvertFrom-Json -InputObject $Trimmed -ErrorAction Stop
+        } catch {
+            $parsed = $null
+        }
+        if ($null -ne $parsed) {
+            $unwrapped = $null
+            foreach ($fieldName in @("Log", "log", "Message", "message")) {
+                if ($parsed.PSObject.Properties.Name -contains $fieldName) {
+                    $fieldValue = $parsed.$fieldName
+                    if ($fieldValue -is [string]) {
+                        $unwrapped = $fieldValue
+                        break
+                    }
+                }
+            }
+            if ($null -ne $unwrapped) {
+                $content = $unwrapped.Trim()
+            } else {
+                # Valid JSON, but not our envelope shape at all -- unrelated
+                # JSON. Never fall through to matching this object's raw text
+                # representation against the strict pattern.
+                return [pscustomobject]@{ Content = ""; Skip = $true }
+            }
+        }
+        # Invalid JSON despite the brace shape: fall through and try the
+        # strict match against the original trimmed text, unmodified --
+        # still safe, since the strict pattern is fully anchored.
+    }
+
+    $tsMatch = [regex]::Match($content, $script:ProcIsoTimestampPrefixPattern)
+    if ($tsMatch.Success) {
+        $content = $content.Substring($tsMatch.Length)
+    }
+    $prefixMatch = [regex]::Match($content, $script:ProcIsoLegacyPrefixPattern)
+    if ($prefixMatch.Success) {
+        $content = $content.Substring($prefixMatch.Length)
+    }
+
+    return [pscustomobject]@{ Content = $content; Skip = $skip }
+}
 
 function Get-ProcIsoObservation {
     <#
@@ -38,6 +153,8 @@ function Get-ProcIsoObservation {
 
     .PARAMETER Lines
         Raw log lines, in the caller's chosen priority order. May be empty.
+        Each line may be raw, a JSON envelope ({"Log":"...", ...} and case
+        variants), or legacy-prefixed (see Get-ProcIsoUnwrappedContent).
 
     .OUTPUTS
         [pscustomobject] with:
@@ -47,11 +164,11 @@ function Get-ProcIsoObservation {
           Hidepid                   "0" | "1" | "2" | "unknown" | ""
           Uid                       string, "" if not observed
           User                      string, "" if not observed
-          RawLine                   the exact matched line, "" if not observed
-                                     (safe to print: the probe's own contract
-                                     guarantees this line never carries a
-                                     sentinel, environment value, or
-                                     credential)
+          RawLine                   the exact matched (post-unwrap/strip)
+                                     line, "" if not observed (safe to print:
+                                     the probe's own contract guarantees this
+                                     line never carries a sentinel,
+                                     environment value, or credential)
     #>
     param(
         [AllowNull()][string[]]$Lines = @()
@@ -61,7 +178,11 @@ function Get-ProcIsoObservation {
         if ($null -eq $line) { continue }
         $trimmed = $line.Trim()
         if (-not $trimmed) { continue }
-        $match = [regex]::Match($trimmed, $script:ProcIsoLinePattern)
+
+        $reduced = Get-ProcIsoUnwrappedContent -Trimmed $trimmed
+        if ($reduced.Skip) { continue }
+
+        $match = [regex]::Match($reduced.Content, $script:ProcIsoLinePattern)
         if ($match.Success) {
             return [pscustomobject]@{
                 Observed               = $true
@@ -70,7 +191,7 @@ function Get-ProcIsoObservation {
                 Hidepid                = $match.Groups[3].Value
                 Uid                    = $match.Groups[4].Value
                 User                   = $match.Groups[5].Value
-                RawLine                = $trimmed
+                RawLine                = $reduced.Content.Trim()
             }
         }
     }

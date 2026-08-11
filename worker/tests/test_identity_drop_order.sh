@@ -62,7 +62,12 @@ check "the identity is dropped before the FIRST background child of any kind (fi
 # closing esac -- entrypoint.sh has several unrelated case/esac blocks, so
 # this must not just grab the first 'esac' in the file.
 case_end="$(awk -v start="${drop_call:-0}" 'NR > start && /^esac$/ { print NR; exit }' "$ENTRYPOINT")"
-probe_call="$(line_of 'squad_proc_iso_line')"
+# R1 (issue #86 security revision): entrypoint.sh now calls the raw
+# squad_proc_iso_run, not squad_proc_iso_line -- squad_proc_iso_run is the
+# probe library's own top-level runner and prints its own composed line
+# directly, so it is the only call site left in this file. Anchored so this
+# finds the bare CALL line, not a comment that merely mentions the name.
+probe_call="$(line_of '^  squad_proc_iso_run$')"
 
 check "T7: the process-isolation probe call is present in entrypoint.sh" \
   bash -c "[[ -n '${probe_call:-}' ]]"
@@ -89,6 +94,20 @@ probe_guard_text="$(sed -n "${probe_guard_start},${probe_call}p" "$ENTRYPOINT")"
 check_probe_unconditional() { ! printf '%s' "$probe_guard_text" | grep -q 'SQUAD_MODE'; }
 check "T14: the probe call is not conditioned on SQUAD_MODE (no SQUAD_MODE test guards the call site)" \
   check_probe_unconditional
+
+# R1/R6 (issue #86 security revision): the probe's ONE emitted line must never
+# be routed through this file's log() wrapper, which prepends a fixed
+# "[squad-on-aca] " literal (see log()'s own definition at the top of this
+# file) and would decorate exactly the bytes a downstream reader has to
+# parse. The call site itself must be the bare `squad_proc_iso_run` -- not
+# `log "$(squad_proc_iso_run)"`, not `log "$(squad_proc_iso_line ...)"`, and
+# not any other wrapping that puts the probe's line through this file's own
+# formatting.
+probe_call_line_text="$(sed -n "${probe_call}p" "$ENTRYPOINT")"
+check "R1: the probe call line is the bare squad_proc_iso_run (no log() wrapping decorating its one emitted line): got '${probe_call_line_text}'" \
+  bash -c "[[ '${probe_call_line_text}' =~ ^[[:space:]]*squad_proc_iso_run[[:space:]]*\$ ]]"
+check "R1/R6: entrypoint.sh never pipes the probe's output back through log() anywhere in the file" \
+  bash -c "! grep -qE 'log \"\\\$\\(squad_proc_iso' '${ENTRYPOINT}'"
 
 # --- the mechanism, reproduced ----------------------------------------------
 

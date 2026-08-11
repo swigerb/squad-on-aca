@@ -6683,12 +6683,14 @@ $procIsoReportPath = Join-Path $RepoRoot "scripts\proc-isolation-report.ps1"
 $procIsoStubHarnessPath = Join-Path $RepoRoot "scripts\tests\proc-isolation-stub-harness.ps1"
 $procIsoFixtureDir = Join-Path $RepoRoot "scripts\tests\fixtures\proc-isolation"
 $procIsoProbePath = Join-Path $RepoRoot "worker\lib\proc-isolation-probe.sh"
+$procIsoEntrypointPath = Join-Path $RepoRoot "worker\entrypoint.sh"
 $procIsoRequiredFiles = @(
     @{ Path = $procIsoReaderPath; Label = "scripts/lib/proc-isolation-reader.ps1" },
     @{ Path = $procIsoParserPath; Label = "scripts/lib/proc-isolation-parser.ps1" },
     @{ Path = $procIsoReportPath; Label = "scripts/proc-isolation-report.ps1" },
     @{ Path = $procIsoStubHarnessPath; Label = "scripts/tests/proc-isolation-stub-harness.ps1" },
-    @{ Path = $procIsoProbePath; Label = "worker/lib/proc-isolation-probe.sh" }
+    @{ Path = $procIsoProbePath; Label = "worker/lib/proc-isolation-probe.sh" },
+    @{ Path = $procIsoEntrypointPath; Label = "worker/entrypoint.sh" }
 )
 $procIsoMissingFiles = @($procIsoRequiredFiles | Where-Object { -not (Test-Path -LiteralPath $_.Path) })
 if ($procIsoMissingFiles.Count -eq 0) {
@@ -6697,12 +6699,16 @@ if ($procIsoMissingFiles.Count -eq 0) {
     Add-Fail "PC-1 is missing file(s): $(($procIsoMissingFiles | ForEach-Object { $_.Label }) -join ', ')"
 }
 
-$procIsoFixtureNames = @("observed-yes", "observed-no", "observed-unknown", "not-yet-observed")
+$procIsoFixtureNames = @(
+    "observed-yes", "observed-no", "observed-unknown", "not-yet-observed",
+    "raw-yes", "legacy-prefixed-yes",
+    "negative-embedded-prose", "negative-v2-schema", "negative-truncated", "negative-unrelated-json"
+)
 $procIsoFixturePaths = @{}
 foreach ($name in $procIsoFixtureNames) { $procIsoFixturePaths[$name] = Join-Path $procIsoFixtureDir "$name.txt" }
 $procIsoMissingFixtures = @($procIsoFixtureNames | Where-Object { -not (Test-Path -LiteralPath $procIsoFixturePaths[$_]) })
 if ($procIsoMissingFixtures.Count -eq 0) {
-    Add-Pass "All 4 PC-1 fixtures are present (observed-yes, observed-no, observed-unknown, not-yet-observed)"
+    Add-Pass "All $($procIsoFixtureNames.Count) PC-1 fixtures are present (JSON-envelope observed-yes/no/unknown/not-yet-observed reflecting the real --format json wire shape, R2's raw and legacy-prefixed backward-compat shapes, and 4 R5 negatives: embedded prose, a v2 schema line, a truncated line, unrelated JSON)"
 } else {
     Add-Fail "PC-1 is missing fixture(s): $($procIsoMissingFixtures -join ', ')"
 }
@@ -6718,6 +6724,48 @@ if ((Test-Path -LiteralPath $procIsoReaderPath) -and (Test-Path -LiteralPath $pr
         Add-Pass "scripts/lib/proc-isolation-parser.ps1 contains no standalone 'az' token -- the parser that decides what a log line means cannot itself call Azure"
     } else {
         Add-Fail "scripts/lib/proc-isolation-parser.ps1 contains a standalone 'az' token; the pure parser must never reference the Azure CLI"
+    }
+
+    # R2/R6 (issue #86 security revision): the parser must never contain a
+    # permissive `.*` anywhere in its own regex definitions -- every strip
+    # (timestamp, legacy prefix) and the strict v1 match itself must be a
+    # fixed, bounded shape. This is the static half of the anti-drift
+    # guarantee: a mutation that widens a strip to `.*` is caught here even
+    # before the negative-fixture runtime checks (R7 mutation (d)).
+    if ($procIsoParserText -notmatch [regex]::Escape('.*')) {
+        Add-Pass "R2/R6: scripts/lib/proc-isolation-parser.ps1 contains no permissive '.*' anywhere -- every strip and the strict match are bounded, fixed shapes"
+    } else {
+        Add-Fail "R2/R6: scripts/lib/proc-isolation-parser.ps1 contains a permissive '.*'; this is the exact widening that would let a legacy-prefix or timestamp strip swallow embedded prose"
+    }
+
+    # R3 (issue #86 security revision): the reader must explicitly pin
+    # `--format json` on the one 'containerapp job logs show' call site, not
+    # rely on the command's own (text) default.
+    if ($procIsoReaderText -match '"containerapp",\s*"job",\s*"logs",\s*"show"[\s\S]{0,400}?"--format",\s*"json"') {
+        Add-Pass "R3: scripts/lib/proc-isolation-reader.ps1 explicitly pins --format json on 'containerapp job logs show'"
+    } else {
+        Add-Fail "R3: scripts/lib/proc-isolation-reader.ps1 does not pin --format json on 'containerapp job logs show'; the reader would receive the unpinned text-format wire shape the parser cannot recognise"
+    }
+
+    # R1/R6 (issue #86 security revision): worker/entrypoint.sh must call the
+    # RAW squad_proc_iso_run and must never route its one emitted line back
+    # through this file's own log() wrapper (which prepends a fixed
+    # "[squad-on-aca] " literal -- see log()'s definition at the top of the
+    # file). This is the static half of worker/tests/
+    # test_identity_drop_order.sh's own R1/R6 assertions, kept here too so a
+    # Windows-only validate.ps1 run (no bash) still catches this class of
+    # regression.
+    if (Test-Path -LiteralPath $procIsoEntrypointPath) {
+        $procIsoEntrypointText = Get-Content -LiteralPath $procIsoEntrypointPath -Raw
+        $procIsoHasRawCall = $procIsoEntrypointText -match '(?m)^\s*squad_proc_iso_run\s*$'
+        $procIsoHasLogWrap = $procIsoEntrypointText -match 'log\s+"\$\(squad_proc_iso'
+        if ($procIsoHasRawCall -and -not $procIsoHasLogWrap) {
+            Add-Pass "R1/R6: worker/entrypoint.sh calls the raw squad_proc_iso_run and never pipes the probe's emitted line through log() decoration"
+        } else {
+            Add-Fail "R1/R6: worker/entrypoint.sh does not call the bare squad_proc_iso_run (found=$procIsoHasRawCall) and/or still wraps the probe's output through log() (found=$procIsoHasLogWrap)"
+        }
+    } else {
+        Add-Fail "R1/R6: worker/entrypoint.sh is missing; cannot check the probe call site"
     }
 
     # T10 (issue #86): the single real chokepoint is Invoke-ProcIsoAzRead's
@@ -6839,15 +6887,24 @@ if (-not $IsWindowsHost) {
     Add-Fail "Cannot exercise Invoke-ProcIsoAzRead's deny/allow rules; reader or stub harness is missing"
 }
 
-# T12: the pure parser's yes/no/unknown classification against each committed
-# fixture, entirely offline (no Azure call, no stub, no child process).
+# T12/R2/R5: the pure parser's yes/no/unknown classification against each
+# committed fixture, entirely offline (no Azure call, no stub, no child
+# process). Includes the R2 JSON-envelope/raw/legacy-prefixed shapes and the
+# R5 negatives (embedded prose, v2 schema, truncated, unrelated JSON), all of
+# which must classify as not-yet-observed -- never a fabricated yes/no.
 if ((Test-Path -LiteralPath $procIsoParserPath) -and $procIsoMissingFixtures.Count -eq 0) {
     . $procIsoParserPath
     $procIsoFixtureExpectations = @{
-        "observed-yes"     = "yes"
-        "observed-no"      = "no"
-        "observed-unknown" = "unknown"
-        "not-yet-observed" = "not-yet-observed"
+        "observed-yes"             = "yes"
+        "observed-no"              = "no"
+        "observed-unknown"         = "unknown"
+        "not-yet-observed"         = "not-yet-observed"
+        "raw-yes"                  = "yes"
+        "legacy-prefixed-yes"      = "yes"
+        "negative-embedded-prose"  = "not-yet-observed"
+        "negative-v2-schema"       = "not-yet-observed"
+        "negative-truncated"       = "not-yet-observed"
+        "negative-unrelated-json"  = "not-yet-observed"
     }
     $procIsoFixtureFailures = @()
     foreach ($name in $procIsoFixtureNames) {
@@ -6859,9 +6916,9 @@ if ((Test-Path -LiteralPath $procIsoParserPath) -and $procIsoMissingFixtures.Cou
         }
     }
     if ($procIsoFixtureFailures.Count -eq 0) {
-        Add-Pass "T12: Get-ProcIsoObservation classifies all 4 committed fixtures correctly (yes/no/unknown/not-yet-observed), entirely offline"
+        Add-Pass "T12/R2/R5: Get-ProcIsoObservation classifies all $($procIsoFixtureNames.Count) committed fixtures correctly -- JSON-envelope yes/no/unknown/not-yet-observed (R2's real wire shape), raw and legacy-prefixed yes (R2 backward compatibility), and all 4 R5 negatives (embedded prose, v2 schema, truncated, unrelated JSON) as not-yet-observed -- entirely offline"
     } else {
-        Add-Fail "T12: parser misclassified fixture(s): $($procIsoFixtureFailures -join '; ')"
+        Add-Fail "T12/R2/R5: parser misclassified fixture(s): $($procIsoFixtureFailures -join '; ')"
     }
 
     $procIsoEmptyObservation = Get-ProcIsoObservation -Lines @()
@@ -6872,6 +6929,92 @@ if ((Test-Path -LiteralPath $procIsoParserPath) -and $procIsoMissingFixtures.Cou
     }
 } else {
     Add-Fail "Cannot exercise the PC-1 parser's classification; parser or fixtures are missing"
+}
+
+# ---------------------------------------------------------------------------
+# R4 (issue #86 security revision): end-to-end contract.
+#
+# Runs the SHIPPED probe (worker/lib/proc-isolation-probe.sh) under a real
+# bash, and feeds the EXACT emitted bytes into the SHIPPED parser
+# (scripts/lib/proc-isolation-parser.ps1) -- raw, wrapped in a JSON envelope,
+# and legacy-prefixed. This is the contract the prior revision's live
+# "not-yet-observed" result was never actually evidence for: the parser could
+# never have observed the emitted shape (log()-decorated, no --format json),
+# so its silence proved nothing. This check proves the CURRENT shipped pair
+# can observe each other, using only the real artifacts -- no reimplemented
+# probe, no reimplemented parser.
+#
+# Skipped (not passed) when bash is unavailable, matching the honesty rule
+# worker/tests/lib/deps.sh already established (a missing dependency is
+# reported as absent, never silently counted as green).
+# ---------------------------------------------------------------------------
+Write-Section "Process-isolation R4 end-to-end contract"
+$procIsoBash = Get-Command bash -ErrorAction SilentlyContinue
+if (-not $procIsoBash) {
+    Add-Skip "R4 end-to-end contract requires bash to run the shipped probe; bash was not found on PATH"
+} elseif (-not (Test-Path -LiteralPath $procIsoProbePath)) {
+    Add-Fail "R4: worker/lib/proc-isolation-probe.sh is missing; the end-to-end contract cannot run"
+} elseif (-not (Test-Path -LiteralPath $procIsoParserPath)) {
+    Add-Fail "R4: scripts/lib/proc-isolation-parser.ps1 is missing; the end-to-end contract cannot run"
+} else {
+    # `bash` on a Windows host is commonly WSL (which needs /mnt/<drive>/...)
+    # or Git Bash/MSYS (which accepts /<drive>/... or a plain forward-slash
+    # path). Try each candidate shape in turn and use whichever actually
+    # produces the probe's output -- this is path-translation plumbing only,
+    # not a change to what is being tested.
+    $procIsoBashPathCandidates = @()
+    if ($procIsoProbePath -match '^([A-Za-z]):\\(.*)$') {
+        $procIsoDriveLetter = $Matches[1].ToLower()
+        $procIsoRestOfPath = $Matches[2] -replace '\\', '/'
+        $procIsoBashPathCandidates += "/mnt/$procIsoDriveLetter/$procIsoRestOfPath"
+        $procIsoBashPathCandidates += "/$procIsoDriveLetter/$procIsoRestOfPath"
+    }
+    $procIsoBashPathCandidates += ($procIsoProbePath -replace '\\', '/')
+
+    $procIsoBashProbeLine = $null
+    foreach ($candidate in $procIsoBashPathCandidates) {
+        try {
+            $attempt = (& $procIsoBash.Source $candidate 2>$null | Select-Object -First 1)
+        } catch {
+            $attempt = $null
+        }
+        if ($attempt) { $procIsoBashProbeLine = $attempt; break }
+    }
+    if (-not $procIsoBashProbeLine) {
+        Add-Fail "R4: running the shipped probe under bash produced no output"
+    } else {
+        . $procIsoParserPath
+
+        # Shape 1: raw -- exactly what worker/entrypoint.sh now emits via the
+        # bare squad_proc_iso_run (R1), and what --format json's Log field
+        # carries verbatim.
+        $procIsoRawObs = Get-ProcIsoObservation -Lines @($procIsoBashProbeLine)
+        if ($procIsoRawObs.Observed -and $procIsoRawObs.SameUidEnvironReadable -match '^(yes|no|unknown)$' -and $procIsoRawObs.ProcMounted -match '^(yes|no)$' -and $procIsoRawObs.Uid -and $procIsoRawObs.User) {
+            Add-Pass "R4: the shipped parser observes the shipped probe's RAW emitted bytes and populates every field (same-uid-environ-readable=$($procIsoRawObs.SameUidEnvironReadable), proc-mounted=$($procIsoRawObs.ProcMounted), hidepid=$($procIsoRawObs.Hidepid), uid=$($procIsoRawObs.Uid), user=$($procIsoRawObs.User))"
+        } else {
+            Add-Fail "R4: the shipped parser did not fully observe the shipped probe's raw output: $($procIsoBashProbeLine)"
+        }
+
+        # Shape 2: JSON envelope -- the real --format json wire shape (R3).
+        $procIsoJsonLine = (@{ Log = $procIsoBashProbeLine; TimeStamp = "2026-08-11T02:30:00.000000Z" } | ConvertTo-Json -Compress)
+        $procIsoJsonObs = Get-ProcIsoObservation -Lines @($procIsoJsonLine)
+        if ($procIsoJsonObs.Observed -and $procIsoJsonObs.SameUidEnvironReadable -eq $procIsoRawObs.SameUidEnvironReadable -and $procIsoJsonObs.Uid -eq $procIsoRawObs.Uid) {
+            Add-Pass "R4: the shipped parser observes the shipped probe's output wrapped in a {`"Log`":...} JSON envelope, identically to the raw shape"
+        } else {
+            Add-Fail "R4: the shipped parser did not observe the JSON-enveloped probe output: $($procIsoJsonLine)"
+        }
+
+        # Shape 3: legacy-prefixed -- an ISO timestamp plus the old log()
+        # helper's literal "[squad-on-aca] " prefix, for backward
+        # compatibility with logs captured before this revision shipped.
+        $procIsoPrefixedLine = "2026-08-11T02:31:00.000000Z [squad-on-aca] $procIsoBashProbeLine"
+        $procIsoPrefixedObs = Get-ProcIsoObservation -Lines @($procIsoPrefixedLine)
+        if ($procIsoPrefixedObs.Observed -and $procIsoPrefixedObs.SameUidEnvironReadable -eq $procIsoRawObs.SameUidEnvironReadable -and $procIsoPrefixedObs.Uid -eq $procIsoRawObs.Uid) {
+            Add-Pass "R4: the shipped parser observes the shipped probe's output with a legacy ISO-timestamp + '[squad-on-aca] ' prefix, identically to the raw shape"
+        } else {
+            Add-Fail "R4: the shipped parser did not observe the legacy-prefixed probe output: $($procIsoPrefixedLine)"
+        }
+    }
 }
 
 # Fail-closed intent resolution: with no explicit parameters and no reachable

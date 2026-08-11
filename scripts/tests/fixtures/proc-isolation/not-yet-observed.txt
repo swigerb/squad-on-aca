@@ -1,3 +1,3 @@
-[squad-on-aca] Mode: prompt
-[squad-on-aca] Squad OTLP endpoint: http://ca-squad-aspire:18889
-[squad-on-aca] Azure identity removed from this session's environment (mode 'prompt' does not call Azure).
+{"Log":"[squad-on-aca] Mode: prompt","TimeStamp":"2026-08-11T02:17:00.100000Z"}
+{"Log":"[squad-on-aca] Squad OTLP endpoint: http://ca-squad-aspire:18889","TimeStamp":"2026-08-11T02:17:00.200000Z"}
+{"Log":"[squad-on-aca] Azure identity removed from this session's environment (mode 'prompt' does not call Azure).","TimeStamp":"2026-08-11T02:17:00.300000Z"}

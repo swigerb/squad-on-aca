@@ -68,15 +68,24 @@ echo ["caj-pc1stub-session-stub01"]
 exit /b 0
 
 :pilogs
-echo ordinary startup line
+rem R3 (issue #86 security revision): the reader must explicitly pin
+rem --format json. This stub enforces that as a wire-shape assertion: any
+rem call missing it is treated as an unhandled shape, exactly like a call to
+rem an unlisted command.
+echo %*|findstr /C:"--format json" >nul
+if errorlevel 1 (
+    >&2 echo ERROR: stub requires --format json on 'containerapp job logs show', got: %*
+    exit /b 9
+)
+echo {"Log":"ordinary startup line","TimeStamp":"2026-08-11T00:00:00.000000Z"}
 if "%SQUAD_PROC_ISO_STUB_MODE%"=="observed-yes" (
-    echo SQUAD-PROC-ISO v1 same-uid-environ-readable=yes proc-mounted=yes hidepid=0 uid=1000 user=squad
+    echo {"Log":"SQUAD-PROC-ISO v1 same-uid-environ-readable=yes proc-mounted=yes hidepid=0 uid=1000 user=squad","TimeStamp":"2026-08-11T00:00:01.000000Z"}
 ) else (
     if "%SQUAD_PROC_ISO_STUB_MODE%"=="observed-no" (
-        echo SQUAD-PROC-ISO v1 same-uid-environ-readable=no proc-mounted=yes hidepid=2 uid=1000 user=squad
+        echo {"Log":"SQUAD-PROC-ISO v1 same-uid-environ-readable=no proc-mounted=yes hidepid=2 uid=1000 user=squad","TimeStamp":"2026-08-11T00:00:01.000000Z"}
     )
 )
-echo ordinary shutdown line
+echo {"Log":"ordinary shutdown line","TimeStamp":"2026-08-11T00:00:02.000000Z"}
 exit /b 0
 '@
 

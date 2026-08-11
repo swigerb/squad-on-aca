@@ -152,6 +152,45 @@ this probe has not yet been redeployed. `scripts/proc-isolation-report.ps1`
 session runs; **this report does not claim a result it has not seen**, and no
 value here should be read as an implicit answer either way.
 
+**Retraction: the prior "not-yet-observed" live run was never evidence.**
+The initial version of this feature ran a real, read-only harvester pass
+against the live deployment and reported `not-yet-observed`, which this
+document originally recorded as if it were a meaningful (if inconclusive)
+observation. It was not. Two independent defects made that parser
+structurally incapable of ever observing the probe's line, regardless of
+what the platform actually did:
+
+1. `worker/entrypoint.sh` routed the probe's one documented line through its
+   own `log()` helper, which prepends a fixed `"[squad-on-aca] "` literal.
+   The parser's match was fully anchored at the start of the line
+   (`^SQUAD-PROC-ISO v1 ...`), so a decorated line could never match.
+2. `scripts/lib/proc-isolation-reader.ps1` read job logs without pinning
+   `--format json`, leaving Azure's own default (`text`) in effect, which
+   additionally prepends an ISO-8601 timestamp to every line — a second,
+   independent reason the same anchored match could never succeed, and a
+   wire shape the parser was never designed to unwrap in the first place.
+
+A `not-yet-observed` result under those conditions is indistinguishable from
+the probe never having run at all: the parser was asking a question it could
+not have heard the answer to even if the platform had shouted it. This
+security revision (R1–R8, the fix for this rejection) removes the `log()`
+decoration so `worker/entrypoint.sh` calls the probe library's raw
+`squad_proc_iso_run` directly, pins `--format json` on the one reader call
+site, and rebuilds the parser to unwrap that format's `{"Log": ...}`
+envelope (with a bounded, non-permissive backward-compatibility strip for
+already-captured logs that carry the old timestamp/prefix shape). An
+end-to-end contract test now runs the shipped probe under bash and feeds its
+exact emitted bytes — raw, JSON-enveloped, and legacy-prefixed — through the
+shipped parser, asserting every field, so this class of "silently
+unobservable" defect cannot recur without failing that check.
+
+**The live PC-1 answer remains genuinely pending**, exactly as before this
+fix: nothing above changes the fact that no redeploy has happened under the
+read-only constraint this work was produced under, so no session has yet run
+with a parser that is actually capable of observing its output. What changed
+is that the *next* operator deploy's `not-yet-observed`-or-otherwise result
+will, for the first time, mean what it says.
+
 **The blocker, exactly.** This work was produced under a hard read-only Azure
 constraint: no deploy, no job start, no exec into a container, no image
 build/push, and no mutation of any Azure resource. Establishing the live
@@ -170,18 +209,19 @@ unavailable" when the question could not even be asked (unreachable
 subscription, missing CLI extension), which is never conflated with
 `not-yet-observed`.
 
-**PC-2 (a second boundary) is explicitly declined for now.** The issue's own
-sprint plan makes PC-2 conditional on PC-1's answer: "add a second boundary
-only if PC-1 says it is needed." Implementing PC-2 — running identity-bearing
-helpers under a separate uid — would change the highest-privilege path in
-this container (the one holding the Azure identity) on the basis of a
-platform property that has not been confirmed on this platform. That change
-cannot itself be verified under the same read-only constraint that prevents
-observing PC-1's answer, so it is not attempted now. **Reversal trigger:**
-if `scripts/proc-isolation-report.ps1` (or a future live observation) ever
-reports `same-uid-environ-readable=yes`, PC-2 is reopened as required rather
-than optional, because that answer means the identity-drop ordering is the
-*only* control and a same-uid read is genuinely possible.
+**PC-2 (a second boundary) is explicitly declined for now, unchanged by this
+revision.** The issue's own sprint plan makes PC-2 conditional on PC-1's
+answer: "add a second boundary only if PC-1 says it is needed." Implementing
+PC-2 — running identity-bearing helpers under a separate uid — would change
+the highest-privilege path in this container (the one holding the Azure
+identity) on the basis of a platform property that has not been confirmed on
+this platform. That change cannot itself be verified under the same
+read-only constraint that prevents observing PC-1's answer, so it is not
+attempted now. **Reversal trigger:** if `scripts/proc-isolation-report.ps1`
+(or a future live observation) ever reports `same-uid-environ-readable=yes`,
+PC-2 is reopened as required rather than optional, because that answer means
+the identity-drop ordering is the *only* control and a same-uid read is
+genuinely possible.
 
 ---
 

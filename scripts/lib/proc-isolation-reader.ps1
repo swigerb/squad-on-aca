@@ -279,6 +279,14 @@ function Get-ProcIsoLiveObservation {
 
     $lines = @()
     foreach ($name in $names) {
+        # R3 (issue #86 security revision): pin `--format json` explicitly.
+        # This command's default (unpinned) format is `text`, which prepends
+        # an ISO-8601 timestamp to every line rather than the NDJSON
+        # {"Log":"...","TimeStamp":"..."} envelope
+        # scripts/lib/proc-isolation-parser.ps1's JSON-unwrap step expects.
+        # Leaving this unpinned is exactly how the prior revision's "not yet
+        # observed" live result was never actually evidence: the reader was
+        # never asking for the wire shape its own parser could recognise.
         $logsResult = Invoke-ProcIsoAzRead -AzArgs @(
             "containerapp", "job", "logs", "show",
             "--name", $Intent.JobName,
@@ -287,6 +295,7 @@ function Get-ProcIsoLiveObservation {
             "--container", $Intent.JobName,
             "--tail", ([string]$TailLines),
             "--subscription", $sub,
+            "--format", "json",
             "--only-show-errors"
         )
         if ($logsResult.ExitCode -ne 0) {
