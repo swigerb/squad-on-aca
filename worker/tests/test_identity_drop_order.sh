@@ -48,6 +48,48 @@ first_bg="$(grep -nE '^\s*[^#]*[^&|]&\s*$' "$ENTRYPOINT" | head -1 | cut -d: -f1
 check "the identity is dropped before the FIRST background child of any kind (first @${first_bg:-none})" \
   bash -c "[[ -z '${first_bg}' || ${drop_call:-0} -lt ${first_bg:-999999} ]]"
 
+# --- PC-1 (issue #86): the process-isolation probe's own ordering -----------
+#
+# The probe call must run (a) after the identity-drop dispatch (the `esac`
+# that closes the ralph/*-mode case above squad_drop_azure_identity, T7), (b)
+# before the lease heartbeat -- the first background child (T8, same
+# requirement as above but re-anchored on the probe call instead of the drop
+# call), and (c) UNCONDITIONALLY: outside of, and after, the mode-dispatch
+# case statement, so it is not itself gated by SQUAD_MODE (T14) -- ralph and
+# every other mode both reach it.
+
+# The nearest 'esac' AFTER the drop call is the identity-drop dispatch's own
+# closing esac -- entrypoint.sh has several unrelated case/esac blocks, so
+# this must not just grab the first 'esac' in the file.
+case_end="$(awk -v start="${drop_call:-0}" 'NR > start && /^esac$/ { print NR; exit }' "$ENTRYPOINT")"
+probe_call="$(line_of 'squad_proc_iso_line')"
+
+check "T7: the process-isolation probe call is present in entrypoint.sh" \
+  bash -c "[[ -n '${probe_call:-}' ]]"
+
+check "T7: the probe call comes AFTER the identity-drop dispatch's case/esac closes (esac @${case_end:-?}, probe @${probe_call:-?})" \
+  bash -c "[[ -n '${case_end}' && -n '${probe_call}' && ${case_end:-0} -lt ${probe_call:-0} ]]"
+
+check "the probe call comes BEFORE the lease heartbeat is spawned, same as the identity drop (probe @${probe_call:-?}, heartbeat @${heartbeat:-?})" \
+  bash -c "[[ -n '${probe_call}' && -n '${heartbeat}' && ${probe_call:-0} -lt ${heartbeat:-0} ]]"
+
+check "the probe call comes before the FIRST background child of any kind (probe @${probe_call:-?}, first @${first_bg:-none})" \
+  bash -c "[[ -z '${first_bg}' || ${probe_call:-0} -lt ${first_bg:-999999} ]]"
+
+# T14: unconditional in every mode. The probe call line must sit strictly
+# AFTER the case statement's closing esac -- i.e. outside the case body
+# entirely -- so no branch (including 'ralph)') can skip it. A probe call
+# accidentally moved inside the case, or gated by an `if [[ "$SQUAD_MODE" ...
+# ]]` of its own, would fail this.
+check "T14: the probe call is unconditional -- it sits after the mode-dispatch case/esac closes, not inside any mode's branch" \
+  bash -c "[[ ${case_end:-0} -lt ${probe_call:-0} ]]"
+
+probe_guard_start=$((probe_call>6?probe_call-6:1))
+probe_guard_text="$(sed -n "${probe_guard_start},${probe_call}p" "$ENTRYPOINT")"
+check_probe_unconditional() { ! printf '%s' "$probe_guard_text" | grep -q 'SQUAD_MODE'; }
+check "T14: the probe call is not conditioned on SQUAD_MODE (no SQUAD_MODE test guards the call site)" \
+  check_probe_unconditional
+
 # --- the mechanism, reproduced ----------------------------------------------
 
 # A child started BEFORE the unset keeps the credential; one started after does

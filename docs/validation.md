@@ -36,6 +36,7 @@ Use this guide before pushing and after deployment changes. Static checks run of
 | CLI golden gate wiring | Verifies capture cases and committed goldens under `scripts/tests/golden/cli/`. |
 | Worker capability tests | Run separately with `bash worker/tests/run-tests.sh`; CI runs them on Linux. |
 | Egress honesty | Confirms ACA Jobs report egress as advisory and do not echo manifest host text. |
+| Process-isolation report (PC-1) | Confirms `scripts/proc-isolation-report.ps1`'s reader/parser split: exactly one `az` call site, all mutating/exec shapes refused, and yes/no/unknown/not-yet-observed classification against committed fixtures. |
 
 The capability manifest contract is documented in [capability-manifest.md](capability-manifest.md).
 
@@ -324,6 +325,37 @@ body="$(printf '%s\n\n%s\n' \
   'A heading' \
   '| a | table |')"
 ```
+
+## Process isolation report (PC-1, issue #86)
+
+`scripts/proc-isolation-report.ps1` is a read-only harvester: it lists recent
+executions of the session job and scans their already-written console logs
+for `worker/lib/proc-isolation-probe.sh`'s single output line. It never
+starts, deploys, or execs into anything.
+
+```powershell
+# Offline, from a saved log excerpt (no Azure call at all):
+pwsh -NoProfile -File .\scripts\proc-isolation-report.ps1 -Fixture .\path\to\log.txt
+
+# Live, read-only (lists executions, reads their logs):
+pwsh -NoProfile -File .\scripts\proc-isolation-report.ps1 -ResourceGroupName <rg> -NamePrefix <prefix> -SubscriptionId <sub>
+```
+
+Reported `sameUidEnvironReadable` values:
+
+| Value | Meaning |
+| --- | --- |
+| `yes` | A scanned execution's log shows the probe found the child's `/proc/<pid>/environ` readable by the same-uid parent. |
+| `no` | A scanned execution's log shows the probe found it unreadable. |
+| `unknown` | The probe ran but could not classify readability. |
+| `not-yet-observed` | No execution log scanned contains the probe's line at all — most commonly because the worker image has not been redeployed since the probe was added. This is the expected result until the next operator deploy. |
+
+A "live read unavailable" failure (exit 2) is distinct from `not-yet-observed`
+(exit 0): the former means the read itself could not be attempted or
+completed (unreachable subscription, missing extension); the latter means the
+read succeeded and simply found no evidence yet. See
+[security-report.md](security-report.md) for the full mechanism, ordering
+guarantee, and the explicit PC-2 decision.
 
 ## Shipped image layout
 

@@ -112,6 +112,77 @@ it.
 A mode added later is covered by default: the exemption names `ralph`
 explicitly and drops everything else.
 
+### Process isolation inside the container (PC-1, issue #86)
+
+The identity-drop ordering above is correct whether or not Azure Container
+Apps restricts one process from reading another's environment through
+`/proc`. What was unknown is which of those is true on the platform, and that
+decides whether the ordering is the *only* control standing between a session
+and the identity, or one of two.
+
+**Mechanism.** `worker/lib/proc-isolation-probe.sh` spawns a short-lived
+child carrying only a synthetic, per-run random sentinel — never a real
+credential — and the same-uid parent attempts to read that child's
+`/proc/<pid>/environ`. It reports only whether the sentinel's *variable name*
+was found, never any value; it always reaps the child it starts; and it
+exits 0 unconditionally, so a probe failure can never fail a session. It
+emits exactly one line, in a fixed format:
+
+```
+SQUAD-PROC-ISO v1 same-uid-environ-readable=yes|no|unknown proc-mounted=yes|no hidepid=0|1|2|unknown uid=<n> user=<name>
+```
+
+**Ordering.** The probe runs in `worker/entrypoint.sh` **unconditionally, in
+every mode including `ralph`**, immediately after the identity-drop dispatch
+and before the lease heartbeat — the first background child of any kind.
+This mirrors the identity-drop control's own ordering rule rather than
+introducing a second one: nothing in the entrypoint starts any child, real or
+diagnostic, before the probe has run.
+
+**Status: not yet observed in ACA; pending next operator deploy.** The
+mechanism is proven on an ordinary Linux filesystem in CI —
+`worker/tests/test_proc_isolation_probe.sh` reproduces every classification
+(`yes`, `no`, `unknown`) against real and fabricated `/proc`-shaped inputs,
+and `worker/tests/test_identity_drop_order.sh` asserts the probe call's
+position relative to the identity drop and the lease heartbeat. What has
+**not** happened is a deployed session or Ralph poll actually emitting the
+`SQUAD-PROC-ISO` line where it can be read back — the worker image carrying
+this probe has not yet been redeployed. `scripts/proc-isolation-report.ps1`
+(below) will report `not-yet-observed` until that redeploy happens and a
+session runs; **this report does not claim a result it has not seen**, and no
+value here should be read as an implicit answer either way.
+
+**The blocker, exactly.** This work was produced under a hard read-only Azure
+constraint: no deploy, no job start, no exec into a container, no image
+build/push, and no mutation of any Azure resource. Establishing the live
+answer requires a redeploy of the worker image and a session (or a Ralph
+poll) actually running in ACA — both of which are deploy/execute actions
+outside that boundary. The live PC-1 answer is therefore genuinely unknown as
+of this writing, and is not fabricated or inferred here.
+
+**Reading the result once it exists.** `scripts/proc-isolation-report.ps1` is
+read-only: it lists existing job executions and reads their already-written
+console logs (never starts one, never execs into a container, never
+deploys), through the same single-chokepoint/allowlist pattern as
+`rbac-drift-check.ps1` (CV-1) and `job-drift-check.ps1` (CV-2). It reports one
+of `yes`, `no`, `unknown`, or `not-yet-observed` — and, distinctly, "live read
+unavailable" when the question could not even be asked (unreachable
+subscription, missing CLI extension), which is never conflated with
+`not-yet-observed`.
+
+**PC-2 (a second boundary) is explicitly declined for now.** The issue's own
+sprint plan makes PC-2 conditional on PC-1's answer: "add a second boundary
+only if PC-1 says it is needed." Implementing PC-2 — running identity-bearing
+helpers under a separate uid — would change the highest-privilege path in
+this container (the one holding the Azure identity) on the basis of a
+platform property that has not been confirmed on this platform. That change
+cannot itself be verified under the same read-only constraint that prevents
+observing PC-1's answer, so it is not attempted now. **Reversal trigger:**
+if `scripts/proc-isolation-report.ps1` (or a future live observation) ever
+reports `same-uid-environ-readable=yes`, PC-2 is reopened as required rather
+than optional, because that answer means the identity-drop ordering is the
+*only* control and a same-uid read is genuinely possible.
+
 ---
 
 ## Reaching Azure from GitHub
@@ -351,7 +422,7 @@ destination differs from that.
 
 ## How these controls are verified
 
-`scripts/validate.ps1` — **455 checks, 0 failing.** It asserts behaviour rather
+`scripts/validate.ps1` — **485 checks, 0 failing.** It asserts behaviour rather
 than structure: where a control is claimed, the check drives the code that
 enforces it.
 

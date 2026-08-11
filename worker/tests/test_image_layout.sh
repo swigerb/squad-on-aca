@@ -153,6 +153,21 @@ assert_eq "1" "$([[ "${#COPY_SOURCES[@]}" -ge 10 ]] && echo 1 || echo 0)" \
 assert_eq "1" "$([[ -f "${IMAGE_LIB}/squad-dispatch.js" ]] && echo 1 || echo 0)" \
   "image layout: squad-dispatch.js is staged at /usr/local/lib/squad-on-aca, the path ralph-dispatch.sh resolves in the image"
 
+# --- T9 (issue #86): the process-isolation probe is shipped in the image ----
+# Derived from the same COPY-line parse as everything above -- deleting the
+# probe from the Dockerfile's COPY line removes it from this throwaway layout
+# too, exactly like squad-dispatch.js above.
+assert_eq "1" "$([[ -f "${IMAGE_LIB}/proc-isolation-probe.sh" ]] && echo 1 || echo 0)" \
+  "image layout (T9): worker/lib/proc-isolation-probe.sh is staged at /usr/local/lib/squad-on-aca, the path worker/entrypoint.sh sources in the image"
+assert_eq "1" "$([[ -x "${IMAGE_LIB}/proc-isolation-probe.sh" ]] && echo 1 || echo 0)" \
+  "image layout (T9): the staged proc-isolation-probe.sh has the executable bit set by the Dockerfile's chmod pass"
+probe_line_endings="$(grep -c $'\r' "${IMAGE_LIB}/proc-isolation-probe.sh" || true)"
+assert_eq "0" "$probe_line_endings" \
+  "image layout (T9): the staged proc-isolation-probe.sh has CRLF line endings normalised away by the Dockerfile's sed pass"
+probe_source_output="$(bash -c "source '${IMAGE_LIB}/proc-isolation-probe.sh'; squad_proc_iso_line" 2>&1)"
+assert_contains "$probe_source_output" "SQUAD-PROC-ISO v1" \
+  "image layout (T9): the shipped proc-isolation-probe.sh, sourced from its staged path, actually runs and emits the documented line"
+
 # --- The environment production actually runs in ------------------------------
 # Nothing here may hand the dispatcher a catalog. Ralph does not, and that is the
 # entire defect. `cd` is outside the repository so no repo-relative fallback can

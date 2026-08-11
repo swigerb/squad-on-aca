@@ -116,6 +116,19 @@ fi
 # shellcheck source=lib/squad-push.sh
 source "$SQUAD_PUSH_LIB"
 
+# PC-1 (issue #86): the process-isolation probe. Sourced (not executed) so its
+# functions are available to call after the identity drop, below. A missing
+# probe library never blocks a session -- unlike the credential/push libraries
+# above, this is defence-in-depth diagnostics, not something a session's
+# correctness depends on.
+SQUAD_PROC_ISO_LIB="${SQUAD_PROC_ISO_LIB:-/usr/local/lib/squad-on-aca/proc-isolation-probe.sh}"
+if [[ -f "$SQUAD_PROC_ISO_LIB" ]]; then
+  # shellcheck source=lib/proc-isolation-probe.sh
+  source "$SQUAD_PROC_ISO_LIB"
+else
+  log "Process-isolation probe library not found at ${SQUAD_PROC_ISO_LIB}; skipping (PC-1, issue #86)."
+fi
+
 if [[ -n "${GH_TOKEN:-}" ]]; then
   squad_credential_write_token "$GH_TOKEN"
 fi
@@ -382,6 +395,26 @@ case "${SQUAD_MODE:-smoke}" in
     squad_drop_azure_identity
     ;;
 esac
+
+# PC-1 (issue #86): run the process-isolation probe UNCONDITIONALLY, in every
+# mode including ralph, right after the identity-drop dispatch above and
+# before the lease heartbeat (the first background child) is started below.
+#
+# This is unconditional-on-mode by design and unrelated to whether THIS
+# session happened to hold an Azure identity: the question it answers --
+# "can a same-uid process on this platform read another process's
+# /proc/<pid>/environ at all" -- is a property of the platform, not of this
+# session, so every mode's run contributes an observation.
+#
+# It runs after the identity drop (never before: even though the probe only
+# ever touches its own synthetic sentinel, ordering it after keeps a single,
+# simple rule -- nothing in this file starts any child, real or diagnostic,
+# before the identity is out of the shell's own environment) and before ANY
+# background child, so it cannot itself become the same category of leak the
+# identity-drop ordering exists to close.
+if declare -F squad_proc_iso_line >/dev/null 2>&1; then
+  log "$(squad_proc_iso_line 2>/dev/null || printf 'SQUAD-PROC-ISO v1 same-uid-environ-readable=unknown proc-mounted=unknown hidepid=unknown uid=%s user=%s' "$(id -u 2>/dev/null || echo unknown)" "$(id -un 2>/dev/null || echo unknown)")"
+fi
 
 if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
   squad_lease_report heartbeat

@@ -1,0 +1,3 @@
+[squad-on-aca] Mode: ralph
+[squad-on-aca] Squad OTLP endpoint: http://ca-squad-aspire:18889
+SQUAD-PROC-ISO v1 same-uid-environ-readable=unknown proc-mounted=no hidepid=unknown uid=1000 user=squad

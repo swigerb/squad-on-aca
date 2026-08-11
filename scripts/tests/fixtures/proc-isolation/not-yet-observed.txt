@@ -1,0 +1,3 @@
+[squad-on-aca] Mode: prompt
+[squad-on-aca] Squad OTLP endpoint: http://ca-squad-aspire:18889
+[squad-on-aca] Azure identity removed from this session's environment (mode 'prompt' does not call Azure).

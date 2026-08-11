@@ -1,0 +1,4 @@
+[squad-on-aca] Mode: prompt
+[squad-on-aca] Squad OTLP endpoint: http://ca-squad-aspire:18889
+SQUAD-PROC-ISO v1 same-uid-environ-readable=no proc-mounted=yes hidepid=2 uid=1000 user=squad
+[squad-on-aca] Azure identity removed from this session's environment (mode 'prompt' does not call Azure).
