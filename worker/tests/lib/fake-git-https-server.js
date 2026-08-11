@@ -68,6 +68,18 @@ const DELAY_MS = Number(argValue('--delay-ms', '0')) || 0;
 const PORT_FILE = argValue('--port-file', '');
 const BACKEND = argValue('--backend', '/usr/lib/git-core/git-http-backend');
 
+/**
+ * The longest this fixture will wait for `git-http-backend` before answering
+ * the client itself.
+ *
+ * Generous next to a clone of a fixture repository holding a handful of
+ * commits, which completes in well under a second -- so exceeding it means
+ * something is genuinely stuck, not merely slow on a loaded machine. Short
+ * enough that a stuck backend surfaces as a failed test in seconds rather
+ * than as a suite, and then a CI job, that never finishes (issue #96).
+ */
+const BACKEND_TIMEOUT_MS = Number(argValue('--backend-timeout-ms', '20000')) || 20000;
+
 if (!ROOT || !CERT || !KEY || !TOKEN_FILE) {
   process.stderr.write('fake-git-https-server: --root, --cert, --key and --token-file are required\n');
   process.exit(64);
@@ -128,16 +140,55 @@ function runBackend(req, res, user) {
   }
   if (req.headers['content-length']) env.CONTENT_LENGTH = String(req.headers['content-length']);
 
-  const child = spawn(BACKEND, [], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  // `detached` puts the backend in its own process group, so the timeout below
+  // can signal the GROUP. Killing the direct child alone would leave
+  // git-http-backend's own children alive holding the pipes -- the same
+  // mistake this timeout exists to stop.
+  const child = spawn(BACKEND, [], { env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
   req.pipe(child.stdin);
+
+  /**
+   * The whole response is sent from `child.on('close')`, so it depends on the
+   * backend exiting AND every one of its pipes closing. With nothing bounding
+   * that, a backend which blocks -- waiting on a stdin that never ends, or
+   * holding a pipe open -- means the client never receives a single byte and
+   * `git clone` waits FOREVER, because git applies no timeout of its own.
+   *
+   * That is not hypothetical: it is issue #96. `git clone` against this
+   * fixture was observed stuck for over seven minutes with the backend still
+   * running, which is what made `test_credential_withholding.sh` hang
+   * intermittently and, before the per-suite timeout existed, hung CI itself.
+   *
+   * So the backend gets a bounded lifetime. If it has not finished in time it
+   * is killed by PROCESS GROUP -- signalling the direct child alone leaves
+   * `git-http-backend`'s own children holding the pipes, which is the same
+   * mistake in miniature -- and the client gets a 504 saying so. A test
+   * fixture that hangs teaches nothing; one that fails says exactly what
+   * happened.
+   */
+  let replied = false;
+  const reply = (status, headers, body) => {
+    if (replied) return;
+    replied = true;
+    clearTimeout(deadline);
+    res.writeHead(status, headers);
+    res.end(body);
+  };
+  const deadline = setTimeout(() => {
+    append(REQUEST_LOG, `backend-timeout ${req.method} ${url.pathname} after ${BACKEND_TIMEOUT_MS}ms`);
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    reply(504, { 'Content-Type': 'text/plain' },
+      `fixture: ${BACKEND} did not finish within ${BACKEND_TIMEOUT_MS}ms\n`);
+  }, BACKEND_TIMEOUT_MS);
 
   const chunks = [];
   child.stdout.on('data', (chunk) => chunks.push(chunk));
   child.stderr.on('data', (chunk) => append(REQUEST_LOG, `backend-stderr ${chunk.toString().trim()}`));
 
   child.on('error', (err) => {
-    res.writeHead(500, { 'Content-Type': 'text/plain' });
-    res.end(`fixture could not run ${BACKEND}: ${err.message}\n`);
+    reply(500, { 'Content-Type': 'text/plain' },
+      `fixture could not run ${BACKEND}: ${err.message}\n`);
   });
 
   child.on('close', () => {
@@ -160,8 +211,7 @@ function runBackend(req, res, user) {
         headers[name] = value;
       }
     }
-    res.writeHead(status, headers);
-    res.end(body);
+    reply(status, headers, body);
   });
 }
 
