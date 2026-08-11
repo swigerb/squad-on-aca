@@ -17,7 +17,56 @@ sanitize_name() {
   printf '%s' "${1:-session}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed -E 's/^-+|-+$//g' | cut -c 1-48
 }
 
-export HOME="${HOME:-/home/squad}"
+# PC-2 (issue #86): a second boundary, now required rather than optional.
+#
+# PC-1's live ACA diagnostic (docs/security-report.md; the exact deployed
+# platform this image runs on) measured this platform's same-uid
+# /proc/<pid>/environ read as POSSIBLE: same-uid-environ-readable=yes,
+# hidepid=0. That means the identity-drop ordering below
+# (squad_drop_azure_identity) is no longer the ONLY control standing between
+# a session and the Azure identity -- on THIS platform, a same-uid neighbour
+# really can read another process's environment out of /proc.
+#
+# Only `ralph` mode ever holds the identity (it is the only mode that runs
+# `az login --identity`, a few dozen lines below); every OTHER mode runs an
+# agent that executes attacker-influenced input -- an issue body, a comment, a
+# file in the repository -- through Copilot. A Linux ptrace/DAC check gates
+# every /proc/<pid>/environ read on a REAL UID match (or CAP_SYS_PTRACE),
+# independent of hidepid, so giving ralph's process a UID that is never the
+# same as the UID any agent-running mode uses closes the exact gap PC-1
+# found -- a control that does not depend on ordering at all.
+#
+# This is the FIRST executable action in this script, before anything else
+# -- including HOME, credentials, and every mode-specific branch below --
+# runs. The image's container-default user is root (worker/Dockerfile has no
+# trailing USER) SOLELY so this one `exec` can drop to the correct
+# unprivileged user before a single credential, child process, or byte of
+# user-influenced input is touched. `exec runuser` REPLACES this process
+# outright -- there is no root parent left running afterward, in any mode.
+# If the container is ever started as a non-root user directly (e.g. a
+# developer running this script locally), `id -u` is already non-zero and
+# this block is a no-op: nothing below depends on having been root.
+if [[ "$(id -u)" -eq 0 ]]; then
+  SQUAD_RUNTIME_USER="squad"
+  if [[ "${SQUAD_MODE:-smoke}" == "ralph" ]]; then
+    SQUAD_RUNTIME_USER="squad-identity"
+  fi
+  # `-p`/`--preserve-environment` is required so every ACA-injected variable
+  # (GITHUB_TOKEN, IDENTITY_ENDPOINT, SQUAD_MODE, ...) survives the switch --
+  # but "preserve" is literal: it also carries over root's own HOME (which
+  # this container's base image sets to /root) into the now-unprivileged
+  # process, which cannot write there. `env -u HOME` clears it BEFORE
+  # runuser runs, so the HOME fallback a few lines below resolves it fresh,
+  # from the ACTUAL user this process now runs as.
+  exec env -u HOME runuser -p -u "$SQUAD_RUNTIME_USER" -- "$0" "$@"
+fi
+
+# The fallback is resolved from THIS process's actual user, never hard-coded
+# to /home/squad -- after the PC-2 drop above, a ralph-mode process is
+# squad-identity, whose home is /home/squad-identity, and a hard-coded
+# /home/squad here would leave it writing outside its own, exclusively-owned
+# directory.
+export HOME="${HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
 export COPILOT_HOME="${COPILOT_HOME:-$HOME/.copilot}"
 export GH_CONFIG_DIR="${GH_CONFIG_DIR:-$HOME/.config/gh}"
 export ASPIRE_OTLP_GRPC_ENDPOINT="${ASPIRE_OTLP_GRPC_ENDPOINT:-http://ca-squad-aspire:18889}"
@@ -115,6 +164,19 @@ if [[ ! -f "$SQUAD_PUSH_LIB" ]]; then
 fi
 # shellcheck source=lib/squad-push.sh
 source "$SQUAD_PUSH_LIB"
+
+# PC-1 (issue #86): the process-isolation probe. Sourced (not executed) so its
+# functions are available to call after the identity drop, below. A missing
+# probe library never blocks a session -- unlike the credential/push libraries
+# above, this is defence-in-depth diagnostics, not something a session's
+# correctness depends on.
+SQUAD_PROC_ISO_LIB="${SQUAD_PROC_ISO_LIB:-/usr/local/lib/squad-on-aca/proc-isolation-probe.sh}"
+if [[ -f "$SQUAD_PROC_ISO_LIB" ]]; then
+  # shellcheck source=lib/proc-isolation-probe.sh
+  source "$SQUAD_PROC_ISO_LIB"
+else
+  log "Process-isolation probe library not found at ${SQUAD_PROC_ISO_LIB}; skipping (PC-1, issue #86)."
+fi
 
 if [[ -n "${GH_TOKEN:-}" ]]; then
   squad_credential_write_token "$GH_TOKEN"
@@ -382,6 +444,37 @@ case "${SQUAD_MODE:-smoke}" in
     squad_drop_azure_identity
     ;;
 esac
+
+# PC-1 (issue #86): run the process-isolation probe UNCONDITIONALLY, in every
+# mode including ralph, right after the identity-drop dispatch above and
+# before the lease heartbeat (the first background child) is started below.
+#
+# This is unconditional-on-mode by design and unrelated to whether THIS
+# session happened to hold an Azure identity: the question it answers --
+# "can a same-uid process on this platform read another process's
+# /proc/<pid>/environ at all" -- is a property of the platform, not of this
+# session, so every mode's run contributes an observation.
+#
+# It runs after the identity drop (never before: even though the probe only
+# ever touches its own synthetic sentinel, ordering it after keeps a single,
+# simple rule -- nothing in this file starts any child, real or diagnostic,
+# before the identity is out of the shell's own environment) and before ANY
+# background child, so it cannot itself become the same category of leak the
+# identity-drop ordering exists to close.
+#
+# R1 (issue #86 security revision): call the RAW squad_proc_iso_run, never
+# route its output through this file's log() wrapper. log() prepends a fixed
+# "[squad-on-aca] " literal to whatever it is given
+# (worker/entrypoint.sh:log()), which decorates the probe's one documented
+# line and changes exactly what a downstream reader would have to expect on
+# the wire. squad_proc_iso_probe.sh already owns emitting exactly one safe
+# line to stdout and exits 0 unconditionally (squad_proc_iso_run's own
+# internal fallback covers a failure inside the probe itself) -- there is
+# nothing left for this file to add, and doing so would mean the probe
+# library no longer solely owns its own emitted line.
+if declare -F squad_proc_iso_run >/dev/null 2>&1; then
+  squad_proc_iso_run
+fi
 
 if [[ -n "${SQUAD_LEASE_KEY:-}" ]]; then
   squad_lease_report heartbeat

@@ -1,0 +1,1 @@
+{"Log":"[squad-on-aca] see the diagnostic output: SQUAD-PROC-ISO v1 same-uid-environ-readable=yes proc-mounted=yes hidepid=0 uid=1000 user=squad","TimeStamp":"2026-08-11T02:19:00.100000Z"}
