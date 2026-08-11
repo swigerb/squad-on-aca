@@ -379,6 +379,58 @@ assert_eq "aca-box42" "$(hub_device_id HOSTNAME=box42)" \
 assert_contains "$(cat "$HUB_LIB")" 'SQUAD_HUB_DEVICE_ID="$(squad_hub_device_id)"' \
   "the composed device id is passed to squad-hub oneshot"
 
+# ---------------------------------------------------------------------------
+# 7. Trust-conditioned hub policy (issue #84 PI-2)
+# ---------------------------------------------------------------------------
+# Squad Hub supervision runs the SAME resolver as the direct path, so an
+# untrusted dispatch source attached to a human at the hub is narrower in
+# exactly the same way it is narrower off the hub -- the hub is a channel for
+# approving what the policy still allows, not a way to relax the policy.
+echo "-- trust-conditioned hub policy --"
+
+# `ralph` above is already the untrusted source this whole file exercises
+# (see section 1); restate that here explicitly, and add the trusted side, so
+# a reader does not have to infer trust from an incidental choice of fixture.
+assert_contains "$HUB_JSON" '"shell(git push)"' \
+  "hub-argv-json for the untrusted source (ralph) carries the untrusted-input deny pattern shell(git push)"
+assert_contains "$HUB_JSON" '"shell(gh pr)"' \
+  "hub-argv-json for the untrusted source (ralph) carries shell(gh pr)"
+assert_contains "$HUB_JSON" '"shell(curl)"' \
+  "hub-argv-json for the untrusted source (ralph) carries shell(curl)"
+assert_contains "$HUB_JSON" '"shell(wget)"' \
+  "hub-argv-json for the untrusted source (ralph) carries shell(wget)"
+
+LOCAL_HUB_JSON="$(policy prompt local-cli hub-argv-json)"
+assert_not_contains "$LOCAL_HUB_JSON" '"shell(git push)"' \
+  "hub-argv-json for the TRUSTED source (local-cli) does NOT carry shell(git push) -- local is unchanged on the hub path too"
+assert_not_contains "$LOCAL_HUB_JSON" '"shell(gh pr)"' \
+  "hub-argv-json for local-cli does NOT carry shell(gh pr)"
+assert_not_contains "$LOCAL_HUB_JSON" '"shell(curl)"' \
+  "hub-argv-json for local-cli does NOT carry shell(curl)"
+assert_not_contains "$LOCAL_HUB_JSON" '"shell(wget)"' \
+  "hub-argv-json for local-cli does NOT carry shell(wget)"
+
+# watch and actions are the other two untrusted, unattended dispatch sources;
+# both must be narrower on the hub path exactly as ralph is.
+WATCH_HUB_JSON="$(policy prompt watch hub-argv-json)"
+ACTIONS_HUB_JSON="$(policy prompt actions hub-argv-json)"
+for label_json in "watch:${WATCH_HUB_JSON}" "actions:${ACTIONS_HUB_JSON}"; do
+  label="${label_json%%:*}"
+  json="${label_json#*:}"
+  assert_contains "$json" '"shell(git push)"' "hub-argv-json for untrusted source '${label}' carries shell(git push)"
+  assert_contains "$json" '"shell(gh pr)"'    "hub-argv-json for untrusted source '${label}' carries shell(gh pr)"
+done
+
+# The hub's own announcement must reflect the same narrowing an operator would
+# see off the hub — a hub session must not look MORE permissive in the log
+# than the direct path for the same untrusted source.
+ANNOUNCE_UNTRUSTED="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+  SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=ralph \
+  bash -c 'source "'"${WORKER_DIR}/lib/squad-policy.sh"'"; squad_policy_resolve >/dev/null 2>&1; squad_policy_announce hub' 2>&1)"
+UNTRUSTED_FLAGS_LINE="$(printf '%s\n' "$ANNOUNCE_UNTRUSTED" | grep 'Copilot flags (via Squad Hub')"
+assert_contains "$UNTRUSTED_FLAGS_LINE" "shell(git push)" \
+  "the hub announcement for an untrusted source shows the untrusted-input deny patterns being applied"
+
 echo ""
 echo "squad-hub supervision: ${TESTS_RUN} assertions, ${TESTS_FAILED} failed"
 exit $(( TESTS_FAILED > 0 ? 1 : 0 ))
