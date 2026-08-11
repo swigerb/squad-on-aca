@@ -37,6 +37,14 @@ echo "== fixture git server: a stuck backend must not hang the client (issue #96
 WORK="$(mktemp -d -t squad-fixture-timeout.XXXXXXXXXXXX)"
 cleanup() {
   [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
+  # Clean up after ourselves. This suite deliberately starts a backend that
+  # never exits, and leaving it running for the remainder of the job is
+  # antisocial whatever else it does -- a test that hunts leaked processes
+  # must not leak its own.
+  for f in "$WORK/backend.pid" "$WORK/backend-child.pid"; do
+    p="$(cat "$f" 2>/dev/null)"
+    [[ -n "$p" ]] && kill -9 "$p" 2>/dev/null
+  done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
