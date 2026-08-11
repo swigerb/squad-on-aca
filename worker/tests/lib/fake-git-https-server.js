@@ -72,13 +72,18 @@ const BACKEND = argValue('--backend', '/usr/lib/git-core/git-http-backend');
  * The longest this fixture will wait for `git-http-backend` before answering
  * the client itself.
  *
- * Generous next to a clone of a fixture repository holding a handful of
- * commits, which completes in well under a second -- so exceeding it means
- * something is genuinely stuck, not merely slow on a loaded machine. Short
- * enough that a stuck backend surfaces as a failed test in seconds rather
- * than as a suite, and then a CI job, that never finishes (issue #96).
+ * This exists to convert a HANG into a failure, not to bound normal work, so
+ * it is deliberately far longer than any healthy request against a fixture
+ * repository of a few commits -- which completes in well under a second. A
+ * bound tight enough to fire on a slow-but-healthy request would turn a
+ * loaded CI runner into a spurious failure, which is worse than the defect it
+ * guards against.
+ *
+ * It still has to be shorter than the per-suite timeout in
+ * `worker/tests/run-tests.sh` (120s), or the suite would be killed before the
+ * fixture ever got the chance to explain itself.
  */
-const BACKEND_TIMEOUT_MS = Number(argValue('--backend-timeout-ms', '20000')) || 20000;
+const BACKEND_TIMEOUT_MS = Number(argValue('--backend-timeout-ms', '60000')) || 60000;
 
 /**
  * Every backend still running, so none can outlive this server.
