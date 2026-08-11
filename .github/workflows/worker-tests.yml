@@ -24,6 +24,13 @@ on:
 jobs:
   worker-tests:
     runs-on: ubuntu-latest
+    # Issue #92 sprint 1: baseline observed runs of this job were 00:03:48,
+    # 00:05:26 and 00:05:44 (worst case under six minutes). With no
+    # timeout-minutes set, a hang inherits GitHub's six-HOUR default and costs
+    # that much runner time reporting nothing. 15 minutes is roughly 2.6x
+    # headroom over the worst observed baseline (5:44) -- generous enough to
+    # absorb normal runner variance, but a hang now fails in minutes, not hours.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -52,7 +59,18 @@ jobs:
       # a CI runner every declared dependency is present, so a skip means the
       # environment regressed and the run proved less than it claims. Fail the
       # job rather than accept a partial green.
+      # Issue #92 sprint 1: this is the exact step that hung for 40+ minutes
+      # with no output. The job-level timeout-minutes above is a backstop for
+      # the whole job; this step-level timeout is finer-grained because it is
+      # the one step whose own internal per-suite timeout (worker/tests/
+      # run-tests.sh, issue #92 sprint 1/2) can still, in principle, take up
+      # to 23 suites * 120s each in the worst case if every suite hung in
+      # sequence. 10 minutes gives headroom over the ~1 minute this step
+      # normally takes while still failing well inside the job's own 15
+      # minute budget, so this step's own timeout is what fires first and
+      # names which step hung.
       - name: Run worker capability tests
+        timeout-minutes: 10
         shell: bash
         run: |
           set -o pipefail

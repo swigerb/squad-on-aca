@@ -18,6 +18,12 @@
 
 set -uo pipefail
 
+# Issue #92 sprint 3: a cancelled/interrupted job with no self-announcing
+# tests gives no way to tell which suite it stopped in. This line is written
+# with `echo` (a raw write(), never libc stdio buffering) before any check
+# runs, so it is the first thing to appear even if the job is killed mid-suite.
+echo "== identity drop ORDER (issue #85 / #92) =="
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTRYPOINT="$SCRIPT_DIR/../entrypoint.sh"
 
@@ -37,7 +43,11 @@ line_of() { grep -n "$1" "$ENTRYPOINT" | head -1 | cut -d: -f1; }
 # --- the ordering, read out of the script ------------------------------------
 
 drop_call="$(line_of '^    squad_drop_azure_identity$')"
-heartbeat="$(line_of 'squad_lease_heartbeat_loop &')"
+# issue #92 added a stdio redirect to this call site
+# (`squad_lease_heartbeat_loop >/dev/null 2>&1 </dev/null &`), so the exact
+# substring this used to match no longer appears; match the call regardless
+# of what redirects follow it, the same way test_no_orphan_children.sh does.
+heartbeat="$(line_of 'squad_lease_heartbeat_loop.*&$')"
 
 check "the identity is dropped BEFORE the lease heartbeat is spawned (drop @${drop_call:-?}, heartbeat @${heartbeat:-?})" \
   bash -c "[[ -n '${drop_call}' && -n '${heartbeat}' && ${drop_call:-0} -lt ${heartbeat:-0} ]]"
@@ -47,6 +57,67 @@ check "the identity is dropped BEFORE the lease heartbeat is spawned (drop @${dr
 first_bg="$(grep -nE '^\s*[^#]*[^&|]&\s*$' "$ENTRYPOINT" | head -1 | cut -d: -f1)"
 check "the identity is dropped before the FIRST background child of any kind (first @${first_bg:-none})" \
   bash -c "[[ -z '${first_bg}' || ${drop_call:-0} -lt ${first_bg:-999999} ]]"
+
+# --- PC-1 (issue #86): the process-isolation probe's own ordering -----------
+#
+# The probe call must run (a) after the identity-drop dispatch (the `esac`
+# that closes the ralph/*-mode case above squad_drop_azure_identity, T7), (b)
+# before the lease heartbeat -- the first background child (T8, same
+# requirement as above but re-anchored on the probe call instead of the drop
+# call), and (c) UNCONDITIONALLY: outside of, and after, the mode-dispatch
+# case statement, so it is not itself gated by SQUAD_MODE (T14) -- ralph and
+# every other mode both reach it.
+
+# The nearest 'esac' AFTER the drop call is the identity-drop dispatch's own
+# closing esac -- entrypoint.sh has several unrelated case/esac blocks, so
+# this must not just grab the first 'esac' in the file.
+case_end="$(awk -v start="${drop_call:-0}" 'NR > start && /^esac$/ { print NR; exit }' "$ENTRYPOINT")"
+# R1 (issue #86 security revision): entrypoint.sh now calls the raw
+# squad_proc_iso_run, not squad_proc_iso_line -- squad_proc_iso_run is the
+# probe library's own top-level runner and prints its own composed line
+# directly, so it is the only call site left in this file. Anchored so this
+# finds the bare CALL line, not a comment that merely mentions the name.
+probe_call="$(line_of '^  squad_proc_iso_run$')"
+
+check "T7: the process-isolation probe call is present in entrypoint.sh" \
+  bash -c "[[ -n '${probe_call:-}' ]]"
+
+check "T7: the probe call comes AFTER the identity-drop dispatch's case/esac closes (esac @${case_end:-?}, probe @${probe_call:-?})" \
+  bash -c "[[ -n '${case_end}' && -n '${probe_call}' && ${case_end:-0} -lt ${probe_call:-0} ]]"
+
+check "the probe call comes BEFORE the lease heartbeat is spawned, same as the identity drop (probe @${probe_call:-?}, heartbeat @${heartbeat:-?})" \
+  bash -c "[[ -n '${probe_call}' && -n '${heartbeat}' && ${probe_call:-0} -lt ${heartbeat:-0} ]]"
+
+check "the probe call comes before the FIRST background child of any kind (probe @${probe_call:-?}, first @${first_bg:-none})" \
+  bash -c "[[ -z '${first_bg}' || ${probe_call:-0} -lt ${first_bg:-999999} ]]"
+
+# T14: unconditional in every mode. The probe call line must sit strictly
+# AFTER the case statement's closing esac -- i.e. outside the case body
+# entirely -- so no branch (including 'ralph)') can skip it. A probe call
+# accidentally moved inside the case, or gated by an `if [[ "$SQUAD_MODE" ...
+# ]]` of its own, would fail this.
+check "T14: the probe call is unconditional -- it sits after the mode-dispatch case/esac closes, not inside any mode's branch" \
+  bash -c "[[ ${case_end:-0} -lt ${probe_call:-0} ]]"
+
+probe_guard_start=$((probe_call>6?probe_call-6:1))
+probe_guard_text="$(sed -n "${probe_guard_start},${probe_call}p" "$ENTRYPOINT")"
+check_probe_unconditional() { ! printf '%s' "$probe_guard_text" | grep -q 'SQUAD_MODE'; }
+check "T14: the probe call is not conditioned on SQUAD_MODE (no SQUAD_MODE test guards the call site)" \
+  check_probe_unconditional
+
+# R1/R6 (issue #86 security revision): the probe's ONE emitted line must never
+# be routed through this file's log() wrapper, which prepends a fixed
+# "[squad-on-aca] " literal (see log()'s own definition at the top of this
+# file) and would decorate exactly the bytes a downstream reader has to
+# parse. The call site itself must be the bare `squad_proc_iso_run` -- not
+# `log "$(squad_proc_iso_run)"`, not `log "$(squad_proc_iso_line ...)"`, and
+# not any other wrapping that puts the probe's line through this file's own
+# formatting.
+probe_call_line_text="$(sed -n "${probe_call}p" "$ENTRYPOINT")"
+check "R1: the probe call line is the bare squad_proc_iso_run (no log() wrapping decorating its one emitted line): got '${probe_call_line_text}'" \
+  bash -c "[[ '${probe_call_line_text}' =~ ^[[:space:]]*squad_proc_iso_run[[:space:]]*\$ ]]"
+check "R1/R6: entrypoint.sh never pipes the probe's output back through log() anywhere in the file" \
+  bash -c "! grep -qE 'log \"\\\$\\(squad_proc_iso' '${ENTRYPOINT}'"
 
 # --- the mechanism, reproduced ----------------------------------------------
 
@@ -58,14 +129,15 @@ if [[ -r /proc/self/environ ]]; then
   IDENTITY_ENDPOINT='http://localhost:42356/msi/token' \
   IDENTITY_HEADER='SECRET-HEADER-VALUE' \
   bash -c '
-    sleep 30 &
+    sleep 30 >/dev/null 2>&1 </dev/null &
     early=$!
     unset IDENTITY_ENDPOINT IDENTITY_HEADER
-    sleep 30 &
+    sleep 30 >/dev/null 2>&1 </dev/null &
     late=$!
     tr "\0" "\n" < /proc/$early/environ | grep -c "^IDENTITY_HEADER=" > '"$probe"'/early || true
     tr "\0" "\n" < /proc/$late/environ  | grep -c "^IDENTITY_HEADER=" > '"$probe"'/late  || true
     kill $early $late 2>/dev/null
+    wait $early $late 2>/dev/null
   ' 2>/dev/null
 
   check "a child spawned BEFORE the unset still holds the credential (this is the bug)" \
