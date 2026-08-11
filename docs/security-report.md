@@ -1,6 +1,6 @@
 # Squad on ACA security report
 
-**Reviewed:** 10 August 2026
+**Reviewed:** 10 August 2026; re-reviewed 11 August 2026 after the Copilot-plane fix
 **Scope:** the GitHub dispatch path, the worker container, the Azure identity
 and its role assignments, and the optional Squad Hub link.
 **Method:** code review against the running system, `scripts/validate.ps1` (414
@@ -214,10 +214,11 @@ Recorded here rather than built, exactly as the egress decision was.
 **Withholding — built.** For `prompt` and `new-project` on an untrusted source,
 the credential is taken away from the agent for the duration of the single
 `copilot -p` call. Before the agent starts: the live token is moved into a
-non-exported shell variable, `GH_TOKEN`/`GITHUB_TOKEN` are unset, the 0600
-token file is deleted, and the git credential helper is uninstalled. After the
-agent exits and **before** anything publishes, all four are restored, so a
-session still ends with a branch and a pull request.
+non-exported shell variable, `GH_TOKEN`/`GITHUB_TOKEN` are unset, a
+`COPILOT_GITHUB_TOKEN` carrying that same value is unset the same way (see
+below), the 0600 token file is deleted, and the git credential helper is
+uninstalled. After the agent exits and **before** anything publishes, all of
+them are restored, so a session still ends with a branch and a pull request.
 
 | Property | Behaviour |
 |---|---|
@@ -244,27 +245,58 @@ from withholding it for one bounded call, and it was not built. Those modes
 hold the credential throughout. `smoke` never runs an attacker-supplied prompt
 and `shell` runs an operator-supplied command, so neither is in scope either.
 
-### Open finding: the Copilot credential plane is not withheld
+### The Copilot credential plane — closed
 
-`worker/entrypoint.sh` exports `COPILOT_GITHUB_TOKEN`, defaulting it to
-`GH_TOKEN` when no separate Copilot credential is supplied, and `deploy.ps1`
-takes that default whenever `-CopilotGitHubToken` is not passed (it warns, and
-proceeds). Withholding unsets `GH_TOKEN` and `GITHUB_TOKEN` but **not**
-`COPILOT_GITHUB_TOKEN`.
+An earlier revision of this report recorded an open finding here: withholding
+unset `GH_TOKEN` and `GITHUB_TOKEN` but not `COPILOT_GITHUB_TOKEN`, which
+`worker/entrypoint.sh` defaults to `GH_TOKEN` whenever no separate Copilot
+credential is supplied — the shape `deploy.ps1` takes whenever
+`-CopilotGitHubToken` is not passed (it warns, and proceeds). A push-capable
+credential under a second variable name is still a push-capable credential, and
+a probe against the shipped library confirmed a child process inherited it
+during the withheld window.
 
-Verified by probe against the shipped library: with the two planes collapsed —
-the default deployment — `GH_TOKEN` and `GITHUB_TOKEN` are unset and the token
-file is gone during the withheld window, while a child process still inherits
-`COPILOT_GITHUB_TOKEN` holding the identical push-capable token. An injected
-prompt that reads that variable can push or exfiltrate with it, which is the
-case the control exists to close.
+That gap is now closed, and re-verified against the code rather than the
+commit message.
 
-The control therefore does **not** yet satisfy "the agent's environment
-contains no push-capable credential" on a default deployment. It does hold on a
-deployment that passes a distinct fine-grained Copilot PAT. Until the
-withholding covers every variable that can carry a repository-write token — or
-the deployment refuses to collapse the two planes — this section describes the
-intended control and an outstanding gap, not a control in force.
+| Property | Behaviour |
+|---|---|
+| Withholding | `squad_credential_withhold` caches `COPILOT_GITHUB_TOKEN` in a non-exported variable and unsets it whenever its value equals the git token — the comparison runs **before** `GH_TOKEN` is unset, because it needs both live |
+| Distinct credential | A `COPILOT_GITHUB_TOKEN` whose value differs from the git token is untouched: it is not the credential this control exists to hide, and a session deployed with a separate fine-grained PAT still authenticates to Copilot throughout the agent phase |
+| Restore | Symmetric with the git token, after the git restore steps and before the heartbeat restarts, with the same fatal `exit 78` on failure |
+| Fail closed | `squad_copilot_shared_token_gate` runs **before** withholding in both the `prompt` and `new-project` blocks and refuses to start the agent (`exit 78`) when the token is shared. The default deployment therefore does not run an issue-sourced agent with a collapsed credential plane; it refuses |
+| Escape hatch | `SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true` — the literal string, nothing else — proceeds with the shared token still exported, and logs it as a `WARNING` |
+| Reported honestly | `resolveCredentialProfile` carries `copilotTokenEnv`, `copilotTokenShared` and `copilotTokenSharedAllowed`. On the escape-hatch path the profile reports `copilotTokenEnv: true` and a `reason` naming a **weakened** boundary, so nothing ever claims unqualified withholding while a push-capable token is still exported. The static matrix defaults every cell to the worst case (`copilotTokenShared: true`) rather than an optimistic guess |
+
+Verified directly: `credential-profile` for `actions`/`prompt` reports
+`copilotTokenEnv: false` with the shared token, `true` with a distinct one, and
+`true` with `copilotTokenSharedAllowed: true` plus the weakened `reason` under
+the escape hatch. The suite's value-scan of the whole exported environment —
+by value, not by variable name — finds nothing equal to the withheld token
+during the agent phase.
+
+**The operational consequence is deliberate and worth stating.** A deployment
+that never passed a distinct Copilot PAT used to run the agent with a
+push-capable token in reach; it now aborts the session with `exit 78` before
+the agent starts. `deploy.ps1` still warns and proceeds at deploy time, so the
+refusal surfaces at the first issue-sourced session rather than at deployment.
+Supply `-CopilotGitHubToken` with a fine-grained PAT, or set the escape hatch
+knowingly.
+
+### Residual risk on this control
+
+- The escape hatch is a real weakening, not a formality. With it set, an
+  untrusted agent keeps a push-capable `COPILOT_GITHUB_TOKEN`. It is explicit,
+  logged as a `WARNING`, and reported in the policy profile — but it is not a
+  lesser exposure than the original finding, only a consented one.
+- Shared-ness is a value comparison against `GH_TOKEN`. That is the right test
+  for this code path — `entrypoint.sh` always exports `GH_TOKEN` (from
+  `GITHUB_TOKEN` when only that is set) before anything reaches withholding —
+  but a future caller that reached `squad_credential_withhold` with the
+  credential only on disk and no `GH_TOKEN` exported would not have its Copilot
+  token compared against anything.
+- Same-uid execution is unchanged by this work: this remains withholding, not
+  separation, with the residual stated above.
 
 ---
 
@@ -303,10 +335,25 @@ The containment controls above have their own suites:
 
 | Suite | What it holds to account |
 |---|---|
-| `worker/tests/test_agent_policy.sh` | 223 assertions: the source × mode matrix agrees cell by cell with a freshly resolved policy; trust is orthogonal to tier; untrusted is narrower and `local-cli` is unchanged; space-bearing patterns are named as undeliverable on the `squad watch` path |
+| `worker/tests/test_agent_policy.sh` | 246 assertions: the source × mode matrix agrees cell by cell with a freshly resolved policy; trust is orthogonal to tier; untrusted is narrower and `local-cli` is unchanged; space-bearing patterns are named as undeliverable on the `squad watch` path; and no matrix row reports `withheld: true` while a shared Copilot token stays exported |
 | `worker/tests/test_dispatch_registry_exhaustiveness.sh` | A production dispatcher naming an unregistered source or mode fails the build |
 | `worker/tests/test_squad_hub.sh` | 64 assertions: the trust-conditioned policy is the same policy on the hub channel, and the deny list survives transport whole |
-| `worker/tests/test_credential_withholding.sh` | Full lifecycle against an HTTPS git fixture: nothing push-capable visible during the agent phase, restore before publish, the heartbeat never straddling the boundary, and a restore with no withheld token fatal. It asserts `GH_TOKEN`, `GITHUB_TOKEN`, the token file and the helper — **not** `COPILOT_GITHUB_TOKEN`, which is why the gap above survived it |
+| `worker/tests/test_credential_withholding.sh` | 62 assertions. Full lifecycle against an HTTPS git fixture: nothing push-capable visible during the agent phase, restore before publish, the heartbeat never straddling the boundary, and a restore with no withheld token fatal. It now also covers the Copilot plane — derived, explicit-equal, explicit-distinct and escape-hatch cases, the fail-closed gate, and a **value-scan of the whole exported environment** that would catch any future variable carrying the same token, whatever it is called |
+
+Re-verified for this report on 11 August 2026: `scripts/validate.ps1` 414/414;
+the worker suite 22/22 suites, 0 failed, 0 skipped — including
+`test_agent_policy.sh` 246/246, `test_credential_withholding.sh` 62/62,
+`test_squad_hub.sh` 64/64, `test_credentials.sh` 56/56 (the refresh path still
+leaves a distinct Copilot token alone), `test_dispatch_registry_exhaustiveness.sh`
+3/3 and `test_egress_honesty.sh` 41/41.
+
+The Copilot-plane assertions were also mutation-tested independently against a
+throwaway copy of the worker tree: removing the Copilot unset, inverting the
+shared/distinct comparison, removing the gate's fatal exit, skipping the
+Copilot restore, and defaulting the escape hatch to on each failed named
+assertions (the value-scan, the gate's `78`, the restore check, and "an UNSET
+`SQUAD_ALLOW_SHARED_COPILOT_TOKEN` fails closed" respectively). The reviewed
+tree was never modified.
 
 ---
 
