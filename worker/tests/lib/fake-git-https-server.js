@@ -68,63 +68,6 @@ const DELAY_MS = Number(argValue('--delay-ms', '0')) || 0;
 const PORT_FILE = argValue('--port-file', '');
 const BACKEND = argValue('--backend', '/usr/lib/git-core/git-http-backend');
 
-/**
- * The longest this fixture will wait for `git-http-backend` before answering
- * the client itself.
- *
- * This exists to convert a HANG into a failure, not to bound normal work, so
- * it is deliberately far longer than any healthy request against a fixture
- * repository of a few commits -- which completes in well under a second. A
- * bound tight enough to fire on a slow-but-healthy request would turn a
- * loaded CI runner into a spurious failure, which is worse than the defect it
- * guards against.
- *
- * It still has to be shorter than the per-suite timeout in
- * `worker/tests/run-tests.sh` (120s), or the suite would be killed before the
- * fixture ever got the chance to explain itself.
- */
-const BACKEND_TIMEOUT_MS = Number(argValue('--backend-timeout-ms', '60000')) || 60000;
-
-/**
- * Every backend still running, so none can outlive this server.
- *
- * The backends stay in this fixture's process group -- see the spawn below --
- * so the suite runner's own group sweep already reaches them. This is the
- * belt to that braces: if the server is asked to stop, it does not leave a
- * backend behind for the sweep to have to catch.
- */
-const LIVE_BACKENDS = new Set();
-function killAllBackends() {
-  for (const c of LIVE_BACKENDS) {
-    try { c.kill('SIGKILL'); } catch { /* already gone */ }
-  }
-  LIVE_BACKENDS.clear();
-}
-// Deliberately NOT installed on SIGTERM/SIGINT/SIGHUP. Installing a handler
-// replaces node's default "die now" with "run this, then die", and this
-// fixture is torn down by a plain `kill` from its suite's cleanup -- so a
-// handler here changes how the fixture dies for no benefit. The backends stay
-// in the suite's process group, which the runner sweeps anyway.
-process.on('exit', killAllBackends);
-
-/**
- * A fixture that dies silently is worse than one that never started.
- *
- * If this server throws, every subsequent git operation in the suite blocks
- * against a port with nothing behind it -- which presents as the SUITE
- * hanging, with no indication that the fixture is the thing that broke. That
- * cost a full day of chasing the wrong process (issue #96), so an unexpected
- * throw now says so loudly, in the request log the suite keeps, and the
- * process stays up rather than taking the suite down with it.
- */
-process.on('uncaughtException', (err) => {
-  append(REQUEST_LOG, `fixture-uncaught ${err && err.stack ? err.stack.split('\n')[0] : err}`);
-  process.stderr.write(`fake-git-https-server: uncaught ${err && err.message}\n`);
-});
-process.on('unhandledRejection', (err) => {
-  append(REQUEST_LOG, `fixture-unhandled-rejection ${err && err.message ? err.message : err}`);
-});
-
 if (!ROOT || !CERT || !KEY || !TOKEN_FILE) {
   process.stderr.write('fake-git-https-server: --root, --cert, --key and --token-file are required\n');
   process.exit(64);
@@ -185,93 +128,16 @@ function runBackend(req, res, user) {
   }
   if (req.headers['content-length']) env.CONTENT_LENGTH = String(req.headers['content-length']);
 
-  // NOT detached. Detaching would let the timeout below signal a whole
-  // process group, but it also takes the backend OUT of the suite's process
-  // group -- and `worker/tests/run-tests.sh` terminates that group to clean up
-  // after a suite. A backend that escapes it outlives the suite, which is the
-  // very leak this file is being fixed for. Staying in the group means the
-  // runner's own sweep reaches every descendant, so the timeout only has to
-  // deal with the direct child.
   const child = spawn(BACKEND, [], { env, stdio: ['pipe', 'pipe', 'pipe'] });
-  LIVE_BACKENDS.add(child);
-  child.once('close', () => LIVE_BACKENDS.delete(child));
   req.pipe(child.stdin);
-
-  /**
-   * The whole response is sent from `child.on('close')`, so it depends on the
-   * backend exiting AND every one of its pipes closing. With nothing bounding
-   * that, a backend which blocks -- waiting on a stdin that never ends, or
-   * holding a pipe open -- means the client never receives a single byte and
-   * `git clone` waits FOREVER, because git applies no timeout of its own.
-   *
-   * That is not hypothetical: it is issue #96. `git clone` against this
-   * fixture was observed stuck for over seven minutes with the backend still
-   * running, which is what made `test_credential_withholding.sh` hang
-   * intermittently and, before the per-suite timeout existed, hung CI itself.
-   *
-   * So the backend gets a bounded lifetime. If it has not finished in time it
-   * is killed by PROCESS GROUP -- signalling the direct child alone leaves
-   * `git-http-backend`'s own children holding the pipes, which is the same
-   * mistake in miniature -- and the client gets a 504 saying so. A test
-   * fixture that hangs teaches nothing; one that fails says exactly what
-   * happened.
-   */
-  let replied = false;
-  /**
-   * Answer once, and never on a response the client has already abandoned.
-   *
-   * `git` closes connections routinely -- it aborts `info/refs` the moment it
-   * has what it needs. Writing to a response whose socket is gone THROWS, and
-   * an uncaught throw here takes the whole fixture server down. Every later
-   * git operation in the suite then blocks against a port with nothing behind
-   * it, which reads as the suite hanging.
-   *
-   * The original code got away with writing unguarded because it only ever
-   * wrote from `child.on('close')`, at a moment the client was usually still
-   * there. Introducing a timeout added a second, much later moment -- long
-   * after an aborted client has gone -- so the guard has to exist now.
-   */
-  const reply = (status, headers, body) => {
-    if (replied) return;
-    replied = true;
-    clearTimeout(deadline);
-    if (res.writableEnded || res.destroyed || res.headersSent) return;
-    try {
-      res.writeHead(status, headers);
-      res.end(body);
-    } catch (e) {
-      append(REQUEST_LOG, `reply-failed ${req.method} ${url.pathname}: ${e.message}`);
-    }
-  };
-  const deadline = setTimeout(() => {
-    append(REQUEST_LOG, `backend-timeout ${req.method} ${url.pathname} after ${BACKEND_TIMEOUT_MS}ms`);
-    try { child.kill('SIGKILL'); } catch { /* already gone */ }
-    reply(504, { 'Content-Type': 'text/plain' },
-      `fixture: ${BACKEND} did not finish within ${BACKEND_TIMEOUT_MS}ms\n`);
-  }, BACKEND_TIMEOUT_MS);
-
-  // An aborted client leaves the backend with nowhere to write and its stdin
-  // half of the pipe broken. Both raise errors that are fatal if unhandled --
-  // EPIPE on the stdin pipe, and the abort itself -- so both are handled, and
-  // the backend is stopped rather than left running for a client that has
-  // gone. This is the same leak the timeout exists for, arriving by a
-  // different route.
-  child.stdin.on('error', () => { /* EPIPE: the backend closed stdin first */ });
-  req.on('aborted', () => {
-    append(REQUEST_LOG, `client-aborted ${req.method} ${url.pathname}`);
-    clearTimeout(deadline);
-    replied = true;
-    try { child.kill('SIGKILL'); } catch { /* already gone */ }
-  });
-  res.on('error', () => { /* the client went away mid-write */ });
 
   const chunks = [];
   child.stdout.on('data', (chunk) => chunks.push(chunk));
   child.stderr.on('data', (chunk) => append(REQUEST_LOG, `backend-stderr ${chunk.toString().trim()}`));
 
   child.on('error', (err) => {
-    reply(500, { 'Content-Type': 'text/plain' },
-      `fixture could not run ${BACKEND}: ${err.message}\n`);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end(`fixture could not run ${BACKEND}: ${err.message}\n`);
   });
 
   child.on('close', () => {
@@ -294,7 +160,8 @@ function runBackend(req, res, user) {
         headers[name] = value;
       }
     }
-    reply(status, headers, body);
+    res.writeHead(status, headers);
+    res.end(body);
   });
 }
 
