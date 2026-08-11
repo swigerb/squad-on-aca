@@ -100,9 +100,11 @@ function killAllBackends() {
   }
   LIVE_BACKENDS.clear();
 }
-for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
-  process.on(sig, () => { killAllBackends(); process.exit(0); });
-}
+// Deliberately NOT installed on SIGTERM/SIGINT/SIGHUP. Installing a handler
+// replaces node's default "die now" with "run this, then die", and this
+// fixture is torn down by a plain `kill` from its suite's cleanup -- so a
+// handler here changes how the fixture dies for no benefit. The backends stay
+// in the suite's process group, which the runner sweeps anyway.
 process.on('exit', killAllBackends);
 
 if (!ROOT || !CERT || !KEY || !TOKEN_FILE) {
