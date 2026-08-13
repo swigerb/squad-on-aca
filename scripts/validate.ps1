@@ -1566,7 +1566,14 @@ if (-not (Test-Path $providerLib)) {
         # redirects, so it is shared with every other run on this machine --
         # see the comparison at the end of this section (issue #100).
         $sbStageDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".squad-on-aca\.credstage"
-        $sbStageBefore = @(if (Test-Path $sbStageDir) { (Get-ChildItem -File $sbStageDir).Name } else { @() })
+        # `@((Get-ChildItem).Name)` on an EMPTY directory is an array holding
+        # one $null, not an empty array -- so an empty staging directory read
+        # as "one leaked file" with a blank name. CI caught that on the first
+        # run of this check; the local runs happened to have either files or no
+        # directory at all. Piping to Select-Object -ExpandProperty yields
+        # nothing for an empty directory, which is the intended answer.
+        $sbStageBefore = @(Get-ChildItem -File -LiteralPath $sbStageDir -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name)
         $env:PATH = "$($sbStub.BinDir);$sbPrevPath"
         $env:SQUAD_STUB_AZ_LOG = $sbStub.AzLog
         $env:SQUAD_STUB_ACA_LOG = $sbStub.AcaLog
@@ -3112,7 +3119,8 @@ if (-not (Test-Path $providerLib)) {
         # comparison is before-and-after rather than "is the directory empty"
         # (issue #100) -- a file from an unrelated run must not fail this, and a
         # genuine leak must not hide behind one.
-        $sbStageEnd = @(if (Test-Path $sbStageDir) { (Get-ChildItem -File $sbStageDir).Name } else { @() })
+        $sbStageEnd = @(Get-ChildItem -File -LiteralPath $sbStageDir -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name)
         $sbStageLeaked = @($sbStageEnd | Where-Object { $sbStageBefore -notcontains $_ })
         if ($sbStageLeaked.Count -eq 0) {
             Add-Pass "No local staging file carrying a plaintext token survives the sandbox provider scenarios, including the ones that fail part-way"
