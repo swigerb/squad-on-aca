@@ -6937,8 +6937,12 @@ if (-not $IsWindowsHost) {
         # nobody is actually on -- while developers who had deployed saw a red
         # run that had nothing to do with their change.
         #
-        # Both facts are asserted: the outputs file supplies a URL when the
-        # user config has none, and a user config value still wins over it.
+        # "The user config has none" means the key is ABSENT, not present-and-
+        # empty: since issue #102 those are deliberately different, an empty
+        # value being an explicit clear. Removing the property is what this
+        # case actually means.
+        $reachConfig.PSObject.Properties.Remove('aspireLoginUrl')
+        $reachConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reachConfigPath -Encoding utf8
         Set-Content -LiteralPath $reachOutputs -Encoding utf8 -Value (@{
             aspireLoginUrl = "https://outputs.stub.invalid/login?t=fromoutputs"
         } | ConvertTo-Json)
@@ -6950,7 +6954,7 @@ if (-not $IsWindowsHost) {
             Add-Fail "doctor did not read the Aspire URL from deploy.outputs.json when the user config had none: $($reachFromOutputs.StdOut)"
         }
 
-        $reachConfig.aspireLoginUrl = "https://aspire.stub.invalid/login?t=fromuserconfig"
+        $reachConfig | Add-Member -NotePropertyName aspireLoginUrl -NotePropertyValue "https://aspire.stub.invalid/login?t=fromuserconfig" -Force
         $reachConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reachConfigPath -Encoding utf8
         Reset-SquadCliStubLog -Stub $reachStub
         $reachPrecedence = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 0
@@ -6959,6 +6963,38 @@ if (-not $IsWindowsHost) {
             Add-Pass "a user-config Aspire URL takes precedence over deploy.outputs.json, so configuring a hub does not get silently overridden by the last deploy"
         } else {
             Add-Fail "user config did not take precedence over deploy.outputs.json for the Aspire URL: $($reachPrecedence.StdOut)"
+        }
+
+        # An EXPLICIT CLEAR must clear (issue #102).
+        #
+        # A value present-but-empty in the user config is an instruction, not an
+        # absence. It used to be ignored, so a cleared URL was restored from
+        # deploy.outputs.json and could not be cleared at all on a machine that
+        # had deployed -- which is exactly where #90's stale-URL fix needed to
+        # work, and the reason it looked correct on a fresh clone.
+        $reachConfig.aspireLoginUrl = ""
+        $reachConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reachConfigPath -Encoding utf8
+        Reset-SquadCliStubLog -Stub $reachStub
+        $reachCleared = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 0
+        if ($reachCleared.StdOut -match $reachMissingPattern -and
+            $reachCleared.StdOut -notmatch 'outputs\.stub\.invalid' -and
+            $reachCleared.CurlCalls.Count -eq 0) {
+            Add-Pass "clearing the Aspire URL in the user config CLEARS it, even with a deploy.outputs.json present -- an explicit empty value is an instruction, not an absence"
+        } else {
+            Add-Fail "a cleared user-config Aspire URL was restored from deploy.outputs.json: $($reachCleared.StdOut), curl calls=$($reachCleared.CurlCalls.Count)"
+        }
+
+        # ...and the fallback still works, so "explicit empty wins" has not
+        # become "the deployment record is ignored". Removing the key entirely
+        # is the ABSENCE case, which must still fall through.
+        $reachConfig.PSObject.Properties.Remove('aspireLoginUrl')
+        $reachConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reachConfigPath -Encoding utf8
+        Reset-SquadCliStubLog -Stub $reachStub
+        $reachAbsent = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 0
+        if ($reachAbsent.StdOut -match 'Aspire URL\s+ok\s+https://outputs\.stub\.invalid/login') {
+            Add-Pass "a key ABSENT from the user config still falls back to deploy.outputs.json, so an explicit clear and a missing key stay different things"
+        } else {
+            Add-Fail "an absent user-config key no longer falls back to deploy.outputs.json: $($reachAbsent.StdOut)"
         }
     } catch {
         Add-Fail "The doctor Aspire URL reachability scenario threw: $($_.Exception.Message)"
