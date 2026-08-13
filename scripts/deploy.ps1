@@ -33,6 +33,44 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $azureDir = Join-Path $repoRoot ".azure"
 New-Item -ItemType Directory -Force -Path $azureDir | Out-Null
 
+# --- Files this deploy needs, checked before anything is created -------------
+#
+# Everything below is addressed from $repoRoot, which is derived from this
+# script's own location and is therefore correct whatever directory you run
+# from. That was NOT true of the Dockerfile: `az acr build` resolves a relative
+# --file against the current working directory, so a deploy started from
+# anywhere but the repository root died at the image build -- after the
+# resource group, the container registry and the managed identity had already
+# been created, leaving a half-built deployment and this to explain it:
+#
+#     ERROR: Unable to find 'worker/Dockerfile'.
+#
+# The path is absolute now, so the deploy simply works from any directory. This
+# check stays because a missing file should stop a deployment at the desk, not
+# four Azure resources in -- and it names the file and the directory, which the
+# az error did not.
+$dockerfilePath = Join-Path $repoRoot "worker/Dockerfile"
+$requiredForDeploy = @(
+    $dockerfilePath,
+    (Join-Path $repoRoot "config/sandbox-classes.json"),
+    (Join-Path $repoRoot "worker/entrypoint.sh")
+)
+$missingForDeploy = @($requiredForDeploy | Where-Object { -not (Test-Path -LiteralPath $_) })
+if ($missingForDeploy.Count -gt 0) {
+    throw @"
+This deployment needs files that are not where they should be:
+
+  $($missingForDeploy -join "`n  ")
+
+Repository root (from this script's location): $repoRoot
+Current directory:                             $(Get-Location)
+
+That usually means the repository is incomplete rather than that you are in the
+wrong directory -- the deploy works from any directory. Re-clone, or check the
+paths above.
+"@
+}
+
 # --- Squad Hub preflight -----------------------------------------------------
 # Checked HERE, at the desk, rather than at minute two inside a container nobody
 # is watching. Both halves or neither: a URL with no token cannot attach and a
@@ -135,8 +173,69 @@ if (-not $SubscriptionId) {
 }
 
 if (-not $AcrName) {
-    $suffix = -join ((48..57) + (97..122) | Get-Random -Count 8 | ForEach-Object {[char]$_})
-    $AcrName = "acrsquadaca$suffix"
+    # A container registry name must be globally unique, so a fresh deployment
+    # invents one. But INVENTING ONE ON EVERY RUN is not a deployment, it is a
+    # new deployment each time: the second run builds a second registry, pushes
+    # the image there, and leaves the first behind with nothing pointing at it.
+    # Reported from a real first-time deploy -- "it would be nice if the azure
+    # deployment were idempotent, but it seems to generate az resource names on
+    # the fly".
+    #
+    # So a name is DISCOVERED before it is invented, in the order a person would
+    # expect: what you asked for, then what this clone deployed last time, then
+    # what is actually in the resource group. Only when all three come up empty
+    # is a new one generated -- and then it says so, with the name, because the
+    # one thing worse than generating a name is generating one silently.
+    $acrStem = "acr" + ($NamePrefix -replace '[^a-z0-9]', '')
+
+    $previous = Join-Path $repoRoot "deploy.outputs.json"
+    if (Test-Path $previous) {
+        try {
+            $recorded = (Get-Content -LiteralPath $previous -Raw | ConvertFrom-Json).acrName
+            if ($recorded) {
+                $AcrName = $recorded
+                Write-Host "Reusing the registry recorded by the last deploy from this clone: $AcrName"
+            }
+        } catch {
+            # A corrupt outputs file must not stop a deploy; fall through to
+            # discovery, which reads Azure itself and cannot be stale.
+        }
+    }
+
+    if (-not $AcrName) {
+        $existing = @(az acr list --resource-group $ResourceGroupName `
+            --query "[?starts_with(name, '$acrStem')].name" -o tsv 2>$null |
+            Where-Object { $_ } | ForEach-Object { $_.Trim() })
+        if ($existing.Count -eq 1) {
+            $AcrName = $existing[0]
+            Write-Host "Reusing the registry already in ${ResourceGroupName}: $AcrName"
+        } elseif ($existing.Count -gt 1) {
+            # Almost certainly the damage this fix exists to stop: several runs
+            # each generated their own. Refuse rather than pick, because picking
+            # wrong deploys a job against an image nobody updated.
+            throw @"
+$($existing.Count) container registries in '$ResourceGroupName' look like this deployment's:
+
+  $($existing -join "`n  ")
+
+That normally means earlier runs each generated their own name. Pass the one you
+want to keep and delete the others:
+
+  -AcrName $($existing[0])
+"@
+        }
+    }
+
+    if (-not $AcrName) {
+        $suffix = -join ((48..57) + (97..122) | Get-Random -Count 8 | ForEach-Object {[char]$_})
+        $AcrName = "$acrStem$suffix"
+        Write-Host ""
+        Write-Host "No existing container registry found, so a new one will be created:"
+        Write-Host "  $AcrName"
+        Write-Host "Later runs from this clone reuse it automatically via deploy.outputs.json."
+        Write-Host "From a different clone or machine, pass it: -AcrName $AcrName"
+        Write-Host ""
+    }
 }
 
 if (-not $DefaultRepository) {
@@ -239,8 +338,20 @@ $loginServer = az acr show --name $AcrName --resource-group $ResourceGroupName -
 # copy config/sandbox-classes.json into the image (it is the catalog the
 # in-image dispatcher reads when no --catalog is passed, which is how Ralph
 # calls it) and a COPY cannot reach above its build context. scripts/validate.ps1
-# asserts this line keeps the root context and the --file flag together.
-az acr build --registry $AcrName --image "squad-worker:$ImageTag" --file "worker/Dockerfile" $repoRoot
+# asserts this line keeps the root context and the Dockerfile together.
+#
+# The Dockerfile path is ABSOLUTE. `az acr build` resolves a relative --file
+# against the CURRENT WORKING DIRECTORY, not against the context argument, so
+# `--file "worker/Dockerfile"` only worked when the script happened to be run
+# from the repository root. Run from anywhere else it failed with
+#
+#     ERROR: Unable to find 'worker/Dockerfile'.
+#
+# -- and it failed HERE, after the resource group, the registry and the identity
+# had already been created. Reported from a real first-time deploy ("deploy ps1
+# fails ungracefully if it's not run from the root dir"), and the preflight at
+# the top of this script now refuses that case before anything is built.
+az acr build --registry $AcrName --image "squad-worker:$ImageTag" --file $dockerfilePath $repoRoot
 az account set --subscription $SubscriptionId
 $image = "$loginServer/squad-worker:$ImageTag"
 
