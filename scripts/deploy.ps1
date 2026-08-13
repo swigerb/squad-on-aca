@@ -459,11 +459,90 @@ if ($UseKeyVault) {
         az keyvault create --name $KeyVaultName --resource-group $ResourceGroupName --location $Location | Out-Null
     }
 
-    $signedInObjectId = az ad signed-in-user show --query id -o tsv
-    az keyvault set-policy --name $KeyVaultName --object-id $signedInObjectId --secret-permissions get list set delete recover 2>$null | Out-Null
-    az keyvault set-policy --name $KeyVaultName --object-id $identityPrincipalId --secret-permissions get list 2>$null | Out-Null
+    # --- key vault permissions -------------------------------------------
+    #
+    # A vault has TWO possible permission models and they are not
+    # interchangeable. `set-policy` works only on an access-policy vault; on an
+    # RBAC vault it fails, and role assignments are the only thing that grants
+    # anything. Vaults created today are frequently RBAC, either by default or
+    # because tenant policy requires it.
+    #
+    # This used to call `set-policy` with `2>$null | Out-Null`, so on an RBAC
+    # vault the grant failed SILENTLY and the very next line -- writing a
+    # secret -- came back 403. The deployment created a vault it could not
+    # then use, and the error a person saw was Azure's, with no hint that the
+    # cause was three lines earlier. Ask the vault which model it is in, and
+    # never discard the answer.
+    $vaultJson = az keyvault show --name $KeyVaultName --resource-group $ResourceGroupName -o json 2>$null
+    $vault = if ($vaultJson) { $vaultJson | ConvertFrom-Json } else { $null }
+    if (-not $vault) {
+        throw "Key Vault '$KeyVaultName' could not be read after creating it. Check the name is globally unique and that you have access to it."
+    }
 
-    $githubTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name github-token --value $GitHubToken --query id -o tsv
+    $usesRbac = [bool]$vault.properties.enableRbacAuthorization
+    $signedInObjectId = az ad signed-in-user show --query id -o tsv
+    $vaultId = $vault.id
+
+    if ($usesRbac) {
+        Write-Host "  key vault     $KeyVaultName (RBAC authorization)"
+        # Secrets Officer to write them; Secrets User for the job identity,
+        # which only ever reads. Least privilege on the side that runs
+        # unattended.
+        az role assignment create --assignee-object-id $signedInObjectId --assignee-principal-type User `
+            --role "Key Vault Secrets Officer" --scope $vaultId 2>&1 | Out-Null
+        az role assignment create --assignee-object-id $identityPrincipalId --assignee-principal-type ServicePrincipal `
+            --role "Key Vault Secrets User" --scope $vaultId 2>&1 | Out-Null
+    } else {
+        Write-Host "  key vault     $KeyVaultName (access policies)"
+        az keyvault set-policy --name $KeyVaultName --object-id $signedInObjectId --secret-permissions get list set delete recover | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not grant yourself access to Key Vault '$KeyVaultName'. Without it the next step cannot write a secret. Re-run once the vault exists, or deploy without -UseKeyVault to keep secrets in the container app instead."
+        }
+        az keyvault set-policy --name $KeyVaultName --object-id $identityPrincipalId --secret-permissions get list | Out-Null
+    }
+
+    # Public network access is a separate gate from permissions, and it is
+    # commonly switched off by tenant policy rather than by anything this
+    # script did. Detected up front so the failure is explained here rather
+    # than arriving as "ForbiddenByConnection" from four `secret set` calls.
+    if ($vault.properties.publicNetworkAccess -eq 'Disabled') {
+        throw @"
+Key Vault '$KeyVaultName' has public network access DISABLED, so secrets cannot be written from this machine.
+
+That is usually tenant policy rather than anything this deployment chose. Pick one:
+
+  * allow your address:  az keyvault network-rule add --name $KeyVaultName --ip-address `$(curl -s https://api.ipify.org)
+                         az keyvault update --name $KeyVaultName --public-network-access Enabled
+  * or skip the vault:   re-run without -UseKeyVault, and secrets are stored in the
+                         container app instead (still not readable from outside it)
+"@
+    }
+
+    # A role assignment is not effective the instant it is created. This is the
+    # first call that depends on one, so it is the one that has to tolerate the
+    # gap -- retrying here rather than leaving a person to read
+    # "please observe propagation time" and guess how long that is.
+    $secretWriteError = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        $probe = az keyvault secret set --vault-name $KeyVaultName --name github-token --value $GitHubToken --query id -o tsv 2>&1
+        if ($LASTEXITCODE -eq 0) { $githubTokenSecretId = $probe; $secretWriteError = $null; break }
+        $secretWriteError = $probe
+        if ($attempt -lt 6) { Start-Sleep -Seconds 10 }
+    }
+    if ($secretWriteError) {
+        throw @"
+Could not write a secret to Key Vault '$KeyVaultName' after waiting for permissions to take effect.
+
+Azure said:
+$secretWriteError
+
+If this is a 403, the account running this deployment needs the "Key Vault
+Secrets Officer" role on the vault (an Owner or Contributor role on the
+subscription does NOT include data-plane access). Otherwise, re-run without
+-UseKeyVault to store secrets in the container app instead.
+"@
+    }
+
     $copilotTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name copilot-github-token --value $CopilotGitHubToken --query id -o tsv
     $otlpHeadersSecretId = az keyvault secret set --vault-name $KeyVaultName --name otlp-headers --value $otlpHeader --query id -o tsv
     $squadHubTokenSecretId = az keyvault secret set --vault-name $KeyVaultName --name squad-hub-token --value $SquadHubToken --query id -o tsv

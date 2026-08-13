@@ -7866,6 +7866,66 @@ Write-Output "LOC=`$Location RG=`$ResourceGroupName"
     }
 }
 
+# --- Key Vault: a permission grant that fails must not fail quietly ---------
+#
+# From issue #105. `az keyvault set-policy` only works on an access-policy
+# vault; on an RBAC vault it fails, and role assignments are the only thing
+# that grants anything. The script used to call it with `2>$null | Out-Null`,
+# so on an RBAC vault the grant failed SILENTLY and the next line -- writing a
+# secret -- came back 403. The deployment created a vault it could not use, and
+# the error a person saw was Azure's, four lines later, with nothing pointing
+# at the cause.
+#
+# These read the real deploy script rather than a copy of its intent.
+Write-Host "`n[key vault] a vault this creates is a vault it can write to" -ForegroundColor Cyan
+$kvText = Get-Content -LiteralPath (Join-Path $RepoRoot "scripts\deploy.ps1") -Raw
+# Comment lines are stripped before the "is it still discarded" check below.
+# The comment there NAMES the old broken call while explaining why it changed,
+# and a check that failed on the explanation would push the next person to
+# delete the explanation -- the same trap the region check documents.
+$kvCode = ($kvText -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+
+if ($kvCode -match 'set-policy[^\r\n]*2>\$null') {
+    Add-Fail "scripts/deploy.ps1 still discards the output of `az keyvault set-policy` (2>`$null); a grant that fails would be invisible again"
+} else {
+    Add-Pass "a failed key vault grant is not discarded"
+}
+
+if ($kvText -match 'enableRbacAuthorization') {
+    Add-Pass "the deploy asks the vault WHICH permission model it uses, instead of assuming"
+} else {
+    Add-Fail "scripts/deploy.ps1 never reads enableRbacAuthorization, so it cannot tell an RBAC vault from an access-policy one"
+}
+
+if ($kvText -match 'Key Vault Secrets Officer') {
+    Add-Pass "an RBAC vault is granted the data-plane role that writing a secret actually needs"
+} else {
+    Add-Fail "scripts/deploy.ps1 never assigns 'Key Vault Secrets Officer'; on an RBAC vault every secret write would 403"
+}
+
+if ($kvText -match 'Key Vault Secrets User') {
+    Add-Pass "the job identity gets read-only access, not the officer role it writes with"
+} else {
+    Add-Fail "scripts/deploy.ps1 does not grant the managed identity 'Key Vault Secrets User'"
+}
+
+if ($kvText -match 'publicNetworkAccess') {
+    Add-Pass "a vault with public access switched off is explained, not left to surface as ForbiddenByConnection"
+} else {
+    Add-Fail "scripts/deploy.ps1 never checks publicNetworkAccess; a policy-locked vault would fail with raw Azure text and no way forward"
+}
+
+# A role assignment is not effective the moment it is created, and the first
+# secret write is what runs into that. Without a retry the fix above still
+# fails intermittently -- which is the worst of both, because it looks like the
+# permission model was wrong after all.
+$kvRetry = [regex]::Match($kvText, '(?s)for \(\$attempt = 1.{0,400}?keyvault secret set')
+if ($kvRetry.Success) {
+    Add-Pass "the first secret write retries while the role assignment propagates"
+} else {
+    Add-Fail "the first key vault secret write does not retry; a fresh role assignment needs a moment and this would 403 on a timing race"
+}
+
 
 Write-Host ("  Passed: {0}" -f $script:Passes.Count) -ForegroundColor Green
 Write-Host ("  Failed: {0}" -f $script:Failures.Count) -ForegroundColor ($(if ($script:Failures.Count -gt 0) { 'Red' } else { 'Green' }))
