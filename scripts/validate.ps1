@@ -5433,12 +5433,31 @@ if ($copyParseError) {
         Add-Fail "scripts/deploy.ps1 is missing; nothing builds the worker image"
     } else {
         $acrBuildLine = @(Get-Content -LiteralPath $deployLayoutPath | Where-Object { $_ -match 'acr build' -and $_ -match 'squad-worker' }) -join ' '
+        # The property is "the Dockerfile is worker/Dockerfile and the context is
+        # the repository root" -- NOT one particular spelling of the --file
+        # argument. Pinning the literal string `--file "worker/Dockerfile"` made
+        # this check fail on the correct fix for a relative-path bug, which is
+        # the opposite of what a guard is for.
+        $dockerfileArg = $acrBuildLine -match '--file\s+(\$dockerfilePath|"?[^\s"]*worker[/\\]Dockerfile"?)'
         if ($acrBuildLine -eq '') {
             Add-Fail "scripts/deploy.ps1 no longer builds squad-worker with 'az acr build'; the layout checks here describe an image nothing produces"
-        } elseif ($acrBuildLine -match '--file\s+"?worker/Dockerfile"?' -and $acrBuildLine -match '\$repoRoot\s*$') {
-            Add-Pass "scripts/deploy.ps1 builds squad-worker with --file worker/Dockerfile and the REPOSITORY ROOT as context, which is the only context that can reach config/sandbox-classes.json"
+        } elseif ($dockerfileArg -and $acrBuildLine -match '\$repoRoot\s*$') {
+            Add-Pass "scripts/deploy.ps1 builds squad-worker from worker/Dockerfile with the REPOSITORY ROOT as context, which is the only context that can reach config/sandbox-classes.json"
         } else {
-            Add-Fail "scripts/deploy.ps1 does not build squad-worker from the repository root with --file worker/Dockerfile; a worker/-rooted context cannot reach config/sandbox-classes.json and every COPY would fail"
+            Add-Fail "scripts/deploy.ps1 does not build squad-worker from the repository root with worker/Dockerfile; a worker/-rooted context cannot reach config/sandbox-classes.json and every COPY would fail"
+        }
+
+        # `az acr build` resolves a RELATIVE --file against the current working
+        # directory, not against the context argument, so a relative path here
+        # only works when the deploy happens to be started from the repository
+        # root -- and fails at the image build, after four Azure resources have
+        # been created. Verified against a live registry: from scripts/, a
+        # relative --file gives "ERROR: Unable to find 'worker/Dockerfile'."
+        # while an absolute one builds.
+        if ($acrBuildLine -match '--file\s+"?worker[/\\]Dockerfile"?') {
+            Add-Fail "scripts/deploy.ps1 passes a RELATIVE --file to 'az acr build'; az resolves it against the working directory, so the deploy breaks unless it is run from the repository root"
+        } else {
+            Add-Pass "scripts/deploy.ps1 passes an absolute Dockerfile path to 'az acr build', so a deploy works from any working directory"
         }
     }
 
@@ -7509,6 +7528,107 @@ if ((Test-Path -LiteralPath $pc2DockerfilePath) -and (Test-Path -LiteralPath $pc
     }
 } else {
     Add-Fail "PC-2: worker/Dockerfile or worker/entrypoint.sh is missing; PC-2 checks cannot run"
+}
+
+# ---------------------------------------------------------------------------
+# The deploy is idempotent about its container registry
+#
+# Reported from a real first-time deploy: "it would be nice if the azure
+# deployment were idempotent, but it seems to generate az resource names on the
+# fly (at least the ACR)". It did: an unconditional Get-Random meant the second
+# run built a SECOND registry, pushed the image there, and left the first with
+# nothing pointing at it. The reporter only escaped it by noticing -AcrName.
+#
+# Behaviour, exercised rather than described: the name-resolution block is
+# extracted from deploy.ps1 and run against a stub `az`, so what is checked is
+# what the deploy would actually pick.
+# ---------------------------------------------------------------------------
+Write-Section "Deploy reuses its container registry (does not invent one per run)"
+
+$deployIdemPath = Join-Path $RepoRoot "scripts\deploy.ps1"
+if (-not (Test-Path $deployIdemPath)) {
+    Add-Fail "scripts/deploy.ps1 is missing; the registry-idempotence checks cannot run"
+} else {
+    $deployText = Get-Content -LiteralPath $deployIdemPath -Raw
+
+    # 1. Structural: a generated name must not be the FIRST thing tried.
+    $randIdx = $deployText.IndexOf('Get-Random -Count 8')
+    $reuseIdx = $deployText.IndexOf('deploy.outputs.json')
+    $listIdx = $deployText.IndexOf('az acr list')
+    if ($randIdx -lt 0) {
+        Add-Fail "scripts/deploy.ps1 no longer generates a registry name at all; a first deploy has nothing to create"
+    } elseif ($reuseIdx -ge 0 -and $listIdx -ge 0 -and $listIdx -lt $randIdx) {
+        Add-Pass "scripts/deploy.ps1 looks for an existing registry (recorded, then live in the resource group) BEFORE generating a new name"
+    } else {
+        Add-Fail "scripts/deploy.ps1 generates a registry name without first looking for one that already exists; every run would create another registry"
+    }
+
+    # 2. Behavioural: run the real resolution block against a stub `az` and a
+    #    stub outputs file, and assert which name comes out. Three cases, each
+    #    of which was silently wrong before.
+    $idemWork = Join-Path ([System.IO.Path]::GetTempPath()) ("squad-acr-idem-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $idemWork | Out-Null
+    try {
+        # Extract the block verbatim so this tests the shipped logic, not a copy.
+        $blockMatch = [regex]::Match($deployText, '(?s)if \(-not \$AcrName\) \{.*?\n\}\r?\n')
+        if (-not $blockMatch.Success) {
+            Add-Fail "Could not extract the registry-name resolution block from scripts/deploy.ps1; its shape changed and this check is no longer reading the real logic"
+        } else {
+            $block = $blockMatch.Value
+            $harness = @"
+param([string]`$AcrName = "", [string]`$ResourceGroupName = "rg-test", [string]`$NamePrefix = "squad-aca", [string]`$repoRoot = "$idemWork")
+function az {
+    if (`$args -contains 'list') { if (`$env:STUB_ACRS) { `$env:STUB_ACRS -split ',' | ForEach-Object { `$_ } } ; return }
+}
+$block
+Write-Output "RESOLVED=`$AcrName"
+"@
+            $harnessPath = Join-Path $idemWork "resolve.ps1"
+            Set-Content -LiteralPath $harnessPath -Value $harness -Encoding UTF8
+
+            # Case A: a previous deploy from this clone recorded a name.
+            Set-Content -LiteralPath (Join-Path $idemWork "deploy.outputs.json") -Value '{"acrName":"acrsquadacarecorded"}' -Encoding UTF8
+            $env:STUB_ACRS = ""
+            $outA = (& pwsh -NoProfile -File $harnessPath 2>&1 | Out-String)
+            if ($outA -match 'RESOLVED=acrsquadacarecorded') {
+                Add-Pass "A second deploy from the same clone REUSES the registry recorded by the first, instead of creating another"
+            } else {
+                Add-Fail "A second deploy from the same clone did not reuse the recorded registry (got: $(($outA -split "`n" | Where-Object { $_ -match 'RESOLVED=' }) -join ''))"
+            }
+
+            # Case B: no record (a fresh clone), but the registry exists in Azure.
+            Remove-Item -LiteralPath (Join-Path $idemWork "deploy.outputs.json") -Force
+            $env:STUB_ACRS = "acrsquadacalive"
+            $outB = (& pwsh -NoProfile -File $harnessPath 2>&1 | Out-String)
+            if ($outB -match 'RESOLVED=acrsquadacalive') {
+                Add-Pass "A deploy from a DIFFERENT clone discovers the registry already in the resource group, so a colleague does not create a duplicate"
+            } else {
+                Add-Fail "A deploy with no recorded name did not discover the existing registry (got: $(($outB -split "`n" | Where-Object { $_ -match 'RESOLVED=' }) -join ''))"
+            }
+
+            # Case C: nothing anywhere -- generate, which is correct exactly once.
+            $env:STUB_ACRS = ""
+            $outC = (& pwsh -NoProfile -File $harnessPath 2>&1 | Out-String)
+            if ($outC -match 'RESOLVED=acrsquadaca\w{8}') {
+                Add-Pass "A genuinely first deploy still generates a registry name, and prints it so it can be passed to later runs"
+            } else {
+                Add-Fail "A first deploy did not generate a usable registry name (got: $(($outC -split "`n" | Where-Object { $_ -match 'RESOLVED=' }) -join ''))"
+            }
+
+            # Case D: several candidates -- refuse rather than guess, because
+            # picking the wrong one deploys against an image nobody updated.
+            $env:STUB_ACRS = "acrsquadacaone,acrsquadacatwo"
+            $outD = (& pwsh -NoProfile -File $harnessPath 2>&1 | Out-String)
+            if ($outD -match 'RESOLVED=') {
+                Add-Fail "With TWO candidate registries the deploy picked one silently; picking wrong deploys a job against a stale image"
+            } else {
+                Add-Pass "With several candidate registries the deploy refuses and names them, rather than guessing"
+            }
+            $env:STUB_ACRS = $null
+        }
+    } finally {
+        Remove-Item -LiteralPath $idemWork -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if (Test-Path -LiteralPath $pc2TestPath) {

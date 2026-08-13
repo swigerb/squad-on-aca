@@ -59,6 +59,25 @@ The Squad team runs in ACA.
 
 Deployment writes secrets and tokens to the local, gitignored `deploy.outputs.json`. Keep it private and never commit it.
 
+### Deploying more than once
+
+`deploy.ps1` is safe to re-run. It reuses the resources it already created rather than making new ones, and it can be run from any directory.
+
+The container registry needs a globally unique name, so a first deploy generates one and prints it. Later runs find it again, in this order:
+
+1. `-AcrName`, if you pass it.
+2. The name recorded in `deploy.outputs.json` by the last deploy from this clone.
+3. An existing registry in the resource group.
+
+That means a **second person deploying the same environment** — a fresh clone, no `deploy.outputs.json` — picks up the registry that is already there instead of creating a second one. If several candidates exist, the deploy stops and lists them rather than guessing, because guessing wrong deploys a job against an image nobody updated.
+
+To pin it explicitly, take the name from the first deploy's output:
+
+```powershell
+.\scripts\deploy.ps1 -SubscriptionId "<azure-subscription-id>" -AcrName "<registry-name>"
+```
+
+
 Useful control-plane commands:
 
 ```powershell
