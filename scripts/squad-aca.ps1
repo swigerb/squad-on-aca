@@ -189,11 +189,37 @@ function Get-AcaConfig {
         sandboxDiskLabel = ""
     }
 
-    foreach ($source in @($deployOutputs, $userConfig)) {
+    # Layering: the deployment record first, the user's own configuration over
+    # the top. Order already says which wins -- the user config is the override
+    # layer -- but a value was applied only when TRUTHY, which conflated two
+    # different things:
+    #
+    #   * the key is ABSENT            -> fall back to the layer below (right)
+    #   * the key is present and EMPTY -> an explicit clear (was ignored)
+    #
+    # So a value cleared in the user config was silently restored from
+    # deploy.outputs.json, and could not be cleared at all on a machine that
+    # had deployed. That defeated issue #90's fix precisely where it mattered:
+    # `configure` clears a stale aspireLoginUrl when the subscription or
+    # resource group changes, by writing an empty value into the user config --
+    # which this then ignored. It worked on a colleague's fresh clone, which is
+    # why it looked correct.
+    #
+    # deploy.outputs.json keeps truthy-only semantics: it is a RECORD of what
+    # was deployed, and an empty field there means "not recorded", never
+    # "deliberately blank".
+    foreach ($layer in @(
+        @{ Source = $deployOutputs; ExplicitEmptyWins = $false },
+        @{ Source = $userConfig;    ExplicitEmptyWins = $true }
+    )) {
+        $source = $layer.Source
         if (-not $source) { continue }
         foreach ($key in @($config.Keys)) {
-            if ($source.PSObject.Properties.Name -contains $key -and $source.$key) {
+            if ($source.PSObject.Properties.Name -notcontains $key) { continue }
+            if ($source.$key) {
                 $config[$key] = [string]$source.$key
+            } elseif ($layer.ExplicitEmptyWins) {
+                $config[$key] = ""
             }
         }
     }
