@@ -1561,6 +1561,19 @@ if (-not (Test-Path $providerLib)) {
         "SQUAD_STUB_ACA_LIST_RC", "SQUAD_STUB_ACA_LIST_ERR")
     try {
         $sbStub = New-SquadCliStubEnvironment
+        # Snapshot the credential staging directory before ANY scenario runs.
+        # It lives under the real user profile, which no stubbed HOME
+        # redirects, so it is shared with every other run on this machine --
+        # see the comparison at the end of this section (issue #100).
+        $sbStageDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".squad-on-aca\.credstage"
+        # `@((Get-ChildItem).Name)` on an EMPTY directory is an array holding
+        # one $null, not an empty array -- so an empty staging directory read
+        # as "one leaked file" with a blank name. CI caught that on the first
+        # run of this check; the local runs happened to have either files or no
+        # directory at all. Piping to Select-Object -ExpandProperty yields
+        # nothing for an empty directory, which is the intended answer.
+        $sbStageBefore = @(Get-ChildItem -File -LiteralPath $sbStageDir -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name)
         $env:PATH = "$($sbStub.BinDir);$sbPrevPath"
         $env:SQUAD_STUB_AZ_LOG = $sbStub.AzLog
         $env:SQUAD_STUB_ACA_LOG = $sbStub.AcaLog
@@ -2422,16 +2435,13 @@ if (-not (Test-Path $providerLib)) {
         }
         $env:SQUAD_STUB_ACA_VAULT_MODE = "700"
 
-        # The local file the upload reads from holds both plaintext tokens. It
-        # must not survive the call -- including when the call FAILS, which is
-        # exactly when a leftover is most likely.
-        $sbStageDir = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".squad-on-aca\.credstage"
-        $sbStageLeft = if (Test-Path $sbStageDir) { @(Get-ChildItem -File $sbStageDir).Count } else { 0 }
-        if ($sbStageLeft -eq 0) {
-            Add-Pass "The local staging file that carries both plaintext tokens is deleted after the upload, including after a failed one"
-        } else {
-            Add-Fail "$sbStageLeft local credential staging file(s) survived in $sbStageDir"
-        }
+        # The local file the upload reads from holds both plaintext tokens and
+        # must not survive -- including when a call FAILS part-way, which is
+        # exactly when a leftover is most likely. That is asserted ONCE, at the
+        # end of this section, across every scenario: measured here it was
+        # vacuous, because the vault-mode refusal above fails before anything
+        # is staged (removing the cleanup from both `finally` blocks in
+        # squad-sandbox-provider.ps1 left this passing).
         Reset-SquadCliStubLog -Stub $sbStub
         $sbCredCalls = @()
         $sbCredOutcome = @{}
@@ -3094,6 +3104,28 @@ if (-not (Test-Path $providerLib)) {
             Add-Pass "A credential that could NOT be revoked is reported as still live rather than silently swallowed, and does not block the teardown"
         } else {
             Add-Fail "An unrevoked credential was swallowed (terminated=$($sbTerm2.Terminated) unrevoked=$($sbTerm2.CredentialsUnrevoked))"
+        }
+
+        # --- Nothing carrying a plaintext token survives this whole section ---
+        #
+        # The earlier check compared this directory around ONE call -- the
+        # vault-mode refusal -- which turns out to fail BEFORE anything is
+        # staged, so it could not have caught a leak: removing the cleanup from
+        # both `finally` blocks in squad-sandbox-provider.ps1 left it passing.
+        #
+        # Measured across the whole section it is no longer vacuous: this run
+        # stages 11 files, so a missing cleanup shows up here. The staging path
+        # is the real user profile, which no stubbed HOME redirects, so the
+        # comparison is before-and-after rather than "is the directory empty"
+        # (issue #100) -- a file from an unrelated run must not fail this, and a
+        # genuine leak must not hide behind one.
+        $sbStageEnd = @(Get-ChildItem -File -LiteralPath $sbStageDir -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name)
+        $sbStageLeaked = @($sbStageEnd | Where-Object { $sbStageBefore -notcontains $_ })
+        if ($sbStageLeaked.Count -eq 0) {
+            Add-Pass "No local staging file carrying a plaintext token survives the sandbox provider scenarios, including the ones that fail part-way"
+        } else {
+            Add-Fail "$($sbStageLeaked.Count) local credential staging file(s) leaked into ${sbStageDir}: $($sbStageLeaked -join ', ')"
         }
     } catch {
         Add-Fail "Sandbox provider checks threw: $($_.Exception.Message)"
@@ -6822,11 +6854,38 @@ if (-not $IsWindowsHost) {
     $reachStub = $null
     try {
         $reachStub = New-SquadCliStubEnvironment
-        $reachCli = Join-Path $RepoRoot "scripts\squad-aca.ps1"
+        # Run against a STAGED copy of the CLI, not the one in this working
+        # tree.
+        #
+        # `Get-AcaConfig` layers `<repo>/deploy.outputs.json` underneath the
+        # user config, and `$RepoRoot` comes from the script's own location --
+        # so invoking the real `scripts/squad-aca.ps1` reads whatever
+        # deploy.outputs.json the developer happens to have. That file is
+        # gitignored and written by a deploy, which made the "missing" case
+        # below pass on a fresh clone and FAIL on any machine that had
+        # deployed: the blanked user-config value could not clear the URL the
+        # real outputs file still supplied. CI, having never deployed, never
+        # saw it (issue #100).
+        #
+        # Staging a root the test owns means both layers are controlled here,
+        # so the result describes the code rather than the machine.
+        $reachRoot = Join-Path $reachStub.Root "staged-repo"
+        New-Item -ItemType Directory -Force -Path $reachRoot | Out-Null
+        Copy-Item -Path (Join-Path $RepoRoot "scripts") -Destination $reachRoot -Recurse -Force
+        Copy-Item -Path (Join-Path $RepoRoot "config") -Destination $reachRoot -Recurse -Force
+        $reachCli = Join-Path $reachRoot "scripts\squad-aca.ps1"
+        $reachOutputs = Join-Path $reachRoot "deploy.outputs.json"
         $reachOkPattern = 'Aspire URL\s+ok\s+https://aspire\.stub\.invalid/login'
         $reachFailedPattern = 'Aspire URL\s+failed\s+'
         $reachUnknownPattern = 'Aspire URL\s+unknown\s+'
         $reachMissingPattern = 'Aspire URL\s+missing\s+'
+
+        # The staging must actually work, or every assertion below is vacuous.
+        if (Test-Path -LiteralPath $reachCli) {
+            Add-Pass "the Aspire reachability scenario runs against a staged repository root, so its result cannot depend on the developer's own deploy.outputs.json"
+        } else {
+            Add-Fail "could not stage a repository root for the Aspire reachability scenario; the checks below would silently read the real working tree"
+        }
 
         # curl exit 0 -> "ok" with the URL, byte-shape-identical to the
         # committed golden 11-doctor.txt/27-doctor-drift.txt rows.
@@ -6869,6 +6928,37 @@ if (-not $IsWindowsHost) {
             Add-Pass "doctor reports 'Aspire URL missing' (not configured) and never calls curl when no URL is configured"
         } else {
             Add-Fail "doctor did not report missing correctly, or called curl with no URL configured: $($reachMissing.StdOut), curl calls=$($reachMissing.CurlCalls.Count)"
+        }
+
+        # The OTHER half of the layering, which CI could never reach before:
+        # a deployed machine has a deploy.outputs.json, and `Get-AcaConfig`
+        # reads it UNDERNEATH the user config. Until this was staged, CI (never
+        # having deployed) only ever exercised the unconfigured path -- the one
+        # nobody is actually on -- while developers who had deployed saw a red
+        # run that had nothing to do with their change.
+        #
+        # Both facts are asserted: the outputs file supplies a URL when the
+        # user config has none, and a user config value still wins over it.
+        Set-Content -LiteralPath $reachOutputs -Encoding utf8 -Value (@{
+            aspireLoginUrl = "https://outputs.stub.invalid/login?t=fromoutputs"
+        } | ConvertTo-Json)
+        Reset-SquadCliStubLog -Stub $reachStub
+        $reachFromOutputs = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 0
+        if ($reachFromOutputs.StdOut -match 'Aspire URL\s+ok\s+https://outputs\.stub\.invalid/login') {
+            Add-Pass "doctor falls back to deploy.outputs.json for the Aspire URL when the user config has none -- the path every deployed machine is on"
+        } else {
+            Add-Fail "doctor did not read the Aspire URL from deploy.outputs.json when the user config had none: $($reachFromOutputs.StdOut)"
+        }
+
+        $reachConfig.aspireLoginUrl = "https://aspire.stub.invalid/login?t=fromuserconfig"
+        $reachConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reachConfigPath -Encoding utf8
+        Reset-SquadCliStubLog -Stub $reachStub
+        $reachPrecedence = Invoke-SquadCliCapture -Stub $reachStub -ScriptPath $reachCli -CliArguments @("doctor") -CurlExitCode 0
+        if ($reachPrecedence.StdOut -match 'Aspire URL\s+ok\s+https://aspire\.stub\.invalid/login' -and
+            $reachPrecedence.StdOut -notmatch 'outputs\.stub\.invalid') {
+            Add-Pass "a user-config Aspire URL takes precedence over deploy.outputs.json, so configuring a hub does not get silently overridden by the last deploy"
+        } else {
+            Add-Fail "user config did not take precedence over deploy.outputs.json for the Aspire URL: $($reachPrecedence.StdOut)"
         }
     } catch {
         Add-Fail "The doctor Aspire URL reachability scenario threw: $($_.Exception.Message)"
