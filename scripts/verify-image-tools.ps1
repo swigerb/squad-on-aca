@@ -72,7 +72,7 @@ param(
     [string]$AcaPath = "$env:USERPROFILE\.aca\bin\aca.exe",
     [string]$Registry = "acrsquadacah81u42kq",
     [string]$Subscription = "3898b8ea-c676-4b43-95fc-d38425627d74",
-    [string]$ResourceGroup = "rg-squad-aca-dev-eastus2",
+    [string]$ResourceGroup = "rg-squad-aca-dev-centralus",
     [string]$SandboxGroup = "sbg-squad-aca",
     [string[]]$AdditionalTools = @(),
     [string]$DiskId,

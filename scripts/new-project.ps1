@@ -6,7 +6,7 @@ param(
     [ValidateSet("private", "public", "internal")]
     [string]$Visibility = "private",
     [string]$Description = "Bootstrapped by Squad on Azure Container Apps",
-    [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
+    [string]$ResourceGroupName = "rg-squad-aca-dev-centralus",
     [string]$JobName = "caj-squad-aca-session",
     [string]$SessionName = "",
     [string]$Prompt = "",

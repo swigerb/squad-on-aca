@@ -1,5 +1,5 @@
 param(
-    [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
+    [string]$ResourceGroupName = "rg-squad-aca-dev-centralus",
     [string]$JobName = "caj-squad-aca-session",
     [string]$RalphJobName = "caj-squad-aca-ralph",
     [string]$WatchAppName = "ca-squad-aca-watch",
