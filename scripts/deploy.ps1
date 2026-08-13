@@ -1,7 +1,11 @@
 param(
     [string]$SubscriptionId = "",
-    [string]$Location = "eastus2",
-    [string]$ResourceGroupName = "rg-squad-aca-dev-eastus2",
+    # Empty means "work it out", not "no preference" -- see the resolution
+    # below. A literal default here could not tell "the caller wants the
+    # default" from "the caller wants exactly this", which is the difference
+    # between reusing a deployment and building a second one beside it.
+    [string]$Location = "",
+    [string]$ResourceGroupName = "",
     [string]$NamePrefix = "squad-aca",
     [string]$AcrName = "",
     [string]$ImageTag = "",
@@ -32,6 +36,71 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $azureDir = Join-Path $repoRoot ".azure"
 New-Item -ItemType Directory -Force -Path $azureDir | Out-Null
+
+# --- Where this deploys, resolved before anything reads it -------------------
+#
+# The default region moved from East US 2 to Central US. East US 2 is a
+# capacity-constrained region and first-time deploys were failing there on
+# capacity rather than on anything wrong with the deployment:
+#
+#     ERROR: ... is experiencing heavy usage in region eastus2 ...
+#     Status: 400 (Bad Request)   ErrorCode: CapacityHeavyUsage
+#
+# A default that fails for a new user is worse than no default, because it
+# reads as "this product does not work".
+#
+# The region used to be baked into the resource-group default as well
+# ("rg-squad-aca-dev-eastus2"), so changing one and not the other would put the
+# group name and the region it names permanently out of step. The group is
+# derived from the location instead, and they cannot disagree.
+#
+# Changing a default is dangerous on its own: someone who deployed to the old
+# default and re-runs with no arguments would build an ENTIRE SECOND
+# environment in a new region rather than update the one they have -- the same
+# shape as the duplicate-registry defect. So the last deploy's own record wins
+# over the default, exactly as the registry name does. An explicit -Location or
+# -ResourceGroupName still wins over everything.
+$DEFAULT_LOCATION = "centralus"
+$previousOutputs = $null
+$previousOutputsPath = Join-Path $repoRoot "deploy.outputs.json"
+if (Test-Path -LiteralPath $previousOutputsPath) {
+    try { $previousOutputs = Get-Content -LiteralPath $previousOutputsPath -Raw | ConvertFrom-Json } catch { $previousOutputs = $null }
+}
+
+if (-not $Location) {
+    if ($previousOutputs -and $previousOutputs.location) {
+        $Location = [string]$previousOutputs.location
+        Write-Host "Reusing the region recorded by the last deploy from this clone: $Location"
+    } else {
+        $Location = $DEFAULT_LOCATION
+    }
+}
+if (-not $ResourceGroupName) {
+    $recordedRg = if ($previousOutputs) { [string]$previousOutputs.resourceGroup } else { "" }
+    $recordedLoc = if ($previousOutputs) { [string]$previousOutputs.location } else { "" }
+    # Reuse the recorded group only while it still describes where this is
+    # going. Somebody moving region -- which is the whole reason the default
+    # changed -- passes -Location and nothing else; reusing the old group then
+    # would put resources for the NEW region into a group named for the old
+    # one, and into the very deployment they were trying to move away from.
+    # A derived name that no longer matches its region is the same defect as a
+    # stale URL surviving a subscription change (issues #90, #102).
+    if ($recordedRg -and (-not $recordedLoc -or $recordedLoc -eq $Location)) {
+        $ResourceGroupName = $recordedRg
+        Write-Host "Reusing the resource group recorded by the last deploy from this clone: $ResourceGroupName"
+    } else {
+        $ResourceGroupName = "rg-$NamePrefix-dev-$Location"
+        if ($recordedRg) {
+            Write-Host "The recorded resource group '$recordedRg' is in '$recordedLoc', not '$Location'."
+            Write-Host "Deploying to '$ResourceGroupName' instead. Pass -ResourceGroupName to choose another."
+        }
+    }
+}
+# --- end region resolution ---
+# scripts/validate.ps1 extracts everything between $DEFAULT_LOCATION and this
+# marker and runs it against a stub, so the four cases it checks are the real
+# logic rather than a copy of it. Brace-counting was tried first and silently
+# captured only the first block, which made every case pass with empty output.
 
 # --- Files this deploy needs, checked before anything is created -------------
 #
@@ -418,7 +487,36 @@ if ($existingEnvState -eq "Failed") {
     $existingEnvState = ""
 }
 if (-not $existingEnvState) {
-    az containerapp env create --name $envName --resource-group $ResourceGroupName --location $Location --logs-workspace-id $workspaceId --logs-workspace-key $workspaceKey | Out-Null
+    # Capture the failure rather than piping it away. A capacity refusal is a
+    # fact about the REGION, not about the deployment, and the raw Azure error
+    # ("...experiencing heavy usage in region...", ErrorCode
+    # CapacityHeavyUsage) reads like a broken product to somebody deploying for
+    # the first time. It is also the one failure with an obvious next step, so
+    # say what it is.
+    $envCreate = az containerapp env create --name $envName --resource-group $ResourceGroupName `
+        --location $Location --logs-workspace-id $workspaceId --logs-workspace-key $workspaceKey 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $envCreateText = ($envCreate | Out-String)
+        if ($envCreateText -match 'CapacityHeavyUsage|heavy usage|capacity|SubscriptionIsOverQuotaForSku|NotAvailableForSubscription') {
+            throw @"
+Azure refused to create the Container Apps environment in '$Location' because
+the region is out of capacity, not because anything is wrong with this
+deployment:
+
+$($envCreateText.Trim())
+
+Deploy to a different region. Nothing was created there yet, so this is safe:
+
+  .\scripts\deploy.ps1 -Location <region> -ResourceGroupName rg-$NamePrefix-dev-<region>
+
+Regions that have had capacity for this workload: centralus (the default),
+westus3, eastus. Check what your subscription can offer:
+
+  az provider show --namespace Microsoft.App --query "resourceTypes[?resourceType=='managedEnvironments'].locations | [0]" -o tsv
+"@
+        }
+        throw "Creating the Container Apps environment failed:`n$($envCreateText.Trim())"
+    }
 }
 $envId = az containerapp env show --name $envName --resource-group $ResourceGroupName --query id -o tsv
 

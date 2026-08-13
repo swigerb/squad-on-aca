@@ -63,6 +63,18 @@ Deployment writes secrets and tokens to the local, gitignored `deploy.outputs.js
 
 `deploy.ps1` is safe to re-run. It reuses the resources it already created rather than making new ones, and it can be run from any directory.
 
+### Choosing a region
+
+The default is **Central US**. Pass `-Location` to deploy anywhere else; the resource group is named for the region it is in, so the two cannot drift apart:
+
+```powershell
+.\scripts\deploy.ps1 -SubscriptionId "<azure-subscription-id>" -Location westus3
+```
+
+Re-running with no arguments keeps the region and resource group the last deploy recorded, so changing the default never moves an existing deployment. Passing a different `-Location` moves to a resource group named for the new region rather than reusing the old one — pass `-ResourceGroupName` to choose it yourself.
+
+If a region is out of capacity, Azure refuses with `CapacityHeavyUsage` and the deploy says so and names the command to try elsewhere. Nothing is created in a region that refuses, so switching is safe.
+
 The container registry needs a globally unique name, so a first deploy generates one and prints it. Later runs find it again, in this order:
 
 1. `-AcrName`, if you pass it.

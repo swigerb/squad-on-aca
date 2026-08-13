@@ -7763,6 +7763,109 @@ if (Test-Path -LiteralPath $pc2TestPath) {
     Add-Fail "PC-2: worker/tests/test_uid_separation.sh is missing; PC-2 has no named test"
 }
 
+# ---------------------------------------------------------------------------
+# Where a deploy lands: the region default, and reusing an existing one
+#
+# East US 2 is capacity-constrained and first-time deploys were failing there
+# on capacity rather than on anything wrong with the deployment. A default that
+# fails for a new user reads as "this product does not work".
+#
+# Changing a default is dangerous on its own: somebody who deployed to the old
+# one and re-runs with no arguments must UPDATE what they have, not build a
+# second environment in a new region.
+# ---------------------------------------------------------------------------
+Write-Section "Deploy region: default, derivation, and reuse"
+
+$regionDeployPath = Join-Path $RepoRoot "scripts\deploy.ps1"
+if (-not (Test-Path $regionDeployPath)) {
+    Add-Fail "scripts/deploy.ps1 is missing; the region checks cannot run"
+} else {
+    $regionText = Get-Content -LiteralPath $regionDeployPath -Raw
+
+    if ($regionText -match '\$DEFAULT_LOCATION\s*=\s*"centralus"') {
+        Add-Pass "the default region is centralus, not a capacity-constrained one"
+    } else {
+        Add-Fail "scripts/deploy.ps1 no longer defaults to centralus; a first-time deploy can fail on region capacity rather than on anything wrong with it"
+    }
+
+    if ($regionText -match 'rg-\$NamePrefix-dev-\$Location') {
+        Add-Pass "the resource-group default is DERIVED from the location, so the group name and the region it names cannot disagree"
+    } else {
+        Add-Fail "scripts/deploy.ps1 does not derive the resource-group name from the location; changing one leaves the other naming a different region"
+    }
+
+    $regionWork = Join-Path ([System.IO.Path]::GetTempPath()) ("squad-region-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $regionWork | Out-Null
+    try {
+        $regionBlock = [regex]::Match($regionText, '(?s)\$DEFAULT_LOCATION = "centralus".*?# --- end region resolution ---')
+        if (-not $regionBlock.Success) {
+            Add-Fail "Could not extract the region resolution block from scripts/deploy.ps1 (its markers moved); this check is no longer reading the real logic"
+        } else {
+            $rHarness = @"
+param([string]`$Location = "", [string]`$ResourceGroupName = "", [string]`$NamePrefix = "squad-aca", [string]`$repoRoot = "$regionWork")
+$($regionBlock.Value)
+Write-Output "LOC=`$Location RG=`$ResourceGroupName"
+"@
+            $rPath = Join-Path $regionWork "resolve.ps1"
+            Set-Content -LiteralPath $rPath -Value $rHarness -Encoding UTF8
+
+            $rFresh = (& pwsh -NoProfile -File $rPath 2>&1 | Out-String)
+            if ($rFresh -match 'LOC=centralus RG=rg-squad-aca-dev-centralus') {
+                Add-Pass "a first deploy lands in centralus, in a resource group named for it"
+            } else {
+                Add-Fail "a first deploy did not resolve to centralus (got: $(($rFresh -split "`n" | Where-Object { $_ -match 'LOC=' }) -join ''))"
+            }
+
+            Set-Content -LiteralPath (Join-Path $regionWork "deploy.outputs.json") -Encoding UTF8 -Value (@{
+                location = "eastus2"; resourceGroup = "rg-squad-aca-dev-eastus2"
+            } | ConvertTo-Json)
+            $rExisting = (& pwsh -NoProfile -File $rPath 2>&1 | Out-String)
+            if ($rExisting -match 'LOC=eastus2 RG=rg-squad-aca-dev-eastus2') {
+                Add-Pass "an EXISTING deployment keeps its own region and resource group, so changing the default cannot silently build a second environment beside it"
+            } else {
+                Add-Fail "an existing deployment did not keep its recorded region/group (got: $(($rExisting -split "`n" | Where-Object { $_ -match 'LOC=' }) -join ''))"
+            }
+
+            $rExplicit = (& pwsh -NoProfile -File $rPath -Location "westus3" 2>&1 | Out-String)
+            if ($rExplicit -match 'LOC=westus3 RG=rg-squad-aca-dev-westus3') {
+                Add-Pass "an explicit -Location wins over both the default and the recorded value, and brings the group name with it"
+            } else {
+                Add-Fail "an explicit -Location did not win (got: $(($rExplicit -split "`n" | Where-Object { $_ -match 'LOC=' }) -join ''))"
+            }
+
+            $rExplicitRg = (& pwsh -NoProfile -File $rPath -Location "westus3" -ResourceGroupName "rg-mine" 2>&1 | Out-String)
+            if ($rExplicitRg -match 'LOC=westus3 RG=rg-mine') {
+                Add-Pass "an explicit -ResourceGroupName is honoured rather than overwritten by the derived name"
+            } else {
+                Add-Fail "an explicit -ResourceGroupName was not honoured (got: $(($rExplicitRg -split "`n" | Where-Object { $_ -match 'RG=' }) -join ''))"
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $regionWork -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($regionText -match 'CapacityHeavyUsage' -and $regionText -match '-Location <region>') {
+        Add-Pass "a region capacity refusal is explained as a region problem, with the command to deploy elsewhere"
+    } else {
+        Add-Fail "scripts/deploy.ps1 does not recognise a region capacity refusal; the raw Azure error reads as a broken product to a first-time user"
+    }
+
+    # No script may keep a region baked into a DEFAULT, or they drift apart.
+    # Matches an assignment or parameter default, not prose: deploy.ps1's own
+    # comments name the old region while explaining why it moved, and a check
+    # that failed on an explanation would push people to delete the
+    # explanation.
+    $bakedIn = @(Get-ChildItem -Path (Join-Path $RepoRoot "scripts") -Filter *.ps1 -Recurse |
+        Where-Object { $_.FullName -notmatch '\\tests\\' -and $_.Name -ne 'validate.ps1' } |
+        Where-Object { (Get-Content -LiteralPath $_.FullName -Raw) -match '=\s*"rg-squad-aca-dev-eastus2"' } |
+        ForEach-Object { $_.Name })
+    if ($bakedIn.Count -eq 0) {
+        Add-Pass "no script still DEFAULTS to the old capacity-constrained region"
+    } else {
+        Add-Fail "these still default to rg-squad-aca-dev-eastus2: $($bakedIn -join ', ')"
+    }
+}
+
 
 Write-Host ("  Passed: {0}" -f $script:Passes.Count) -ForegroundColor Green
 Write-Host ("  Failed: {0}" -f $script:Failures.Count) -ForegroundColor ($(if ($script:Failures.Count -gt 0) { 'Red' } else { 'Green' }))

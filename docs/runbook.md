@@ -154,8 +154,8 @@ node .\worker\lib\agent-policy.js classify-governance-path .squad/agents/docs/ch
 Common defaults:
 
 ```text
-Location: eastus2
-Resource group: rg-squad-aca-dev-eastus2
+Location: centralus
+Resource group: rg-squad-aca-dev-centralus
 ```
 
 For Key Vault-backed secret references:
@@ -417,7 +417,7 @@ The Azure identity behind `AZURE_CLIENT_ID` needs rights to create and update re
 2. Create a sandbox group with no managed identity:
 
 ```powershell
-aca sandboxgroup create --name sbg-squad-aca --location eastus2 --set-config
+aca sandboxgroup create --name sbg-squad-aca --location centralus --set-config
 ```
 
 Do not pass `--identity`.
@@ -628,7 +628,7 @@ Cleanup after an interrupted probe:
 
 ```powershell
 $aca = "C:\Users\<you>\.aca\bin\aca.exe"
-$c = @("-s", "<sub>", "-g", "rg-squad-aca-dev-eastus2", "--sandbox-group", "sbg-squad-aca")
+$c = @("-s", "<sub>", "-g", "rg-squad-aca-dev-centralus", "--sandbox-group", "sbg-squad-aca")
 & $aca @c sandbox list -o json
 & $aca @c sandbox delete --id <sandbox id> --yes
 & $aca @c sandboxgroup disk list -o json

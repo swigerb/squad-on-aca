@@ -194,7 +194,7 @@ function Resolve-ProcIsoIntent {
     if (-not $resourceGroup -and $DeployOutputs -and $DeployOutputs.PSObject.Properties.Name -contains "resourceGroup" -and $DeployOutputs.resourceGroup) {
         $resourceGroup = [string]$DeployOutputs.resourceGroup
     }
-    if (-not $resourceGroup) { $resourceGroup = "rg-squad-aca-dev-eastus2" }
+    if (-not $resourceGroup) { $resourceGroup = "rg-squad-aca-dev-centralus" }
 
     $namePrefix = $NamePrefix
     if (-not $namePrefix -and $DeployOutputs -and $DeployOutputs.PSObject.Properties.Name -contains "pullIdentity" -and $DeployOutputs.pullIdentity -match '^uai-(.+)-acrpull$') {

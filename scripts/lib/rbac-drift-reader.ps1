@@ -291,7 +291,7 @@ function Resolve-RbacDriftIntent {
         discovery itself requires a live read.
 
         Resource group and name prefix fall back to deploy.ps1's OWN
-        documented defaults ("rg-squad-aca-dev-eastus2" / "squad-aca") when
+        documented defaults ("rg-squad-aca-dev-centralus" / "squad-aca") when
         neither a parameter nor the deployment config supplies one -- the same
         default deploy.ps1 itself would have used, not a guess across
         environments. Subscription and registry get NO such default: deploy.ps1
@@ -318,7 +318,7 @@ function Resolve-RbacDriftIntent {
     if (-not $resourceGroup -and $DeployOutputs -and $DeployOutputs.PSObject.Properties.Name -contains "resourceGroup" -and $DeployOutputs.resourceGroup) {
         $resourceGroup = [string]$DeployOutputs.resourceGroup
     }
-    if (-not $resourceGroup) { $resourceGroup = "rg-squad-aca-dev-eastus2" }
+    if (-not $resourceGroup) { $resourceGroup = "rg-squad-aca-dev-centralus" }
 
     $namePrefix = $NamePrefix
     if (-not $namePrefix -and $DeployOutputs -and $DeployOutputs.PSObject.Properties.Name -contains "pullIdentity" -and $DeployOutputs.pullIdentity -match '^uai-(.+)-acrpull$') {
