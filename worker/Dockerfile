@@ -19,7 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # attaches to a hub is the normal case, and it must keep building and running
 # when squad-hub is unavailable, unpublished, or simply unwanted. So:
 #
-#   SQUAD_HUB_SPEC=squad-hub@0.3.0  (default) install the pinned npm version
+#   SQUAD_HUB_SPEC=squad-hub@0.4.1  (default) install the pinned npm version
 #   SQUAD_HUB_SPEC=none                       do not install it at all
 #   SQUAD_HUB_SPEC=github:owner/repo#<sha>    install from an immutable git ref
 #
@@ -35,7 +35,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # release. It is not a hole to smuggle a package through: whoever passes a
 # build arg already controls the Dockerfile. Anything other than the default
 # should be a SHA, never a branch, or the image is not reproducible.
-ARG SQUAD_HUB_SPEC=squad-hub@0.3.0
+#
+# 0.4.1 IS A FLOOR, NOT A PREFERENCE. It is where `hooks` arrived, which is what
+# lets `watch` and `loop` be supervised at all -- those modes own their own loop
+# and spawn Copilot themselves, so there is no single session to hand over.
+# Everything below 0.4.0 is also deprecated on npm for security fixes, and 0.4.0
+# itself crashes the daemon on its first heartbeat once hooks are installed.
+ARG SQUAD_HUB_SPEC=squad-hub@0.4.1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg openssh-client \
@@ -70,7 +76,16 @@ RUN apt-get update \
          # It runs inside this branch, so it checks an override just as well as
          # the default -- and cannot make an image that opted OUT fail to build.
          && (squad-hub --help 2>&1 | grep -q 'squad-hub oneshot' \
-             || (echo "FATAL: squad-hub '$SQUAD_HUB_SPEC' has no 'oneshot' verb, which worker/lib/squad-hub.sh requires. Install a version that has it, or build with SQUAD_HUB_SPEC=none to leave hub supervision out." >&2; exit 1)); \
+             || (echo "FATAL: squad-hub '$SQUAD_HUB_SPEC' has no 'oneshot' verb, which worker/lib/squad-hub.sh requires. Install a version that has it, or build with SQUAD_HUB_SPEC=none to leave hub supervision out." >&2; exit 1)) \
+         # The same check for the OTHER verb this image depends on. `hooks` is
+         # what supervises `watch` and `loop`: those modes own their own loop and
+         # spawn Copilot themselves, so there is no single session to hand over,
+         # and without hooks a configured hub is simply never contacted. Caught
+         # here for the same reason as above -- the alternative is a container
+         # that runs perfectly and reports nothing, which is the defect this
+         # replaces.
+         && (squad-hub --help 2>&1 | grep -q 'squad-hub hooks' \
+             || (echo "FATAL: squad-hub '$SQUAD_HUB_SPEC' has no 'hooks' verb, which worker/lib/squad-hub.sh needs to supervise watch and loop. Install 0.4.1 or later, or build with SQUAD_HUB_SPEC=none to leave hub supervision out." >&2; exit 1)); \
        fi \
     && useradd -m -s /bin/bash squad \
     # PC-2 (issue #86): a second, distinct, unprivileged user for the ONE mode

@@ -911,3 +911,33 @@ if ($sessionJobScope) {
 $outputsPath = Join-Path $repoRoot "deploy.outputs.json"
 $outputs | ConvertTo-Json -Depth 5 | Set-Content -Path $outputsPath -Encoding utf8
 $outputs | ConvertTo-Json -Depth 5
+
+# --- Squad Hub supervision, per component ------------------------------------
+#
+# Says whether each thing that runs an agent will actually appear in the hub.
+#
+# This exists because the failure it replaces was INVISIBLE from the outside. An
+# operator set SQUAD_HUB_URL and SQUAD_HUB_TOKEN, saw no error, watched the
+# watcher work through a backlog, and saw nothing in the hub -- because `watch`
+# had no hub integration at all. Configured and working looked identical to
+# configured and ignored.
+#
+# Reported at the end, from what was actually deployed, rather than from what
+# was asked for.
+Write-Host ""
+Write-Host "=== Squad Hub supervision ===" -ForegroundColor Cyan
+if (-not $SquadHubUrl -and -not $SquadHubToken) {
+    Write-Host "  not configured -- sessions run unattended and will not appear in a hub."
+    Write-Host "  To turn it on: -SquadHubUrl <url> -SquadHubToken <device token>"
+} else {
+    Write-Host "  hub           $SquadHubUrl"
+    Write-Host "  session job   supervised (one session per dispatch)"
+    Write-Host "  ralph         dispatches into the session job above, which is supervised"
+    Write-Host "  watcher       supervised (the container attaches; each session it starts registers itself)"
+    Write-Host ""
+    Write-Host "  Watch and loop need squad-hub >= 0.4.1 in the image; the build refuses"
+    Write-Host "  anything older, so an image that got here can do it."
+    Write-Host ""
+    Write-Host "  Devices appear under the account that MINTED the device token, so mint"
+    Write-Host "  your own rather than reusing somebody else's to see your own work."
+}

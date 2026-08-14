@@ -188,3 +188,97 @@ squad_hub_run() {
   esac
   return "$rc"
 }
+
+# --- ambient supervision, for the modes that own their own loop ---------------
+#
+# `squad_hub_run` above supervises ONE session, which is what `prompt` and
+# `new-project` need. `watch`, `loop` and `ralph` are different: the `squad` CLI
+# owns the loop and spawns Copilot itself, many times, so there is no single
+# session to wrap and no seam to wrap it at.
+#
+# That gap is why a hub could be configured, valid and reachable and still show
+# nothing at all for the modes doing the actual work.
+#
+# The seam that does exist is Copilot's own hooks. They are user-level, so they
+# fire for EVERY Copilot session on the machine, whoever spawned it -- verified
+# against Copilot CLI 1.0.79 by spawning a session from an unrelated parent
+# process and watching it register itself. So instead of wrapping the loop, the
+# container attaches once as a device and lets each session the loop starts
+# report itself.
+#
+# Requires squad-hub >= 0.4.1, which is where `hooks` arrived.
+
+# Is ambient supervision actually available in this image?
+#
+# Asked rather than assumed, because the image can legitimately be built with
+# SQUAD_HUB_SPEC=none, or pinned to a version that predates `hooks`. A missing
+# verb must read as "this image cannot do it" rather than as a crash.
+squad_hub_has_hooks() {
+  command -v squad-hub >/dev/null 2>&1 \
+    && squad-hub --help 2>&1 | grep -q 'squad-hub hooks'
+}
+
+# Attach this container to the hub, and make every Copilot session it starts
+# report itself.
+#
+# Fails loudly. A mode that was told to supervise and then quietly did not is
+# the whole defect this exists to close: the operator sets a URL and a token,
+# sees no error, and reasonably concludes the work is supervised.
+squad_hub_supervise_ambient() {
+  squad_hub_preflight
+
+  if ! squad_hub_has_hooks; then
+    squad_hub_abort \
+      "This image's squad-hub has no 'hooks' verb, so ${SQUAD_MODE:-this mode} cannot be supervised." \
+      "Ambient supervision needs squad-hub >= 0.4.1." \
+      "Rebuild with --build-arg SQUAD_HUB_SPEC=squad-hub@0.4.1 (or later), or unset SQUAD_HUB_URL/SQUAD_HUB_TOKEN to run unattended on purpose."
+  fi
+
+  squad_hub_log "Supervising this container with the hub at ${SQUAD_HUB_URL}."
+  squad_hub_log "Attaching as device $(squad_hub_device_id)."
+
+  # `connect`, not `start`. Two reasons, both found by reading the CLI rather
+  # than assuming:
+  #
+  #   * `start` accepts no --name, so the device would appear under the
+  #     container's hostname -- a random ACA replica id nobody can identify.
+  #   * `start` returns 0 even when the hub REFUSES the attach; it prints
+  #     "(NOT connected)" and exits successfully. An abort keyed on its exit
+  #     code would therefore never fire, and the mode would run unsupervised
+  #     while reporting that it was supervised -- the exact defect this
+  #     replaces, reintroduced one layer down.
+  #
+  # `connect` validates the token, attaches, and returns non-zero when the hub
+  # refuses. It starts the daemon itself.
+  if ! squad-hub connect \
+        --hub "$SQUAD_HUB_URL" \
+        --token "$SQUAD_HUB_TOKEN" \
+        --name "$(squad_hub_device_id)"; then
+    squad_hub_abort \
+      "Could not attach to the hub at ${SQUAD_HUB_URL} as $(squad_hub_device_id)." \
+      "A device that cannot attach cannot be supervised, and this mode was asked to be." \
+      "Check the device token is current, and that its --prefix matches this device id."
+  fi
+
+  # Installed AFTER the daemon is up, so the first session cannot fire a hook
+  # into nothing. squad-hub 0.4.1+ leaves an unsupervised session alone when the
+  # daemon is unreachable, so this does not degrade unrelated work in the image.
+  if ! squad-hub hooks install --force; then
+    squad_hub_abort "Could not install the Copilot hooks, so sessions this mode starts would not be visible."
+  fi
+
+  squad_hub_log "Every Copilot session started here will register itself, report what it is doing,"
+  squad_hub_log "and ask before it acts. An approval nobody answers is refused, never granted."
+  return 0
+}
+
+# Detach, on the way out.
+#
+# Best effort by design: the work is already finished by the time this runs, and
+# a failure to tidy up must not turn a successful session into a failed one.
+squad_hub_release_ambient() {
+  command -v squad-hub >/dev/null 2>&1 || return 0
+  squad-hub hooks remove >/dev/null 2>&1 || true
+  squad-hub stop >/dev/null 2>&1 || true
+  return 0
+}
