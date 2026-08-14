@@ -750,6 +750,12 @@ NODE
     squad_policy_announce squad
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
+    # Same shape as watch: the loop belongs to `squad`, so the container
+    # attaches and each session it starts reports itself.
+    if squad_hub_should_supervise; then
+      squad_hub_supervise_ambient
+      trap squad_hub_release_ambient EXIT
+    fi
     squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --copilot-flags "$SQUAD_COPILOT_FLAG_STRING"
     squad_policy_checkpoint
     ;;
@@ -870,6 +876,14 @@ NODE
     squad_policy_announce squad
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
+    # `squad watch` owns its own loop and spawns Copilot itself, so there is no
+    # single session to hand to the hub. Attach the CONTAINER instead and let
+    # each session report itself. Before the loop starts, or the first
+    # iterations run unwatched.
+    if squad_hub_should_supervise; then
+      squad_hub_supervise_ambient
+      trap squad_hub_release_ambient EXIT
+    fi
     squad watch \
       --execute \
       --interval "${WATCH_INTERVAL_MINUTES:-5}" \

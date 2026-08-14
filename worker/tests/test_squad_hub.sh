@@ -317,14 +317,31 @@ assert_contains "$DOCKERFILE" "squad-hub oneshot" \
 # ...but that assertion must live INSIDE the install branch. Outside it, an
 # image built with SQUAD_HUB_SPEC=none would fail on a missing command -- the
 # opt-out would not opt out of anything.
-VERB_CHECK_LINE="$(grep -n "squad-hub --help" "${WORKER_DIR}/Dockerfile" | cut -d: -f1)"
-BRANCH_LINE="$(grep -n 'SQUAD_HUB_SPEC" = "none"' "${WORKER_DIR}/Dockerfile" | cut -d: -f1)"
-if [[ -n "$VERB_CHECK_LINE" && -n "$BRANCH_LINE" && "$VERB_CHECK_LINE" -gt "$BRANCH_LINE" ]]; then
+#
+# EVERY verb check is measured, not "the" one. This originally took the first
+# match and compared it, which silently stopped measuring anything the moment a
+# second verb assertion was added: `cut -d: -f1` then yields two lines, and the
+# comparison errors rather than answering. A guard that cannot fail when the
+# property breaks is worse than no guard.
+BRANCH_LINE="$(grep -n 'SQUAD_HUB_SPEC" = "none"' "${WORKER_DIR}/Dockerfile" | cut -d: -f1 | head -1)"
+VERB_CHECK_LINES="$(grep -n "squad-hub --help" "${WORKER_DIR}/Dockerfile" | cut -d: -f1)"
+verb_checks_ok=1
+verb_check_count=0
+if [[ -z "$VERB_CHECK_LINES" || -z "$BRANCH_LINE" ]]; then
+  verb_checks_ok=0
+else
+  while read -r ln; do
+    [[ -z "$ln" ]] && continue
+    verb_check_count=$((verb_check_count + 1))
+    if [[ "$ln" -le "$BRANCH_LINE" ]]; then verb_checks_ok=0; fi
+  done <<< "$VERB_CHECK_LINES"
+fi
+if [[ "$verb_checks_ok" -eq 1 && "$verb_check_count" -ge 2 ]]; then
   TESTS_RUN=$((TESTS_RUN + 1))
-  echo "ok - the verb assertion is inside the install branch, so opting out still builds"
+  echo "ok - all ${verb_check_count} verb assertions are inside the install branch, so opting out still builds"
 else
   TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-  echo "FAIL: the verb assertion is not inside the install branch; SQUAD_HUB_SPEC=none would fail the build"
+  echo "FAIL: expected >=2 verb assertions, all inside the install branch (found ${verb_check_count}, ok=${verb_checks_ok}); SQUAD_HUB_SPEC=none would fail the build"
 fi
 
 # The library and the image have to agree on which verb is being called, or
@@ -430,6 +447,104 @@ ANNOUNCE_UNTRUSTED="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILO
 UNTRUSTED_FLAGS_LINE="$(printf '%s\n' "$ANNOUNCE_UNTRUSTED" | grep 'Copilot flags (via Squad Hub')"
 assert_contains "$UNTRUSTED_FLAGS_LINE" "shell(git push)" \
   "the hub announcement for an untrusted source shows the untrusted-input deny patterns being applied"
+
+
+# =============================================================================
+# Issue #107: a configured hub must not be silently ignored
+# =============================================================================
+#
+# `watch` and `loop` own their own loop and spawn Copilot themselves, so there
+# is no single session to hand to `squad-hub oneshot`. Before this, they simply
+# never contacted a hub that was configured, valid and reachable -- and said
+# nothing about it. An operator saw work happening and an empty hub.
+#
+# The assertions below are about the RESOLVED BEHAVIOUR of the entrypoint and
+# the library, not about comments describing it.
+
+ENTRYPOINT_SRC="$(cat "${WORKER_DIR}/entrypoint.sh")"
+
+# Every mode that RUNS AN AGENT must reach the hub by one of the two routes:
+#   squad_hub_run              -- one session (prompt, new-project)
+#   squad_hub_supervise_ambient -- the container attaches (watch, loop)
+# Extracted per mode block so a call in a NEIGHBOURING mode cannot satisfy it.
+mode_block() {
+  printf '%s\n' "$ENTRYPOINT_SRC" | awk -v want="$1" '
+    index($0, "  " want ")") == 1 { inb=1; next }
+    inb && /^  [a-z|_-]+\)[ \t]*$/ { exit }
+    inb { print }
+  '
+}
+
+for mode in "watch|triage" "loop"; do
+  block="$(mode_block "$mode")"
+  assert_contains "$block" "squad_hub_supervise_ambient" \
+    "mode '${mode}' attaches to a configured hub instead of ignoring it"
+  assert_contains "$block" "squad_hub_should_supervise" \
+    "mode '${mode}' only attaches when a hub is actually configured"
+done
+
+# prompt/new-project keep the one-session route; ambient there would attach a
+# whole container for a single run.
+for mode in "prompt" "new-project"; do
+  block="$(mode_block "$mode")"
+  assert_contains "$block" "squad_hub_run" \
+    "mode '${mode}' still supervises its single session directly"
+done
+
+# The library must actually provide what the entrypoint calls. A missing
+# function in bash is a runtime error at the worst moment, not a load error.
+HUB_LIB_SRC="$(cat "$HUB_LIB")"
+for fn in squad_hub_supervise_ambient squad_hub_release_ambient squad_hub_has_hooks; do
+  assert_contains "$HUB_LIB_SRC" "${fn}()" \
+    "the supervision library defines ${fn}, which entrypoint.sh calls"
+done
+
+# ATTACH BEFORE THE LOOP STARTS. Iterations that run before anything is
+# listening are lost, which looks exactly like the bug this replaces.
+WATCH_BLOCK="$(mode_block "watch|triage")"
+# Matched against the COMMAND, not any line mentioning it: the block carries a
+# comment explaining why `squad watch` needs this, and that comment sits above
+# the call -- so a naive grep reports the wrong order and fails a correct file.
+ambient_line="$(printf '%s\n' "$WATCH_BLOCK" | grep -n '^ *squad_hub_supervise_ambient' | head -1 | cut -d: -f1)"
+squad_line="$(printf '%s\n' "$WATCH_BLOCK" | grep -n '^ *squad watch ' | head -1 | cut -d: -f1)"
+if [[ -n "$ambient_line" && -n "$squad_line" && "$ambient_line" -lt "$squad_line" ]]; then
+  assert_eq "ok" "ok" "watch attaches to the hub BEFORE it starts the loop"
+else
+  assert_eq "before" "after" "watch attaches to the hub BEFORE it starts the loop"
+fi
+
+# A version without `hooks` cannot supervise a loop. Caught at BUILD, because
+# the alternative is a container that runs perfectly and reports nothing.
+assert_contains "$DOCKERFILE" "squad-hub hooks" \
+  "the build asserts the installed squad-hub actually has the 'hooks' verb"
+
+# The pin is a floor: hooks arrived in 0.4.1, and 0.4.0 crashes the daemon on
+# its first heartbeat once hooks are installed.
+PINNED="$(printf '%s\n' "$DOCKERFILE" | grep -o 'squad-hub@[0-9][0-9.]*' | head -1)"
+PINNED_VER="${PINNED#squad-hub@}"
+lowest="$(printf '%s\n0.4.1\n' "$PINNED_VER" | sort -V | head -1)"
+assert_eq "0.4.1" "$lowest" \
+  "the pinned squad-hub (${PINNED_VER}) is at least 0.4.1, where 'hooks' arrived"
+
+# Ambient supervision must FAIL LOUDLY, never downgrade. A mode told to
+# supervise that quietly did not is the whole defect.
+AMBIENT_FN="$(printf '%s\n' "$HUB_LIB_SRC" | awk '/^squad_hub_supervise_ambient\(\)/{f=1} f{print} f&&/^}/{exit}')"
+assert_contains "$AMBIENT_FN" "squad_hub_abort" \
+  "ambient supervision aborts rather than running unsupervised when it cannot attach"
+assert_contains "$AMBIENT_FN" "hooks install" \
+  "ambient supervision installs the hooks that make each spawned session visible"
+assert_contains "$AMBIENT_FN" "squad-hub connect" \
+  "ambient supervision attaches the container as a device"
+
+# NOT `squad-hub start`. It accepts no --name, so the device appears under a
+# random ACA replica hostname; and it returns 0 even when the hub REFUSES the
+# attach, printing "(NOT connected)" and exiting successfully. An abort keyed
+# on its exit code would never fire, and the mode would run unsupervised while
+# reporting that it was supervised -- this defect, reintroduced one layer down.
+assert_not_contains "$AMBIENT_FN" "squad-hub start" \
+  "ambient supervision does not use 'start', which succeeds even when the hub refuses"
+assert_contains "$AMBIENT_FN" 'name "$(squad_hub_device_id)"' \
+  "the container attaches under a nameable device id, not the replica hostname"
 
 echo ""
 echo "squad-hub supervision: ${TESTS_RUN} assertions, ${TESTS_FAILED} failed"
