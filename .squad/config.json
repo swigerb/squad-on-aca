@@ -3,7 +3,7 @@
   "defaultModel": "claude-sonnet-5",
   "agentModelOverrides": {
     "advisor": "claude-opus-5",
-    "lead": "claude-opus-5",
+    "lead": "claude-opus-5.5",
     "security": "claude-opus-5",
     "Rai": "claude-opus-5",
     "fact-checker": "claude-opus-5",
