@@ -349,6 +349,17 @@ fi
 assert_contains "$(cat "$HUB_LIB")" "squad-hub oneshot" \
   "the supervision library calls the same verb the image checks for"
 
+# A supervised session is still a Copilot session and must export telemetry the
+# same way the unsupervised `copilot -p` path does. It once shipped without this,
+# so every hub-supervised run was invisible in Aspire.
+HUB_RUN_BLOCK="$(sed -n '/^squad_hub_run()/,/squad-hub oneshot/p' "$HUB_LIB")"
+assert_contains "$HUB_RUN_BLOCK" "COPILOT_OTEL_ENABLED=true" \
+  "supervised sessions enable Copilot OpenTelemetry"
+assert_contains "$HUB_RUN_BLOCK" "COPILOT_OTEL_EXPORTER_TYPE=otlp-http" \
+  "supervised sessions export over OTLP/HTTP like the direct path"
+assert_contains "$HUB_RUN_BLOCK" 'OTEL_EXPORTER_OTLP_ENDPOINT="${ASPIRE_OTLP_HTTP_ENDPOINT' \
+  "supervised sessions point Copilot at the Aspire OTLP/HTTP endpoint"
+
 # ---------------------------------------------------------------------------
 # 6. Device identity — the binding that makes the token safe to ship
 # ---------------------------------------------------------------------------
