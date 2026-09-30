@@ -160,6 +160,13 @@ squad_hub_run() {
   squad_hub_log "  Anything else now asks, and waits for a person to answer."
 
   local rc=0
+  # Same telemetry wiring as the unsupervised `copilot -p` path in entrypoint.sh.
+  # squad-hub spawns `copilot --acp` with its own environment, so without these
+  # the global default (COPILOT_OTEL_ENABLED=false, gRPC endpoint) wins and a
+  # supervised session never reaches Aspire.
+  OTEL_EXPORTER_OTLP_ENDPOINT="${ASPIRE_OTLP_HTTP_ENDPOINT:-$OTEL_EXPORTER_OTLP_ENDPOINT}" \
+  COPILOT_OTEL_ENABLED=true \
+  COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
   SQUAD_HUB_ONESHOT=1 \
   SQUAD_HUB_PROMPT="$prompt" \
   SQUAD_HUB_CWD="$REPO_DIR" \
