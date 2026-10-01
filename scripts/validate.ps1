@@ -4623,6 +4623,21 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
 # destroyed the audit trail PRD #6 asks for. The exclusion is only safe while it
 # stays anchored at both ends and stays inside the integrity check, so both
 # properties are asserted here against the REAL resolver rather than described.
+#
+# Issue #113: Squad 0.13.1 writes to two more paths during a normal session
+# that this section must now classify correctly, derived from the SAME
+# resolver rather than a second hand-maintained list (agent-policy.js is the
+# single source of truth; this section only asks it questions):
+#   - `.squad/memory/audit.jsonl` moved OUT of `locked` and into `append-only`,
+#     for the identical reason history.md is append-only: squad-sdk's
+#     `MemoryManager.audit()` only ever appends a line to it.
+#   - `.squad/casting/policy.json`, `registry.json`, `history.json`, and
+#     `.squad/identity/now.md` are a THIRD class, `reported-mutable`: Squad
+#     0.13 legitimately REWRITES these wholesale rather than appending, so the
+#     append-only prefix rule is the wrong rule for them. They are excluded
+#     from the write lock like append-only paths, but any change -- not just a
+#     prefix-preserving grow -- is permitted. See REPORTED_MUTABLE_GOVERNANCE_PATTERNS
+#     in worker/lib/agent-policy.js for the full reasoning.
 if ($nodeCmd -and (Test-Path $policyResolver)) {
     function Get-GovernanceClass {
         param([string]$Path)
@@ -4636,24 +4651,53 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
         Add-Fail "An agent history file is not classified append-only; autonomous runs cannot write .squad/agents/<name>/history.md and the audit trail is lost"
     }
 
+    # Issue #113: the audit trail is append-only too, now that Squad 0.13.1
+    # writes to it mid-session. This used to be in $mustStayLocked below (a
+    # `locked` audit.jsonl cannot be written at all); asserting it here instead
+    # is the actual fix, not a relocation of a stale comment.
+    if ((Get-GovernanceClass '.squad/memory/audit.jsonl') -eq 'append-only') {
+        Add-Pass "The audit trail (.squad/memory/audit.jsonl) is classified append-only, so Squad 0.13.1 can write to it during a normal session"
+    } else {
+        Add-Fail "The audit trail is not classified append-only; Squad 0.13.1 writes to .squad/memory/audit.jsonl mid-session and a locked file cannot be written at all"
+    }
+
+    # Issue #113: the reported-mutable class -- rewritable, never a violation,
+    # but still tracked and still reported. Asserted by name, one at a time, so
+    # a single mis-anchored pattern names exactly which path regressed.
+    $mustBeReportedMutable = @(
+        '.squad/casting/policy.json',
+        '.squad/casting/registry.json',
+        '.squad/casting/history.json',
+        '.squad/identity/now.md'
+    )
+    $notReported = @($mustBeReportedMutable | Where-Object { (Get-GovernanceClass $_) -ne 'reported-mutable' })
+    if ($notReported.Count -eq 0) {
+        Add-Pass "Casting state (policy/registry/history.json) and identity/now.md all classify reported-mutable: writable all session, changes surfaced rather than blocked"
+    } else {
+        Add-Fail "These Squad 0.13 runtime-state paths should classify reported-mutable but do not: $($notReported -join ', ')"
+    }
+
     # The thing it must NOT allow. A charter states what an agent is permitted to
     # do; an agent that can rewrite its charter has rewritten its authorisation.
+    # Issue #113: `.squad/identity/now.md` is carved out of identity/ above, by
+    # name, into reported-mutable -- `identity.md` and `mission.md` prove that
+    # carve-out did not become a blanket unlock of the rest of the directory.
     $mustStayLocked = @(
         @{ Path = '.squad/agents/security/charter.md';     Why = 'a charter defines what an agent is permitted to do' },
         @{ Path = '.squad/agents/security/history.md.bak'; Why = 'a lookalike filename must not inherit the exclusion' },
         @{ Path = '.squad/agents/history.md';              Why = 'the exclusion is anchored to <name>/history.md, not anything named history.md under .squad/agents' },
         @{ Path = '.squad/agents/a/b/history.md';          Why = 'exactly one path segment may stand for the agent name' },
         @{ Path = '.squad/policies/history.md';            Why = 'the exclusion is scoped to .squad/agents' },
-        @{ Path = '.squad/identity/identity.md';           Why = 'identity is governance' },
+        @{ Path = '.squad/identity/identity.md';           Why = 'identity is governance; now.md is a narrow carve-out, not a blanket unlock of identity/' },
+        @{ Path = '.squad/identity/mission.md';             Why = 'identity is governance; now.md is a narrow carve-out, not a blanket unlock of identity/' },
         @{ Path = '.squad/config.json';                    Why = 'config is governance' },
-        @{ Path = '.squad/routing.md';                     Why = 'routing is governance' },
-        @{ Path = '.squad/memory/audit.jsonl';             Why = 'audit state is governance' }
+        @{ Path = '.squad/routing.md';                     Why = 'routing is governance' }
     )
     $leaked = @($mustStayLocked | Where-Object { (Get-GovernanceClass $_.Path) -ne 'locked' })
     if ($leaked.Count -eq 0) {
-        Add-Pass "The append-only exclusion is anchored: all $($mustStayLocked.Count) neighbouring governance paths -- charter.md included -- stay locked"
+        Add-Pass "The append-only and reported-mutable exclusions are anchored: all $($mustStayLocked.Count) neighbouring governance paths -- charter.md and the rest of identity/ included -- stay locked"
     } else {
-        Add-Fail "The append-only exclusion is too wide; these should be locked but are not: $(($leaked | ForEach-Object { "$($_.Path) ($($_.Why))" }) -join '; ')"
+        Add-Fail "An exclusion is too wide; these should be locked but are not: $(($leaked | ForEach-Object { "$($_.Path) ($($_.Why))" }) -join '; ')"
     }
 
     # Widening the pattern to `.squad/agents/**` is the specific regression this
@@ -4661,11 +4705,23 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
     # classification -- a pattern that stopped anchoring the filename would fail
     # here even if someone also loosened the cases above.
     $patterns = @((& node $policyResolver mutable-governance-patterns 2>&1) | Where-Object { $_ -match '\S' })
-    $unanchored = @($patterns | Where-Object { $_ -notmatch 'history' -or $_ -notmatch '\$$' -or $_ -notmatch '\^' })
+    $unanchored = @($patterns | Where-Object { $_ -notmatch '\$$' -or $_ -notmatch '\^' })
     if ($patterns.Count -ge 1 -and $unanchored.Count -eq 0) {
-        Add-Pass "Every append-only pattern is fully anchored and filename-specific ($($patterns -join ', '))"
+        Add-Pass "Every append-only pattern is fully anchored ($($patterns -join ', '))"
     } else {
-        Add-Fail "An append-only pattern is unanchored or not filename-specific: $($unanchored -join ', '); a wildcard here re-opens charter.md"
+        Add-Fail "An append-only pattern is unanchored: $($unanchored -join ', '); a wildcard here re-opens charter.md"
+    }
+
+    # Issue #113: the reported-mutable patterns get the identical anchoring
+    # check. An unanchored entry here would re-open the rest of identity/ or
+    # casting/ the same way an unanchored append-only pattern would re-open
+    # charter.md.
+    $reportedPatterns = @((& node $policyResolver reported-mutable-governance-patterns 2>&1) | Where-Object { $_ -match '\S' })
+    $unanchoredReported = @($reportedPatterns | Where-Object { $_ -notmatch '\$$' -or $_ -notmatch '\^' })
+    if ($reportedPatterns.Count -ge 1 -and $unanchoredReported.Count -eq 0) {
+        Add-Pass "Every reported-mutable pattern is fully anchored ($($reportedPatterns -join ', '))"
+    } else {
+        Add-Fail "A reported-mutable pattern is unanchored: $($unanchoredReported -join ', '); a wildcard here re-opens the rest of identity/ or casting/"
     }
 }
 

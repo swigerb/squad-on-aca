@@ -453,6 +453,15 @@ const GOVERNANCE_PATHS = [
   '.squad/routing.md',
   '.squad/casting-policy.json',
   '.squad/casting/policy.json',
+  // Issue #113: Squad 0.13.1 ships fixes (#1876, #1898) so the coordinator can
+  // persist these two alongside casting/policy.json. They were not previously
+  // in this list at all, which meant they were untracked rather than
+  // protected -- a silent blind spot for exactly the casting state that
+  // policy.json already covered. They are tracked now, under the
+  // REPORTED_MUTABLE_GOVERNANCE_PATTERNS class below, not locked: casting is
+  // runtime state upstream, so the write must be allowed, just visible.
+  '.squad/casting/registry.json',
+  '.squad/casting/history.json',
   '.squad/memory/config.json',
   '.squad/memory/audit.jsonl',
   '.squad/fact-checker/policy.md',
@@ -499,8 +508,75 @@ const GOVERNANCE_PATHS = [
  * a JS RegExp, a POSIX ERE (bash `[[ =~ ]]`) and a .NET regex, because all
  * three consume it (this file, squad-policy.sh, scripts/validate.ps1). One
  * pattern, three readers, no restatement to drift.
+ *
+ * Issue #113: `.squad/memory/audit.jsonl` joins this list for the SAME reason
+ * `history.md` is here -- it is an append-only audit trail (`MemoryManager
+ * .audit()` in squad-sdk only ever appends a JSON line to it), not policy.
+ * What is NOT solved by this list alone is ROTATION: squad-sdk's
+ * `rotateAuditIfNeeded()` RENAMES audit.jsonl once it crosses
+ * `policy.auditMaxBytes`, and a rename is indistinguishable from "the file was
+ * deleted and a new one started" to the prefix-hash check below -- it would
+ * fail the session exactly like a real deletion. See
+ * squad_policy_pin_memory_audit_config in squad-policy.sh for how rotation is
+ * made impossible for the session instead of merely detected after the fact.
  */
-const MUTABLE_GOVERNANCE_PATTERNS = ['^\\.squad/agents/[^/]+/history\\.md$'];
+const MUTABLE_GOVERNANCE_PATTERNS = [
+  '^\\.squad/agents/[^/]+/history\\.md$',
+  '^\\.squad/memory/audit\\.jsonl$',
+];
+
+/**
+ * Issue #113: a SECOND, DELIBERATELY DIFFERENT exclusion from the write lock.
+ *
+ * APPEND-ONLY (above) says "this file may only grow, and the bytes already
+ * written may never change" -- the right rule for an audit trail or a work
+ * log. It is the WRONG rule for state Squad 0.13 legitimately REWRITES, not
+ * just appends to:
+ *
+ *   .squad/casting/policy.json    Squad 0.13.1 (upstream fixes #1876/#1898)
+ *   .squad/casting/registry.json  persists casting state here across a
+ *   .squad/casting/history.json   session; a coordinator may rewrite the
+ *                                 whole file, not append a line to it.
+ *   .squad/identity/now.md        Squad's "what the team is focused on"
+ *                                 pointer, rewritten each session by design --
+ *                                 see the identity/ split below.
+ *
+ * A prefix-hash check would fail every one of these on the first legitimate
+ * write. So this class is REPORTED-MUTABLE instead: hashed at baseline the
+ * same as everything else, writable for the whole session (chmod u+w, not
+ * append-only), and a DIFFERENCE at verify time is never a violation -- it is
+ * collected and surfaced in the governance report and the PR body (see
+ * squad_policy_reported_changes_report in squad-policy.sh). "Allowed" is the
+ * whole point of the class; "invisible" is not, which is why it stays in the
+ * manifest and in the diff output instead of simply being left off
+ * GOVERNANCE_PATHS.
+ *
+ * WHY identity/now.md AND NOT THE REST OF identity/
+ * --------------------------------------------------
+ * `.squad/identity` stays a GOVERNANCE_PATHS entry (the whole directory), and
+ * every file under it stays LOCKED by default. `now.md` is carved out, by
+ * name, for the same reason squad-sdk's state tools put identity/ in their own
+ * mutable allowlist: it is the one file that is supposed to change constantly
+ * -- "what is the team focused on right now" is session state, not
+ * governance. Everything else under identity/ (identity.md, mission.md, and
+ * anything else) is stable governance describing WHO the team is; a session
+ * has no more business rewriting that than it does rewriting a charter. The
+ * pattern below is anchored to the exact filename for the same reason the
+ * append-only history.md pattern is anchored to one path segment: an
+ * unanchored `identity/**` would silently re-open the rest of the directory.
+ */
+const REPORTED_MUTABLE_GOVERNANCE_PATTERNS = [
+  '^\\.squad/identity/now\\.md$',
+  '^\\.squad/casting/policy\\.json$',
+  '^\\.squad/casting/registry\\.json$',
+  '^\\.squad/casting/history\\.json$',
+];
+
+function normalizeGovernanceRelPath(relativePath) {
+  return String(relativePath === undefined || relativePath === null ? '' : relativePath)
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '');
+}
 
 /**
  * True when a repository-relative path is a governance path that a session is
@@ -508,13 +584,25 @@ const MUTABLE_GOVERNANCE_PATTERNS = ['^\\.squad/agents/[^/]+/history\\.md$'];
  * classifies the same way as a container-produced one.
  */
 function isMutableGovernancePath(relativePath) {
-  const p = String(relativePath === undefined || relativePath === null ? '' : relativePath)
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '');
+  const p = normalizeGovernanceRelPath(relativePath);
   if (p === '') {
     return false;
   }
   return MUTABLE_GOVERNANCE_PATTERNS.some((pattern) => new RegExp(pattern).test(p));
+}
+
+/**
+ * True when a repository-relative path is a governance path that a session may
+ * freely REWRITE -- not just append to -- with the change reported rather than
+ * blocked. See REPORTED_MUTABLE_GOVERNANCE_PATTERNS above for which paths and
+ * why.
+ */
+function isReportedMutableGovernancePath(relativePath) {
+  const p = normalizeGovernanceRelPath(relativePath);
+  if (p === '') {
+    return false;
+  }
+  return REPORTED_MUTABLE_GOVERNANCE_PATTERNS.some((pattern) => new RegExp(pattern).test(p));
 }
 
 const TIER_ATTENDED = 'attended';
@@ -712,6 +800,7 @@ function resolvePolicy(input) {
     denyTools,
     governancePaths: GOVERNANCE_PATHS.slice(),
     mutableGovernancePatterns: MUTABLE_GOVERNANCE_PATTERNS.slice(),
+    reportedMutableGovernancePatterns: REPORTED_MUTABLE_GOVERNANCE_PATTERNS.slice(),
     flags,
     // A single shell-ready string. Only safe where the caller can hand it to a
     // process as an argv array; see squadFlagString for the other path.
@@ -853,6 +942,7 @@ module.exports = {
   FORBIDDEN_EXTRA_FLAGS,
   GOVERNANCE_PATHS,
   MUTABLE_GOVERNANCE_PATTERNS,
+  REPORTED_MUTABLE_GOVERNANCE_PATTERNS,
   TIER_ATTENDED,
   TIER_AUTONOMOUS,
   AgentPolicyError,
@@ -860,6 +950,7 @@ module.exports = {
   resolveTrust,
   resolveCredentialProfile,
   isMutableGovernancePath,
+  isReportedMutableGovernancePath,
   resolvePolicy,
   resolvePolicyFromEnv,
   buildPolicyMatrix,
@@ -932,7 +1023,16 @@ function main(argv) {
     case 'mutable-governance-patterns':
       process.stdout.write(`${policy.mutableGovernancePatterns.join('\n')}\n`);
       return 0;
-    // `classify-governance-path <relative-path>` -> `append-only` | `locked`.
+    // Issue #113: the REPORTED-MUTABLE sibling of the command above. One
+    // regular expression per line; a governance path that matches is excluded
+    // from the write lock AND from the append-only prefix rule -- it may be
+    // rewritten freely, and the rewrite is reported rather than blocked. See
+    // REPORTED_MUTABLE_GOVERNANCE_PATTERNS for which paths and why.
+    case 'reported-mutable-governance-patterns':
+      process.stdout.write(`${policy.reportedMutableGovernancePatterns.join('\n')}\n`);
+      return 0;
+    // `classify-governance-path <relative-path>` ->
+    // `append-only` | `reported-mutable` | `locked`.
     // Exists so a test (and an operator diagnosing a run) can ask the SAME
     // resolver the shell asks, rather than restating the pattern.
     case 'classify-governance-path': {
@@ -941,7 +1041,13 @@ function main(argv) {
         process.stderr.write('Usage: agent-policy.js classify-governance-path <repo-relative-path>\n');
         return 78;
       }
-      process.stdout.write(`${isMutableGovernancePath(target) ? 'append-only' : 'locked'}\n`);
+      let cls = 'locked';
+      if (isMutableGovernancePath(target)) {
+        cls = 'append-only';
+      } else if (isReportedMutableGovernancePath(target)) {
+        cls = 'reported-mutable';
+      }
+      process.stdout.write(`${cls}\n`);
       return 0;
     }
     // Issue #84 PI-2: the orthogonal trust axis, read the same way `tier` is.
@@ -1008,7 +1114,8 @@ function main(argv) {
       process.stderr.write(
         'Usage: agent-policy.js [json|flags|argv|squad-flags|hub-argv-json|undeliverable|tier|reason|' +
           'trust|trust-reason|credential-profile|should-withhold-credential|copilot-token-shared|matrix|' +
-          'governance-paths|mutable-governance-patterns|classify-governance-path <path>|' +
+          'governance-paths|mutable-governance-patterns|reported-mutable-governance-patterns|' +
+          'classify-governance-path <path>|' +
           'watch-agent-argv-json|watch-agent-parity-argv-json|watch-agent-strict-argv-json|' +
           'watch-agent-policy-mode]\n'
       );

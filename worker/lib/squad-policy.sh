@@ -249,6 +249,31 @@ squad_policy_state_dir() {
   return 0
 }
 
+# Loaded once per process and cached, same reasoning as the pattern arrays
+# below: `harden` and `verify` each need the governance-paths list more than
+# once (the manifest walk, the chmod lock/unlock passes, and the committed-
+# change diff), and a fresh `node` fork per call is pure overhead for a value
+# that never changes within one session.
+#
+# Fail closed: if the resolver cannot produce the list, the array stays empty,
+# which means the lock/manifest loops below see nothing to protect -- the
+# caller (`squad_policy_harden`) treats a missing `node`/resolver as a hard
+# abort before this is ever reached, so an empty list here only happens if the
+# resolver itself ran and legitimately returned nothing.
+SQUAD_POLICY_GOVERNANCE_PATHS=()
+squad_policy_load_governance_paths() {
+  if [[ "${SQUAD_POLICY_GOVERNANCE_PATHS_LOADED:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  SQUAD_POLICY_GOVERNANCE_PATHS=()
+  local path
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && SQUAD_POLICY_GOVERNANCE_PATHS+=("$path")
+  done < <(node "$SQUAD_POLICY_RESOLVER" governance-paths)
+  SQUAD_POLICY_GOVERNANCE_PATHS_LOADED=1
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 3. Governance path classification
 # ---------------------------------------------------------------------------
@@ -294,6 +319,83 @@ squad_policy_is_mutable() {
   return 1
 }
 
+# Issue #113: the REPORTED-MUTABLE sibling of the two functions above. Same
+# single-source-of-truth argument, same fail-closed shape (an empty array
+# means nothing is excluded, so everything stays locked and hash-pinned).
+#
+# squad_policy_is_reported_mutable <repo-relative-path>
+# 0 == reported-mutable (excluded from BOTH the write lock and the append-only
+#      rule; a difference at verify time is reported, never a violation)
+# 1 == not in this class (still subject to the lock or the append-only rule)
+squad_policy_load_reported_mutable_patterns() {
+  if [[ "${SQUAD_POLICY_REPORTED_PATTERNS_LOADED:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  SQUAD_POLICY_REPORTED_PATTERNS=()
+  local pattern
+  while IFS= read -r pattern; do
+    if [[ -n "$pattern" ]]; then
+      SQUAD_POLICY_REPORTED_PATTERNS+=("$pattern")
+    fi
+  done < <(node "$SQUAD_POLICY_RESOLVER" reported-mutable-governance-patterns 2>/dev/null)
+  SQUAD_POLICY_REPORTED_PATTERNS_LOADED=1
+  return 0
+}
+
+squad_policy_is_reported_mutable() {
+  local rel="$1" pattern
+  squad_policy_load_reported_mutable_patterns
+  for pattern in "${SQUAD_POLICY_REPORTED_PATTERNS[@]:-}"; do
+    [[ -n "$pattern" ]] || continue
+    if [[ "$rel" =~ $pattern ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True for either kind of exclusion from the write lock -- used by
+# squad_policy_harden's second chmod pass, which restores write access the
+# same way (chmod u+w) regardless of which rule then governs the content.
+squad_policy_is_unlockable() {
+  local rel="$1"
+  squad_policy_is_mutable "$rel" && return 0
+  squad_policy_is_reported_mutable "$rel" && return 0
+  return 1
+}
+
+# squad_policy_verify's part (a) compares every LOCKED path's manifest line
+# unchanged. Append-only and reported-mutable paths are excluded from that
+# comparison by PATH, not by the manifest line's literal kind word: a deleted
+# append-only or reported-mutable file manifests as an `absent` line on
+# whichever side it is missing from, not an `append-only`/`reported` line, and
+# excluding only those two kind-words would let that `absent` line slip
+# through part (a) as an apparent locked-path change. That is exactly
+# backwards for the reported-mutable class, where a deletion is supposed to be
+# PERMITTED (and handled by part (d)), not flagged here and separately
+# excused. `dir` lines are passed through unfiltered -- a directory path never
+# matches either pattern, so the check is simply a no-op for them.
+squad_policy_filter_locked_lines() {
+  local src="$1" dest="$2" kind rel rest
+  : >"$dest"
+  # Deliberately plain `read` (default IFS) so the line splits on whitespace
+  # into kind/rel/rest the same way every other manifest reader in this file
+  # does -- `IFS= read` would disable field splitting entirely and leave the
+  # whole line in $kind, silently defeating every check below.
+  while read -r kind rel rest; do
+    [[ -n "$kind" ]] || continue
+    if [[ "$kind" != "dir" ]]; then
+      squad_policy_is_mutable "$rel" && continue
+      squad_policy_is_reported_mutable "$rel" && continue
+    fi
+    if [[ -n "$rest" ]]; then
+      printf '%s %s %s\n' "$kind" "$rel" "$rest" >>"$dest"
+    else
+      printf '%s %s\n' "$kind" "$rel" >>"$dest"
+    fi
+  done <"$src"
+}
+
 # SHA-256 of the FIRST <bytes> bytes of a file. This is the whole append-only
 # check: if the prefix still hashes to what the baseline recorded, everything
 # that was already written is still there, byte for byte, and whatever follows
@@ -318,11 +420,17 @@ squad_policy_byte_len() {
 #   append-only <path> <sha256> <bytes> MAY GROW; the first <bytes> bytes must
 #                                       still hash to <sha256>
 #   absent <path>                       protected path not present at baseline
+#   reported <path> <sha256>            Issue #113: MAY be rewritten freely;
+#                                       a different hash at verify time is
+#                                       REPORTED, never a violation
 #
 # The append-only kind exists so that "expected to change" and "must not change"
 # are distinguishable IN THE BASELINE rather than by dropping the path from it.
 # A dropped path is invisible to an operator reading the manifest and invisible
-# to the diff; a differently-typed path is neither.
+# to the diff; a differently-typed path is neither. `reported` exists for the
+# same reason, for a class of path that is allowed to change arbitrarily
+# (casting/*.json, identity/now.md -- see REPORTED_MUTABLE_GOVERNANCE_PATTERNS
+# in agent-policy.js) rather than only by growing.
 #
 # NOTE ON THE `absent` MARKERS. They are manifest COMPLETENESS, not an
 # independent control, and this file will not claim otherwise: the baseline-vs-
@@ -338,7 +446,8 @@ squad_policy_write_manifest() {
 
   : >"$out" || return 1
 
-  while IFS= read -r path; do
+  squad_policy_load_governance_paths
+  for path in "${SQUAD_POLICY_GOVERNANCE_PATHS[@]:-}"; do
     [[ -n "$path" ]] || continue
     local target="${repo_dir}/${path}"
     if [[ -d "$target" ]]; then
@@ -353,7 +462,7 @@ squad_policy_write_manifest() {
     else
       printf 'absent %s\n' "$path" >>"$out"
     fi
-  done < <(node "$SQUAD_POLICY_RESOLVER" governance-paths)
+  done
 
   return 0
 }
@@ -368,6 +477,8 @@ squad_policy_manifest_line() {
     len="$(squad_policy_byte_len "$file")"
     [[ -n "$len" ]] || return 1
     printf 'append-only %s %s %s\n' "$rel" "$sum" "$len"
+  elif squad_policy_is_reported_mutable "$rel"; then
+    printf 'reported %s %s\n' "$rel" "$sum"
   else
     printf 'file %s %s\n' "$rel" "$sum"
   fi
@@ -380,6 +491,98 @@ squad_policy_manifest_line() {
 # Called AFTER session bootstrap (`squad init`, SubSquad activation) and
 # immediately BEFORE the agent runs, because bootstrap legitimately creates the
 # very files the agent must not then rewrite.
+
+# Issue #113: pin `.squad/memory/config.json`'s `policy.auditMaxBytes` to 0
+# before the baseline is recorded and before the path is locked.
+#
+# VERIFIED, not assumed: @bradygaster/squad-sdk 0.13.1, dist/memory/index.js,
+# `rotateAuditIfNeeded()`:
+#     const maxBytes = config.policy.auditMaxBytes;
+#     if (maxBytes <= 0) return;
+# `auditMaxBytes <= 0` is squad-sdk's OWN "rotation disabled" sentinel -- read
+# from the function body (retrieved via `npm pack
+# @bradygaster/squad-sdk@0.13.1`), not guessed from the key's name. `0` means
+# "never rotate", not "always rotate", so pinning it is the SAFE direction.
+#
+# WHY PIN RATHER THAN JUST DETECT THE RENAME
+# -------------------------------------------
+# `.squad/memory/audit.jsonl` is append-only (MUTABLE_GOVERNANCE_PATTERNS), and
+# the append-only rule is a prefix-hash check: appends pass, anything else --
+# including the rename `rotateAuditIfNeeded()` performs once the file crosses
+# `auditMaxBytes` -- fails the session exactly like a genuine deletion. Brian
+# asked for the SAFER, more testable option of the two offered. Detecting the
+# rotation after the fact only tells us it happened AFTER the append-only
+# verifier has already failed the session for what looks exactly like the
+# audit trail being deleted -- the "detection" and "false-positive governance
+# failure" are the same event, so there is nothing to choose between
+# detecting it and preventing it; preventing it is strictly better and is
+# directly testable (write more than the default 1_048_576-byte threshold
+# worth of audit records and assert no `audit.1.jsonl` appears). So prevention
+# is what is implemented; "detect the rename" is not a fallback this file
+# also carries, because a rename that is actually impossible needs no
+# detector.
+#
+# Fail CLOSED: if the pin cannot be written, hardening aborts. Running the
+# session with rotation still enabled would make a routine audit-trail
+# rotation indistinguishable from an agent deleting its own audit trail, and
+# that is not a degraded mode this file is willing to run in.
+squad_policy_pin_memory_audit_config() {
+  local repo_dir="$1"
+  local config_path="${repo_dir}/.squad/memory/config.json"
+
+  mkdir -p "${repo_dir}/.squad/memory" 2>/dev/null || true
+
+  if ! node -e '
+    const fs = require("fs");
+    const target = process.argv[1];
+    let config = {};
+    if (fs.existsSync(target)) {
+      const raw = fs.readFileSync(target, "utf8");
+      if (raw.trim() !== "") {
+        config = JSON.parse(raw);
+      }
+    }
+    config.policy = config.policy || {};
+    config.policy.auditMaxBytes = 0;
+    fs.writeFileSync(target, JSON.stringify(config, null, 2) + "\n");
+  ' "$config_path" 2>&1; then
+    squad_policy_abort "Could not pin .squad/memory/config.json policy.auditMaxBytes to 0; refusing to run with audit-trail rotation enabled."
+  fi
+
+  # `.squad/memory/config.json` stays a plain LOCKED governance path (it is
+  # not append-only, and it is not the casting/identity runtime state Issue
+  # #113 made reported-mutable) -- an agent has no business changing its own
+  # audit-rotation policy mid-session. But THIS write happens before the lock
+  # is even applied, as part of hardening itself, and `squad_policy_harden`
+  # records `base-commit` for the "was a protected path changed in a commit
+  # made during this session" detector (c) right after this function returns.
+  # Left uncommitted, this pin would be an uncommitted change to a LOCKED path
+  # sitting in the working tree at session start; the session's own
+  # `git add -A && git commit` (worker/entrypoint.sh) would then sweep it in,
+  # and detector (c) would flag it as a governance violation every single run
+  # -- not because the agent did anything, but because the CONTROL did.
+  # Committing the pin here, before `base-commit` is captured, makes it part
+  # of the commit the session starts FROM rather than a change the session
+  # made, so the real question -- did the AGENT touch a locked path -- stays
+  # answerable. If git is unavailable or this is not a git checkout, there is
+  # nothing to commit against and the working-tree write still stands (and is
+  # still picked up by the baseline manifest a few lines later in
+  # `squad_policy_harden`).
+  if command -v git >/dev/null 2>&1 && git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
+    if ! git -C "$repo_dir" diff --quiet -- .squad/memory/config.json 2>/dev/null \
+        || ! git -C "$repo_dir" ls-files --error-unmatch .squad/memory/config.json >/dev/null 2>&1; then
+      git -C "$repo_dir" add -- .squad/memory/config.json 2>/dev/null || true
+      if ! git -C "$repo_dir" diff --cached --quiet -- .squad/memory/config.json 2>/dev/null; then
+        git -C "$repo_dir" -c user.name="${GIT_AUTHOR_NAME:-squad-policy}" \
+            -c user.email="${GIT_AUTHOR_EMAIL:-squad-policy@local}" \
+            commit -m "chore(governance): pin audit.jsonl rotation off for this session (#113)" \
+            -- .squad/memory/config.json >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+  return 0
+}
+
 squad_policy_harden() {
   local repo_dir="$1"
   local state path target
@@ -387,6 +590,11 @@ squad_policy_harden() {
   if ! command -v sha256sum >/dev/null 2>&1; then
     squad_policy_abort "sha256sum is not available, so governance integrity cannot be recorded."
   fi
+  if ! command -v node >/dev/null 2>&1; then
+    squad_policy_abort "node is not available, so the audit-rotation pin cannot be applied."
+  fi
+
+  squad_policy_pin_memory_audit_config "$repo_dir"
 
   state="$(squad_policy_state_dir "$repo_dir")" || \
     squad_policy_abort "Could not create a private policy state directory outside the checkout."
@@ -401,7 +609,8 @@ squad_policy_harden() {
   ( cd "$repo_dir" && git rev-parse HEAD 2>/dev/null ) >"${state}/base-commit" || true
 
   SQUAD_POLICY_HARDENED_PATHS=()
-  while IFS= read -r path; do
+  squad_policy_load_governance_paths
+  for path in "${SQUAD_POLICY_GOVERNANCE_PATHS[@]:-}"; do
     [[ -n "$path" ]] || continue
     target="${repo_dir}/${path}"
     [[ -e "$target" ]] || continue
@@ -409,18 +618,19 @@ squad_policy_harden() {
       squad_policy_abort "Could not make governance path '${path}' read-only."
     fi
     SQUAD_POLICY_HARDENED_PATHS+=("$path")
-  done < <(node "$SQUAD_POLICY_RESOLVER" governance-paths)
+  done
 
   # SECOND PASS, and the ordering is the control. The recursive lock above has
   # already frozen every governance directory; this puts the owner write bit
-  # back on the append-only FILES only. `chmod` on a file requires ownership,
-  # not write permission on its parent, so an unlocked `history.md` can sit
-  # inside a directory that still refuses `creat()` and `unlink()`. Doing it the
-  # other way round -- excluding the path from the recursive `chmod` -- would
-  # not express that, because the exclusion would have to be a directory to
-  # allow the file to be created, and a writable directory is a writable
-  # directory.
+  # back on the append-only and reported-mutable FILES only. `chmod` on a file
+  # requires ownership, not write permission on its parent, so an unlocked file
+  # can sit inside a directory that still refuses `creat()` and `unlink()`.
+  # Doing it the other way round -- excluding the path from the recursive
+  # `chmod` -- would not express that, because the exclusion would have to be a
+  # directory to allow the file to be created, and a writable directory is a
+  # writable directory.
   SQUAD_POLICY_UNLOCKED_FILES=()
+  SQUAD_POLICY_REPORTED_MUTABLE_FILES=()
   local file rel
   for path in "${SQUAD_POLICY_HARDENED_PATHS[@]:-}"; do
     [[ -n "$path" ]] || continue
@@ -428,18 +638,26 @@ squad_policy_harden() {
     if [[ -d "$target" ]]; then
       while IFS= read -r -d '' file; do
         rel="${file#"${repo_dir}/"}"
-        squad_policy_is_mutable "$rel" || continue
+        squad_policy_is_unlockable "$rel" || continue
         if ! chmod u+w "$file" 2>/dev/null; then
-          squad_policy_abort "Could not restore append access to '${rel}'."
+          squad_policy_abort "Could not restore write access to '${rel}'."
         fi
-        SQUAD_POLICY_UNLOCKED_FILES+=("$rel")
+        if squad_policy_is_mutable "$rel"; then
+          SQUAD_POLICY_UNLOCKED_FILES+=("$rel")
+        else
+          SQUAD_POLICY_REPORTED_MUTABLE_FILES+=("$rel")
+        fi
       done < <(find "$target" -type f -print0 2>/dev/null | sort -z)
     else
-      squad_policy_is_mutable "$path" || continue
+      squad_policy_is_unlockable "$path" || continue
       if ! chmod u+w "$target" 2>/dev/null; then
-        squad_policy_abort "Could not restore append access to '${path}'."
+        squad_policy_abort "Could not restore write access to '${path}'."
       fi
-      SQUAD_POLICY_UNLOCKED_FILES+=("$path")
+      if squad_policy_is_mutable "$path"; then
+        SQUAD_POLICY_UNLOCKED_FILES+=("$path")
+      else
+        SQUAD_POLICY_REPORTED_MUTABLE_FILES+=("$path")
+      fi
     fi
   done
 
@@ -450,6 +668,10 @@ squad_policy_harden() {
   fi
   if [[ "${#SQUAD_POLICY_UNLOCKED_FILES[@]}" -gt 0 ]]; then
     squad_policy_log "Append-only exception (work log, not policy; still integrity-checked): ${SQUAD_POLICY_UNLOCKED_FILES[*]}"
+    squad_policy_log "  Their containing directories stay locked, so no file can be created or deleted beside them."
+  fi
+  if [[ "${#SQUAD_POLICY_REPORTED_MUTABLE_FILES[@]}" -gt 0 ]]; then
+    squad_policy_log "Reported-mutable exception (Squad 0.13 runtime state; writable this session, changes listed in the governance report and the PR body): ${SQUAD_POLICY_REPORTED_MUTABLE_FILES[*]}"
     squad_policy_log "  Their containing directories stay locked, so no file can be created or deleted beside them."
   fi
   squad_policy_log "Governance baseline recorded at ${state}/governance.sha256"
@@ -472,11 +694,17 @@ squad_policy_harden() {
 #      than silently allowed;
 #   c. nothing under a governance path may differ between the base commit and
 #      the working tree, except an append-only path, whose committed form is
-#      prefix-checked the same way.
+#      prefix-checked the same way, or a reported-mutable path, which may
+#      differ freely (d).
+#   d. every `reported` line (Issue #113: casting/*.json, identity/now.md) may
+#      change arbitrarily -- rewritten, recreated, or removed -- and is never a
+#      violation; a difference is collected into SQUAD_POLICY_REPORTED_CHANGES
+#      for the governance report and the PR body.
 squad_policy_verify() {
   local repo_dir="$1"
   local state="$SQUAD_POLICY_STATE_DIR"
-  local baseline current violated=0 appended=0
+  local baseline current violated=0 appended=0 reported_count=0
+  SQUAD_POLICY_REPORTED_CHANGES=()
 
   if [[ -z "$state" || ! -d "$state" ]]; then
     squad_policy_abort "The governance baseline is missing; this session cannot be verified."
@@ -492,12 +720,19 @@ squad_policy_verify() {
   fi
 
   # --- (a) the immutable half -----------------------------------------------
-  # `append-only` lines are held out of this comparison ON PURPOSE and checked
-  # by (b) instead. They are NOT dropped from the manifest: an operator reading
-  # either file still sees the path, its hash and its length, which is what
-  # makes "this was expected to change" reviewable rather than invisible.
-  grep -v '^append-only ' "$baseline" >"${state}/governance.locked.baseline" 2>/dev/null || true
-  grep -v '^append-only ' "$current"  >"${state}/governance.locked.now" 2>/dev/null || true
+  # Append-only and reported-mutable PATHS are held out of this comparison ON
+  # PURPOSE and checked by (b)/(d) instead. This filters by PATH, not by the
+  # line's literal kind word: a deleted append-only or reported-mutable file
+  # manifests as an `absent` line on the side where it is missing, not an
+  # `append-only`/`reported` line, and a kind-only filter would let that
+  # `absent` line slip through as an apparent locked-path change -- which is
+  # exactly backwards for the reported-mutable class, where a deletion is
+  # supposed to be PERMITTED, not flagged here and then separately excused.
+  # Neither manifest is dropped wholesale: an operator reading either file
+  # still sees the path and its hash, which is what makes "this was expected
+  # to change" reviewable rather than invisible.
+  squad_policy_filter_locked_lines "$baseline" "${state}/governance.locked.baseline"
+  squad_policy_filter_locked_lines "$current"  "${state}/governance.locked.now"
   if ! diff -u "${state}/governance.locked.baseline" "${state}/governance.locked.now" >"${state}/governance.diff" 2>&1; then
     violated=1
     squad_policy_log "GOVERNANCE VIOLATION: a protected path changed during this session."
@@ -544,6 +779,44 @@ squad_policy_verify() {
     fi
   done <"$current"
 
+  # --- (d) the reported-mutable half ----------------------------------------
+  # Issue #113: casting/*.json and identity/now.md are runtime state Squad 0.13
+  # legitimately rewrites. Unlike append-only, ANY difference is permitted --
+  # rewritten, recreated, or removed -- so this loop never sets `violated`. It
+  # exists purely to COLLECT what changed, so the change is visible in the
+  # session log and can be surfaced in the PR body (see
+  # squad_policy_reported_changes_report below), rather than silently allowed.
+  while read -r kind rel bsum; do
+    [[ "$kind" == "reported" ]] || continue
+    local now_sum
+    now_sum="$(awk -v P="$rel" '$1=="reported" && $2==P {print $3; exit}' "$current")"
+    if [[ -z "$now_sum" ]]; then
+      reported_count=$((reported_count + 1))
+      SQUAD_POLICY_REPORTED_CHANGES+=("${rel} (removed)")
+      squad_policy_log "Reported-mutable change (permitted): ${rel} was removed during this session."
+      continue
+    fi
+    if [[ "$now_sum" != "$bsum" ]]; then
+      reported_count=$((reported_count + 1))
+      SQUAD_POLICY_REPORTED_CHANGES+=("${rel} (modified)")
+      squad_policy_log "Reported-mutable change (permitted): ${rel} was modified during this session."
+    fi
+  done <"$baseline"
+
+  # The mirror of the append-only "new file" check above, but PERMITTED rather
+  # than a violation: a reported-mutable path that did not exist at hardening
+  # time and was created during the session (for example a fresh
+  # casting/registry.json) is exactly the kind of change this class exists to
+  # allow.
+  while read -r kind rel csum; do
+    [[ "$kind" == "reported" ]] || continue
+    if ! grep -q "^reported ${rel} " "$baseline" 2>/dev/null; then
+      reported_count=$((reported_count + 1))
+      SQUAD_POLICY_REPORTED_CHANGES+=("${rel} (created)")
+      squad_policy_log "Reported-mutable change (permitted): ${rel} was created during this session."
+    fi
+  done <"$current"
+
   # --- (c) committed changes -------------------------------------------------
   # A change that was committed rather than left in the working tree.
   # `git diff <base>` sees it even if the working tree hashes match the baseline
@@ -551,14 +824,20 @@ squad_policy_verify() {
   local base_commit
   base_commit="$(cat "${state}/base-commit" 2>/dev/null || true)"
   if [[ -n "$base_commit" ]]; then
-    local paths=() p committed committed_head violating=()
-    while IFS= read -r p; do
-      [[ -n "$p" ]] && paths+=("$p")
-    done < <(node "$SQUAD_POLICY_RESOLVER" governance-paths)
+    local p committed committed_head violating=()
+    squad_policy_load_governance_paths
+    local -a paths=("${SQUAD_POLICY_GOVERNANCE_PATHS[@]:-}")
     committed="$(cd "$repo_dir" && git diff --name-only "$base_commit" -- "${paths[@]}" 2>/dev/null || true)"
     while IFS= read -r p; do
       [[ -n "$p" ]] || continue
       squad_policy_is_mutable "$p" && continue
+      # A committed change to a reported-mutable path is already captured by
+      # the hash-based detector (d) above (it compares the CURRENT working-tree
+      # file, which reflects a committed change unless the agent also reverted
+      # the working tree afterward -- see the KNOWN GAP note below). It must
+      # not ALSO be flagged as a hard violation here, or "changes allowed"
+      # would not actually mean allowed for a committed casting update.
+      squad_policy_is_reported_mutable "$p" && continue
       violating+=("$p")
     done <<<"$committed"
     if [[ "${#violating[@]}" -gt 0 ]]; then
@@ -613,10 +892,37 @@ squad_policy_verify() {
     return 1
   fi
 
-  if [[ "$appended" -gt 0 ]]; then
-    squad_policy_log "Governance integrity verified: no protected path changed (${appended} permitted append-only work-log update(s), listed above)."
+  if [[ "$appended" -gt 0 || "$reported_count" -gt 0 ]]; then
+    local extras=()
+    if [[ "$appended" -gt 0 ]]; then
+      extras+=("${appended} permitted append-only work-log update(s), listed above")
+    fi
+    if [[ "$reported_count" -gt 0 ]]; then
+      extras+=("${reported_count} permitted reported-mutable change(s), listed above")
+    fi
+    local extras_joined
+    extras_joined="$(IFS='; '; echo "${extras[*]}")"
+    squad_policy_log "Governance integrity verified: no protected path changed (${extras_joined})."
   else
     squad_policy_log "Governance integrity verified: no protected path changed."
   fi
   return 0
+}
+
+# Issue #113: a multi-line markdown fragment summarising this session's
+# REPORTED_CHANGES (casting/*.json, identity/now.md), for appending to the
+# pull request body. Empty output (nothing printed, nothing returned) when
+# squad_policy_verify found no reported-mutable change -- entrypoint.sh appends
+# this unconditionally, and an empty addendum must not alter the PR body at
+# all.
+squad_policy_reported_changes_report() {
+  if [[ "${#SQUAD_POLICY_REPORTED_CHANGES[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  printf '\n\n## Reported-mutable governance changes\n\n'
+  printf 'Squad 0.13 runtime state this session legitimately rewrote (casting state and `identity/now.md`). These are ALLOWED, not governance violations -- listed here for visibility:\n\n'
+  local c
+  for c in "${SQUAD_POLICY_REPORTED_CHANGES[@]}"; do
+    printf -- '- %s\n' "$c"
+  done
 }

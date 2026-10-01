@@ -251,6 +251,14 @@ for p in ".squad/policies" ".squad/agents" ".squad/identity" ".squad/config.json
 done
 assert_contains "$gov" ".squad/memory/audit.jsonl"        "audit state is protected"
 assert_contains "$gov" ".squad/fact-checker/audit-trail.md" "approval/audit trail state is protected"
+# Issue #113: casting/registry.json and casting/history.json are tracked
+# (protected) alongside casting/policy.json now, not left as an untracked blind
+# spot. "Protected" here means IN THE MANIFEST -- whether a given path then
+# stays locked or is classified reported-mutable is what classify-governance-path
+# answers, in section 6c below.
+assert_contains "$gov" ".squad/casting/policy.json"       "casting/policy.json is protected"
+assert_contains "$gov" ".squad/casting/registry.json"     "casting/registry.json is protected (new, Issue #113)"
+assert_contains "$gov" ".squad/casting/history.json"      "casting/history.json is protected (new, Issue #113)"
 
 # Identical in both tiers: an attended run is not licensed to rewrite the
 # policies that govern it either. If that ever diverges it must be a deliberate,
@@ -269,10 +277,30 @@ assert_eq "$(policy prompt local-cli '' aca-job governance-paths)" "$gov" \
 echo "-- append-only exclusion --"
 
 pat="$(policy ralph ralph '' aca-job mutable-governance-patterns)"
-assert_eq "^\\.squad/agents/[^/]+/history\\.md\$" "$pat" \
-  "the resolver publishes exactly one, fully anchored, append-only pattern"
+# Issue #113: `.squad/memory/audit.jsonl` joins history.md as a SECOND
+# append-only pattern -- the resolver now publishes two lines, not one, and an
+# exact-match assertion against the old single-pattern string must be updated
+# alongside the resolver or it is just restating the old answer.
+expected_pat="$(printf '^\\.squad/agents/[^/]+/history\\.md$\n^\\.squad/memory/audit\\.jsonl$')"
+assert_eq "$expected_pat" "$pat" \
+  "the resolver publishes exactly the two, fully anchored, append-only patterns"
 assert_eq "$(policy prompt local-cli '' aca-job mutable-governance-patterns)" "$pat" \
   "the append-only exclusion is identical for attended and autonomous runs"
+
+# ---------------------------------------------------------------------------
+# 6c. Issue #113 — the reported-mutable class
+# ---------------------------------------------------------------------------
+# casting/*.json and identity/now.md are a THIRD class, distinct from both
+# locked and append-only: freely rewritable, never a violation, but still
+# tracked (see governance-paths assertions above) and still reported.
+echo "-- reported-mutable class (Issue #113) --"
+
+rpat="$(policy ralph ralph '' aca-job reported-mutable-governance-patterns)"
+expected_rpat="$(printf '^\\.squad/identity/now\\.md$\n^\\.squad/casting/policy\\.json$\n^\\.squad/casting/registry\\.json$\n^\\.squad/casting/history\\.json$')"
+assert_eq "$expected_rpat" "$rpat" \
+  "the resolver publishes exactly the four reported-mutable patterns"
+assert_eq "$(policy prompt local-cli '' aca-job reported-mutable-governance-patterns)" "$rpat" \
+  "the reported-mutable set is identical for attended and autonomous runs"
 
 classify_path() {
   policy ralph ralph '' aca-job classify-governance-path "$1"
@@ -293,6 +321,27 @@ do
 done
 assert_eq "78" "$(policy_status ralph ralph '' aca-job classify-governance-path '')" \
   "classifying an empty path exits 78 rather than answering for it"
+
+# Issue #113: the three-way classification across all three classes, plus an
+# unrecognised path. (f) from the issue -- this resolver is the single source
+# of truth both squad-policy.sh and scripts/validate.ps1 consume, so if this is
+# wrong, both downstream consumers are wrong the same way.
+assert_eq "append-only"      "$(classify_path '.squad/memory/audit.jsonl')" \
+  "the audit trail classifies as append-only (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/casting/policy.json')" \
+  "casting/policy.json classifies as reported-mutable (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/casting/registry.json')" \
+  "casting/registry.json classifies as reported-mutable (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/casting/history.json')" \
+  "casting/history.json classifies as reported-mutable (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/identity/now.md')" \
+  "identity/now.md classifies as reported-mutable (Issue #113)"
+assert_eq "locked"           "$(classify_path '.squad/identity/mission.md')" \
+  "the REST of identity/ stays locked -- now.md is a narrow carve-out, not a blanket unlock"
+assert_eq "locked"           "$(classify_path '.squad/identity/identity.md')" \
+  "identity.md (what/who the team is) stays locked, unlike now.md (what it's focused on)"
+assert_eq "locked"           "$(classify_path 'src/some/unknown/path.txt')" \
+  "an unrecognised, non-governance path classifies as locked -- fail closed, not 'uncovered'"
 
 # ---------------------------------------------------------------------------
 # 7. Determinism

@@ -22,7 +22,24 @@ set -uo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKER_DIR="$(cd "${TEST_DIR}/.." && pwd)"
 LIB="${WORKER_DIR}/lib/squad-policy.sh"
-TEST_TMP_ROOT="${TEST_DIR}/.tmp-governance-guard"
+# Issue #113 hygiene: scratch state lives OUTSIDE the repo (mktemp -d, same as
+# test_push.sh), not under worker/tests/. A previous run of this suite left
+# worker/tests/.tmp-governance-guard/ behind uncommitted and ungitignored
+# because a prior session ended mid-task before its EXIT trap could fire; a
+# path under worker/tests/ is one `rm -rf` away from being swept into a commit
+# by accident. mktemp -d has no such failure mode: nothing this suite creates
+# is ever inside the git worktree to begin with.
+TEST_TMP_ROOT="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/squad-governance-guard-test.XXXXXXXXXXXX")" || {
+  echo "FAIL: could not create a private work directory"
+  exit 1
+}
+# chmod -R u+w first: the suite deliberately leaves read-only trees behind on a
+# failing path, and rm would otherwise be unable to clean them up. EXIT INT
+# TERM (not EXIT alone, matching test_push.sh) so an interrupted run, or the
+# root-skip exit below, still cleans the scratch directory up instead of
+# leaving it behind. Set immediately after mktemp, before anything else can
+# exit early, so there is no window where TEST_TMP_ROOT exists but is unguarded.
+trap 'chmod -R u+w "$TEST_TMP_ROOT" 2>/dev/null; rm -rf "$TEST_TMP_ROOT"' EXIT INT TERM
 
 # shellcheck source=lib/assert.sh
 source "${TEST_DIR}/lib/assert.sh"
@@ -41,12 +58,6 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 77
 fi
 
-rm -rf "$TEST_TMP_ROOT"
-mkdir -p "$TEST_TMP_ROOT"
-# chmod -R u+w first: the suite deliberately leaves read-only trees behind on a
-# failing path, and rm would otherwise be unable to clean them up.
-trap 'chmod -R u+w "$TEST_TMP_ROOT" 2>/dev/null; rm -rf "$TEST_TMP_ROOT"' EXIT
-
 export GIT_CONFIG_GLOBAL="${TEST_TMP_ROOT}/gitconfig"
 export GIT_CONFIG_SYSTEM=/dev/null
 export GIT_AUTHOR_NAME="Test" GIT_AUTHOR_EMAIL="test@example.com"
@@ -57,28 +68,60 @@ git config --global user.email "test@example.com" >/dev/null 2>&1 || true
 
 # Every governance path PRD #6 names, plus the audit/approval state. These stay
 # LOCKED: nothing in this list may be written, appended to, created or deleted.
+#
+# Issue #113: `.squad/identity/mission.md` is here specifically to prove the
+# identity/now.md narrowing (see REPORTED_MUTABLE_FILES below) did NOT become a
+# blanket unlock of `.squad/identity/` -- every OTHER file under identity/
+# must stay exactly as locked as it always was.
 GOVERNANCE_FILES=(
   ".squad/policies/security.md"
   ".squad/agents/security/charter.md"
   ".squad/identity/identity.md"
+  ".squad/identity/mission.md"
   ".squad/config.json"
   ".squad/routing.md"
-  ".squad/memory/audit.jsonl"
   ".squad/fact-checker/audit-trail.md"
   ".squad/rai/audit-trail.md"
 )
 
-# The ONE narrow exclusion. `.squad/agents/<name>/history.md` is an append-only
-# WORK LOG, not policy: it records what an agent did and grants it nothing.
-# Locking it prevented no escalation and destroyed the audit trail PRD #6 asks
-# for, so it is excluded from the write lock and held to an append-only
-# integrity rule instead. `charter.md` in the SAME DIRECTORY stays locked —
-# a charter defines what an agent is permitted to do, which is governance.
+# The narrow exclusion for append-only work logs / audit trails.
+# `.squad/agents/<name>/history.md` is an append-only WORK LOG, not policy: it
+# records what an agent did and grants it nothing. Locking it prevented no
+# escalation and destroyed the audit trail PRD #6 asks for, so it is excluded
+# from the write lock and held to an append-only integrity rule instead.
+# `charter.md` in the SAME DIRECTORY stays locked — a charter defines what an
+# agent is permitted to do, which is governance.
+#
+# Issue #113: `.squad/memory/audit.jsonl` joins this list for the identical
+# reason -- `MemoryManager.audit()` (squad-sdk) only ever appends a JSON line
+# to it. It used to sit in GOVERNANCE_FILES above (plain LOCKED), which is now
+# WRONG: Squad 0.13.1 writes to it during a normal session, and a locked file
+# cannot be written at all. See squad_policy_pin_memory_audit_config in
+# worker/lib/squad-policy.sh for how the one way this file's append-only rule
+# could be violated without an agent touching it -- squad-sdk's own rotation
+# -- is made impossible for the session, rather than merely detected.
 APPEND_ONLY_FILES=(
   ".squad/agents/security/history.md"
+  ".squad/memory/audit.jsonl"
 )
 
-ALL_FIXTURE_FILES=("${GOVERNANCE_FILES[@]}" "${APPEND_ONLY_FILES[@]}")
+# Issue #113: a NEW class, distinct from both of the above. Squad 0.13.1
+# legitimately REWRITES these as runtime state (upstream fixes #1876/#1898 for
+# casting/*.json; `identity/now.md` is squad-sdk's own mutable-state-tool
+# allowlist entry for "what the team is focused on right now"). A prefix-hash
+# append-only rule is the wrong rule for a file that gets rewritten wholesale,
+# not appended to -- so this class is writable all session, and ANY change
+# (create, modify, or even remove) is PERMITTED, not blocked. It is not
+# invisible, though: every change is collected and surfaced in the governance
+# report and the PR body (squad_policy_reported_changes_report).
+REPORTED_MUTABLE_FILES=(
+  ".squad/casting/policy.json"
+  ".squad/casting/registry.json"
+  ".squad/casting/history.json"
+  ".squad/identity/now.md"
+)
+
+ALL_FIXTURE_FILES=("${GOVERNANCE_FILES[@]}" "${APPEND_ONLY_FILES[@]}" "${REPORTED_MUTABLE_FILES[@]}")
 
 make_repo() {
   local repo="$1" f
@@ -236,6 +279,19 @@ assert_eq "locked"      "$(classify '.squad/agents/security/history.md.bak')" "a
 assert_eq "locked"      "$(classify '.squad/policies/history.md')"        "history.md outside .squad/agents is NOT excluded"
 assert_eq "locked"      "$(classify '.squad/identity/identity.md')"       "an unrelated governance file is locked"
 
+# Issue #113: the resolver's three-way classification, one representative path
+# per class plus an unrecognised path. This is (f) from the issue -- the
+# single source of truth (worker/lib/agent-policy.js) is what both
+# squad-policy.sh and scripts/validate.ps1 consume, so if THIS is wrong,
+# everything downstream is wrong the same way.
+assert_eq "append-only"       "$(classify '.squad/memory/audit.jsonl')"        "the resolver classifies the audit trail as append-only"
+assert_eq "reported-mutable"  "$(classify '.squad/casting/policy.json')"       "the resolver classifies casting/policy.json as reported-mutable"
+assert_eq "reported-mutable"  "$(classify '.squad/casting/registry.json')"     "the resolver classifies casting/registry.json as reported-mutable"
+assert_eq "reported-mutable"  "$(classify '.squad/casting/history.json')"      "the resolver classifies casting/history.json as reported-mutable"
+assert_eq "reported-mutable"  "$(classify '.squad/identity/now.md')"           "the resolver classifies identity/now.md as reported-mutable"
+assert_eq "locked"            "$(classify '.squad/identity/mission.md')"      "the resolver keeps the REST of identity/ locked, not just identity.md"
+assert_eq "locked"            "$(classify 'src/some/unknown/path.txt')"       "an unknown, non-governance path classifies as locked (fail closed, not 'uncovered')"
+
 # ---------------------------------------------------------------------------
 # 2. DETECTIVE — a governance change fails the session
 # ---------------------------------------------------------------------------
@@ -245,7 +301,7 @@ assert_eq "locked"      "$(classify '.squad/identity/identity.md')"       "an un
 # agent that defeated the preventive layer — and asserts the verdict still comes.
 echo "-- detective: a defeated preventive layer is still caught --"
 
-for target in ".squad/policies/security.md" ".squad/agents/security/charter.md" ".squad/identity/identity.md" ".squad/config.json" ".squad/routing.md" ".squad/memory/audit.jsonl"; do
+for target in ".squad/policies/security.md" ".squad/agents/security/charter.md" ".squad/identity/identity.md" ".squad/identity/mission.md" ".squad/config.json" ".squad/routing.md"; do
   REPO="${TEST_TMP_ROOT}/repo-detect"
   STATE="${TEST_TMP_ROOT}/state-detect"
   rm -rf "$STATE"
@@ -445,6 +501,162 @@ assert_contains "$(cat "${STATE}/governance.sha256" 2>/dev/null)" "append-only .
   "the baseline records the excluded path under an 'append-only' rule instead of dropping it"
 assert_contains "$(cat "${STATE}/governance.sha256" 2>/dev/null)" "file .squad/agents/security/charter.md" \
   "the baseline still pins charter.md as immutable"
+
+# ---------------------------------------------------------------------------
+# 2c. Issue #113 — .squad/memory/audit.jsonl: append-only, rotation impossible
+# ---------------------------------------------------------------------------
+# The chosen design is PREVENTION, not detection: `squad_policy_harden` pins
+# `.squad/memory/config.json`'s `policy.auditMaxBytes` to 0 BEFORE the
+# baseline is recorded, which (verified against @bradygaster/squad-sdk@0.13.1,
+# dist/memory/index.js: `if (maxBytes <= 0) return;` in rotateAuditIfNeeded())
+# disables squad-sdk's own rotation entirely. So this section proves the pin
+# actually lands on disk, and that the append-only rule behaves exactly like
+# history.md's: append passes, truncate/rewrite/rename/delete all fail.
+echo "-- Issue #113: audit.jsonl is append-only, and rotation cannot happen --"
+
+# Issue #113 timing note: run-tests.sh (worker/tests/run-tests.sh) kills any
+# suite that has not finished within SQUAD_ACA_TEST_SUITE_TIMEOUT (120s
+# default). Each make_repo+harden(+verify) cycle is a handful of real `git`
+# and `node` process spawns -- cheap on Linux CI, not cheap under git-bash on
+# Windows. The pin-landed-on-disk check below used to be its own hardened
+# repo; it is folded into the SAME repo as the append check instead, because
+# squad_policy_harden already wrote both the pin and the baseline before the
+# append happens, so reading them here costs nothing extra. The three
+# genuinely distinct MUTATIONS (append / truncate / rename) still each get
+# their own hardened repo, because each needs its OWN untampered baseline.
+REPO="${TEST_TMP_ROOT}/repo-auditappend"; STATE="${TEST_TMP_ROOT}/state-auditappend"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  printf "{\"event\":\"audit\"}\n" >> "'"$REPO"'/.squad/memory/audit.jsonl"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$(cat "${REPO}/.squad/memory/config.json" 2>/dev/null)" '"auditMaxBytes": 0' \
+  "hardening pins .squad/memory/config.json policy.auditMaxBytes to 0"
+assert_contains "$(cat "${STATE}/governance.sha256" 2>/dev/null)" "append-only .squad/memory/audit.jsonl" \
+  "the baseline records audit.jsonl under the append-only rule, same as history.md"
+assert_contains "$out" "VERIFY_RC=0"               "an append to audit.jsonl PASSES verification"
+assert_not_contains "$out" "GOVERNANCE VIOLATION"  "appending to audit.jsonl is not reported as a violation"
+assert_contains "$out" "Agent history appended (permitted): .squad/memory/audit.jsonl" \
+  "the detector reports the audit.jsonl append the same way it reports a history.md append"
+
+# A truncate/overwrite — the same shape rotateAuditIfNeeded's rename would leave
+# the verifier looking at (a shorter or differently-prefixed file) — and a
+# rename/delete, the literal mechanics of rotateAuditIfNeeded() if the pin had
+# not disabled it, share ONE hardened repo: both are refusals checked against
+# the SAME original baseline, so the file is reset to its pristine content
+# between the two mutations rather than re-hardening a second repo for a
+# mutation that is, at the hash level, just a different way of not being an
+# append. This is the assertion that proves WHY prevention beats bare
+# detection: an un-pinned rotation's rename is refused exactly like any other
+# deletion, which means it would have hard-failed every session that crossed
+# the default 1 MiB threshold.
+REPO="${TEST_TMP_ROOT}/repo-audittrunc"; STATE="${TEST_TMP_ROOT}/state-audittrunc"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+original_audit="$(cat "${REPO}/.squad/memory/audit.jsonl")"
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  printf "TAMPERED\n" > "'"$REPO"'/.squad/memory/audit.jsonl"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1"                "a TRUNCATE/overwrite of audit.jsonl is refused"
+assert_contains "$out" "REWRITTEN, not appended to"  "the refusal says the audit trail was rewritten, not appended to"
+
+# Reset to the baseline's exact bytes (write access to the file itself was
+# never revoked -- only its containing directory is locked -- so this needs
+# no chmod) before the second, independent mutation against the same baseline.
+printf '%s' "$original_audit" > "${REPO}/.squad/memory/audit.jsonl"
+out="$(scenario "$REPO" "$STATE" '
+  chmod -R u+w "'"$REPO"'/.squad/memory"
+  mv "'"$REPO"'/.squad/memory/audit.jsonl" "'"$REPO"'/.squad/memory/audit.1.jsonl"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1"  "a RENAME/delete of audit.jsonl (what an un-pinned rotation would do) is refused"
+assert_contains "$out" "was DELETED"  "the refusal names it as the work log being deleted, same as history.md's deletion case"
+
+# ---------------------------------------------------------------------------
+# 2d. Issue #113 — the reported-mutable class: casting/*.json, identity/now.md
+# ---------------------------------------------------------------------------
+# Unlike append-only, ANY change here is permitted — Squad 0.13.1 REWRITES
+# these, it does not append to them. The behavioural proof is therefore the
+# opposite shape from the sections above: verification must PASS no matter
+# what changed, and the change must show up in both the governance log and
+# the markdown fed to the PR body.
+echo "-- Issue #113: casting/*.json and identity/now.md are reported-mutable --"
+
+# All four reported-mutable paths rewritten in the SAME session, verified in
+# ONE call: this is exactly what the class permits (simultaneous unrelated
+# rewrites, no coordination required between them), and one hardened repo
+# proves it for all four at once instead of isolating each into its own
+# make_repo+harden+verify cycle (see the timing note in section 2c above).
+REPO="${TEST_TMP_ROOT}/repo-reported"; STATE="${TEST_TMP_ROOT}/state-reported"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  for rf in "${REPORTED_MUTABLE_FILES[@]}"; do
+    printf "{\"rewritten\": true}\n" > "'"$REPO"'/${rf}"
+  done
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+  squad_policy_reported_changes_report
+')"
+assert_contains "$out" "VERIFY_RC=0" \
+  "rewriting every reported-mutable path in the same session PASSES verification"
+assert_not_contains "$out" "GOVERNANCE VIOLATION" \
+  "none of the simultaneous reported-mutable rewrites is reported as a violation"
+assert_contains "$out" "## Reported-mutable governance changes" \
+  "the PR-body addendum heading appears once any reported-mutable path changed"
+for f in "${REPORTED_MUTABLE_FILES[@]}"; do
+  assert_contains "$out" "Reported-mutable change (permitted): ${f}" \
+    "${f}'s change is reported in the governance log"
+  assert_contains "$out" "- ${f} (modified)" \
+    "${f} appears, by name, in the text that gets appended to the PR body"
+done
+
+# A reported-mutable file REMOVED, and identity/now.md rewritten, in the SAME
+# session -- both permitted, both reported, combined for the same reason as
+# above. This repo also carries the narrowing proof the issue specifically
+# asks for: identity/mission.md (the REST of identity/) must stay refused even
+# though now.md, right beside it, changed freely and casting/ had a file
+# deleted out from under it. Deleting registry.json needs the casting/
+# directory's own write bit back (unlinking needs write on the PARENT, not
+# just the file) -- that chmod is scoped to .squad/casting ONLY, specifically
+# so it cannot also reopen .squad/identity and silently invalidate the
+# narrowing assertion below.
+REPO="${TEST_TMP_ROOT}/repo-reporteddel"; STATE="${TEST_TMP_ROOT}/state-reporteddel"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  chmod -R u+w "'"$REPO"'/.squad/casting"
+  rm -f "'"$REPO"'/.squad/casting/registry.json"
+  printf "focused on #113\n" > "'"$REPO"'/.squad/identity/now.md"
+  ( printf "TAMPERED\n" > "'"$REPO"'/.squad/identity/mission.md" ) 2>/dev/null
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=0" \
+  "deleting one reported-mutable file and rewriting another (now.md) in the same session PASSES verification"
+assert_contains "$out" "(permitted): .squad/casting/registry.json was removed" \
+  "the removal is reported, not treated as a violation"
+assert_contains "$out" "Reported-mutable change (permitted): .squad/identity/now.md" \
+  "the now.md rewrite is reported alongside the registry.json removal"
+assert_eq "original .squad/identity/mission.md" "$(cat "${REPO}/.squad/identity/mission.md" 2>/dev/null)" \
+  "identity/now.md writable, and casting/ defeated by chmod, does NOT make identity/mission.md writable — the attempted write never lands, same mode-bit lock as before"
+
+# A session that touches NO reported-mutable path must get an EMPTY addendum —
+# otherwise every PR body would carry a pointless empty section. This needs an
+# untouched baseline, so it keeps its own hardened repo.
+REPO="${TEST_TMP_ROOT}/repo-noreported"; STATE="${TEST_TMP_ROOT}/state-noreported"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  squad_policy_verify "'"$REPO"'" >/dev/null
+  squad_policy_reported_changes_report
+')"
+assert_eq "" "$out" "a session that changed no reported-mutable path gets no PR-body addendum at all"
 
 
 REPO="${TEST_TMP_ROOT}/repo-clean"; STATE="${TEST_TMP_ROOT}/state-clean"; rm -rf "$STATE"

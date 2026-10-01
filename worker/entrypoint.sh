@@ -601,7 +601,16 @@ commit_and_push_if_needed() {
     # at startup and an exported variable is frozen for the life of the shell.
     # Re-read the file into the environment immediately before the call.
     squad_credential_refresh_env || true
-    gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}" || true
+    # Issue #113: casting/*.json and identity/now.md are a NEW "reported-mutable"
+    # governance class -- changes are allowed (squad_policy_checkpoint above
+    # does not fail the session over them) but must be VISIBLE, not silently
+    # folded into "Created by Azure-hosted Squad session". squad_policy_verify
+    # (run by squad_policy_checkpoint) populates SQUAD_POLICY_REPORTED_CHANGES;
+    # the report function below is a no-op (empty string) when there were none,
+    # so a session that touched no reported-mutable path gets an unchanged body.
+    local pr_body="${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}"
+    pr_body+="$(squad_policy_reported_changes_report)"
+    gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "$pr_body" || true
   fi
 }
 
