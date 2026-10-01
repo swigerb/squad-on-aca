@@ -6,6 +6,12 @@
 
 Run Brady Gaster's Squad on Azure Container Apps (ACA): one isolated ACA job execution per Squad session, GitHub-hosted code and state, GitHub remote session access, and centralized Aspire telemetry.
 
+## See it in action
+
+https://github.com/user-attachments/assets/53e4b61f-a737-40c4-ac58-64729def4714
+
+A 3-minute tour: `squad-aca doctor`, a session dispatched to its own ACA job, the job locking itself down before the agent starts, approvals answered from [Squad Hub](https://github.com/swigerb/squad-hub) on the desktop and a phone, the security and observability story, the issue-label trigger, and the pull request that comes back.
+
 ## What you get
 
 | Capability | ACA implementation |
