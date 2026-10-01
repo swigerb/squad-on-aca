@@ -5552,6 +5552,46 @@ if (-not (Test-Path $imageLayoutSuite)) {
 }
 
 # ---------------------------------------------------------------------------
+# Version pins (issue #114)
+# ---------------------------------------------------------------------------
+# No assertion previously pinned these versions in this file at all -- the
+# bump from squad-cli 0.11.0 / squad-hub@0.4.1 could have silently drifted
+# again with nothing here to catch it. These checks read worker/Dockerfile
+# directly (the single source of truth for what gets installed) rather than
+# hard-coding an expected string independent of it, so they fail if the
+# Dockerfile's own pins regress, not merely if this file's copy goes stale.
+Write-Section "Version pins (issue #114)"
+
+if (-not (Test-Path $workerDockerfileLayout)) {
+    Add-Fail "worker/Dockerfile is missing; the version pins it would otherwise assert could not be checked"
+} else {
+    $dockerfileText = Get-Content -LiteralPath $workerDockerfileLayout -Raw
+
+    if ($dockerfileText -match 'ARG SQUAD_HUB_SPEC=squad-hub@0\.5\.0') {
+        Add-Pass "worker/Dockerfile's default SQUAD_HUB_SPEC is pinned to squad-hub@0.5.0"
+    } else {
+        Add-Fail "worker/Dockerfile's default SQUAD_HUB_SPEC is not pinned to squad-hub@0.5.0 (issue #114); it has drifted from the version this image was last verified against"
+    }
+
+    if ($dockerfileText -match '@bradygaster/squad-cli@0\.13\.1') {
+        Add-Pass "worker/Dockerfile installs @bradygaster/squad-cli@0.13.1"
+    } else {
+        Add-Fail "worker/Dockerfile does not install @bradygaster/squad-cli@0.13.1 (issue #114); it has drifted from the version this image was last verified against"
+    }
+
+    # The Copilot CLI pin is DELIBERATELY independent of the squad-cli/squad-hub
+    # bump above (see the Dockerfile's own comment on the npm install line) --
+    # this assertion exists so that a future squad-cli/squad-hub bump cannot
+    # accidentally also bump this pin without a fresh compatibility check, not
+    # to force it to change here.
+    if ($dockerfileText -match '@github/copilot@1\.0\.69-2') {
+        Add-Pass "worker/Dockerfile installs @github/copilot@1.0.69-2, unchanged by the squad-cli/squad-hub bump in issue #114"
+    } else {
+        Add-Fail "worker/Dockerfile does not install @github/copilot@1.0.69-2; this pin is independent of issue #114's squad-cli/squad-hub bump and should not have moved alongside it"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # The manifest-path decision is defined ONCE
 # (ADR 0003 finding 2 / future-work sprint 2)
 # ---------------------------------------------------------------------------
