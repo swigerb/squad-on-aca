@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# squad-agent
+#
+# Issue #112: the `--agent-cmd` wrapper that stops Squad's `watch` and `loop`
+# modes from ever running Copilot with `--yolo`.
+#
+# THE BUG THIS WORKS AROUND (verified by Brian against @bradygaster/squad-cli
+# 0.11.0 through 0.13.1, unchanged across every version in that range):
+# `buildAdditionalMcpConfigArgs()` in squad-cli's `copilot-invocation.ts`
+# returns `['--yolo', '--additional-mcp-config', '@<teamRoot>/.mcp.json']`
+# whenever the team root has a `.mcp.json` -- and `squad init` creates that
+# file, so every Squad repository has one. `watch` and `loop` both call that
+# function to build the Copilot command they spawn. There is no flag that
+# turns this off; the only way NOT to hit it is to not let Squad build the
+# command at all.
+#
+# THE FIX: `--agent-cmd` bypasses `buildAdditionalMcpConfigArgs()` entirely --
+# `buildCustomAgentCommand()` is a completely separate code path in squad-cli
+# that never calls it. worker/entrypoint.sh now passes
+# `--agent-cmd /usr/local/lib/squad-on-aca/squad-agent` to both `squad watch`
+# and `squad loop`, and this script is what actually runs in Copilot's place.
+#
+# WHY THIS SCRIPT TAKES NO TOKEN. The issue that motivated this fix describes
+# `--agent-cmd "<cmd> {prompt}"`, using the `{prompt}` substitution token
+# Squad 0.13 added. Brian verified directly (both Squad 0.11 and Squad 0.13)
+# that squad-cli does NOT do token substitution for a plain `--agent-cmd`
+# value AT ALL -- it always APPENDS `-p <prompt>` to whatever command string
+# was given, token or no token. A wrapper written to expect `{prompt}` as its
+# own argument would see a literal, un-substituted `{prompt}` string and a
+# second, real prompt arriving behind it -- two arguments where one was
+# expected, and the real prompt silently discarded. So this script is
+# registered with NO trailing token at all, and is written to accept whatever
+# Squad appends as ordinary trailing arguments ("$@"): today that is exactly
+# `-p <the prompt>`, and if a future Squad version appends something else,
+# this script still forwards it rather than silently losing it.
+#
+# WHAT THIS SCRIPT DOES, IN ORDER:
+#   1. Reads the session's resolved Copilot policy argv from
+#      SQUAD_AGENT_POLICY_ARGV_JSON (a JSON array of strings), which
+#      worker/entrypoint.sh exports before it ever invokes `squad watch` or
+#      `squad loop`. This script does NOT re-derive policy independently --
+#      worker/lib/agent-policy.js is still the one place that decides it, and
+#      re-deriving it a second way here would be exactly the kind of drift
+#      PRD #6 and agent-policy.js's own header both warn about.
+#   2. Fails closed (exit 78, this repo's policy-failure code) if that
+#      variable is missing, empty, not valid JSON, or not a JSON array of
+#      strings.
+#   3. Adds `--additional-mcp-config @<repo>/.mcp.json` itself, WITHOUT
+#      `--yolo`, if `.mcp.json` exists in the repo -- so `squad_state_*` MCP
+#      tools keep working on this path. `<repo>` comes from
+#      SQUAD_AGENT_REPO_DIR, which worker/entrypoint.sh sets to the same
+#      `$REPO_DIR` every other mode clones into, rather than this script
+#      re-deriving a workspace path from its own idea of where things live.
+#   4. Re-checks, as a last gate before `copilot` is exec'd, that neither the
+#      resolved policy argv nor the arguments Squad appended ("$@") carry a
+#      permission-widening flag. This is defence in depth, not the primary
+#      control -- agent-policy.js's own `validateExtraFlags` is -- but this
+#      script is the last place in the process that could still let a
+#      widened argv through to `copilot`, so it checks anyway.
+#   5. `exec`s `copilot` with the combined argv. `exec` so this script is
+#      REPLACED by the copilot process (same reason worker/entrypoint.sh's own
+#      identity-drop uses `exec runuser`): no wrapper process survives to be a
+#      second thing watch/loop have to manage or that could swallow a signal
+#      meant for copilot.
+#
+# PARITY VS STRICT (issue #112's `undeliverableViaSquad` gap). Before this
+# fix, `watch`/`loop` passed the resolved policy through `squad
+# --copilot-flags <string>`, which squad-cli word-splits on whitespace before
+# handing it to `copilot` -- so a multi-word deny pattern such as
+# `shell(git push)` or `shell(gh pr)` was silently torn into two tokens and
+# stopped being a deny rule (see agent-policy.js's `squadFlags` /
+# `undeliverableViaSquad`). This script execs `copilot` directly, so that
+# whitespace-splitting problem does not apply here -- both the parity subset
+# and the full set are equally deliverable now. But watch agents legitimately
+# push and open PRs TODAY under the parity behaviour, so closing that gap by
+# default would be a silent tightening that could break an unattended watcher
+# with no warning. SQUAD_AGENT_POLICY_ARGV_JSON is therefore populated by
+# worker/entrypoint.sh from whichever of agent-policy.js's
+# `watchAgentParityArgv` / `watchAgentStrictArgv` fields
+# SQUAD_WATCH_STRICT_POLICY selects -- this script does not choose; it execs
+# whatever argv it was handed, parity or strict, verbatim, because the opt-in
+# decision belongs in the one place (agent-policy.js) that already owns every
+# other policy decision.
+#
+# EXIT CODES:
+#   78  EX_CONFIG -- the policy argv could not be resolved, or was found to
+#       contain a permission-widening flag. Mirrors
+#       worker/lib/squad-policy.sh's squad_policy_abort.
+#   Anything else -- whatever `copilot` itself exits with, via `exec`.
+#
+# Environment:
+#   SQUAD_AGENT_POLICY_ARGV_JSON   required. JSON array of strings: the
+#                                  resolved Copilot policy argv for this
+#                                  session, from
+#                                  `node agent-policy.js watch-agent-argv-json`.
+#   SQUAD_AGENT_REPO_DIR           optional. Repository root to look for
+#                                  `.mcp.json` in. If unset or the file is
+#                                  absent, no `--additional-mcp-config` is
+#                                  added -- that is a feature gap (squad_state_*
+#                                  tools unavailable), not a security failure,
+#                                  so it does not abort the session.
+
+set -Eeuo pipefail
+
+squad_agent_log() {
+  printf '[squad-agent] %s\n' "$*" >&2
+}
+
+squad_agent_abort() {
+  squad_agent_log "$@"
+  squad_agent_log "Refusing to exec copilot. A session whose policy cannot be resolved, or whose argv was found to be widened past what agent-policy.js resolved, must not run with blanket allow."
+  exit 78
+}
+
+if ! command -v node >/dev/null 2>&1; then
+  squad_agent_abort "node is not available, so SQUAD_AGENT_POLICY_ARGV_JSON cannot be parsed."
+fi
+
+if ! command -v copilot >/dev/null 2>&1; then
+  squad_agent_abort "copilot is not on PATH."
+fi
+
+POLICY_ARGV_JSON="${SQUAD_AGENT_POLICY_ARGV_JSON:-}"
+if [[ -z "$POLICY_ARGV_JSON" ]]; then
+  squad_agent_abort "SQUAD_AGENT_POLICY_ARGV_JSON is missing or empty. worker/entrypoint.sh must export it (from 'node agent-policy.js watch-agent-argv-json') before invoking 'squad watch'/'squad loop' with --agent-cmd pointed at this script."
+fi
+
+# Parsed with node, not hand-rolled shell JSON parsing. The multi-word deny
+# patterns this whole fix exists to carry intact (`shell(git push)`) are
+# exactly the kind of value a sh/bash JSON "parser" built out of sed and case
+# statements gets wrong silently -- node is already a hard dependency of this
+# image (agent-policy.js requires it to run at all), so reaching for it here
+# is the most honest parser available, not an additional one.
+policy_tokens_raw=""
+if ! policy_tokens_raw="$(POLICY_JSON="$POLICY_ARGV_JSON" node -e '
+const raw = process.env.POLICY_JSON;
+let parsed;
+try {
+  parsed = JSON.parse(raw);
+} catch (e) {
+  process.stderr.write("squad-agent: SQUAD_AGENT_POLICY_ARGV_JSON is not valid JSON: " + e.message + "\n");
+  process.exit(78);
+}
+if (!Array.isArray(parsed)) {
+  process.stderr.write("squad-agent: SQUAD_AGENT_POLICY_ARGV_JSON must be a JSON array, got " + typeof parsed + ".\n");
+  process.exit(78);
+}
+if (parsed.length === 0) {
+  process.stderr.write("squad-agent: SQUAD_AGENT_POLICY_ARGV_JSON resolved to an empty argv.\n");
+  process.exit(78);
+}
+if (parsed.some((t) => typeof t !== "string")) {
+  process.stderr.write("squad-agent: SQUAD_AGENT_POLICY_ARGV_JSON must be an array of strings only.\n");
+  process.exit(78);
+}
+process.stdout.write(parsed.join("\n"));
+')"; then
+  squad_agent_abort "SQUAD_AGENT_POLICY_ARGV_JSON could not be parsed (see the diagnostic above)."
+fi
+
+# One token per line -> a real bash array, so a multi-word deny pattern stays
+# ONE argv element instead of being re-split on whitespace -- the exact bug
+# `--copilot-flags` has (see agent-policy.js's `squadFlags` comment). Mirrors
+# worker/lib/squad-policy.sh's `squad_policy_resolve` reading of `... argv`.
+POLICY_ARGV=()
+while IFS= read -r token; do
+  [[ -n "$token" ]] && POLICY_ARGV+=("$token")
+done <<< "$policy_tokens_raw"
+
+if [[ "${#POLICY_ARGV[@]}" -eq 0 ]]; then
+  squad_agent_abort "SQUAD_AGENT_POLICY_ARGV_JSON parsed to zero usable tokens."
+fi
+
+# `--additional-mcp-config @<repo>/.mcp.json`, WITHOUT `--yolo` -- this is the
+# whole point of issue #112. `<repo>` is the SAME directory
+# worker/entrypoint.sh clones into for every mode ($REPO_DIR), passed in
+# explicitly rather than this script guessing a workspace path from $PWD or
+# $WORKDIR, so there is exactly one place that decides where the repo lives.
+MCP_ARGV=()
+REPO_DIR="${SQUAD_AGENT_REPO_DIR:-}"
+if [[ -n "$REPO_DIR" && -f "${REPO_DIR}/.mcp.json" ]]; then
+  MCP_ARGV=(--additional-mcp-config "@${REPO_DIR}/.mcp.json")
+fi
+
+# Defence in depth -- the primary control is agent-policy.js's own
+# `validateExtraFlags`/`FORBIDDEN_EXTRA_FLAGS`, which is what SHOULD stop a
+# widened policy from ever reaching SQUAD_AGENT_POLICY_ARGV_JSON in the first
+# place. This script is simply the LAST point before `copilot` is exec'd, so it
+# checks again rather than trusting that nothing upstream regressed.
+#
+# `--allow-all-tools` is deliberately NOT on the resolved-argv forbidden list
+# below. agent-policy.js's resolvePolicy() ALWAYS includes it -- the Copilot
+# CLI documents it as "required for non-interactive mode", and the resolver's
+# own FORBIDDEN_EXTRA_FLAGS (the list that guards SQUAD_COPILOT_FLAGS) agrees:
+# it is not in that list either. A check here that flagged `--allow-all-tools`
+# in the resolved argv would refuse EVERY session unconditionally, which is
+# not a defence, it is an outage. It is NOT exempted from the check against
+# Squad's own trailing arguments below, where nothing legitimate should ever
+# introduce it.
+POLICY_ARGV_FORBIDDEN=(--yolo --allow-all --allow-all-paths --add-dir)
+for token in "${POLICY_ARGV[@]}"; do
+  bare="${token%%=*}"
+  for bad in "${POLICY_ARGV_FORBIDDEN[@]}"; do
+    if [[ "$bare" == "$bad" ]]; then
+      squad_agent_abort "SQUAD_AGENT_POLICY_ARGV_JSON contains '${token}', which worker/lib/agent-policy.js never emits. The policy argv may have been tampered with or the resolver has regressed."
+    fi
+  done
+done
+
+TRAILING_ARGV_FORBIDDEN=(--yolo --allow-all --allow-all-tools --allow-all-paths --add-dir)
+for token in "$@"; do
+  bare="${token%%=*}"
+  for bad in "${TRAILING_ARGV_FORBIDDEN[@]}"; do
+    if [[ "$bare" == "$bad" ]]; then
+      squad_agent_abort "Squad appended '${token}' to this agent command, which widens tool/path scope. Refusing to exec copilot."
+    fi
+  done
+done
+
+# Order: Squad's own trailing arguments ("$@" -- today exactly `-p <prompt>`)
+# FIRST, then the resolved policy argv, then the MCP config this script adds
+# itself. `copilot`'s flag parser does not require a particular order, but
+# putting the policy argv and this script's own additions AFTER whatever
+# Squad appended means a future Squad that starts appending its own
+# `--deny-tool`/`--additional-mcp-config` could never silently override what
+# this script resolved -- the LAST occurrence of a given flag is this script's,
+# not Squad's.
+exec copilot "$@" "${POLICY_ARGV[@]}" "${MCP_ARGV[@]}"

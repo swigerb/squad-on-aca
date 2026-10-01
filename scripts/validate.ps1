@@ -116,6 +116,7 @@ foreach ($file in $psFiles) {
 Write-Section "Worker bash scripts (bash -n)"
 $bashScripts = @(
     (Join-Path $RepoRoot "worker\entrypoint.sh"),
+    (Join-Path $RepoRoot "worker\squad-agent"),
     (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"),
     (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh"),
     (Join-Path $RepoRoot "worker\lib\git-checkout.sh"),
@@ -123,7 +124,8 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\tests\test_agent_policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh"),
     (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh"),
-    (Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh")
+    (Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_squad_agent_wrapper.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
@@ -5453,6 +5455,30 @@ if ($copyParseError) {
         Add-Pass "worker/Dockerfile does not CRLF-strip the packaged catalog; JSON.parse already treats CR as whitespace, and .gitattributes pins config/*.json to LF"
     } else {
         Add-Fail "worker/Dockerfile CRLF-strips sandbox-classes.json; that list is for shell scripts, and adding data files to it hides which files actually need it"
+    }
+
+    # --- 4b. squad-agent (issue #112) is shipped, de-CRLF'd, and executable --
+    # worker/squad-agent is the --agent-cmd wrapper entrypoint.sh hands to
+    # `squad watch`/`squad loop` so Squad cannot inject --yolo into those
+    # sessions. Unlike the catalog, this IS a shell script: it must ship into
+    # the image, survive a Windows checkout (sed -i CRLF-strip), and be
+    # executable (chmod +x), or the container's `--agent-cmd` invocation fails
+    # at the first watch/loop session with "Exec format error" or a CRLF
+    # shebang failure.
+    if ($libRecord -and ($libRecord.Sources -contains 'worker/squad-agent')) {
+        Add-Pass "worker/Dockerfile ships worker/squad-agent into /usr/local/lib/squad-on-aca/, the --agent-cmd wrapper entrypoint.sh invokes for watch/loop"
+    } else {
+        Add-Fail "worker/Dockerfile does not ship worker/squad-agent into /usr/local/lib/squad-on-aca/; entrypoint.sh's --agent-cmd would point at a file that is not in the image"
+    }
+    if ($sedLine -match 'squad-agent') {
+        Add-Pass "worker/Dockerfile CRLF-strips squad-agent, so a Windows checkout cannot break its shebang"
+    } else {
+        Add-Fail "worker/Dockerfile does not CRLF-strip squad-agent; a Windows checkout could leave a CRLF shebang that fails at exec time"
+    }
+    if ($chmodLine -match 'squad-agent') {
+        Add-Pass "worker/Dockerfile chmod +x's squad-agent, so it is executable as the --agent-cmd target"
+    } else {
+        Add-Fail "worker/Dockerfile does not chmod +x squad-agent; --agent-cmd would fail with permission denied on every watch/loop session"
     }
 
     # --- 5. The build context can actually reach those sources ---------------

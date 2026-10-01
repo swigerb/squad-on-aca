@@ -615,6 +615,18 @@ function validateExtraFlags(tokens) {
  * @param {boolean} [input.copilotTokenSharedAllowed] whether
  *   SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true was set to explicitly accept a
  *   shared Copilot token remaining exported.
+ * @param {boolean} [input.watchStrictPolicy] issue #112: which argv
+ *   worker/squad-agent (the `--agent-cmd` wrapper `watch`/`loop` now run
+ *   through) should prefer. Default `false` selects PARITY -- the SAME
+ *   effective deny set `--copilot-flags` has always delivered on this path
+ *   (squadFlags, below), so turning this file's fix for #112 on does not also
+ *   silently start enforcing `shell(git push)` / `shell(gh pr)` against watch
+ *   agents that legitimately push and open PRs today. `true` selects STRICT --
+ *   the full argv, multi-word deny rules included -- which closes the
+ *   `undeliverableViaSquad` gap but is an opt-in tightening, not a default
+ *   one, because the wrapper execs `copilot` directly instead of going through
+ *   `squad --copilot-flags`'s whitespace split, so either set is deliverable
+ *   now; the field only decides which one entrypoint.sh asks for.
  */
 function resolvePolicy(input) {
   const opts = input || {};
@@ -707,6 +719,18 @@ function resolvePolicy(input) {
     squadFlags,
     squadFlagString: squadFlags.join(' '),
     undeliverableViaSquad: undeliverable,
+    // Issue #112: the two argv variants worker/squad-agent (the `--agent-cmd`
+    // wrapper watch/loop run through, so Squad never gets a chance to inject
+    // its own `--yolo` on their behalf) can be told to exec `copilot` with,
+    // plus the field that picks between them. These are not new policy -- they
+    // are the SAME `squadFlags`/`flags` arrays already computed above, named
+    // for this specific caller so a reader of worker/entrypoint.sh or
+    // worker/squad-agent does not have to already know that "parity" means
+    // "the --copilot-flags-survivable subset" to find the right field.
+    watchAgentParityArgv: squadFlags.slice(),
+    watchAgentStrictArgv: flags.slice(),
+    watchAgentPolicyMode: opts.watchStrictPolicy ? 'strict' : 'parity',
+    watchAgentArgv: (opts.watchStrictPolicy ? flags : squadFlags).slice(),
     // The SAME policy, for a session supervised by Squad Hub.
     //
     // `--allow-all-tools` exists because a container has no TTY and no
@@ -762,6 +786,11 @@ function resolvePolicyFromEnv(env) {
     executionPlane: e.SQUAD_EXECUTION_MODE,
     copilotTokenShared,
     copilotTokenSharedAllowed: normalize(e.SQUAD_ALLOW_SHARED_COPILOT_TOKEN) === 'true',
+    // Issue #112: opt-in only. Absent, empty, or anything other than the
+    // literal string "true" is PARITY -- the same fail-closed-to-the-narrower-
+    // reading the rest of this file applies to every other boolean-flavoured
+    // environment input (see ATTENDED_SOURCES' comment above).
+    watchStrictPolicy: normalize(e.SQUAD_WATCH_STRICT_POLICY) === 'true',
   });
 }
 
@@ -948,11 +977,40 @@ function main(argv) {
     case 'matrix':
       process.stdout.write(`${JSON.stringify(POLICY_MATRIX, null, 2)}\n`);
       return 0;
+    // Issue #112: the argv worker/squad-agent should exec `copilot` with, as
+    // a JSON array -- the shape `SQUAD_AGENT_POLICY_ARGV_JSON` takes, and the
+    // one the wrapper's `node -e` parser reads. Which of the two variants
+    // (see resolvePolicy's `watchStrictPolicy` doc) depends on
+    // SQUAD_WATCH_STRICT_POLICY in the SAME environment this invocation
+    // already reads everything else from -- there is no separate flag to this
+    // subcommand, because a resolver whose output depended on both its
+    // environment AND its argv would be two sources of truth for one answer.
+    case 'watch-agent-argv-json':
+      process.stdout.write(`${JSON.stringify(policy.watchAgentArgv)}\n`);
+      return 0;
+    // The two variants individually, for a test (or an operator) that wants
+    // to compare them without re-exporting SQUAD_WATCH_STRICT_POLICY and
+    // re-invoking the resolver.
+    case 'watch-agent-parity-argv-json':
+      process.stdout.write(`${JSON.stringify(policy.watchAgentParityArgv)}\n`);
+      return 0;
+    case 'watch-agent-strict-argv-json':
+      process.stdout.write(`${JSON.stringify(policy.watchAgentStrictArgv)}\n`);
+      return 0;
+    // `parity` | `strict`. worker/entrypoint.sh logs this at session start so
+    // which deny set a watch/loop session is actually running under is a
+    // fact in the session log, not something an operator has to infer from
+    // whether SQUAD_WATCH_STRICT_POLICY happens to be set.
+    case 'watch-agent-policy-mode':
+      process.stdout.write(`${policy.watchAgentPolicyMode}\n`);
+      return 0;
     default:
       process.stderr.write(
         'Usage: agent-policy.js [json|flags|argv|squad-flags|hub-argv-json|undeliverable|tier|reason|' +
           'trust|trust-reason|credential-profile|should-withhold-credential|copilot-token-shared|matrix|' +
-          'governance-paths|mutable-governance-patterns|classify-governance-path <path>]\n'
+          'governance-paths|mutable-governance-patterns|classify-governance-path <path>|' +
+          'watch-agent-argv-json|watch-agent-parity-argv-json|watch-agent-strict-argv-json|' +
+          'watch-agent-policy-mode]\n'
       );
       return 78;
   }

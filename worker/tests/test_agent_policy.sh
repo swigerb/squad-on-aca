@@ -591,4 +591,97 @@ console.log(bad);
 assert_eq "0" "$invariant_violations" \
   "no matrix row claims withheld:true while a shared, non-escape-hatched Copilot token stays exported"
 
+# ---------------------------------------------------------------------------
+# 13. Issue #112: watch/loop agent-cmd policy (parity vs strict)
+# ---------------------------------------------------------------------------
+# worker/squad-agent (the `--agent-cmd` wrapper watch/loop now run through)
+# does not re-derive policy -- it reads SQUAD_AGENT_POLICY_ARGV_JSON, which
+# worker/entrypoint.sh populates from exactly one of the two new exports below,
+# chosen by SQUAD_WATCH_STRICT_POLICY. SQUAD_DISPATCH_SOURCE is fixed at
+# 'watch' here (not in TRUSTED_SOURCES) so trust=untrusted, which is what puts
+# the multi-word `shell(git push)`/`shell(gh pr)` rules into the deny set in
+# the first place -- the realistic shape of a watch/loop session, not an
+# attended one.
+echo "-- watch-agent-* exports and SQUAD_WATCH_STRICT_POLICY (issue #112) --"
+
+# watch_policy <SQUAD_WATCH_STRICT_POLICY-value-or-__UNSET__> <subcommand>
+watch_policy() {
+  local strict_env="$1" sub="$2"
+  if [[ "$strict_env" == "__UNSET__" ]]; then
+    env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+        -u GH_TOKEN -u GITHUB_TOKEN -u COPILOT_GITHUB_TOKEN \
+        -u SQUAD_COPILOT_TOKEN_PROVENANCE -u SQUAD_ALLOW_SHARED_COPILOT_TOKEN \
+        -u SQUAD_WATCH_STRICT_POLICY \
+      SQUAD_MODE="watch" SQUAD_DISPATCH_SOURCE="watch" SQUAD_COPILOT_FLAGS="" SQUAD_EXECUTION_MODE="aca-job" \
+      node "$RESOLVER" "$sub" 2>&1
+  else
+    env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+        -u GH_TOKEN -u GITHUB_TOKEN -u COPILOT_GITHUB_TOKEN \
+        -u SQUAD_COPILOT_TOKEN_PROVENANCE -u SQUAD_ALLOW_SHARED_COPILOT_TOKEN \
+        -u SQUAD_WATCH_STRICT_POLICY \
+      SQUAD_MODE="watch" SQUAD_DISPATCH_SOURCE="watch" SQUAD_COPILOT_FLAGS="" SQUAD_EXECUTION_MODE="aca-job" \
+      SQUAD_WATCH_STRICT_POLICY="$strict_env" \
+      node "$RESOLVER" "$sub" 2>&1
+  fi
+}
+
+watch_policy_status() {
+  watch_policy "$@" >/dev/null 2>&1
+  printf '%s' "$?"
+}
+
+# SQUAD_WATCH_STRICT_POLICY=true selects STRICT, and the dedicated
+# watch-agent-argv-json alias agrees with watch-agent-strict-argv-json.
+assert_eq "strict" "$(watch_policy true watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY=true resolves to strict"
+strict_argv_true="$(watch_policy true watch-agent-argv-json)"
+assert_eq "$(watch_policy true watch-agent-strict-argv-json)" "$strict_argv_true" \
+  "watch-agent-argv-json matches watch-agent-strict-argv-json when SQUAD_WATCH_STRICT_POLICY=true"
+assert_contains "$strict_argv_true" "shell(git push)" "strict watch-agent-argv-json carries the multi-word deny rule"
+
+# unset / empty / "false" / garbage all fail closed to the NARROWER reading
+# (parity) -- consistent with every other boolean-flavoured environment input
+# this resolver reads (see resolvePolicyFromEnv's own doc comment on
+# watchStrictPolicy, and ATTENDED_SOURCES' comment above it).
+assert_eq "parity" "$(watch_policy __UNSET__ watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY unset resolves to parity"
+assert_eq "parity" "$(watch_policy ''        watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY='' resolves to parity"
+assert_eq "parity" "$(watch_policy 'false'   watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY=false resolves to parity"
+assert_eq "parity" "$(watch_policy 'nah'     watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY=garbage resolves to parity"
+
+# normalize() trims and lowercases EVERY boolean-flavoured input this resolver
+# reads (see normalize()'s own definition) -- so "TRUE " (trailing whitespace,
+# wrong case) is NOT a 'garbage' value by this resolver's existing,
+# deliberately lenient contract: it normalizes to 'true' the same way it would
+# for SQUAD_ALLOW_SHARED_COPILOT_TOKEN or any other boolean env var here, and
+# resolves to STRICT. Asserted directly against the real resolver rather than
+# assumed, so this suite documents the actual contract instead of a guessed one.
+assert_eq "strict" "$(watch_policy 'TRUE ' watch-agent-policy-mode)" \
+  "SQUAD_WATCH_STRICT_POLICY='TRUE ' normalizes (trim+lowercase) to strict, matching this file's existing boolean-env convention"
+
+parity_argv_unset="$(watch_policy __UNSET__ watch-agent-argv-json)"
+assert_eq "$(watch_policy __UNSET__ watch-agent-parity-argv-json)" "$parity_argv_unset" \
+  "watch-agent-argv-json matches watch-agent-parity-argv-json by default (unset)"
+assert_not_contains "$parity_argv_unset" "shell(git push)" "default (unset) watch-agent-argv-json omits the multi-word deny rule"
+
+# The four new fields are also reachable on the whole resolvePolicy() object
+# (the `json` dump), not just through their dedicated CLI subcommands -- so a
+# caller reading the full policy object sees the same facts the dedicated
+# subcommands report.
+json_strict="$(watch_policy true json)"
+assert_contains "$json_strict" '"watchAgentPolicyMode": "strict"' "json: watchAgentPolicyMode field is present and 'strict'"
+assert_contains "$json_strict" '"watchAgentParityArgv"'            "json: watchAgentParityArgv field is present"
+assert_contains "$json_strict" '"watchAgentStrictArgv"'            "json: watchAgentStrictArgv field is present"
+assert_contains "$json_strict" '"watchAgentArgv"'                  "json: watchAgentArgv field is present"
+
+json_parity="$(watch_policy __UNSET__ json)"
+assert_contains "$json_parity" '"watchAgentPolicyMode": "parity"' "json (unset): watchAgentPolicyMode field is 'parity'"
+
+# An unknown subcommand still exits 78 after adding the four new verbs, and the
+# usage string lists all of them.
+unknown_out="$(watch_policy __UNSET__ no-such-subcommand)"
+assert_eq "78" "$(watch_policy_status __UNSET__ no-such-subcommand)" \
+  "an unknown resolver sub-command still exits 78 after adding the watch-agent-* verbs"
+for verb in watch-agent-argv-json watch-agent-parity-argv-json watch-agent-strict-argv-json watch-agent-policy-mode; do
+  assert_contains "$unknown_out" "$verb" "the usage string lists the new verb '${verb}'"
+done
+
 test_summary

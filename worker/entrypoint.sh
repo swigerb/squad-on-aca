@@ -291,6 +291,44 @@ squad_policy_harden "$REPO_DIR"
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
 
+# --- watch/loop agent-cmd wrapper policy (issue #112) ------------------------
+# `squad watch` and `squad loop` own their own loop and spawn Copilot
+# themselves through Squad's `buildAdditionalMcpConfigArgs()`, which prepends
+# `--yolo` whenever the team root has a `.mcp.json` -- and `squad init` always
+# creates one. There is no flag that turns this off, so both modes are instead
+# pointed at /usr/local/lib/squad-on-aca/squad-agent via `--agent-cmd`, which
+# bypasses that code path entirely. See worker/squad-agent's own header for
+# the full rationale, including why it is registered with no `{prompt}` token.
+#
+# squad-agent does not re-derive policy; it reads the SAME resolver
+# squad_policy_resolve above already used, asked for the one JSON array it is
+# built to parse (`watch-agent-argv-json`). SQUAD_WATCH_STRICT_POLICY (default
+# false) picks which of agent-policy.js's two variants that resolves to:
+# PARITY (default) is today's effective deny set -- the squadFlags subset that
+# has always survived `squad --copilot-flags`'s whitespace split -- so turning
+# this fix on does not also start silently enforcing `shell(git push)` /
+# `shell(gh pr)` against a watch agent that legitimately pushes and opens PRs
+# today. STRICT closes that gap by handing squad-agent the FULL argv,
+# multi-word deny rules included. See agent-policy.js's `watchStrictPolicy` doc
+# and .squad/decisions/inbox/ for the follow-up this trade-off is tracked
+# under.
+SQUAD_WATCH_STRICT_POLICY="${SQUAD_WATCH_STRICT_POLICY:-false}"
+export SQUAD_WATCH_STRICT_POLICY
+
+SQUAD_AGENT_POLICY_ARGV_JSON="$(node "$SQUAD_POLICY_RESOLVER" watch-agent-argv-json 2>&1)"; rc=$?
+if [[ "$rc" -ne 0 || -z "$SQUAD_AGENT_POLICY_ARGV_JSON" ]]; then
+  squad_policy_abort "The policy resolver produced no watch/loop agent-cmd argv (exit ${rc}): ${SQUAD_AGENT_POLICY_ARGV_JSON}"
+fi
+export SQUAD_AGENT_POLICY_ARGV_JSON
+
+# The same directory every other mode clones into. squad-agent reads this
+# rather than re-deriving a workspace path from its own idea of $PWD or
+# $WORKDIR, so there is exactly one place that decides where the repo lives.
+SQUAD_AGENT_REPO_DIR="$REPO_DIR"
+export SQUAD_AGENT_REPO_DIR
+
+SQUAD_WATCH_AGENT_POLICY_MODE="$(node "$SQUAD_POLICY_RESOLVER" watch-agent-policy-mode 2>&1)"
+
 # --- Squad Hub supervision (optional) ----------------------------------------
 # Loaded next to the policy it depends on, and BEFORE any mode runs an agent.
 # Absent library with a hub configured is a refusal, not a downgrade: the whole
@@ -747,7 +785,20 @@ NODE
       sed -i 's/configured: false/configured: true/' loop.md
     fi
     log "Starting Squad loop."
-    squad_policy_announce squad
+    # Issue #112: `--agent-cmd`, NOT `--copilot-flags`. squad-agent now owns
+    # the whole resolved argv (read from SQUAD_AGENT_POLICY_ARGV_JSON, which
+    # was exported above); passing --copilot-flags here as well would be a
+    # second, competing source of truth for the same decision -- and the one
+    # this fix exists to stop using, since it is the path that cannot carry a
+    # multi-word deny pattern and the path squad-cli's --yolo injection was
+    # found on. squad_policy_announce is not called here for the same reason:
+    # its "squad" branch narrates --copilot-flags specifically, which no
+    # longer applies to this invocation, and its other branches describe the
+    # FULL argv regardless of the parity/strict choice squad-agent actually
+    # makes -- so the log line below reports what will truly be exec'd instead.
+    log "Tier: ${SQUAD_POLICY_TIER} (${SQUAD_POLICY_REASON})"
+    log "watch/loop agent-cmd policy mode: ${SQUAD_WATCH_AGENT_POLICY_MODE} (SQUAD_WATCH_STRICT_POLICY=${SQUAD_WATCH_STRICT_POLICY})"
+    log "watch/loop agent-cmd argv: ${SQUAD_AGENT_POLICY_ARGV_JSON}"
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
     # Same shape as watch: the loop belongs to `squad`, so the container
@@ -756,7 +807,7 @@ NODE
       squad_hub_supervise_ambient
       trap squad_hub_release_ambient EXIT
     fi
-    squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --copilot-flags "$SQUAD_COPILOT_FLAG_STRING"
+    squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
     squad_policy_checkpoint
     ;;
   ralph)
@@ -873,7 +924,13 @@ NODE
     ;;
   watch|triage)
     log "Starting Squad watch."
-    squad_policy_announce squad
+    # Issue #112: `--agent-cmd`, NOT `--copilot-flags` -- see the matching
+    # comment in the `loop)` branch above for why both would be a double
+    # source of truth, and why squad_policy_announce is skipped in favour of
+    # the explicit lines below.
+    log "Tier: ${SQUAD_POLICY_TIER} (${SQUAD_POLICY_REASON})"
+    log "watch/loop agent-cmd policy mode: ${SQUAD_WATCH_AGENT_POLICY_MODE} (SQUAD_WATCH_STRICT_POLICY=${SQUAD_WATCH_STRICT_POLICY})"
+    log "watch/loop agent-cmd argv: ${SQUAD_AGENT_POLICY_ARGV_JSON}"
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
     # `squad watch` owns its own loop and spawns Copilot itself, so there is no
@@ -889,7 +946,7 @@ NODE
       --interval "${WATCH_INTERVAL_MINUTES:-5}" \
       --timeout "${WATCH_TIMEOUT_MINUTES:-45}" \
       --max-concurrent "${WATCH_MAX_CONCURRENT:-1}" \
-      --copilot-flags "$SQUAD_COPILOT_FLAG_STRING" \
+      --agent-cmd /usr/local/lib/squad-on-aca/squad-agent \
       --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
       --verbose
     squad_policy_checkpoint

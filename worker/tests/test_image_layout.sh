@@ -139,6 +139,17 @@ build_layout() {
     find "${root}/usr/local/bin" -type f -exec sed -i 's/\r$//' {} + 2>/dev/null || true
     find "${root}/usr/local/bin" -type f -exec chmod +x {} + 2>/dev/null || true
   fi
+  # worker/squad-agent (issue #112) is NOT caught by either pass above: it has
+  # no `.sh` extension (it is invoked as an opaque `--agent-cmd`, the same
+  # calling convention as `copilot` itself, which also carries no extension)
+  # and it does not live under usr/local/bin. The real Dockerfile's
+  # sed/chmod RUN line names it explicitly for exactly this reason; this
+  # throwaway layout must do the same or it would silently diverge from what
+  # actually ships.
+  if [[ -f "${root}/usr/local/lib/squad-on-aca/squad-agent" ]]; then
+    sed -i 's/\r$//' "${root}/usr/local/lib/squad-on-aca/squad-agent" 2>/dev/null || true
+    chmod +x "${root}/usr/local/lib/squad-on-aca/squad-agent" 2>/dev/null || true
+  fi
 }
 
 parse_dockerfile_copies
