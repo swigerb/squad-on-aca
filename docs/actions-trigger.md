@@ -110,6 +110,18 @@ The label and command prefix are configurable through repository variables `SQUA
 
 Use `squad-aca` as the default label. Keep Ralph's `RALPH_LABELS` aligned with `SQUAD_TRIGGER_LABEL` so all dispatchers use the same lease key and marker label.
 
+## Command trigger matching and gh-aw compatibility
+
+### Does `/squad-aca` collide with Squad's own `/squad` gh-aw router?
+
+No. Squad 0.12+ repositories may also carry a GitHub Agentic Workflows (gh-aw) router that responds to `/squad`. squad-on-aca's trigger is the distinct command `/squad-aca`, and the two do not collide.
+
+gh-aw compiles `slash_command: name: squad` into a condition that requires a delimiter immediately after the command name — the comment body must start with `/squad ` (space), `/squad\n`, `/squad\r`, or equal `/squad` exactly. A comment body of `/squad-aca ...` satisfies none of those: the character right after `/squad` is `-`, not a delimiter.
+
+**Verification (high confidence):** The matching condition was verified against the compiled `squad.lock.yml` that github/gh-aw itself ships (checked 2026-10-01, <https://github.com/github/gh-aw/blob/main/.github/workflows/squad.lock.yml>, HTTP 200), which uses the same `slash_command: name: squad` frontmatter as `bradygaster/squad`'s router template. The compiled lock file shows the four-branch `startsWith` guard on line 115 — the authoritative evidence, since gh-aw is the actual compiler.
+
+**Caveat:** This is static compiled-code evidence, not a live two-workflow test in a single repository. If a future Squad release changes gh-aw's router-matching semantics (for example to a looser prefix match), this conclusion should be re-verified against that release's compiled lock file rather than assumed to still hold.
+
 ## Who may trigger a run
 
 Every route into Squad on ACA is gated. A run costs money and executes an agent
