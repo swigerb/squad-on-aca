@@ -290,7 +290,8 @@ Check `worker/Dockerfile` pins:
 
 - base image `node:24-bookworm-slim`;
 - Copilot CLI `@github/copilot@1.0.69-2`;
-- Squad CLI `@bradygaster/squad-cli@0.11.0`.
+- Squad CLI `@bradygaster/squad-cli@0.13.1`;
+- squad-hub `squad-hub@0.5.0` (default; see `SQUAD_HUB_SPEC` in Dockerfile).
 
 Pin the Aspire Dashboard image to a specific tag or digest for production.
 
@@ -313,6 +314,7 @@ If validation fails after a deploy or config change, follow [rollback.md](rollba
 - `worker/tests/run-tests.sh` needs Linux/WSL.
 - `scripts/validate.ps1` is Windows-only.
 - Secret scans are pattern-based.
+- **Externalized Squad state not supported:** Squad on ACA requires the Squad team state to live in the repository's `.squad/` directory. If `.squad/config.json` has `stateLocation: "external"` (from `squad externalize`) or a non-`.` `teamRoot` pointing outside the repo, dispatch is refused with a clear message. `squad-aca doctor`, `squad-aca run`, and the worker all fail closed with exit 78. The remedy is to run `squad internalize` before dispatching to ACA. See issue [#117](https://github.com/swigerb/squad-on-aca/issues/117).
 
 ## Workflow files must parse
 

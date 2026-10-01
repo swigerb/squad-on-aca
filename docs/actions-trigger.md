@@ -43,6 +43,59 @@ sequenceDiagram
 
 The workflow starts a job and exits. It does not wait for the session, poll it, or hold the session credential.
 
+## GitHub OIDC Subject Format
+
+GitHub Actions sends an OIDC token to authenticate to Azure. The token's `sub` (subject) claim takes one of two formats depending on the event type:
+
+| Subject Format | Event Type | Example |
+|---|---|---|
+| **Classic** | Push, schedule, workflow_dispatch | `repo:<owner>/<repo>:ref:refs/heads/main` |
+| **ID-based** | Issues (labeled, opened, etc.) | `repo:<owner>@<ownerId>/<repo>@<repoId>:ref:refs/heads/main` |
+
+The ID-based format (added by GitHub for `issues` events) includes the owner's and repository's numeric IDs, making the subject resistant to username/repo renames.
+
+### Federated Credential Setup
+
+You must configure your Azure Entra app with **both** subject formats as separate federated credentials:
+
+```bash
+# Classic credential (works for push, schedule, workflow_dispatch)
+az ad app federated-credential create \
+  --id <app-object-id> \
+  --parameters '{
+    "name": "squad-on-aca-github",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:<owner>/<repo>:ref:refs/heads/main",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+
+# ID-based credential (required for `issues` events)
+az ad app federated-credential create \
+  --id <app-object-id> \
+  --parameters '{
+    "name": "squad-on-aca-github-issues",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:<owner>@<ownerId>/<repo>@<repoId>:ref:refs/heads/main",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+```
+
+**Find your IDs:** Replace `<ownerId>` and `<repoId>` with the numeric IDs from:
+- `gh api repos/<owner>/<repo> --jq .owner.id,.id`
+
+### Why Both Credentials?
+
+Without the ID-based credential, Azure login from an `issues` event fails with:
+```
+AADSTS700213: No matching federated identity record found for presented assertion.
+```
+
+This was verified on `swigerb/arcade-hall-of-fame` on 2026-09-30.
+
+### Related
+
+See upstream issue [bradygaster/squad#2140](https://github.com/bradygaster/squad/issues/2140) for context on GitHub's OIDC subject format adoption.
+
 ## Triggers
 
 | Trigger | What happens |

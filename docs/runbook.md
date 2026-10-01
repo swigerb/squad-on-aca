@@ -77,7 +77,7 @@ An attended session gets:
 --allow-all-tools --agent squad --remote --no-auto-update --deny-tool <pattern> ...
 ```
 
-An unattended session also gets `--no-ask-user` and a longer deny list. `--yolo` is not used. `COPILOT_ALLOW_ALL=true` is not set in `worker/Dockerfile`.
+An unattended session also gets `--no-ask-user` and a longer deny list. Neither attended nor unattended sessions pass `--yolo` to Copilot CLI. `COPILOT_ALLOW_ALL=true` is not set in `worker/Dockerfile`.
 
 Use `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` for Copilot CLI headless auth. Fine-grained PATs with the GitHub Copilot Requests permission are preferred.
 
@@ -123,6 +123,29 @@ Governance paths are made read-only before the agent starts and their SHA-256 ha
 `.squad/agents/<name>/history.md` is append-only. A `history.md` file that did not exist when the session started cannot be created by the run.
 
 `SQUAD_COPILOT_FLAGS` supports extras such as `--model` or `--log-level`. Permission-widening flags (`--yolo`, `--allow-all`, `--allow-all-paths`, `--add-dir`) abort the session with exit `78`.
+
+## watch/loop policy
+
+The `watch` and `loop` modes run continuously and spawn their own Copilot CLI invocations. squad-on-aca routes these through a wrapper at `/usr/local/lib/squad-on-aca/squad-agent` (instead of the default `copilot` CLI path) that:
+
+1. Resolves the session's `attended` or `autonomous` policy tier (same rules as above).
+2. Execs `copilot -p <prompt>` with the resolved policy argv, so permission-widening flags abort with exit 78.
+3. Adds `--additional-mcp-config @<repo>/.mcp.json` itself (without `--yolo`) so `squad_state_*` tools keep working.
+4. Refuses to start (exit 78) if the policy cannot be resolved.
+
+This prevents watch/loop from inheriting the upstream Squad behavior of injecting `--yolo` whenever `.mcp.json` exists.
+
+### Policy gap: multi-word deny rules
+
+The policy honors single-word deny rules like `shell(sudo)` and `shell(az)`. **Multi-word deny rules such as `shell(git push)` and `shell(gh pr)` are not fully enforced** on the watch/loop path because the whitespace-delimited deny list gets split before reaching `copilot` CLI.
+
+To apply strict multi-word policy to watch/loop, set:
+
+```powershell
+$env:SQUAD_WATCH_STRICT_POLICY = "true"
+```
+
+This uses the full argv instead of the deny-list subset, fully closing the gap. By default, `SQUAD_WATCH_STRICT_POLICY` is unset or `false`, preserving today's effective single-word enforcement for backward compatibility.
 
 Policy output is prefixed `[squad-policy]`. Read it with:
 
