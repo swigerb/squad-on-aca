@@ -892,10 +892,26 @@ commit_and_push_if_needed() {
   git checkout -B "$branch"
   if [[ -n "$(git status --porcelain)" ]]; then
     git add -A
-    git commit -m "${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}"
+    local commit_rc=0
+    git commit -m "${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}" || commit_rc=$?
+    if (( commit_rc != 0 )); then
+      # The worker-generated pre-commit hook refuses a commit that would carry
+      # the session-only memory audit pin; report that as the policy failure it
+      # is (78), not as a generic error.
+      if [[ -n "${SQUAD_POLICY_PIN_SEAL_MODE:-}" ]] && ! squad_policy_assert_pin_unpublished "$REPO_DIR"; then
+        exit 78
+      fi
+      exit "$commit_rc"
+    fi
   else
     log "Publishing the commits the agent made itself."
   fi
+
+  # The session-only memory audit pin publication check runs inside
+  # squad_push_branch (worker/lib/squad-push.sh), so it gates every push this
+  # container makes, not only this one; see squad_policy_seal_memory_audit_
+  # config_pin (worker/lib/squad-policy.sh) for what is prevented and what is
+  # only detected.
 
   # THE PUSH IS THE MOMENT THE CREDENTIAL IS FIRST REALLY TESTED (issue #32).
   # Everything before it -- including the clone -- succeeds against a public

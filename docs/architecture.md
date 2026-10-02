@@ -245,6 +245,8 @@ Governance paths are made read-only before the agent starts and hash-verified be
 
 `.squad/agents/<name>/history.md` and `.squad/memory/audit.jsonl` are append-only. They may grow; the pre-session prefix must remain byte-identical. `.squad/casting/policy.json`, `.squad/casting/registry.json`, `.squad/casting/history.json`, and `.squad/identity/now.md` are reported-mutable: changes are allowed and reported rather than blocked.
 
+The session-only audit-rotation pin (`.squad/memory/config.json`'s `policy.auditMaxBytes = 0`) is never committed by the worker. It is kept in the working tree and sealed out of git staging (`squad_policy_seal_memory_audit_config_pin`): with `--skip-worktree` when the path is tracked at base (an index property), or with `.git/info/exclude` when it is not (only an ignore rule, which `add -f`, a `.gitignore` negation or `clean -x` can defeat). The in-session sampler re-checks the seal and re-pins a deleted file. `worker/squad-agent` re-checks it before every watch/loop iteration, and worker-generated `pre-commit`/`pre-push` hooks refuse it. `squad_push_branch` runs `squad_policy_assert_pin_unpublished` before every container push and exits `78` with nothing pushed. A deliberate agent-side publish in watch/loop/triage is not prevented, and is detected only while the break persists; see [security.md](security.md#session-only-memory-audit-pin).
+
 Failures exit `78` (`EX_CONFIG`). See [runbook.md#agent-tool-policy](runbook.md#agent-tool-policy).
 
 ### Source × mode policy matrix (issue #84)

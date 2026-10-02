@@ -97,11 +97,12 @@ GOVERNANCE_FILES=(
 # to it. It used to sit in GOVERNANCE_FILES above (plain LOCKED), which is now
 # WRONG: Squad 0.13.1 writes to it during a normal session, and a locked file
 # cannot be written at all. See squad_policy_harden and
-# squad_policy_commit_memory_audit_config_pin in worker/lib/squad-policy.sh
+# squad_policy_seal_memory_audit_config_pin in worker/lib/squad-policy.sh
 # (and pinMemoryAuditConfig in worker/lib/agent-policy.js, which applies the
-# pin itself) for how the one way this file's append-only rule could be
-# violated without an agent touching it -- squad-sdk's own rotation -- is
-# made impossible for the session, rather than merely detected.
+# pin itself, working-tree only and never committed) for how the one way this
+# file's append-only rule could be violated without an agent touching it --
+# squad-sdk's own rotation -- is made impossible for the session, rather than
+# merely detected.
 APPEND_ONLY_FILES=(
   ".squad/agents/security/history.md"
   ".squad/memory/audit.jsonl"
