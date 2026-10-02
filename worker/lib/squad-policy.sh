@@ -114,6 +114,103 @@ squad_policy_abort() {
 }
 
 # ---------------------------------------------------------------------------
+# 0. Governance bundle parser
+# ---------------------------------------------------------------------------
+# Issue #113 perf follow-up. Every function below this point that needs a
+# field out of worker/lib/agent-policy.js used to fork its OWN `node` process
+# for that one field -- up to nine forks for a single harden/verify/resolve
+# cycle. `node` startup is a rounding error on Linux CI but measured at several
+# hundred ms to over a second under git-bash on Windows
+# (worker/tests/test_governance_guard.sh's harden-heavy suite was the suite
+# that made this visible: 88.5s on a clean baseline checkout vs 159.9s after
+# issue #113 added more harden/verify cycles, enough to blow through
+# run-tests.sh's 120s per-suite timeout). agent-policy.js's `bundle` and
+# `harden-init` subcommands emit every field this file reads, from the SAME
+# resolved policy object, in ONE process; this parser is the one place that
+# has to agree with agent-policy.js's serializeGovernanceBundle on the line
+# format, so that format is also documented there.
+#
+# squad_policy_bundle_assign exists only so the block-reading loop below can
+# address "the array this block's 'kind' name maps to" without a `node`-style
+# dynamic property lookup -- bash's nameref (`local -n`) is the same tool for
+# the job.
+squad_policy_bundle_assign() {
+  local -n _squad_policy_bundle_target="$1"
+  _squad_policy_bundle_target=("${SQUAD_POLICY_BUNDLE_BLOCK[@]}")
+}
+
+# Reads a bundle (as emitted by `agent-policy.js bundle` or `harden-init`) on
+# stdin and populates every SQUAD_POLICY_* global the resolver can answer.
+# Fail closed: a line this parser does not recognise is simply ignored, so a
+# resolver that emitted nothing (or failed before writing anything) leaves
+# every array empty -- the same "nothing is excluded, everything stays locked"
+# posture the original per-field loaders documented.
+squad_policy_parse_bundle() {
+  local line mode="" remaining=0 name count target_var=""
+  SQUAD_POLICY_BUNDLE_BLOCK=()
+  SQUAD_POLICY_ARGV=()
+  SQUAD_POLICY_UNDELIVERABLE=()
+  SQUAD_POLICY_GOVERNANCE_PATHS=()
+  SQUAD_POLICY_MUTABLE_PATTERNS=()
+  SQUAD_POLICY_REPORTED_PATTERNS=()
+
+  while IFS= read -r line; do
+    if [[ -n "$mode" ]]; then
+      SQUAD_POLICY_BUNDLE_BLOCK+=("$line")
+      remaining=$((remaining - 1))
+      if [[ "$remaining" -le 0 ]]; then
+        squad_policy_bundle_assign "$target_var"
+        mode=""
+      fi
+      continue
+    fi
+    case "$line" in
+      "TIER "*) SQUAD_POLICY_TIER="${line#TIER }" ;;
+      "REASON "*) SQUAD_POLICY_REASON="${line#REASON }" ;;
+      "FLAGSTRING "*) SQUAD_POLICY_FLAGS="${line#FLAGSTRING }" ;;
+      "SQUADFLAGSTRING "*) SQUAD_POLICY_SQUAD_FLAGS="${line#SQUADFLAGSTRING }" ;;
+      "ARGV "*|"UNDELIVERABLE "*|"GOVPATHS "*|"MUTABLE "*|"REPORTED "*)
+        name="${line%% *}"
+        count="${line#* }"
+        case "$name" in
+          ARGV) target_var=SQUAD_POLICY_ARGV ;;
+          UNDELIVERABLE) target_var=SQUAD_POLICY_UNDELIVERABLE ;;
+          GOVPATHS) target_var=SQUAD_POLICY_GOVERNANCE_PATHS ;;
+          MUTABLE) target_var=SQUAD_POLICY_MUTABLE_PATTERNS ;;
+          REPORTED) target_var=SQUAD_POLICY_REPORTED_PATTERNS ;;
+        esac
+        SQUAD_POLICY_BUNDLE_BLOCK=()
+        remaining="$count"
+        if [[ "$remaining" -le 0 ]]; then
+          # Zero-element block: there is no data line to wait for, so assign
+          # the empty array immediately rather than treating the NEXT header
+          # line as this block's (nonexistent) first element.
+          squad_policy_bundle_assign "$target_var"
+        else
+          mode="$name"
+        fi
+        ;;
+    esac
+  done
+
+  SQUAD_POLICY_BUNDLE_LOADED=1
+  return 0
+}
+
+# Fetches `bundle` (no side effects, no pin) and parses it, once per process.
+# squad_policy_harden loads the bundle itself via `harden-init` (which ALSO
+# applies the audit-rotation pin in the same fork) and sets
+# SQUAD_POLICY_BUNDLE_LOADED=1 itself, so a harden'd process never re-fetches
+# here.
+squad_policy_load_governance_bundle() {
+  if [[ "${SQUAD_POLICY_BUNDLE_LOADED:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  squad_policy_parse_bundle < <(node "$SQUAD_POLICY_RESOLVER" bundle 2>/dev/null)
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 1. Resolve
 # ---------------------------------------------------------------------------
 # Populates SQUAD_POLICY_TIER / _REASON / _FLAGS from the shared resolver.
@@ -127,63 +224,40 @@ squad_policy_resolve() {
     squad_policy_abort "Policy resolver not found at ${SQUAD_POLICY_RESOLVER}."
   fi
 
-  local tier reason flags rc
-
-  tier="$(node "$SQUAD_POLICY_RESOLVER" tier 2>&1)"; rc=$?
+  # Issue #113 perf: ONE `node` fork for tier/reason/flags/argv/squad-flags/
+  # undeliverable together, instead of six. See squad_policy_parse_bundle.
+  local bundle_output rc
+  bundle_output="$(node "$SQUAD_POLICY_RESOLVER" bundle 2>&1)"; rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    squad_policy_log "Policy resolution failed (exit ${rc}): ${tier}"
+    squad_policy_log "Policy resolution failed (exit ${rc}): ${bundle_output}"
     squad_policy_abort "The session policy could not be resolved."
   fi
+  squad_policy_parse_bundle <<<"$bundle_output"
 
-  reason="$(node "$SQUAD_POLICY_RESOLVER" reason 2>&1)"; rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    squad_policy_log "Policy resolution failed (exit ${rc}): ${reason}"
-    squad_policy_abort "The session policy could not be resolved."
-  fi
-
-  flags="$(node "$SQUAD_POLICY_RESOLVER" flags 2>&1)"; rc=$?
-  if [[ "$rc" -ne 0 ]]; then
-    squad_policy_log "Policy resolution failed (exit ${rc}): ${flags}"
-    squad_policy_abort "The session policy could not be resolved."
-  fi
-
-  if [[ -z "$tier" || -z "$flags" ]]; then
+  if [[ -z "$SQUAD_POLICY_TIER" || -z "$SQUAD_POLICY_FLAGS" ]]; then
     squad_policy_abort "The policy resolver produced an empty tier or flag set."
   fi
 
   # A resolver that ever emitted a blanket-allow flag would silently undo this
   # whole change, so the caller checks rather than trusts. This is cheap and it
   # is the last line of defence before the flags reach `copilot`.
-  case " $flags " in
+  case " $SQUAD_POLICY_FLAGS " in
     *" --yolo "*|*" --allow-all "*|*" --allow-all-paths "*)
-      squad_policy_abort "The resolved flag set contains a blanket-allow flag: ${flags}"
+      squad_policy_abort "The resolved flag set contains a blanket-allow flag: ${SQUAD_POLICY_FLAGS}"
       ;;
   esac
 
   # The authoritative argv, one token per line, so a multi-word deny pattern
-  # stays ONE argument. Anything that word-splits `$flags` loses those rules.
-  SQUAD_POLICY_ARGV=()
-  local token
-  while IFS= read -r token; do
-    [[ -n "$token" ]] && SQUAD_POLICY_ARGV+=("$token")
-  done < <(node "$SQUAD_POLICY_RESOLVER" argv)
+  # stays ONE argument. SQUAD_POLICY_ARGV is populated by the parse above
+  # straight from the bundle's ARGV block.
   if [[ "${#SQUAD_POLICY_ARGV[@]}" -eq 0 ]]; then
     squad_policy_abort "The policy resolver produced an empty argv."
   fi
 
-  SQUAD_POLICY_SQUAD_FLAGS="$(node "$SQUAD_POLICY_RESOLVER" squad-flags 2>&1)"; rc=$?
-  if [[ "$rc" -ne 0 || -z "$SQUAD_POLICY_SQUAD_FLAGS" ]]; then
+  if [[ -z "$SQUAD_POLICY_SQUAD_FLAGS" ]]; then
     squad_policy_abort "The policy resolver produced no --copilot-flags string."
   fi
 
-  SQUAD_POLICY_UNDELIVERABLE=()
-  while IFS= read -r token; do
-    [[ -n "$token" ]] && SQUAD_POLICY_UNDELIVERABLE+=("$token")
-  done < <(node "$SQUAD_POLICY_RESOLVER" undeliverable)
-
-  SQUAD_POLICY_TIER="$tier"
-  SQUAD_POLICY_REASON="$reason"
-  SQUAD_POLICY_FLAGS="$flags"
   return 0
 }
 
@@ -260,17 +334,17 @@ squad_policy_state_dir() {
 # caller (`squad_policy_harden`) treats a missing `node`/resolver as a hard
 # abort before this is ever reached, so an empty list here only happens if the
 # resolver itself ran and legitimately returned nothing.
+#
+# Issue #113 perf: this, squad_policy_load_mutable_patterns and
+# squad_policy_load_reported_mutable_patterns all used to fork their OWN
+# `node` process for their one field; now they are three thin wrappers over
+# the SAME cached bundle fetch (squad_policy_load_governance_bundle), so
+# three forks become (at most) one, shared with squad_policy_resolve's and
+# squad_policy_harden's bundle fetch when those already ran first in this
+# process.
 SQUAD_POLICY_GOVERNANCE_PATHS=()
 squad_policy_load_governance_paths() {
-  if [[ "${SQUAD_POLICY_GOVERNANCE_PATHS_LOADED:-0}" -eq 1 ]]; then
-    return 0
-  fi
-  SQUAD_POLICY_GOVERNANCE_PATHS=()
-  local path
-  while IFS= read -r path; do
-    [[ -n "$path" ]] && SQUAD_POLICY_GOVERNANCE_PATHS+=("$path")
-  done < <(node "$SQUAD_POLICY_RESOLVER" governance-paths)
-  SQUAD_POLICY_GOVERNANCE_PATHS_LOADED=1
+  squad_policy_load_governance_bundle
   return 0
 }
 
@@ -290,17 +364,7 @@ squad_policy_load_governance_paths() {
 # hash-pinned. A broken exclusion must degrade towards more protection, never
 # less.
 squad_policy_load_mutable_patterns() {
-  if [[ "${SQUAD_POLICY_MUTABLE_PATTERNS_LOADED:-0}" -eq 1 ]]; then
-    return 0
-  fi
-  SQUAD_POLICY_MUTABLE_PATTERNS=()
-  local pattern
-  while IFS= read -r pattern; do
-    if [[ -n "$pattern" ]]; then
-      SQUAD_POLICY_MUTABLE_PATTERNS+=("$pattern")
-    fi
-  done < <(node "$SQUAD_POLICY_RESOLVER" mutable-governance-patterns 2>/dev/null)
-  SQUAD_POLICY_MUTABLE_PATTERNS_LOADED=1
+  squad_policy_load_governance_bundle
   return 0
 }
 
@@ -328,17 +392,7 @@ squad_policy_is_mutable() {
 #      rule; a difference at verify time is reported, never a violation)
 # 1 == not in this class (still subject to the lock or the append-only rule)
 squad_policy_load_reported_mutable_patterns() {
-  if [[ "${SQUAD_POLICY_REPORTED_PATTERNS_LOADED:-0}" -eq 1 ]]; then
-    return 0
-  fi
-  SQUAD_POLICY_REPORTED_PATTERNS=()
-  local pattern
-  while IFS= read -r pattern; do
-    if [[ -n "$pattern" ]]; then
-      SQUAD_POLICY_REPORTED_PATTERNS+=("$pattern")
-    fi
-  done < <(node "$SQUAD_POLICY_RESOLVER" reported-mutable-governance-patterns 2>/dev/null)
-  SQUAD_POLICY_REPORTED_PATTERNS_LOADED=1
+  squad_policy_load_governance_bundle
   return 0
 }
 
@@ -440,48 +494,151 @@ squad_policy_byte_len() {
 # pretend to detect it. What the markers buy is a baseline that states what was
 # checked rather than what happened to exist, so a protected path that is absent
 # at hardening time is visibly accounted for instead of silently unrepresented.
+# Issue #113 perf: this used to fork `sha256sum` (and `awk` to pull the hash
+# back out of it, and sometimes `wc` for an append-only file's byte length)
+# ONCE PER GOVERNANCE FILE. That is a rounding error on Linux CI, but this
+# function runs TWICE per harden/verify cycle, and each external-process fork
+# measured several tens of milliseconds on Windows/git-bash (MSYS emulates
+# `fork()`; it does not have one) -- with the Issue #113 reported-mutable set
+# (casting/*.json x3, identity/now.md) adding four more governance files, that
+# per-file cost is what actually grew, not the one-time `node` resolution.
+#
+# The fix is NOT "skip hashing some files" (that would be exactly the
+# coverage loss this file refuses to ship) -- it is forking `sha256sum` and
+# `wc` ONCE EACH for the WHOLE governance set instead of once per file, AND
+# ONE `find`+`sort` for every governance DIRECTORY TOGETHER instead of one
+# find+sort per directory. Passing every directory target to a single `find`
+# call still produces a fully deterministic file list -- `sort -z` orders the
+# WHOLE combined NUL-terminated stream byte-for-byte, so "same directories,
+# same files" always yields the same manifest regardless of how many roots
+# were given to `find` in one call versus several -- and every external-
+# process fork measured several tens of milliseconds on Windows/git-bash, so
+# collapsing N finds into one is not a rounding error at this suite's scale
+# (22 harden/verify cycles).
+#
+# SQUAD_POLICY_MANIFEST_RELS/_ABS cache the exact (rel, abs) file list this
+# walk produced, in manifest order, so squad_policy_harden's unlock pass can
+# reuse it instead of re-walking the same directories a second time -- see
+# the comment at that loop.
+SQUAD_POLICY_MANIFEST_RELS=()
+SQUAD_POLICY_MANIFEST_ABS=()
 squad_policy_write_manifest() {
   local repo_dir="$1" out="$2"
-  local path
+  local path target
 
   : >"$out" || return 1
 
   squad_policy_load_governance_paths
+
+  local -a rel_order=() abs_order=() dir_targets=()
   for path in "${SQUAD_POLICY_GOVERNANCE_PATHS[@]:-}"; do
     [[ -n "$path" ]] || continue
-    local target="${repo_dir}/${path}"
+    target="${repo_dir}/${path}"
     if [[ -d "$target" ]]; then
       printf 'dir %s\n' "$path" >>"$out"
-      # -print0/sort -z keeps ordering stable regardless of locale or readdir
-      # order, so an identical tree always produces an identical manifest.
-      while IFS= read -r -d '' file; do
-        squad_policy_manifest_line "$file" "${file#"${repo_dir}/"}" >>"$out" || return 1
-      done < <(find "$target" -type f -print0 2>/dev/null | sort -z)
+      dir_targets+=("$target")
     elif [[ -f "$target" ]]; then
-      squad_policy_manifest_line "$target" "$path" >>"$out" || return 1
+      rel_order+=("$path")
+      abs_order+=("$target")
     else
       printf 'absent %s\n' "$path" >>"$out"
     fi
   done
 
-  return 0
+  if [[ "${#dir_targets[@]}" -gt 0 ]]; then
+    local file
+    # -print0/sort -z keeps ordering stable regardless of locale or readdir
+    # order, so an identical set of trees always produces an identical
+    # manifest, the same guarantee the old per-directory find+sort gave.
+    while IFS= read -r -d '' file; do
+      rel_order+=("${file#"${repo_dir}/"}")
+      abs_order+=("$file")
+    done < <(find "${dir_targets[@]}" -type f -print0 2>/dev/null | sort -z)
+  fi
+
+  SQUAD_POLICY_MANIFEST_RELS=("${rel_order[@]}")
+  SQUAD_POLICY_MANIFEST_ABS=("${abs_order[@]}")
+
+  squad_policy_write_manifest_file_lines "$out" rel_order abs_order
 }
 
-squad_policy_manifest_line() {
-  local file="$1" rel="$2"
-  local sum
-  sum="$(sha256sum "$file" 2>/dev/null | awk '{print $1}')" || return 1
-  [[ -n "$sum" ]] || return 1
-  if squad_policy_is_mutable "$rel"; then
-    local len
-    len="$(squad_policy_byte_len "$file")"
-    [[ -n "$len" ]] || return 1
-    printf 'append-only %s %s %s\n' "$rel" "$sum" "$len"
-  elif squad_policy_is_reported_mutable "$rel"; then
-    printf 'reported %s %s\n' "$rel" "$sum"
-  else
-    printf 'file %s %s\n' "$rel" "$sum"
+# squad_policy_write_manifest_file_lines <out> <rel-array-name> <abs-array-name>
+# Appends one `file`/`append-only`/`reported` line per entry in the two arrays
+# (same index order) to <out>. Hashing and length-checking are each ONE
+# external-process fork for every file passed in, not one fork per file.
+squad_policy_write_manifest_file_lines() {
+  local out="$1"
+  local -n _rel_ref="$2"
+  local -n _abs_ref="$3"
+  local n="${#_rel_ref[@]}"
+  [[ "$n" -gt 0 ]] || return 0
+
+  local -A sums=() lens=()
+  local line sum rest abs_path
+
+  # One `sha256sum` fork for every governance file, in one shot. coreutils
+  # (and the Windows sha256sum shipped with Git for Windows) print one
+  # "<hash> <mode><path>" line per argument, in argument order -- <mode> is
+  # ` ` (text) or `*` (binary); sha256sum defaults to binary mode on
+  # Windows/MSYS, so the `*` marker is always stripped before using the
+  # filename as the lookup key below, not just handled defensively.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    sum="${line%% *}"
+    rest="${line#* }"
+    rest="${rest# }"
+    rest="${rest#\*}"
+    sums["$rest"]="$sum"
+  done < <(sha256sum "${_abs_ref[@]}" 2>/dev/null)
+
+  # Byte lengths are only needed for append-only paths (the prefix-hash check
+  # in squad_policy_verify); everything else only needs the hash above. Build
+  # that subset, then ONE `wc -c` fork for all of them -- `wc -c` with more
+  # than one file prints a trailing "total" line, so that line (which has no
+  # matching governance path) is simply never looked up below.
+  local -a mutable_abs=()
+  local i
+  for ((i = 0; i < n; i++)); do
+    squad_policy_is_mutable "${_rel_ref[$i]}" || continue
+    mutable_abs+=("${_abs_ref[$i]}")
+  done
+  if [[ "${#mutable_abs[@]}" -gt 0 ]]; then
+    local wc_len
+    # Plain `read` (default IFS), not `${line%% *}`/`${line##* }`: `wc -c`
+    # right-justifies its counts to the width of the WIDEST number it prints
+    # (including the trailing "total"), so any shorter count is left-padded
+    # with a space. `${line%% *}` removes the LONGEST matching suffix, and
+    # when the line itself starts with that pad space, the whole line matches
+    # " *" and the count comes out empty -- which made this block silently
+    # drop a file's length, `squad_policy_write_manifest_file_lines` then hit
+    # its `[[ -n "$len" ]] || return 1` guard, and the manifest was never
+    # written. Word-splitting on whitespace (what the rest of this file's
+    # manifest readers already use) does not care how many pad spaces precede
+    # the first field.
+    while read -r wc_len rest; do
+      [[ -n "$wc_len" ]] || continue
+      [[ "$rest" == total ]] && continue
+      lens["$rest"]="$wc_len"
+    done < <(wc -c "${mutable_abs[@]}" 2>/dev/null)
   fi
+
+  local rel
+  for ((i = 0; i < n; i++)); do
+    rel="${_rel_ref[$i]}"
+    abs_path="${_abs_ref[$i]}"
+    sum="${sums[$abs_path]:-}"
+    [[ -n "$sum" ]] || return 1
+    if squad_policy_is_mutable "$rel"; then
+      local len="${lens[$abs_path]:-}"
+      [[ -n "$len" ]] || return 1
+      printf 'append-only %s %s %s\n' "$rel" "$sum" "$len"
+    elif squad_policy_is_reported_mutable "$rel"; then
+      printf 'reported %s %s\n' "$rel" "$sum"
+    else
+      printf 'file %s %s\n' "$rel" "$sum"
+    fi
+  done >>"$out"
+
   return 0
 }
 
@@ -526,58 +683,52 @@ squad_policy_manifest_line() {
 # session with rotation still enabled would make a routine audit-trail
 # rotation indistinguishable from an agent deleting its own audit trail, and
 # that is not a degraded mode this file is willing to run in.
-squad_policy_pin_memory_audit_config() {
+#
+# Issue #113 perf: the pin ITSELF used to be applied by an inline `node -e`
+# fork in this file. It is now applied by agent-policy.js's
+# pinMemoryAuditConfig(), called as part of the single `harden-init` fork
+# squad_policy_harden makes (pin + governance bundle together, one process).
+# squad_policy_commit_memory_audit_config_pin below is the part that stays in
+# bash: it shells out to `git`, not `node`, to commit the pin before
+# `base-commit` is captured.
+#
+# `.squad/memory/config.json` stays a plain LOCKED governance path (it is
+# not append-only, and it is not the casting/identity runtime state Issue
+# #113 made reported-mutable) -- an agent has no business changing its own
+# audit-rotation policy mid-session. But THIS write happens before the lock
+# is even applied, as part of hardening itself, and `squad_policy_harden`
+# records `base-commit` for the "was a protected path changed in a commit
+# made during this session" detector (c) right after this function returns.
+# Left uncommitted, this pin would be an uncommitted change to a LOCKED path
+# sitting in the working tree at session start; the session's own
+# `git add -A && git commit` (worker/entrypoint.sh) would then sweep it in,
+# and detector (c) would flag it as a governance violation every single run
+# -- not because the agent did anything, but because the CONTROL did.
+# Committing the pin here, before `base-commit` is captured, makes it part
+# of the commit the session starts FROM rather than a change the session
+# made, so the real question -- did the AGENT touch a locked path -- stays
+# answerable. If git is unavailable or this is not a git checkout, there is
+# nothing to commit against and the working-tree write still stands (and is
+# still picked up by the baseline manifest a few lines later in
+# `squad_policy_harden`).
+squad_policy_commit_memory_audit_config_pin() {
   local repo_dir="$1"
-  local config_path="${repo_dir}/.squad/memory/config.json"
-
-  mkdir -p "${repo_dir}/.squad/memory" 2>/dev/null || true
-
-  if ! node -e '
-    const fs = require("fs");
-    const target = process.argv[1];
-    let config = {};
-    if (fs.existsSync(target)) {
-      const raw = fs.readFileSync(target, "utf8");
-      if (raw.trim() !== "") {
-        config = JSON.parse(raw);
-      }
-    }
-    config.policy = config.policy || {};
-    config.policy.auditMaxBytes = 0;
-    fs.writeFileSync(target, JSON.stringify(config, null, 2) + "\n");
-  ' "$config_path" 2>&1; then
-    squad_policy_abort "Could not pin .squad/memory/config.json policy.auditMaxBytes to 0; refusing to run with audit-trail rotation enabled."
-  fi
-
-  # `.squad/memory/config.json` stays a plain LOCKED governance path (it is
-  # not append-only, and it is not the casting/identity runtime state Issue
-  # #113 made reported-mutable) -- an agent has no business changing its own
-  # audit-rotation policy mid-session. But THIS write happens before the lock
-  # is even applied, as part of hardening itself, and `squad_policy_harden`
-  # records `base-commit` for the "was a protected path changed in a commit
-  # made during this session" detector (c) right after this function returns.
-  # Left uncommitted, this pin would be an uncommitted change to a LOCKED path
-  # sitting in the working tree at session start; the session's own
-  # `git add -A && git commit` (worker/entrypoint.sh) would then sweep it in,
-  # and detector (c) would flag it as a governance violation every single run
-  # -- not because the agent did anything, but because the CONTROL did.
-  # Committing the pin here, before `base-commit` is captured, makes it part
-  # of the commit the session starts FROM rather than a change the session
-  # made, so the real question -- did the AGENT touch a locked path -- stays
-  # answerable. If git is unavailable or this is not a git checkout, there is
-  # nothing to commit against and the working-tree write still stands (and is
-  # still picked up by the baseline manifest a few lines later in
-  # `squad_policy_harden`).
   if command -v git >/dev/null 2>&1 && git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
-    if ! git -C "$repo_dir" diff --quiet -- .squad/memory/config.json 2>/dev/null \
-        || ! git -C "$repo_dir" ls-files --error-unmatch .squad/memory/config.json >/dev/null 2>&1; then
-      git -C "$repo_dir" add -- .squad/memory/config.json 2>/dev/null || true
-      if ! git -C "$repo_dir" diff --cached --quiet -- .squad/memory/config.json 2>/dev/null; then
-        git -C "$repo_dir" -c user.name="${GIT_AUTHOR_NAME:-squad-policy}" \
-            -c user.email="${GIT_AUTHOR_EMAIL:-squad-policy@local}" \
-            commit -m "chore(governance): pin audit.jsonl rotation off for this session (#113)" \
-            -- .squad/memory/config.json >/dev/null 2>&1 || true
-      fi
+    # Issue #113 perf: this used to run `git diff --quiet` and, if THAT found
+    # no difference (true for an untracked file -- `git diff` does not cover
+    # untracked paths), a SECOND detection fork (`git ls-files
+    # --error-unmatch`) before ever staging anything. `git add` is a safe
+    # no-op when the file is already tracked and unchanged, so staging it
+    # unconditionally and then asking ONE question -- "is anything staged for
+    # this path?" (`git diff --cached --quiet`) -- replaces both detection
+    # forks with the one check that actually decides whether a commit is
+    # needed, for every case (new file, changed file, unchanged file) alike.
+    git -C "$repo_dir" add -- .squad/memory/config.json 2>/dev/null || true
+    if ! git -C "$repo_dir" diff --cached --quiet -- .squad/memory/config.json 2>/dev/null; then
+      git -C "$repo_dir" -c user.name="${GIT_AUTHOR_NAME:-squad-policy}" \
+          -c user.email="${GIT_AUTHOR_EMAIL:-squad-policy@local}" \
+          commit -m "chore(governance): pin audit.jsonl rotation off for this session (#113)" \
+          -- .squad/memory/config.json >/dev/null 2>&1 || true
     fi
   fi
   return 0
@@ -594,7 +745,22 @@ squad_policy_harden() {
     squad_policy_abort "node is not available, so the audit-rotation pin cannot be applied."
   fi
 
-  squad_policy_pin_memory_audit_config "$repo_dir"
+  mkdir -p "${repo_dir}/.squad/memory" 2>/dev/null || true
+
+  # Issue #113 perf: `harden-init` applies the audit-rotation pin AND returns
+  # the governance bundle (paths/patterns) in the SAME `node` process -- the
+  # ONE fork this function needs, instead of the four separate forks
+  # (pin, governance-paths, mutable-governance-patterns,
+  # reported-mutable-governance-patterns) it used to make.
+  local bundle_output rc
+  bundle_output="$(node "$SQUAD_POLICY_RESOLVER" harden-init "$repo_dir" 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    squad_policy_log "Policy resolution failed while hardening (exit ${rc}): ${bundle_output}"
+    squad_policy_abort "Could not pin .squad/memory/config.json policy.auditMaxBytes to 0; refusing to run with audit-trail rotation enabled."
+  fi
+  squad_policy_parse_bundle <<<"$bundle_output"
+
+  squad_policy_commit_memory_audit_config_pin "$repo_dir"
 
   state="$(squad_policy_state_dir "$repo_dir")" || \
     squad_policy_abort "Could not create a private policy state directory outside the checkout."
@@ -610,15 +776,24 @@ squad_policy_harden() {
 
   SQUAD_POLICY_HARDENED_PATHS=()
   squad_policy_load_governance_paths
+  # Issue #113 perf: ONE `chmod -R a-w` for every governance path that exists,
+  # instead of one fork per path -- the set this loop locks grew by four
+  # entries (casting/*.json, identity/now.md) and a `chmod` per entry is pure
+  # per-process overhead for a value that is identical whether it is applied
+  # to one path or all of them at once.
+  local -a existing_targets=()
   for path in "${SQUAD_POLICY_GOVERNANCE_PATHS[@]:-}"; do
     [[ -n "$path" ]] || continue
     target="${repo_dir}/${path}"
     [[ -e "$target" ]] || continue
-    if ! chmod -R a-w "$target" 2>/dev/null; then
-      squad_policy_abort "Could not make governance path '${path}' read-only."
-    fi
+    existing_targets+=("$target")
     SQUAD_POLICY_HARDENED_PATHS+=("$path")
   done
+  if [[ "${#existing_targets[@]}" -gt 0 ]]; then
+    if ! chmod -R a-w "${existing_targets[@]}" 2>/dev/null; then
+      squad_policy_abort "Could not make one or more governance paths read-only: ${SQUAD_POLICY_HARDENED_PATHS[*]}"
+    fi
+  fi
 
   # SECOND PASS, and the ordering is the control. The recursive lock above has
   # already frozen every governance directory; this puts the owner write bit
@@ -631,35 +806,34 @@ squad_policy_harden() {
   # writable directory.
   SQUAD_POLICY_UNLOCKED_FILES=()
   SQUAD_POLICY_REPORTED_MUTABLE_FILES=()
-  local file rel
-  for path in "${SQUAD_POLICY_HARDENED_PATHS[@]:-}"; do
-    [[ -n "$path" ]] || continue
-    target="${repo_dir}/${path}"
-    if [[ -d "$target" ]]; then
-      while IFS= read -r -d '' file; do
-        rel="${file#"${repo_dir}/"}"
-        squad_policy_is_unlockable "$rel" || continue
-        if ! chmod u+w "$file" 2>/dev/null; then
-          squad_policy_abort "Could not restore write access to '${rel}'."
-        fi
-        if squad_policy_is_mutable "$rel"; then
-          SQUAD_POLICY_UNLOCKED_FILES+=("$rel")
-        else
-          SQUAD_POLICY_REPORTED_MUTABLE_FILES+=("$rel")
-        fi
-      done < <(find "$target" -type f -print0 2>/dev/null | sort -z)
+  # Issue #113 perf: this used to re-walk every governance DIRECTORY with its
+  # own `find`+`sort` to classify unlockable files, duplicating the walk
+  # squad_policy_write_manifest just did two lines above to build the SAME
+  # baseline. SQUAD_POLICY_MANIFEST_RELS/_ABS cache that walk's exact (rel,
+  # abs) file list (directory-sourced AND plain-file governance paths alike),
+  # so this pass reuses it directly -- one loop over an already-built array,
+  # not a second filesystem traversal. Classification itself
+  # (squad_policy_is_mutable / squad_policy_is_reported_mutable) stays
+  # per-file bash regex matching, not a fork; only the redundant `find` is
+  # gone. The `chmod u+w` itself is still ONE batched call for everything
+  # this pass collects.
+  local i rel
+  local -a to_unlock=()
+  for ((i = 0; i < ${#SQUAD_POLICY_MANIFEST_RELS[@]}; i++)); do
+    rel="${SQUAD_POLICY_MANIFEST_RELS[$i]}"
+    squad_policy_is_unlockable "$rel" || continue
+    to_unlock+=("${SQUAD_POLICY_MANIFEST_ABS[$i]}")
+    if squad_policy_is_mutable "$rel"; then
+      SQUAD_POLICY_UNLOCKED_FILES+=("$rel")
     else
-      squad_policy_is_unlockable "$path" || continue
-      if ! chmod u+w "$target" 2>/dev/null; then
-        squad_policy_abort "Could not restore write access to '${path}'."
-      fi
-      if squad_policy_is_mutable "$path"; then
-        SQUAD_POLICY_UNLOCKED_FILES+=("$path")
-      else
-        SQUAD_POLICY_REPORTED_MUTABLE_FILES+=("$path")
-      fi
+      SQUAD_POLICY_REPORTED_MUTABLE_FILES+=("$rel")
     fi
   done
+  if [[ "${#to_unlock[@]}" -gt 0 ]]; then
+    if ! chmod u+w "${to_unlock[@]}" 2>/dev/null; then
+      squad_policy_abort "Could not restore write access to one or more append-only/reported-mutable files: ${SQUAD_POLICY_UNLOCKED_FILES[*]} ${SQUAD_POLICY_REPORTED_MUTABLE_FILES[*]}"
+    fi
+  fi
 
   if [[ "${#SQUAD_POLICY_HARDENED_PATHS[@]}" -gt 0 ]]; then
     squad_policy_log "Governance paths locked read-only: ${SQUAD_POLICY_HARDENED_PATHS[*]}"
@@ -881,11 +1055,17 @@ squad_policy_verify() {
 
   # Restore write bits regardless of the outcome so the workspace stays usable
   # for teardown and diagnostics. The integrity answer is already recorded.
+  # Issue #113 perf: ONE `chmod -R u+w` for every hardened path, the same
+  # batching squad_policy_harden applies to the lock side of this operation.
   local path
+  local -a restore_targets=()
   for path in "${SQUAD_POLICY_HARDENED_PATHS[@]:-}"; do
     [[ -n "$path" ]] || continue
-    chmod -R u+w "${repo_dir}/${path}" 2>/dev/null || true
+    restore_targets+=("${repo_dir}/${path}")
   done
+  if [[ "${#restore_targets[@]}" -gt 0 ]]; then
+    chmod -R u+w "${restore_targets[@]}" 2>/dev/null || true
+  fi
 
   if [[ "$violated" -eq 1 ]]; then
     squad_policy_log "Governance is enforced identically on every execution substrate; see docs/runbook.md#diagnosing-a-run-blocked-by-policy."

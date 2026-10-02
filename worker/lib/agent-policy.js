@@ -516,9 +516,10 @@ const GOVERNANCE_PATHS = [
  * `rotateAuditIfNeeded()` RENAMES audit.jsonl once it crosses
  * `policy.auditMaxBytes`, and a rename is indistinguishable from "the file was
  * deleted and a new one started" to the prefix-hash check below -- it would
- * fail the session exactly like a real deletion. See
- * squad_policy_pin_memory_audit_config in squad-policy.sh for how rotation is
- * made impossible for the session instead of merely detected after the fact.
+ * fail the session exactly like a real deletion. See pinMemoryAuditConfig
+ * below (applied by squad_policy_harden via the `harden-init` subcommand) for
+ * how rotation is made impossible for the session instead of merely detected
+ * after the fact.
  */
 const MUTABLE_GOVERNANCE_PATTERNS = [
   '^\\.squad/agents/[^/]+/history\\.md$',
@@ -927,6 +928,86 @@ function buildPolicyMatrix() {
 
 const POLICY_MATRIX = buildPolicyMatrix();
 
+/**
+ * Issue #113 perf follow-up (worker/tests/test_governance_guard.sh timing
+ * regression). worker/lib/squad-policy.sh used to fork `node` once PER FIELD
+ * it needed (tier, reason, flags, argv, squad-flags, undeliverable,
+ * governance-paths, mutable-governance-patterns,
+ * reported-mutable-governance-patterns) -- up to nine forks for ONE
+ * harden/verify/resolve cycle. `node` startup is a rounding error on Linux CI
+ * but measured at several hundred ms to over a second under git-bash on
+ * Windows, and this suite's `make_repo`+`harden`(+`verify`) cycle runs that
+ * many times over. This function is not a new source of truth: every field it
+ * emits is copied verbatim from the SAME `policy` object the single-field
+ * subcommands below already read. Those subcommands (`tier`, `governance-
+ * paths`, `classify-governance-path`, etc.) are UNCHANGED and still exist on
+ * their own -- scripts/validate.ps1 calls several of them directly, and this
+ * bundle is additive, not a replacement.
+ *
+ * Line format (consumed by worker/lib/squad-policy.sh's
+ * squad_policy_parse_bundle -- the two must agree):
+ *   TIER <tier>
+ *   REASON <reason>
+ *   FLAGSTRING <flagString>
+ *   SQUADFLAGSTRING <squadFlagString>
+ *   ARGV <n>\n<n lines>
+ *   UNDELIVERABLE <n>\n<n lines>
+ *   GOVPATHS <n>\n<n lines>
+ *   MUTABLE <n>\n<n lines>
+ *   REPORTED <n>\n<n lines>
+ * Every scalar above is a single-line value by construction (resolveTier/
+ * resolveTrust/validateExtraFlags never emit embedded newlines), so a
+ * line-oriented bash reader can parse this without a JSON library.
+ */
+function serializeGovernanceBundle(policy) {
+  const lines = [
+    `TIER ${policy.tier}`,
+    `REASON ${policy.reason}`,
+    `FLAGSTRING ${policy.flagString}`,
+    `SQUADFLAGSTRING ${policy.squadFlagString}`,
+  ];
+  const block = (name, items) => {
+    lines.push(`${name} ${items.length}`);
+    for (const item of items) {
+      lines.push(item);
+    }
+  };
+  block('ARGV', policy.flags);
+  block('UNDELIVERABLE', policy.undeliverableViaSquad);
+  block('GOVPATHS', policy.governancePaths);
+  block('MUTABLE', policy.mutableGovernancePatterns);
+  block('REPORTED', policy.reportedMutableGovernancePatterns);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Issue #113: the audit-rotation pin that used to be an inline `node -e`
+ * string in worker/lib/squad-policy.sh's squad_policy_pin_memory_audit_config,
+ * now a named function so the `harden-init` subcommand below can fold it and
+ * the governance bundle into the SAME `node` process -- the one fork
+ * squad_policy_harden needs. See squad_policy_harden's doc in
+ * worker/lib/squad-policy.sh for WHY this pin exists (it disables
+ * squad-sdk's own audit.jsonl rotation; verified against
+ * @bradygaster/squad-sdk@0.13.1, dist/memory/index.js:
+ * `if (maxBytes <= 0) return;` in rotateAuditIfNeeded()).
+ */
+function pinMemoryAuditConfig(repoDir) {
+  const fs = require('fs');
+  const path = require('path');
+  const target = path.join(repoDir, '.squad', 'memory', 'config.json');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  let config = {};
+  if (fs.existsSync(target)) {
+    const raw = fs.readFileSync(target, 'utf8');
+    if (raw.trim() !== '') {
+      config = JSON.parse(raw);
+    }
+  }
+  config.policy = config.policy || {};
+  config.policy.auditMaxBytes = 0;
+  fs.writeFileSync(target, `${JSON.stringify(config, null, 2)}\n`);
+}
+
 module.exports = {
   ATTENDED_MODES,
   ATTENDED_SOURCES,
@@ -955,6 +1036,8 @@ module.exports = {
   resolvePolicyFromEnv,
   buildPolicyMatrix,
   POLICY_MATRIX,
+  serializeGovernanceBundle,
+  pinMemoryAuditConfig,
 };
 
 
@@ -1050,6 +1133,31 @@ function main(argv) {
       process.stdout.write(`${cls}\n`);
       return 0;
     }
+    // Issue #113 perf: every field `squad_policy_resolve` /
+    // `squad_policy_harden` / `squad_policy_verify` read individually above,
+    // in ONE process. See serializeGovernanceBundle's doc for the line
+    // format and why this exists.
+    case 'bundle':
+      process.stdout.write(serializeGovernanceBundle(policy));
+      return 0;
+    // Issue #113 perf: `bundle`, plus the audit-rotation pin
+    // (pinMemoryAuditConfig), in the SAME process -- the one `node` fork
+    // squad_policy_harden needs instead of four. <repo-dir> is required.
+    case 'harden-init': {
+      const repoDir = argv[1];
+      if (repoDir === undefined || String(repoDir).trim() === '') {
+        process.stderr.write('Usage: agent-policy.js harden-init <repo-dir>\n');
+        return 78;
+      }
+      try {
+        pinMemoryAuditConfig(repoDir);
+      } catch (error) {
+        process.stderr.write(`${error.message}\n`);
+        return 78;
+      }
+      process.stdout.write(serializeGovernanceBundle(policy));
+      return 0;
+    }
     // Issue #84 PI-2: the orthogonal trust axis, read the same way `tier` is.
     case 'trust':
       process.stdout.write(`${policy.trust}\n`);
@@ -1115,7 +1223,7 @@ function main(argv) {
         'Usage: agent-policy.js [json|flags|argv|squad-flags|hub-argv-json|undeliverable|tier|reason|' +
           'trust|trust-reason|credential-profile|should-withhold-credential|copilot-token-shared|matrix|' +
           'governance-paths|mutable-governance-patterns|reported-mutable-governance-patterns|' +
-          'classify-governance-path <path>|' +
+          'classify-governance-path <path>|bundle|harden-init <repo-dir>|' +
           'watch-agent-argv-json|watch-agent-parity-argv-json|watch-agent-strict-argv-json|' +
           'watch-agent-policy-mode]\n'
       );

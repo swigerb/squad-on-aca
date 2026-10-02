@@ -96,10 +96,12 @@ GOVERNANCE_FILES=(
 # reason -- `MemoryManager.audit()` (squad-sdk) only ever appends a JSON line
 # to it. It used to sit in GOVERNANCE_FILES above (plain LOCKED), which is now
 # WRONG: Squad 0.13.1 writes to it during a normal session, and a locked file
-# cannot be written at all. See squad_policy_pin_memory_audit_config in
-# worker/lib/squad-policy.sh for how the one way this file's append-only rule
-# could be violated without an agent touching it -- squad-sdk's own rotation
-# -- is made impossible for the session, rather than merely detected.
+# cannot be written at all. See squad_policy_harden and
+# squad_policy_commit_memory_audit_config_pin in worker/lib/squad-policy.sh
+# (and pinMemoryAuditConfig in worker/lib/agent-policy.js, which applies the
+# pin itself) for how the one way this file's append-only rule could be
+# violated without an agent touching it -- squad-sdk's own rotation -- is
+# made impossible for the session, rather than merely detected.
 APPEND_ONLY_FILES=(
   ".squad/agents/security/history.md"
   ".squad/memory/audit.jsonl"
@@ -128,13 +130,25 @@ make_repo() {
   rm -rf "$repo"
   mkdir -p "$repo"
   ( cd "$repo" && git init --quiet . ) || return 1
+  # Issue #113 perf: ONE `mkdir -p` for every directory this fixture needs,
+  # instead of one `mkdir -p` PLUS one `dirname` fork PER FILE. Both `mkdir`
+  # and `dirname` are external processes under git-bash on Windows, and this
+  # fixture is rebuilt fresh once per scenario across ~20 scenarios in this
+  # suite -- `${f%/*}` (bash parameter expansion, no fork) replaces `dirname`,
+  # and collecting every directory into one array lets `mkdir -p` create them
+  # all in its own single fork; `mkdir -p` tolerates an already-existing or
+  # overlapping directory in the same argument list, so no de-duplication is
+  # needed first.
+  local -a dirs=("${repo}/src")
   for f in "${ALL_FIXTURE_FILES[@]}"; do
-    mkdir -p "${repo}/$(dirname "$f")"
+    dirs+=("${repo}/${f%/*}")
+  done
+  mkdir -p "${dirs[@]}"
+  for f in "${ALL_FIXTURE_FILES[@]}"; do
     printf 'original %s\n' "$f" >"${repo}/${f}"
   done
   # A NON-governance file, so the guard is shown to protect a set rather than
   # simply freezing the whole checkout.
-  mkdir -p "${repo}/src"
   printf 'original work\n' >"${repo}/src/app.js"
   printf 'team\n' >"${repo}/.squad/team.md"
   ( cd "$repo" && git add -A && git commit --quiet -m "baseline" ) || return 1
