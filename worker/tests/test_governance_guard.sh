@@ -547,20 +547,22 @@ assert_contains "$(cat "${STATE}/governance.sha256" 2>/dev/null)" "file .squad/a
 # the grown length, THEN truncate back to precisely the baseline length/hash
 # (or to some intermediate point still above it) before verification runs.
 # `csum == bsum` alone used to make the append-only loop `continue` silently
-# -- indistinguishable from a session that never touched the file. We call
-# squad_policy_highwater_scan directly to stand in for "the background
-# sampler happened to tick" without this suite needing to sleep past
-# SQUAD_POLICY_HIGHWATER_INTERVAL_SECONDS.
+# -- in the sampler (a 5s window was left open). We deliberately do NOT call
+# squad_policy_highwater_scan by hand any more (security re-review N2: a test
+# that hand-cranks the scanner structurally cannot catch a sampler that never
+# ticks). The REAL background sampler started by squad_policy_harden runs at a
+# 0.2s interval here and the scenario sleeps across several ticks, so what is
+# exercised is harden -> live sampler -> verify's collect, end to end. The
+# timing-INDEPENDENT half (exact-to-baseline revert caught by ctime even with
+# a 5s window and no sleep) lives in test_security_n2_sampler_invariant.sh.
 #
 # F6's exploit is the reported-mutable sibling: a change-then-revert to the
 # exact baseline bytes used to be wholly invisible because detector (d) only
-# compares the FINAL state. The sticky `everdiffered` flag set by
-# squad_policy_highwater_scan survives the revert.
+# compares the FINAL state.
 #
-# Both findings share one mechanism (squad_policy_highwater_scan's sticky
-# per-file state), so one VIOLATING repo and one CLEAN repo -- each touching
-# two independent governed files at once -- prove every case below without
-# paying for five separate make_repo/harden/verify round trips.
+# One VIOLATING repo and one CLEAN repo -- each touching two independent
+# governed files at once -- prove every case below without paying for five
+# separate make_repo/harden/verify round trips.
 echo "-- Security review F4/F6: high-water-mark tracking catches truncation and reports reverts --"
 
 # -- Violating repo: history.md truncated BACK TO EXACTLY its baseline after
@@ -570,11 +572,12 @@ echo "-- Security review F4/F6: high-water-mark tracking catches truncation and 
 REPO="${TEST_TMP_ROOT}/repo-f4-f6-violate"; STATE="${TEST_TMP_ROOT}/state-f4-f6-violate"; rm -rf "$STATE"
 make_repo "$REPO" >/dev/null
 out="$(scenario "$REPO" "$STATE" '
+  SQUAD_POLICY_HIGHWATER_INTERVAL_SECONDS=0.2
   squad_policy_harden "'"$REPO"'" >/dev/null
   printf "## Session 1\nDid the work.\n" >> "'"$REPO"'/.squad/agents/security/history.md"
   printf "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n" >> "'"$REPO"'/.squad/memory/audit.jsonl"
-  # Stand in for the background sampler ticking while both files are grown.
-  squad_policy_highwater_scan "'"$REPO"'" "'"$STATE"'/governance.sha256" "'"$STATE"'"
+  # Let the REAL sampler tick several times while both files are grown.
+  sleep 1
   # history.md: truncate back to EXACTLY the baseline bytes.
   printf "original .squad/agents/security/history.md\n" > "'"$REPO"'/.squad/agents/security/history.md"
   # audit.jsonl: keep the baseline prefix, but drop part of what was appended
@@ -600,10 +603,11 @@ assert_contains "$out" "TRUNCATED to" \
 REPO="${TEST_TMP_ROOT}/repo-f4-f6-clean"; STATE="${TEST_TMP_ROOT}/state-f4-f6-clean"; rm -rf "$STATE"
 make_repo "$REPO" >/dev/null
 out="$(scenario "$REPO" "$STATE" '
+  SQUAD_POLICY_HIGHWATER_INTERVAL_SECONDS=0.2
   squad_policy_harden "'"$REPO"'" >/dev/null
   printf "## Session 1\n" >> "'"$REPO"'/.squad/agents/security/history.md"
   printf "{\"rewritten\": true}" > "'"$REPO"'/.squad/casting/registry.json"
-  squad_policy_highwater_scan "'"$REPO"'" "'"$STATE"'/governance.sha256" "'"$STATE"'"
+  sleep 1
   printf "## Session 2\n" >> "'"$REPO"'/.squad/agents/security/history.md"
   printf "original .squad/casting/registry.json\n" > "'"$REPO"'/.squad/casting/registry.json"
   squad_policy_verify "'"$REPO"'"
@@ -670,26 +674,31 @@ assert_contains "$out" "Agent history appended (permitted): .squad/memory/audit.
 # the default 1 MiB threshold.
 REPO="${TEST_TMP_ROOT}/repo-audittrunc"; STATE="${TEST_TMP_ROOT}/state-audittrunc"; rm -rf "$STATE"
 make_repo "$REPO" >/dev/null
-original_audit="$(cat "${REPO}/.squad/memory/audit.jsonl")"
-out="$(scenario "$REPO" "$STATE" '
+# Security re-review N1: the baseline now lives only in the memory of the
+# process that hardened, so both mutations (and both verifies) run inside ONE
+# scenario -- a second, fresh process has no trustworthy baseline and is
+# refused outright (see the fail-closed section). The output is split on a
+# marker so each mutation is still asserted on its own verify's output.
+both="$(scenario "$REPO" "$STATE" '
+  original_audit="$(cat "'"$REPO"'/.squad/memory/audit.jsonl")"
   squad_policy_harden "'"$REPO"'" >/dev/null
   printf "TAMPERED\n" > "'"$REPO"'/.squad/memory/audit.jsonl"
   squad_policy_verify "'"$REPO"'"
   echo "VERIFY_RC=$?"
-')"
-assert_contains "$out" "VERIFY_RC=1"                "a TRUNCATE/overwrite of audit.jsonl is refused"
-assert_contains "$out" "REWRITTEN, not appended to"  "the refusal says the audit trail was rewritten, not appended to"
-
-# Reset to the baseline's exact bytes (write access to the file itself was
-# never revoked -- only its containing directory is locked -- so this needs
-# no chmod) before the second, independent mutation against the same baseline.
-printf '%s' "$original_audit" > "${REPO}/.squad/memory/audit.jsonl"
-out="$(scenario "$REPO" "$STATE" '
+  echo "=====SECOND-MUTATION====="
+  # Reset to the baseline bytes before the second, independent mutation
+  # against the same in-memory baseline.
+  printf "%s\n" "$original_audit" > "'"$REPO"'/.squad/memory/audit.jsonl"
   chmod -R u+w "'"$REPO"'/.squad/memory"
   mv "'"$REPO"'/.squad/memory/audit.jsonl" "'"$REPO"'/.squad/memory/audit.1.jsonl"
   squad_policy_verify "'"$REPO"'"
   echo "VERIFY_RC=$?"
 ')"
+out="${both%%=====SECOND-MUTATION=====*}"
+assert_contains "$out" "VERIFY_RC=1"                "a TRUNCATE/overwrite of audit.jsonl is refused"
+assert_contains "$out" "REWRITTEN, not appended to"  "the refusal says the audit trail was rewritten, not appended to"
+
+out="${both#*=====SECOND-MUTATION=====}"
 assert_contains "$out" "VERIFY_RC=1"  "a RENAME/delete of audit.jsonl (what an un-pinned rotation would do) is refused"
 assert_contains "$out" "was DELETED"  "the refusal names it as the work log being deleted, same as history.md's deletion case"
 
@@ -793,84 +802,16 @@ assert_eq "1" "$([[ -w "${REPO}/.squad/config.json" ]] && echo 1 || echo 0)" \
   "verify restores write access when the session is clean"
 
 # ---------------------------------------------------------------------------
-# 2e. Security review of #112/#113 (S1) — a symlinked governance directory
+# 2e. Security review S1 -- a symlinked governance directory
 # ---------------------------------------------------------------------------
-# "Suspected, needs a test": does `squad_policy_write_manifest`'s
-# `find "${dir_targets[@]}" -type f` descend into a governance directory that
-# is itself a SYMLINK, and does `chmod -R a-w` on that same path lock the
-# files it points at? Verified independently against real GNU find/chmod on
-# Linux (WSL Ubuntu) during this fix: `find <symlink-to-dir> -type f` DOES
-# walk into it and list every file beneath it (this is GNU find's documented
-# behaviour for symlinks named directly as command-line operands, which is
-# NOT governed by -P/-H/-L — only symlinks *encountered during the walk* are),
-# and `chmod -R a-w <symlink-to-dir>` DOES recursively strip the write bit
-# from the real target tree. So the manifest the review worried would hold
-# only a bare `dir` line in fact holds a `file`/`append-only` line per file
-# underneath, identically to a real directory — CONCLUSION: handled fully,
-# not a gap; this test proves it rather than leaving it "probably fine".
-echo "-- Security review S1: a symlinked governance directory is fully manifested and locked --"
-
-REPO="${TEST_TMP_ROOT}/repo-s1-symlink"; STATE="${TEST_TMP_ROOT}/state-s1-symlink"
-REAL_AGENTS="${TEST_TMP_ROOT}/s1-real-agents"
-rm -rf "$STATE" "$REAL_AGENTS"
-make_repo "$REPO" >/dev/null
-# Replace the plain .squad/agents directory with a symlink to an identical
-# tree living OUTSIDE .squad, the way a repo that vendors/shares its agent
-# definitions from elsewhere on disk might ship it.
-rm -rf "${REPO}/.squad/agents"
-mkdir -p "${REAL_AGENTS}/security"
-printf 'original .squad/agents/security/charter.md\n' >"${REAL_AGENTS}/security/charter.md"
-printf 'original .squad/agents/security/history.md\n' >"${REAL_AGENTS}/security/history.md"
-ln -s "$REAL_AGENTS" "${REPO}/.squad/agents"
-( cd "$REPO" && git add -A && git commit --quiet -m "agents as a symlink" )
-
-out="$(scenario "$REPO" "$STATE" '
-  squad_policy_harden "'"$REPO"'"
-  echo "HARDEN_RC=$?"
-')"
-assert_contains "$out" "HARDEN_RC=0" "S1: hardening succeeds when a governance directory is a symlink"
-manifest="$(cat "${STATE}/governance.sha256" 2>/dev/null)"
-assert_contains "$manifest" "file .squad/agents/security/charter.md" \
-  "S1: the manifest holds a per-FILE line for charter.md reached THROUGH the symlink, not just a bare 'dir' line"
-assert_contains "$manifest" "append-only .squad/agents/security/history.md" \
-  "S1: history.md reached through the symlink still gets its append-only manifest line"
-
-# Preventive: writing through the symlink must be blocked exactly like a real
-# directory.
-( printf 'TAMPERED\n' >"${REPO}/.squad/agents/security/charter.md" ) 2>/dev/null
-assert_eq "original .squad/agents/security/charter.md" "$(cat "${REPO}/.squad/agents/security/charter.md" 2>/dev/null)" \
-  "S1: a governance file reached through a symlinked directory cannot be overwritten"
-
-# Detective: append-only still applies to history.md through the symlink.
-out="$(scenario "$REPO" "$STATE" '
-  printf "## appended\n" >> "'"$REPO"'/.squad/agents/security/history.md"
-  squad_policy_verify "'"$REPO"'"
-  echo "VERIFY_RC=$?"
-')"
-assert_contains "$out" "VERIFY_RC=0" \
-  "S1: appending to history.md through the symlinked directory still passes verification"
-assert_not_contains "$out" "GOVERNANCE VIOLATION" \
-  "S1: the permitted append through the symlink is not reported as a violation"
-
-# Detective: a REWRITE through the symlink (not just an append) is still
-# caught, proving the manifest's per-file hash — not merely the directory lock
-# — is what is doing the work. Reuses the SAME repo/baseline as the append
-# check above (no rebuild): the prior append touched only history.md, so
-# charter.md is still at its hardened baseline, and one more harden+verify
-# round trip is unnecessary -- unlocking the directory and rewriting the file
-# is enough to prove the per-file hash (not merely the directory lock) is
-# what catches it.
-out="$(scenario "$REPO" "$STATE" '
-  chmod -R u+w "'"$REPO"'/.squad/agents"
-  printf "REWRITTEN THROUGH SYMLINK\n" > "'"$REPO"'/.squad/agents/security/charter.md"
-  squad_policy_verify "'"$REPO"'"
-  echo "VERIFY_RC=$?"
-')"
-assert_contains "$out" "VERIFY_RC=1" \
-  "S1: a rewrite of charter.md reached through the symlinked directory is still caught as a violation"
-assert_contains "$out" ".squad/agents/security/charter.md" \
-  "S1: the violation names the file, proving the per-file manifest line (not just the dir lock) is what caught it"
-rm -rf "$REAL_AGENTS"
+# MOVED to test_security_n3_s1_symlink.sh, with the INVERSE expectation. The
+# assertions that used to live here claimed a symlinked governance directory
+# was "handled fully"; that was an artifact of this suite running under
+# git-bash, where `ln -s` silently COPIES instead of linking, so the fixture
+# was never a symlink. On real Linux (findutils 4.8.0) `find <link> -type f`
+# returns nothing and detection was silently lost (security re-review, S1).
+# The fix REFUSES such a directory (exit 78); that suite proves it with a real
+# link and skips LOUDLY (exit 77) where a real link cannot be created.
 
 # ---------------------------------------------------------------------------
 # 3. FAIL CLOSED — an unapplicable policy aborts, it does not proceed

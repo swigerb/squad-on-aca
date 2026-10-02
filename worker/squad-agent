@@ -99,6 +99,13 @@
 #                                  added -- that is a feature gap (squad_state_*
 #                                  tools unavailable), not a security failure,
 #                                  so it does not abort the session.
+#   SQUAD_POLICY_MCP_CONFIG_SHA256 set by squad_policy_harden: the harden-time
+#                                  SHA-256 of .mcp.json, or `absent`. The
+#                                  AUTHORITATIVE baseline (see the F8 block).
+#   SQUAD_POLICY_STATE_DIR         set by squad_policy_harden: holds the
+#                                  mcp-config.sha256 TRIPWIRE copy. If either
+#                                  variable is set the session is hardened and
+#                                  the check below fails CLOSED (78).
 
 set -Eeuo pipefail
 
@@ -226,24 +233,43 @@ fi
 # attacker-controlled MCP server, and THIS script -- run fresh for the very
 # next `squad watch`/`squad loop` iteration -- would load it via
 # `--additional-mcp-config` with no check at all; that is remote code
-# execution via the next spawn's MCP connection. squad_policy_harden records a
-# SHA-256 baseline of .mcp.json (or the sentinel "absent") in
-# SQUAD_POLICY_STATE_DIR at harden time, before the agent ever runs, and now
-# exports that variable so this CHILD process can find it. If a baseline
-# exists and disagrees with what .mcp.json hashes to right now, this refuses
-# to exec copilot at all -- fail closed, same exit code (78) as every other
-# policy failure in this script. A MISSING baseline (an older harden that
-# predates this fix, or a mode that never calls squad_policy_harden at all) is
-# not itself a violation: there is nothing recorded to compare against, so
-# this stays a detector, not a new hard requirement that harden must always
-# run first.
-mcp_baseline_file="${SQUAD_POLICY_STATE_DIR:-}/mcp-config.sha256"
-if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" && -f "$mcp_baseline_file" ]]; then
-  mcp_baseline="$(cat "$mcp_baseline_file" 2>/dev/null)"
-  mcp_current="absent"
-  [[ "$mcp_present" -eq 1 ]] && mcp_current="$mcp_hash"
+# execution via the next spawn's MCP connection.
+#
+# Security re-review N1/N3 (repros A5b, A5c). The previous round read the
+# baseline from ${SQUAD_POLICY_STATE_DIR}/mcp-config.sha256 and SKIPPED the
+# check when that file was missing. The agent runs as the same uid that owns
+# that directory, so `rm` disabled the check (A5b) and rewriting the file to
+# the new hash forged it (A5c). Now:
+#   - the AUTHORITY is SQUAD_POLICY_MCP_CONFIG_SHA256, exported by
+#     squad_policy_harden into the environment `squad watch`/`squad loop`
+#     inherit and pass to every spawn of this script. The agent is a
+#     descendant of that process and cannot rewrite an ancestor's environment;
+#   - the file in the state directory is a TRIPWIRE: it must still exist and
+#     still equal the env value, or the session has been tampered with;
+#   - FAIL CLOSED: in a hardened session (either variable set) a missing or
+#     malformed digest, a missing tripwire, or any mismatch refuses to exec
+#     copilot (78). Missing integrity state is a violation, never "nothing to
+#     check". Only a session with NEITHER variable -- one that never ran
+#     squad_policy_harden at all -- skips the check.
+mcp_current="absent"
+[[ "$mcp_present" -eq 1 ]] && mcp_current="$mcp_hash"
+if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" || -n "${SQUAD_POLICY_MCP_CONFIG_SHA256:-}" ]]; then
+  mcp_baseline="${SQUAD_POLICY_MCP_CONFIG_SHA256:-}"
+  if [[ ! "$mcp_baseline" =~ ^([0-9a-f]{64}|absent)$ ]]; then
+    squad_agent_abort "This session was hardened but carries no valid .mcp.json baseline (SQUAD_POLICY_MCP_CONFIG_SHA256='${mcp_baseline}'). Missing integrity state is a violation; refusing to run."
+  fi
   if [[ "$mcp_current" != "$mcp_baseline" ]]; then
     squad_agent_abort ".mcp.json has changed since this session was hardened (baseline '${mcp_baseline}', now '${mcp_current}'). It may have been rewritten to point at an attacker-controlled MCP server; refusing to load it."
+  fi
+  if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" ]]; then
+    mcp_baseline_file="${SQUAD_POLICY_STATE_DIR}/mcp-config.sha256"
+    if [[ ! -f "$mcp_baseline_file" ]]; then
+      squad_agent_abort "The .mcp.json baseline tripwire ${mcp_baseline_file} was DELETED during this session. Governance policy state was tampered with; refusing to run."
+    fi
+    mcp_tripwire="$(cat "$mcp_baseline_file" 2>/dev/null || true)"
+    if [[ "$mcp_tripwire" != "$mcp_baseline" ]]; then
+      squad_agent_abort "The .mcp.json baseline tripwire ${mcp_baseline_file} was REWRITTEN during this session (recorded '${mcp_baseline}', file now '${mcp_tripwire}'). Governance policy state was tampered with; refusing to run."
+    fi
   fi
 fi
 
