@@ -3267,6 +3267,132 @@ if (-not (Test-Path $harness)) {
 }
 
 # ---------------------------------------------------------------------------
+# 9a. Refuse externalized Squad state / remote teamRoot (issue #117)
+# ---------------------------------------------------------------------------
+# Squad 0.13's `squad externalize` can move a repo's mutable state to a
+# per-user app-data directory (`stateLocation: "external"`) or point
+# `teamRoot` at another `.squad/` directory entirely. Neither is supportable
+# here: the worker container hardens and commits THIS checkout's `.squad/`,
+# so if the real state lives elsewhere the governance lock is guarding a
+# directory Squad never actually reads or writes. `doctor` must report it,
+# `run` must refuse to dispatch rather than silently doing the wrong thing,
+# and both must still treat an ordinary repo (no config.json, or one with
+# neither key, or `teamRoot: "."`) as perfectly normal.
+Write-Section "squad-aca refuses externalized Squad state (issue #117)"
+$issue117NodeAvailable = [bool](Get-Command node -ErrorAction SilentlyContinue)
+if (-not ((Test-Path $harness) -and $IsWindowsHost -and $issue117NodeAvailable)) {
+    Write-Host "  [SKIP] issue #117 externalized-state checks require Windows + node" -ForegroundColor Yellow
+} else {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment
+        Initialize-SquadCliStubRepository -Stub $stub | Out-Null
+        $squadDir = Join-Path $stub.WorkDir ".squad"
+        $configPath = Join-Path $squadDir "config.json"
+
+        # Case 1: stateLocation: "external" -- doctor must fail the row, run
+        # must refuse before ever touching the dispatch plane.
+        Set-Content -LiteralPath $configPath -Value (@(
+            '{ "version": 1, "teamRoot": ".", "stateLocation": "external", "projectKey": "stub-project" }'
+        ) -join "`n") -Encoding utf8
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorExternal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorExternal.StdOut -match "Squad state location\s+failed" -and
+            $doctorExternal.StdOut -match "external") {
+            Add-Pass "squad-aca doctor reports a failed 'Squad state location' row for stateLocation: external, naming the cause"
+        } else {
+            Add-Fail "squad-aca doctor did not flag stateLocation: external. stdout=$($doctorExternal.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runExternal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-external", "do the thing")
+        $externalStartCalls = @($runExternal.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runExternal.ExitCode -ne 0 -and
+            "$($runExternal.StdErr)`n$($runExternal.StdOut)" -match "external" -and
+            $externalStartCalls.Count -eq 0) {
+            Add-Pass "squad-aca run refuses to dispatch when stateLocation is external, naming the cause, and never requests compute"
+        } else {
+            Add-Fail "squad-aca run did not refuse stateLocation: external (exit=$($runExternal.ExitCode), starts=$($externalStartCalls.Count))"
+        }
+
+        # Case 2: a non-'.' teamRoot (remote/satellite mode) -- same refusal.
+        Set-Content -LiteralPath $configPath -Value (@(
+            '{ "version": 1, "teamRoot": "../other-repo/.squad" }'
+        ) -join "`n") -Encoding utf8
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorRemote = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorRemote.StdOut -match "Squad state location\s+failed" -and
+            $doctorRemote.StdOut -match "\.\./other-repo/\.squad") {
+            Add-Pass "squad-aca doctor reports a failed 'Squad state location' row for a remote teamRoot, naming the configured path"
+        } else {
+            Add-Fail "squad-aca doctor did not flag a remote teamRoot. stdout=$($doctorRemote.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runRemote = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-remote", "do the thing")
+        $remoteStartCalls = @($runRemote.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runRemote.ExitCode -ne 0 -and
+            "$($runRemote.StdErr)`n$($runRemote.StdOut)" -match "\.\./other-repo/\.squad" -and
+            $remoteStartCalls.Count -eq 0) {
+            Add-Pass "squad-aca run refuses to dispatch for a remote teamRoot, naming the configured path, and never requests compute"
+        } else {
+            Add-Fail "squad-aca run did not refuse a remote teamRoot (exit=$($runRemote.ExitCode), starts=$($remoteStartCalls.Count))"
+        }
+
+        # Case 3: the common cases must still work -- no config.json at all,
+        # a config.json missing the version/teamRoot pair Squad itself
+        # requires to treat it as live, and the explicit local sentinel
+        # (teamRoot: "." + stateLocation other than external).
+        Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorAbsent = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorAbsent.StdOut -match "Squad state location\s+ok") {
+            Add-Pass "squad-aca doctor reports 'Squad state location' ok when .squad/config.json is absent"
+        } else {
+            Add-Fail "squad-aca doctor misclassified an absent config.json. stdout=$($doctorAbsent.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runAbsent = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-absent", "do the thing")
+        $absentStartCalls = @($runAbsent.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runAbsent.ExitCode -eq 0 -and $absentStartCalls.Count -eq 1) {
+            Add-Pass "squad-aca run dispatches normally when .squad/config.json is absent"
+        } else {
+            Add-Fail "squad-aca run no longer dispatches with an absent config.json (exit=$($runAbsent.ExitCode), starts=$($absentStartCalls.Count))"
+        }
+
+        Set-Content -LiteralPath $configPath -Value (@(
+            '{ "version": 1, "teamRoot": ".", "stateLocation": "local" }'
+        ) -join "`n") -Encoding utf8
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorLocal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorLocal.StdOut -match "Squad state location\s+ok") {
+            Add-Pass "squad-aca doctor reports 'Squad state location' ok for teamRoot: '.' (the local sentinel)"
+        } else {
+            Add-Fail "squad-aca doctor misclassified teamRoot: '.'. stdout=$($doctorLocal.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runLocal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-local-dot", "do the thing")
+        $localStartCalls = @($runLocal.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runLocal.ExitCode -eq 0 -and $localStartCalls.Count -eq 1) {
+            Add-Pass "squad-aca run dispatches normally for teamRoot: '.' (the local sentinel)"
+        } else {
+            Add-Fail "squad-aca run no longer dispatches with teamRoot: '.' (exit=$($runLocal.ExitCode), starts=$($localStartCalls.Count))"
+        }
+    } catch {
+        Add-Fail "issue #117 externalized-state checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 9b. Unified dispatch contract + durable leases (Sprint 6, PRD #6)
 # ---------------------------------------------------------------------------
 # Two things are proven here that no other check can prove:

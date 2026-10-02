@@ -216,6 +216,75 @@ if [[ -n "${GITHUB_REF:-}" ]]; then
   fi
 fi
 
+# --- Externalized Squad state gate (issue #117) ------------------------------
+# squad-aca clones this repo into THIS ephemeral container, hardens `.squad/`
+# in THIS checkout, then commits and pushes from THIS checkout. Squad 0.13
+# supports two layouts where the real mutable state is NOT in the repo's own
+# `.squad/`:
+#   - `stateLocation: "external"` (written by `squad externalize`): state
+#     moves to a per-user app-data directory outside the repo entirely.
+#   - a `teamRoot` other than `.` (written by `squad init --mode remote`):
+#     state lives in another `.squad/`, resolved relative to the project root.
+# In a fresh container neither of those directories exists (or if it did, it
+# would not belong to this checkout), so a session would either start without
+# the real team, or `squad init` would silently fabricate a NEW local team
+# that masks the problem. Worse, the governance hardening below targets
+# `${REPO_DIR}/.squad/...` paths that would not hold the real state at all --
+# the lock and the audit trail would be silently meaningless. Called AFTER
+# the repo is cloned/checked out (so it reads the config this session
+# actually targets) and BEFORE `squad init`, the health gate, or policy
+# hardening -- all of which assume local state and must never run against an
+# unsupported layout.
+#
+# Mirrors Squad's OWN config.json validation (verified against the published
+# @bradygaster/squad-sdk@0.13.1 package's dist/resolution.js: loadDirConfig()
+# only recognizes a config.json that has BOTH a numeric `version` and a
+# string `teamRoot` -- anything else, including no .squad/config.json at all,
+# resolves to ordinary local state exactly like Squad itself would resolve
+# it). Uses `node`, not grep, for the same reason the rest of this script
+# does: grepping for `stateLocation`/`teamRoot` would false-positive on those
+# strings appearing in comments or unrelated string values.
+squad_external_state_gate() {
+  local config_path="${REPO_DIR}/.squad/config.json"
+  [[ -f "$config_path" ]] || return 0
+
+  local reason
+  reason="$(SQUAD_EXTERNAL_STATE_CONFIG_PATH="$config_path" node -e '
+    const fs = require("fs");
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(process.env.SQUAD_EXTERNAL_STATE_CONFIG_PATH, "utf8"));
+    } catch {
+      process.exit(0);
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      process.exit(0);
+    }
+    const hasVersion = typeof parsed.version === "number";
+    const hasTeamRoot = typeof parsed.teamRoot === "string";
+    if (!hasVersion || !hasTeamRoot) {
+      // Not a config.json Squad itself would recognize; treat as local state.
+      process.exit(0);
+    }
+    if (parsed.stateLocation === "external") {
+      process.stdout.write("external\tstateLocation is \u0027external\u0027 (state was moved out of the repo by \u0027squad externalize\u0027, into a per-user app-data directory outside this checkout)");
+      process.exit(0);
+    }
+    if (parsed.teamRoot !== ".") {
+      process.stdout.write("remote-teamRoot\tteamRoot is \u0027" + parsed.teamRoot + "\u0027, not \u0027.\u0027 (a satellite/remote team root outside this checkout)");
+      process.exit(0);
+    }
+  ' 2>/dev/null)" || reason=""
+  [[ -n "$reason" ]] || return 0
+
+  local detail="${reason#*$'\t'}"
+  log "Externalized Squad state detected: ${detail}."
+  log "squad-aca only clones, hardens, and commits/pushes THIS checkout's .squad/ -- if the real Squad state lives elsewhere, the governance lock and audit trail would protect a directory that does not hold it, and writes here would not reach the real state. Run 'squad internalize' (or point teamRoot back at '.') before dispatching to ACA. Refusing to start."
+  exit 78
+}
+
+squad_external_state_gate
+
 CAPABILITY_PREFLIGHT_SCRIPT="/usr/local/lib/squad-on-aca/squad-capability-preflight.sh"
 CAPABILITY_MANIFEST_RELATIVE="${CAPABILITY_MANIFEST_PATH:-squad-capabilities.yml}"
 capability_preflight_disabled=false

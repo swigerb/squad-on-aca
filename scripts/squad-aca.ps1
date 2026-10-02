@@ -286,6 +286,81 @@ function Ensure-ExistingSquad {
     }
 }
 
+function Test-ExternalizedSquadState {
+    <#
+    .SYNOPSIS
+        Detect a repo whose Squad state does not actually live in this
+        checkout's .squad/, because squad-aca cannot protect state it cannot
+        see (issue #117).
+
+    .DESCRIPTION
+        squad-aca clones a repo into an ephemeral container, hardens
+        `.squad/` in THAT checkout, then commits and pushes from it. Squad
+        0.13 supports two layouts where the mutable state is NOT under the
+        repo's own `.squad/`:
+
+          - `stateLocation: "external"` (written by `squad externalize`):
+            state moves to a per-user app-data directory
+            (`%APPDATA%/squad/projects/<key>` etc.), leaving only a thin
+            marker in `.squad/config.json`.
+          - a `teamRoot` other than `.` (written by `squad init --mode
+            remote`): state lives in another `.squad/` entirely, resolved
+            relative to the project root.
+
+        If either is true, the governance hardening and commit/push this tool
+        performs would operate on a `.squad/` that holds none of the real
+        state -- the lock and the audit trail would be silently meaningless,
+        protecting an empty or stale directory while the actual state goes
+        unobserved and out of sync.
+
+        Mirrors Squad's OWN config.json validation (verified against the
+        published @bradygaster/squad-sdk@0.13.1 package's
+        dist/resolution.js: loadDirConfig / resolveSquadPaths), not a
+        superset or subset of it: a config.json is only "live" to Squad
+        itself when it has BOTH a numeric `version` and a string `teamRoot`.
+        Anything else -- no `.squad/config.json`, or one missing either
+        field -- resolves to ordinary local state, exactly like Squad would
+        resolve it, so the common case (no config.json, or one with neither
+        key) is never falsely refused.
+
+    .OUTPUTS
+        $null when state is local (no config.json, an unrecognized
+        config.json, or teamRoot "." with no external stateLocation).
+        Otherwise a [pscustomobject] with Reason and Detail describing why.
+    #>
+    param([string]$SquadDir = ".squad")
+
+    $configPath = Join-Path $SquadDir "config.json"
+    if (-not (Test-Path $configPath)) { return $null }
+
+    $raw = Get-Content -LiteralPath $configPath -Raw -ErrorAction SilentlyContinue
+    if (-not $raw -or -not $raw.Trim()) { return $null }
+
+    $parsed = $null
+    try { $parsed = $raw | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $parsed) { return $null }
+
+    $versionProp = $parsed.PSObject.Properties["version"]
+    $teamRootProp = $parsed.PSObject.Properties["teamRoot"]
+    $hasVersion = $versionProp -and ($versionProp.Value -is [int] -or $versionProp.Value -is [long] -or $versionProp.Value -is [double])
+    $hasTeamRoot = $teamRootProp -and ($teamRootProp.Value -is [string])
+    if (-not ($hasVersion -and $hasTeamRoot)) { return $null }
+
+    if ($parsed.stateLocation -eq "external") {
+        return [pscustomobject]@{
+            Reason = "external"
+            Detail = "stateLocation is 'external' (state was moved out of the repo by 'squad externalize', into a per-user app-data directory). squad-aca only clones, hardens and commits THIS repo's .squad/ -- the real state would be invisible to it, so the governance lock and audit trail would protect an empty directory while the actual Squad state goes unobserved and unsynced. Run 'squad internalize' before dispatching to ACA."
+        }
+    }
+    if ($parsed.teamRoot -ne ".") {
+        return [pscustomobject]@{
+            Reason = "remote-teamRoot"
+            Detail = "teamRoot is '$($parsed.teamRoot)', not '.' (a satellite/remote team root outside this checkout). squad-aca only clones and hardens THIS repository, so the directory holding the real Squad state would never be cloned, hardened, or committed, and the governance lock would protect a directory with none of the real state. Point teamRoot back at '.' or dispatch from the team repo directly before using ACA."
+        }
+    }
+    return $null
+}
+
 function Sync-LocalSquadState {
     param([switch]$SyncAll)
 
@@ -1070,6 +1145,15 @@ function Invoke-Run {
     $config = Assert-AcaConfigured
     Ensure-ExistingSquad
 
+    # Issue #117: refuse BEFORE any dispatch work if this repo's Squad state
+    # does not actually live in THIS checkout's .squad/ (externalized via
+    # `squad externalize`, or a remote `teamRoot`). See
+    # Test-ExternalizedSquadState for why that is unsupportable here.
+    $externalized = Test-ExternalizedSquadState
+    if ($externalized) {
+        throw "squad-aca run refuses to dispatch: $($externalized.Detail)"
+    }
+
     # Captured once: Get-CurrentRepo shells out to `gh`, and the capability
     # manifest source below needs to know whether the working tree IS the
     # repository being dispatched. Calling it twice would add an observable `gh`
@@ -1445,6 +1529,18 @@ function Invoke-Doctor {
     $repo = Get-CurrentRepo
     $checks += [pscustomobject]@{ Check = "GitHub repo"; Status = if ($repo) { "ok" } else { "missing" }; Detail = if ($repo) { $repo } else { "Run squad-aca init or pass --repo" } }
     $checks += [pscustomobject]@{ Check = ".squad"; Status = if (Test-Path ".squad\team.md") { "ok" } else { "missing" }; Detail = "Required for existing-repo dispatch" }
+
+    # Issue #117: squad-aca can only harden, commit, and push the .squad/
+    # state that is actually IN this checkout. `squad externalize` and a
+    # remote `teamRoot` both move the real state elsewhere, so surface that
+    # here -- before a `run` ever gets as far as refusing -- the same way
+    # "Squad health" surfaces a broken local state for #116.
+    $externalizedState = Test-ExternalizedSquadState
+    if ($externalizedState) {
+        $checks += [pscustomobject]@{ Check = "Squad state location"; Status = "failed"; Detail = $externalizedState.Detail }
+    } else {
+        $checks += [pscustomobject]@{ Check = "Squad state location"; Status = "ok"; Detail = "Local (state lives in this repo's .squad/)" }
+    }
 
     # Issue #116: `squad health --json` (schema `squad-health/v1`, Squad
     # 0.13+) is the same readiness gate worker/entrypoint.sh runs before
