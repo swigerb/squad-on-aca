@@ -112,10 +112,29 @@ squad_session_has_publishable_work() {
     if [[ -z "$head" ]]; then
         return 1
     fi
-    if [[ -z "$base" || "$head" != "$base" ]]; then
+    if [[ -n "$base" && "$head" == "$base" ]]; then
+        return 1
+    fi
+    # The agent's commits are already on the remote -- an attended agent that
+    # was allowed to push did so itself. Publishing them again would open a
+    # second pull request for the same work.
+    if [[ -n "$(git -C "$repo_dir" for-each-ref --contains "$head" --format='%(refname)' refs/remotes 2>/dev/null)" ]]; then
+        squad_push_log "The agent's commits are already on the remote; nothing more to publish."
+        return 1
+    fi
+    return 0
+}
+
+# The note appended to the agent's prompt whenever the WORKER publishes
+# (PUSH_CHANGES=true). Without it a well-behaved agent tries `git push` and
+# `gh pr create`, is refused by policy, retries with workarounds, and ends its
+# session reporting a "blocker" for a step the worker then does anyway.
+squad_publish_contract_note() {
+    if [[ "${PUSH_CHANGES:-false}" != "true" ]]; then
         return 0
     fi
-    return 1
+    printf '\n\n---\n%s\n' \
+        "Publishing is handled for you: when you finish, leave your work in this checkout (committing it is fine). Do not run git push or gh pr, and do not change git or gh credentials. After you exit, the Squad on ACA worker pushes the branch and opens the pull request. If the brief asks you to open a pull request, that is how it will be opened, so it is not a blocker and you do not need to report it as one."
 }
 
 # Push whatever exists RIGHT NOW to the session branch, best effort.

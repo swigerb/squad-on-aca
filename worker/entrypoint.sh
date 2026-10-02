@@ -1049,6 +1049,7 @@ NODE
     ;;
   prompt)
     require SQUAD_PROMPT
+    SQUAD_AGENT_PROMPT="${SQUAD_PROMPT}$(squad_publish_contract_note)"
     log "Running one-shot Squad prompt."
     # Issue #84 PI-3: withhold the push credential from the agent for an
     # untrusted-input session (an issue/comment-sourced prompt), and restore it
@@ -1067,14 +1068,14 @@ NODE
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      ( squad_policy_exec_agent squad_hub_run "$SQUAD_PROMPT" )
+      ( squad_policy_exec_agent squad_hub_run "$SQUAD_AGENT_PROMPT" )
     else
       squad_policy_announce direct
       ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
         squad_policy_exec_agent \
-          copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}" )
+          copilot -p "$SQUAD_AGENT_PROMPT" "${COPILOT_ARGV[@]}" )
     fi
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
@@ -1086,6 +1087,7 @@ NODE
     export PUSH_CHANGES="${PUSH_CHANGES:-true}"
     export OUTPUT_BRANCH="${OUTPUT_BRANCH:-squad/bootstrap-${SESSION_NAME}}"
     export PR_TITLE="${PR_TITLE:-Bootstrap project with Squad on ACA}"
+    SQUAD_AGENT_PROMPT="${SQUAD_PROMPT}$(squad_publish_contract_note)"
     log "Running new-project bootstrap Squad prompt."
     # Issue #84 PI-3: same withholding as `prompt`. new-project is the OTHER
     # entrypoint-publishes mode: it always intends to push (PUSH_CHANGES
@@ -1103,14 +1105,14 @@ NODE
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      ( squad_policy_exec_agent squad_hub_run "$SQUAD_PROMPT" )
+      ( squad_policy_exec_agent squad_hub_run "$SQUAD_AGENT_PROMPT" )
     else
       squad_policy_announce direct
       ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
         squad_policy_exec_agent \
-          copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}" )
+          copilot -p "$SQUAD_AGENT_PROMPT" "${COPILOT_ARGV[@]}" )
     fi
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
