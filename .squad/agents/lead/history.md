@@ -94,3 +94,7 @@ Evidence:
 Merge note: #121 on main auto-merges but drops the commit-rc→78 mapping. Details are in decisions/inbox/lead-pin-seal-revision.md.
 
 **Learned:** never compare git paths as strings across Git Bash and Windows; decide from git config and ev-parse --path-format=absolute instead. Test drivers that run the sampler need private SQUAD_POLICY_STATE_DIRs.
+
+## 2026-10-02 — Pin seal fix → commit b54b3be, pushed
+
+The full session cycle: engineer implemented the B0 index-seal design; security rejected with 10 findings; I revised with continuous enforcement layers, all findings closed; security re-reviewed (🟡 with advisories); reviewer closed all advisories and has final say. Commit b54b3be authorized and pushed on `fix/governance-pin-leak`. Lockout chain: engineer → lead (first revision) → lead locked for re-review → reviewer (edit authority, closes advisories).

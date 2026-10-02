@@ -59,6 +59,14 @@ identical ignoring PowerShell's error-record line annotation, exit 0** — the
 zero-behaviour-change guarantee is intact. Worker suite: **6 suites / 302
 assertions (123/11/62/40/23/43), 0 failed, 0 skipped**, unchanged.
 
+## 2026-10-02 — Pin seal fix: REJECT (10 findings) → RE-REVIEW (APPROVE WITH ADVISORIES, findings CLOSED)
+
+Performed adversarial review of engineer's implementation of lead's design B0. The tracked `--skip-worktree` seal was sound, but the untracked `.git/info/exclude` seal was breakable by `git add -f` and `.gitignore` negations, and the detector overclaimed what it guaranteed in documentation (finding 10). **REJECTED** with 10 findings. Lead took revision author under lockout.
+
+After lead's revision added continuous enforcement layers (sampler tick, pre-commit/pre-push hooks, agent-wrapper gate, seal-integrity checks), performed a second review. **All 10 original findings CLOSED.** Re-produced every attack empirically in throwaway repos outside the repo root: `git add -f`, `.gitignore` negation, `clean -fdx`, `ls-files -v` case-sensitivity, checkout/merge blocking. Six new advisories remain (R5 mid-range commit, R-CI suite timeout, R5-b/R6 doc, R7 symlink guard scope, R8 PR merge conflicts) — all closed by reviewer's edit authority.
+
+**Verdict:** 🟡 APPROVE WITH ADVISORIES (all six closed). All 10 original findings CLOSED. Nothing blocking. Commit b54b3be authorized.
+
 **Mutation-tested the new checks.** Re-applying the reviewer's three mutations:
 a no-op ACA `terminate` fails 4 adapter checks; `throw "MUTANT wait"` in ACA
 `wait` fails both wait checks; `| Out-Null` on the ACA `cancel` az call fails
