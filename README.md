@@ -22,11 +22,11 @@ A 3-minute tour: `squad-aca doctor`, a session dispatched to its own ACA job, th
 | GitHub `/remote` session access | Copilot CLI runs with `--remote` by default |
 | GitHub-backed code | Each session clones `owner/repo`, works in an isolated workspace, and can push a branch/PR |
 | Monitoring | Standalone Aspire Dashboard on ACA as the default OTLP sink, with OTLP API-key auth and browser-token UI auth |
-| Unattended work | ACA watcher app running `squad watch --execute` |
+| Unattended work | ACA watcher app running `squad watch --execute` through the `squad-agent` wrapper |
 | Secure image pulls | ACR plus user-assigned managed identity |
 | Token storage | ACA secrets by default; optional Key Vault references with `-UseKeyVault` |
 | Second execution plane (opt-in preview) | ACA Sandboxes behind `SQUAD_ACA_ENABLE_SANDBOX`, for per-session isolation and default-deny egress. Off by default; ACA Jobs stay the default and rollback path |
-| Agent tool policy | Every session resolves an `attended` or `autonomous` tier before any agent starts; unattended runs do not receive destructive infrastructure verbs. `--yolo` is never emitted |
+| Agent tool policy | Every session resolves an `attended` or `autonomous` tier before any agent starts; unattended runs do not receive destructive infrastructure verbs. Copilot CLI is invoked without `--yolo`; see [docs/runbook.md § watch/loop policy](docs/runbook.md#watchloop-policy) for the watch/loop wrapper and parity-vs-strict behavior |
 | Governance-path protection | `.squad/` policy, identity, and audit state is made read-only and hash-verified for the session; a violation fails the run and pushes nothing |
 | Event-driven trigger | A GitHub Actions workflow (`squad-dispatch.yml`) fires on an issue label or a `/squad-aca` comment, federates to Azure by OIDC, and starts the ACA session job. Actions is the trigger transport; the decision, lease, and run stay in Azure |
 | Duplicate-dispatch protection | A durable lease is claimed before compute is requested, shared by the CLI, Ralph, the watcher, and the Actions trigger (`squad-aca leases`) |
@@ -198,7 +198,7 @@ The helper starts `SQUAD_MODE=new-project`, initializes Squad state in the ACA s
 
 ## Ralph and watcher
 
-The worker image contains Node.js, Azure CLI, GitHub CLI, Copilot CLI, and Squad CLI. Ralph is a scheduled job mode in that image. `caj-squad-aca-ralph` runs `SQUAD_MODE=ralph` every 5 minutes, polls GitHub issues, marks actionable issues as dispatched, and starts new `caj-squad-aca-session` executions.
+The worker image contains Node.js, Azure CLI, GitHub CLI, Copilot CLI `@github/copilot@1.0.69-2`, Squad CLI `@bradygaster/squad-cli@0.13.1`, and squad-hub `squad-hub@0.5.0` by default. Ralph is a scheduled job mode in that image. `caj-squad-aca-ralph` runs `SQUAD_MODE=ralph` every 5 minutes, polls GitHub issues, marks actionable issues as dispatched, and starts new `caj-squad-aca-session` executions.
 
 Run a watcher:
 
@@ -355,6 +355,33 @@ dotnet run --project aspire/Squad.Aca.Agents.MAF.Sample -- `
 | Understand how it fits together | [docs/architecture.md](docs/architecture.md) |
 | Turn something off | [docs/rollback.md](docs/rollback.md) |
 | Verify a change | [docs/validation.md](docs/validation.md) |
+
+## Relationship to Upstream Squad
+
+Squad on ACA and [upstream Squad](https://github.com/bradygaster/squad) take different architectural approaches to production deployment:
+
+| Aspect | squad-on-aca | Upstream (long-running app) |
+|---|---|---|
+| **Execution model** | One isolated **ACA Job per session** — scale-to-zero, no idle compute | Long-running **Container App** with KEDA scaling |
+| **Trigger** | GitHub Actions workflow with OIDC federation (no stored secrets) | Squad Agent spawns Copilot locally or in the container |
+| **Cost** | Pay only for active sessions; Jobs scale to zero between runs | Always-on app + ingress + optional KEDA autoscaling |
+| **Supervision** | Optional: Squad Hub for human approval of tool calls | Optional: Squad Hub integration via hooks |
+
+When to use **squad-on-aca**:
+- You want zero idle compute and on-demand execution.
+- You need GitHub Actions integration and OIDC federation.
+- You want least-privilege per-session isolation.
+
+When to use **upstream Squad container**:
+- You want a long-running agent polling continuously.
+- KEDA autoscaling on HTTP or queue length fits your workflow.
+- Simpler operational model without per-session setup.
+
+Both implement the same Squad agent model and team structure. To learn more about Squad fundamentals, deployment patterns, and container image configuration, see the upstream guides:
+
+- [Azure Container Apps Scenarios](https://bradygaster.github.io/squad/docs/scenarios/azure-container-apps/) — long-running container app with KEDA
+- [Container Image Reference](https://bradygaster.github.io/squad/docs/reference/container-image/) — environment variables and volume mount contract
+- [Production Security Hardening](https://bradygaster.github.io/squad/docs/features/security-hardening/) — threat model, trust boundaries, and operational security
 
 ## License
 

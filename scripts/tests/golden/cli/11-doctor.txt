@@ -14,6 +14,7 @@ auth status
 api user --jq .login
 api repos/octo/demo --jq .permissions
 ### SQUAD CALLS
+health --json
 ### ACA CALLS
 ### STDOUT
 
@@ -25,6 +26,8 @@ az                      ok      Required for ACA job control
 squad                   ok      Used by init; npx fallback is available
 GitHub repo             ok      octo/demo
 .squad                  missing Required for existing-repo dispatch
+Squad state location    ok      Local (state lives in this repo's .squad/)
+Squad health            ok      squad health --json reports pass
 GitHub auth             ok      gh auth status succeeded
 GitHub push             ok      octo-stub has push access to octo/demo
 Azure auth              ok      Stub Subscription

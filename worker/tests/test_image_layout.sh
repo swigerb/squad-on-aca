@@ -66,11 +66,16 @@ die() {
 
 # --- Parse the Dockerfile COPY instructions ---------------------------------
 # Emits one "<dest>\t<src> [<src>...]" record per COPY, with build-context
-# (= repository root) relative sources.
+# (= repository root) relative sources. COPY_CHOWNS is a PARALLEL array (same
+# index as COPY_RECORDS) carrying that COPY's `--chown=` value, or "" when the
+# instruction has none -- added for F1 (security-review-112-113.md): the
+# ownership a COPY assigns is exactly what that review found broken, so this
+# suite must be able to see it without guessing a layout.
 COPY_RECORDS=()
 COPY_SOURCES=()
+COPY_CHOWNS=()
 parse_dockerfile_copies() {
-  local line token dest
+  local line token dest chown
   local -a tokens args srcs
 
   [[ -f "$DOCKERFILE" ]] || die "worker/Dockerfile is missing"
@@ -84,9 +89,11 @@ parse_dockerfile_copies() {
 
     read -r -a tokens <<< "$line"
     args=()
+    chown=""
     for token in "${tokens[@]:1}"; do
       case "$token" in
         --from=*) die "a COPY instruction copies from another build stage (--from=); its source is not a context file" ;;
+        --chown=*) chown="${token#--chown=}" ;;
         --*) continue ;;
         *) args+=("$token") ;;
       esac
@@ -101,6 +108,7 @@ parse_dockerfile_copies() {
     fi
 
     COPY_RECORDS+=("$(printf '%s\t%s' "$dest" "${srcs[*]}")")
+    COPY_CHOWNS+=("$chown")
     COPY_SOURCES+=("${srcs[@]}")
   done < "$DOCKERFILE"
 
@@ -139,6 +147,17 @@ build_layout() {
     find "${root}/usr/local/bin" -type f -exec sed -i 's/\r$//' {} + 2>/dev/null || true
     find "${root}/usr/local/bin" -type f -exec chmod +x {} + 2>/dev/null || true
   fi
+  # worker/squad-agent (issue #112) is NOT caught by either pass above: it has
+  # no `.sh` extension (it is invoked as an opaque `--agent-cmd`, the same
+  # calling convention as `copilot` itself, which also carries no extension)
+  # and it does not live under usr/local/bin. The real Dockerfile's
+  # sed/chmod RUN line names it explicitly for exactly this reason; this
+  # throwaway layout must do the same or it would silently diverge from what
+  # actually ships.
+  if [[ -f "${root}/usr/local/lib/squad-on-aca/squad-agent" ]]; then
+    sed -i 's/\r$//' "${root}/usr/local/lib/squad-on-aca/squad-agent" 2>/dev/null || true
+    chmod +x "${root}/usr/local/lib/squad-on-aca/squad-agent" 2>/dev/null || true
+  fi
 }
 
 parse_dockerfile_copies
@@ -164,6 +183,86 @@ assert_eq "1" "$([[ -x "${IMAGE_LIB}/proc-isolation-probe.sh" ]] && echo 1 || ec
 probe_line_endings="$(grep -c $'\r' "${IMAGE_LIB}/proc-isolation-probe.sh" || true)"
 assert_eq "0" "$probe_line_endings" \
   "image layout (T9): the staged proc-isolation-probe.sh has CRLF line endings normalised away by the Dockerfile's sed pass"
+
+# ---------------------------------------------------------------------------
+# F1 (security-review-112-113.md, CRITICAL, REJECTED #112): squad-agent (and
+# everything else shipped under /usr/local/lib/squad-on-aca and
+# /usr/local/bin/squad-on-aca) must be ROOT-owned and NOT writable by the
+# `squad` user it is executed as -- otherwise `squad` can rewrite its own
+# `--agent-cmd` leash and `squad watch`/`squad loop` re-exec the rewritten
+# file on every spawn for the life of the container, with no governance
+# detector ever seeing it (the path is outside .squad/).
+#
+# This suite cannot run the Dockerfile's COPY under a real root/squad UID
+# split (it is not run inside the image, by design -- see the suite header),
+# so ownership is asserted the same way every other packaging fact in this
+# suite is: parsed directly out of the Dockerfile text, so a regression
+# (reverting to --chown=squad:squad) fails this suite rather than silently
+# shipping. The write-bit removal, by contrast, IS run for real below: the
+# exact `chmod -R a-w ...` command is extracted from the Dockerfile and
+# applied to the materialised throwaway layout, and the resulting file modes
+# are asserted with a real `stat`, not inferred from the Dockerfile text.
+find_copy_chown() {
+  # Finds the --chown= value of the (single) COPY_RECORDS entry whose dest
+  # matches exactly, or whose dest is a directory prefix of it.
+  local want="$1" i dest
+  for i in "${!COPY_RECORDS[@]}"; do
+    dest="${COPY_RECORDS[$i]%%$'\t'*}"
+    if [[ "$dest" == "$want" ]]; then
+      printf '%s' "${COPY_CHOWNS[$i]}"
+      return 0
+    fi
+  done
+  printf ''
+  return 1
+}
+
+bin_chown="$(find_copy_chown "/usr/local/bin/squad-on-aca")"
+lib_chown="$(find_copy_chown "/usr/local/lib/squad-on-aca/")"
+assert_eq "root:root" "$bin_chown" \
+  "image layout (F1): the COPY that stages /usr/local/bin/squad-on-aca uses --chown=root:root, not --chown=squad:squad -- squad must not own the entrypoint it executes"
+assert_eq "root:root" "$lib_chown" \
+  "image layout (F1): the COPY that stages /usr/local/lib/squad-on-aca/ uses --chown=root:root, not --chown=squad:squad -- squad must not own squad-agent, the --agent-cmd leash it is executed through on every watch/loop spawn"
+
+# Extract the real `chmod -R a-w ...` command this Dockerfile ships (rather
+# than hand-writing an equivalent one here, which could pass while the real
+# RUN line regressed) and apply it to the materialised layout.
+chmod_line="$(grep -o 'chmod -R a-w [^&]*' "$DOCKERFILE" | head -1)"
+chmod_line="${chmod_line%$'\r'}"
+assert_ne "" "$chmod_line" \
+  "image layout (F1): the Dockerfile's RUN block contains a 'chmod -R a-w' pass over the shipped squad-on-aca paths"
+assert_contains "$chmod_line" "/usr/local/lib/squad-on-aca" \
+  "image layout (F1): the chmod -R a-w pass covers /usr/local/lib/squad-on-aca"
+assert_contains "$chmod_line" "/usr/local/bin/squad-on-aca" \
+  "image layout (F1): the chmod -R a-w pass covers /usr/local/bin/squad-on-aca"
+
+if [[ -n "$chmod_line" ]]; then
+  # Rewrite the two absolute paths onto the throwaway root and actually run
+  # the command -- this is the real chmod, not a reimplementation of it.
+  real_chmod_cmd="${chmod_line//\/usr\/local\/lib\/squad-on-aca/${IMAGE_ROOT}/usr/local/lib/squad-on-aca}"
+  real_chmod_cmd="${real_chmod_cmd//\/usr\/local\/bin\/squad-on-aca/${IMAGE_ROOT}/usr/local/bin/squad-on-aca}"
+  bash -c "$real_chmod_cmd" || die "the extracted chmod -R a-w command failed to run against the materialised layout"
+fi
+
+no_write_bit() {
+  # "no write bit for owner, group, OR other" -- true root-ownership in the
+  # real image additionally means `squad` (neither the owning user nor its
+  # group) only ever sees the "other" bits, but this assertion is stricter:
+  # it holds regardless of who ends up owning the file, which is exactly the
+  # belt-and-suspenders property the Dockerfile's comment above the RUN line
+  # describes.
+  local path="$1" mode
+  mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null)"
+  [[ -n "$mode" ]] || return 1
+  # Any of the three write bits (0200 owner, 0020 group, 0002 other) being
+  # set anywhere in the mode fails this check.
+  (( (8#$mode & 8#222) == 0 ))
+}
+
+for f in "${IMAGE_LIB}/squad-agent" "${IMAGE_LIB}/sandbox-classes.json" "${IMAGE_LIB}/agent-policy.js" "${IMAGE_ROOT}/usr/local/bin/squad-on-aca"; do
+  assert_eq "1" "$([[ -f "$f" ]] && no_write_bit "$f" && echo 1 || echo 0)" \
+    "image layout (F1): $(basename "$f") has no write bit set for owner, group, or other after the Dockerfile's real chmod -R a-w pass runs -- squad cannot rewrite it even though it can read/execute it"
+done
 probe_source_output="$(bash -c "source '${IMAGE_LIB}/proc-isolation-probe.sh'; squad_proc_iso_line" 2>&1)"
 assert_contains "$probe_source_output" "SQUAD-PROC-ISO v1" \
   "image layout (T9): the shipped proc-isolation-probe.sh, sourced from its staged path, actually runs and emits the documented line"

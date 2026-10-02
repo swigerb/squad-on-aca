@@ -122,7 +122,10 @@ check "every other mode is dropped by a wildcard, so a NEW mode is safe by defau
 
 # The drop has to happen BEFORE any agent runs, or it protects nothing.
 drop_line="$(grep -n 'squad_drop_azure_identity$' "$ENTRYPOINT" | tail -1 | cut -d: -f1)"
-first_agent_line="$(grep -n 'copilot -p\|squad loop\|squad_hub_run' "$ENTRYPOINT" | head -1 | cut -d: -f1)"
+# Exclude comment lines: issue #112 added prose above the watch/loop dispatch
+# that legitimately contains the words "squad loop" (explaining why it is
+# routed through squad-agent), and a comment is not an invocation.
+first_agent_line="$(grep -nv '^\s*#' "$ENTRYPOINT" | grep 'copilot -p\|squad loop\|squad_hub_run' | head -1 | cut -d: -f1)"
 check "the identity is dropped before the first agent invocation (drop @${drop_line}, agent @${first_agent_line})" \
   test "$drop_line" -lt "$first_agent_line"
 

@@ -102,7 +102,7 @@ bash worker/tests/run-tests.sh
 
 | Suite | What it exercises |
 |---|---|
-| `worker/tests/test_agent_policy.sh` | The `POLICY_MATRIX` built by `buildPolicyMatrix()` agrees, cell by cell, with a freshly resolved policy for every `KNOWN_SOURCES` x `KNOWN_MODES` combination; the trust axis (only `local-cli` trusted) is orthogonal to the attended/autonomous tier and narrows untrusted sources without touching `local-cli`'s effective policy; `UNTRUSTED_INPUT_DENY_TOOLS` never denies bare `git`/`gh`/`npm`/`pip`; space-bearing deny patterns are deliverable on argv/hub-json paths and undeliverable on the `squad watch` path; credential-withholding profiles per source/mode; the `copilotTokenEnv`/`copilotTokenShared`/`copilotTokenSharedAllowed` credential-profile fields across the matrix (derived/explicit-equal/explicit-distinct/escape-hatch cases resolved from a live environment via `resolvePolicyFromEnv`), and a matrix-wide invariant that `withheld:true` never co-occurs with an unqualified exported shared Copilot token. |
+| `worker/tests/test_agent_policy.sh` | The `POLICY_MATRIX` built by `buildPolicyMatrix()` agrees, cell by cell, with a freshly resolved policy for every `KNOWN_SOURCES` x `KNOWN_MODES` combination; the trust axis (only `local-cli` trusted) is orthogonal to the attended/autonomous tier and narrows untrusted sources without touching `local-cli`'s effective policy; `UNTRUSTED_INPUT_DENY_TOOLS` never denies bare `git`/`gh`/`npm`/`pip`; space-bearing deny patterns are available in the strict argv while the watch/loop default parity argv preserves the previous single-word effective deny set; credential-withholding profiles per source/mode; the `copilotTokenEnv`/`copilotTokenShared`/`copilotTokenSharedAllowed` credential-profile fields across the matrix (derived/explicit-equal/explicit-distinct/escape-hatch cases resolved from a live environment via `resolvePolicyFromEnv`), and a matrix-wide invariant that `withheld:true` never co-occurs with an unqualified exported shared Copilot token. |
 
 ## Closing the Copilot-token gap in partial withholding (issue #84 follow-up)
 
@@ -290,7 +290,8 @@ Check `worker/Dockerfile` pins:
 
 - base image `node:24-bookworm-slim`;
 - Copilot CLI `@github/copilot@1.0.69-2`;
-- Squad CLI `@bradygaster/squad-cli@0.11.0`.
+- Squad CLI `@bradygaster/squad-cli@0.13.1`;
+- squad-hub `squad-hub@0.5.0` (default; see `SQUAD_HUB_SPEC` in Dockerfile).
 
 Pin the Aspire Dashboard image to a specific tag or digest for production.
 
@@ -313,6 +314,7 @@ If validation fails after a deploy or config change, follow [rollback.md](rollba
 - `worker/tests/run-tests.sh` needs Linux/WSL.
 - `scripts/validate.ps1` is Windows-only.
 - Secret scans are pattern-based.
+- **Externalized Squad state not supported:** Squad on ACA requires the Squad team state to live in the repository's own `.squad/` directory. squad-aca clones a repo into an ephemeral container, hardens and commits/pushes `.squad/` in that checkout only — if the real state lives elsewhere, the governance lock and audit trail protect a directory that does not hold it. `.squad/config.json` is only "live" to Squad itself (and to squad-aca's detection) when it has both a numeric `version` and a string `teamRoot`; anything else (no config.json, or one missing either field) is ordinary local state. Given a live config: `stateLocation: "external"` (written by `squad externalize`) or a `teamRoot` other than `.` (a satellite/remote team root) are both refused. `squad-aca doctor` reports this as a failed "Squad state location" check rather than using the worker's exit 78; `squad-aca run` refuses to start through a PowerShell `throw` (exit 1) with a message naming the cause; the worker (`entrypoint.sh`) detects it right after cloning the repo, before `squad init`, the health gate, or policy hardening, and fails closed with exit 78. The remedy is to run `squad internalize`, or point `teamRoot` back at `.`, before dispatching to ACA. See issue [#117](https://github.com/swigerb/squad-on-aca/issues/117).
 
 ## Workflow files must parse
 

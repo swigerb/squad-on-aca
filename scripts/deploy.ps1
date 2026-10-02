@@ -761,6 +761,20 @@ if (-not $existingRalphJobImage) {
     az containerapp job secret set --name $ralphJobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 
+# Issue #115: how long ACA lets this replica drain after SIGTERM before it is
+# force-killed. Verified against the live az CLI source (not guessed): the
+# containerapp command group registers a real `--termination-grace-period`
+# (alias `--tgp`) argument -- `c.argument('termination_grace_period', type=int,
+# options_list=['--termination-grace-period', '--tgp'], ...)` in
+# src/azure-cli/azure/cli/command_modules/containerapp/_params.py, accepted by
+# both `containerapp create` and `containerapp update`, and an az CLI
+# integration test (`test_containerapp_termination_grace_period_seconds`)
+# asserts it round-trips to the ARM property this worker's SIGTERM-forwarding
+# fix (worker/entrypoint.sh) needs time to act on:
+# `properties.template.terminationGracePeriodSeconds` (default 30s if unset).
+# 60s matches the drain budget Squad's own docs suggest for `watch`/`loop`.
+$watchTerminationGracePeriodSeconds = 60
+
 if (-not (az containerapp show --name $watchName --resource-group $ResourceGroupName --query id -o tsv 2>$null)) {
     az containerapp create `
         --name $watchName `
@@ -771,6 +785,7 @@ if (-not (az containerapp show --name $watchName --resource-group $ResourceGroup
         --memory 2.0Gi `
         --min-replicas 0 `
         --max-replicas 1 `
+        --termination-grace-period $watchTerminationGracePeriodSeconds `
         --user-assigned $identityId `
         --registry-server $loginServer `
         --registry-identity $identityId `
@@ -799,7 +814,7 @@ if (-not (az containerapp show --name $watchName --resource-group $ResourceGroup
         }
     }
     az containerapp registry set --name $watchName --resource-group $ResourceGroupName --server $loginServer --identity $identityId | Out-Null
-    az containerapp update --name $watchName --resource-group $ResourceGroupName --image $image --set-env-vars @commonEnv | Out-Null
+    az containerapp update --name $watchName --resource-group $ResourceGroupName --image $image --termination-grace-period $watchTerminationGracePeriodSeconds --set-env-vars @commonEnv | Out-Null
     az containerapp secret set --name $watchName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 

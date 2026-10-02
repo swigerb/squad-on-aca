@@ -19,7 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # attaches to a hub is the normal case, and it must keep building and running
 # when squad-hub is unavailable, unpublished, or simply unwanted. So:
 #
-#   SQUAD_HUB_SPEC=squad-hub@0.4.1  (default) install the pinned npm version
+#   SQUAD_HUB_SPEC=squad-hub@0.5.0  (default) install the pinned npm version
 #   SQUAD_HUB_SPEC=none                       do not install it at all
 #   SQUAD_HUB_SPEC=github:owner/repo#<sha>    install from an immutable git ref
 #
@@ -36,12 +36,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # build arg already controls the Dockerfile. Anything other than the default
 # should be a SHA, never a branch, or the image is not reproducible.
 #
-# 0.4.1 IS A FLOOR, NOT A PREFERENCE. It is where `hooks` arrived, which is what
-# lets `watch` and `loop` be supervised at all -- those modes own their own loop
-# and spawn Copilot themselves, so there is no single session to hand over.
+# 0.4.1 WAS THE FLOOR, NOT THE PREFERENCE. It is where `hooks` arrived, which is
+# what lets `watch` and `loop` be supervised at all -- those modes own their own
+# loop and spawn Copilot themselves, so there is no single session to hand over.
 # Everything below 0.4.0 is also deprecated on npm for security fixes, and 0.4.0
 # itself crashes the daemon on its first heartbeat once hooks are installed.
-ARG SQUAD_HUB_SPEC=squad-hub@0.4.1
+# That floor still holds for 0.5.0 -- it is a strict superset of 0.4.1's
+# `hooks`/`oneshot` surface, so nothing below changes on its account. 0.5.0 is
+# now the DEFAULT, not merely an allowed upgrade, because of what squad-hub's
+# web UI needed to keep up with worker-side changes already shipped here
+# (issue #114's tracked list): approval buttons no longer render blank from an
+# older device (#139), a watched session can be steered mid-run (#142), a
+# queued steer is reported back as queued rather than silently dropped
+# (#146/#147), and the command a card is asking to approve is shown on the
+# card itself (#144). None of that is a worker-side behaviour change -- it is
+# the hub becoming usable for the two modes (`watch`/`loop`) that this image
+# can only ever supervise, never hand a single session to.
+ARG SQUAD_HUB_SPEC=squad-hub@0.5.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg openssh-client \
@@ -54,7 +65,14 @@ RUN apt-get update \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
     && npm config set fetch-retries 5 \
     && npm config set fetch-retry-maxtimeout 120000 \
-    && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.11.0 \
+    # Copilot CLI is pinned independently of the Squad bump above. Brian
+    # verified @github/copilot@1.0.69-2 directly against Squad 0.13.1's
+    # DEFAULT models (gpt-5.6-terra, gpt-5.6-luna, claude-sonnet-5 all
+    # answered) before this bump landed -- see issue #114. It is NOT bumped
+    # here alongside squad-cli/squad-hub: nothing about those two pins forces
+    # a Copilot CLI version, and re-verifying compatibility is the cost of
+    # changing this pin, not a side effect of changing the other two.
+    && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.13.1 \
     # Record what was asked for, so a running container can be ASKED which
     # squad-hub it has rather than guessed at -- including "none".
     && printf '%s\n' "$SQUAD_HUB_SPEC" > /etc/squad-hub-spec \
@@ -138,10 +156,49 @@ RUN apt-get update \
 # "unsafe path" into "no manifest" would be a fail-OPEN on a path-traversal
 # boundary. scripts/validate.ps1's "every shipped require() target is shipped"
 # check and worker/tests/test_manifest_path_corpus.sh both fail if it goes.
-COPY --chown=squad:squad worker/entrypoint.sh /usr/local/bin/squad-on-aca
-COPY --chown=squad:squad worker/lib/squad-capability-preflight.sh worker/lib/squad-token-preflight.sh worker/lib/squad-credentials.sh worker/lib/squad-push.sh worker/lib/squad-git-credential-helper.sh worker/lib/parse-capabilities.js worker/lib/locate-manifest.js worker/lib/resolve-capability-route.js worker/lib/dispatch-decision.js worker/lib/dispatch-lease.js worker/lib/squad-dispatch.js worker/lib/ralph-dispatch.sh worker/lib/git-checkout.sh worker/lib/agent-policy.js worker/lib/squad-policy.sh worker/lib/squad-hub.sh worker/lib/proc-isolation-probe.sh config/sandbox-classes.json /usr/local/lib/squad-on-aca/
-RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-credentials.sh /usr/local/lib/squad-on-aca/squad-push.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh /usr/local/lib/squad-on-aca/squad-hub.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh \
-    && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh
+#
+# squad-agent (issue #112) is the `--agent-cmd` worker/entrypoint.sh points
+# `squad watch`/`squad loop` at, so that Squad never gets the chance to inject
+# its own `--yolo` on their behalf. It is EXECUTED directly by `squad`, unlike
+# agent-policy.js (required by node) or squad-policy.sh (sourced by
+# entrypoint.sh), so it needs the same CRLF-strip and +x treatment below that
+# every other directly-executed script in this image gets.
+# SECURITY REVIEW F1 (security-review-112-113.md, CRITICAL, REJECTED #112):
+# these two COPY lines used to read `--chown=squad:squad`. That left
+# /usr/local/lib/squad-on-aca/squad-agent OWNED by the exact unprivileged user
+# `squad` that worker/entrypoint.sh drops watch/loop to -- so the agent could
+# overwrite its own `--agent-cmd` leash with no `chmod`/`chown` needed (it
+# already owned the file), and `squad watch`/`squad loop` re-exec that path on
+# EVERY spawn for the life of the container. The path is outside `.squad/`, so
+# no governance manifest, hash, or detector ever sees the rewrite. `squad` is
+# in neither the `root` user nor the `root` group, so chown=root:root alone
+# already drops squad to "other" (no write bit via the chmod pass below); the
+# explicit `chmod -R a-w` after it is belt-and-suspenders so this holds even if
+# a future COPY/RUN edit here accidentally reintroduces an owner- or group-
+# writable file. The thing being protected (`copilot`, installed by
+# `npm install -g` as root, a few RUN steps above) is already root-owned; nothing
+# executed on its behalf may be weaker than that. Every RUN in this Dockerfile
+# runs as root (there is no USER instruction until the runtime drop inside
+# entrypoint.sh), so chown=root:root here, and the root-run sed/chmod pass
+# below, both still work exactly as before -- only the final ownership and
+# writability of what ships changes. worker/tests/test_image_layout.sh asserts
+# chown=root:root on both COPY lines and that the final RUN strips every write
+# bit under both destinations.
+COPY --chown=root:root worker/entrypoint.sh /usr/local/bin/squad-on-aca
+COPY --chown=root:root worker/squad-agent worker/lib/squad-capability-preflight.sh worker/lib/squad-token-preflight.sh worker/lib/squad-credentials.sh worker/lib/squad-push.sh worker/lib/squad-signal-forwarding.sh worker/lib/squad-git-credential-helper.sh worker/lib/parse-capabilities.js worker/lib/locate-manifest.js worker/lib/resolve-capability-route.js worker/lib/dispatch-decision.js worker/lib/dispatch-lease.js worker/lib/squad-dispatch.js worker/lib/ralph-dispatch.sh worker/lib/git-checkout.sh worker/lib/agent-policy.js worker/lib/squad-policy.sh worker/lib/squad-hub.sh worker/lib/proc-isolation-probe.sh config/sandbox-classes.json /usr/local/lib/squad-on-aca/
+RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-agent /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-credentials.sh /usr/local/lib/squad-on-aca/squad-push.sh /usr/local/lib/squad-on-aca/squad-signal-forwarding.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh /usr/local/lib/squad-on-aca/squad-hub.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh \
+    && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-agent /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh \
+    # F1 fix, continued: strip every write bit under both destinations, for
+    # EVERY shipped file -- not just the ones chmod +x'd above. This also
+    # covers config/sandbox-classes.json and the node modules (agent-policy.js,
+    # squad-dispatch.js, ...) that are read by `node`/`require()` rather than
+    # exec'd directly: those were equally squad-writable before this fix, and
+    # a review recommendation (lower urgency, since they are consumed once at
+    # container start rather than re-exec'd per agent spawn) asked for the same
+    # treatment. 0555/0444 (whatever chmod +x above left as the base) with the
+    # write bit removed, owned by root: readable and, where applicable,
+    # executable by `squad`, writable by nobody at runtime.
+    && chmod -R a-w /usr/local/lib/squad-on-aca /usr/local/bin/squad-on-aca
 
 # PC-2 (issue #86): this image's default runtime user is intentionally left
 # as root (no trailing USER instruction). worker/entrypoint.sh's own FIRST

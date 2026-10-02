@@ -17,6 +17,27 @@ sanitize_name() {
   printf '%s' "${1:-session}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed -E 's/^-+|-+$//g' | cut -c 1-48
 }
 
+# Re-review N1 (the uid boundary). Runs AS ROOT, inside the privilege-drop
+# block below, immediately before `runuser`: creates the root-owned 0711
+# policy state directory and the root sealer that alone writes into it (see
+# section 4c of worker/lib/squad-policy.sh). Everything after the drop --
+# including the agent -- runs as a uid that cannot create, rewrite, rename or
+# delete anything there. A container started as root that cannot set this up
+# refuses to start rather than silently running without the boundary.
+squad_root_seal_policy_state() {
+  local lib="${SQUAD_POLICY_LIB:-/usr/local/lib/squad-on-aca/squad-policy.sh}"
+  if [[ ! -f "$lib" ]]; then
+    log "Agent policy library not found at ${lib}; cannot create the root-owned policy state store. Refusing to start."
+    exit 78
+  fi
+  # shellcheck source=lib/squad-policy.sh
+  source "$lib"
+  if ! squad_policy_sealer_start "${SQUAD_POLICY_SEAL_BASE:-/run}"; then
+    log "Could not create the root-owned policy state store under ${SQUAD_POLICY_SEAL_BASE:-/run}. Refusing to start without the governance uid boundary."
+    exit 78
+  fi
+}
+
 # PC-2 (issue #86): a second boundary, now required rather than optional.
 #
 # PC-1's live ACA diagnostic (docs/security-report.md; the exact deployed
@@ -41,8 +62,13 @@ sanitize_name() {
 # runs. The image's container-default user is root (worker/Dockerfile has no
 # trailing USER) SOLELY so this one `exec` can drop to the correct
 # unprivileged user before a single credential, child process, or byte of
-# user-influenced input is touched. `exec runuser` REPLACES this process
-# outright -- there is no root parent left running afterward, in any mode.
+# user-influenced input is touched. `exec runuser` replaces THIS shell, but
+# runuser itself forks: it stays alive as a ROOT parent that waits for the
+# dropped child and relays its exit status (util-linux; verified: `runuser -u
+# nobody -- sleep 3` shows a root `runuser` pid with the `nobody` child under
+# it). That root parent runs no script code and reads no input. The only other
+# root process is the policy sealer started just before the drop (re-review
+# N1), which reads one pipe and writes only into its own root-owned directory.
 # If the container is ever started as a non-root user directly (e.g. a
 # developer running this script locally), `id -u` is already non-zero and
 # this block is a no-op: nothing below depends on having been root.
@@ -51,13 +77,11 @@ if [[ "$(id -u)" -eq 0 ]]; then
   if [[ "${SQUAD_MODE:-smoke}" == "ralph" ]]; then
     SQUAD_RUNTIME_USER="squad-identity"
   fi
-  # `-p`/`--preserve-environment` is required so every ACA-injected variable
-  # (GITHUB_TOKEN, IDENTITY_ENDPOINT, SQUAD_MODE, ...) survives the switch --
-  # but "preserve" is literal: it also carries over root's own HOME (which
-  # this container's base image sets to /root) into the now-unprivileged
-  # process, which cannot write there. `env -u HOME` clears it BEFORE
-  # runuser runs, so the HOME fallback a few lines below resolves it fresh,
-  # from the ACTUAL user this process now runs as.
+  squad_root_seal_policy_state
+  # `-p` keeps every ACA-injected variable (and SQUAD_POLICY_SEAL_FD /
+  # SQUAD_POLICY_SEALED_DIR) across the switch, but would also carry root's
+  # HOME (/root) into a process that cannot write there. `env -u HOME` clears
+  # it so the fallback below resolves HOME from the user this process becomes.
   exec env -u HOME runuser -p -u "$SQUAD_RUNTIME_USER" -- "$0" "$@"
 fi
 
@@ -165,6 +189,18 @@ fi
 # shellcheck source=lib/squad-push.sh
 source "$SQUAD_PUSH_LIB"
 
+# Issue #115: forwards SIGTERM/SIGINT from this script to the backgrounded
+# `squad watch`/`squad loop` child so Squad can drain instead of being killed
+# abruptly when ACA stops this replica. See worker/lib/squad-signal-forwarding.sh.
+SQUAD_SIGNAL_FORWARDING_LIB="${SQUAD_SIGNAL_FORWARDING_LIB:-/usr/local/lib/squad-on-aca/squad-signal-forwarding.sh}"
+if [[ ! -f "$SQUAD_SIGNAL_FORWARDING_LIB" ]]; then
+  log "Signal forwarding library not found at ${SQUAD_SIGNAL_FORWARDING_LIB}."
+  log "Without it watch/loop would run as this script's foreground child, which never receives a forwarded SIGTERM, so ACA stopping this replica would kill Squad mid-turn instead of letting it drain. Refusing to start."
+  exit 78
+fi
+# shellcheck source=lib/squad-signal-forwarding.sh
+source "$SQUAD_SIGNAL_FORWARDING_LIB"
+
 # PC-1 (issue #86): the process-isolation probe. Sourced (not executed) so its
 # functions are available to call after the identity drop, below. A missing
 # probe library never blocks a session -- unlike the credential/push libraries
@@ -203,6 +239,75 @@ if [[ -n "${GITHUB_REF:-}" ]]; then
     git checkout "${GITHUB_REF}" || git checkout -B "${GITHUB_REF}" "origin/${GITHUB_REF}"
   fi
 fi
+
+# --- Externalized Squad state gate (issue #117) ------------------------------
+# squad-aca clones this repo into THIS ephemeral container, hardens `.squad/`
+# in THIS checkout, then commits and pushes from THIS checkout. Squad 0.13
+# supports two layouts where the real mutable state is NOT in the repo's own
+# `.squad/`:
+#   - `stateLocation: "external"` (written by `squad externalize`): state
+#     moves to a per-user app-data directory outside the repo entirely.
+#   - a `teamRoot` other than `.` (written by `squad init --mode remote`):
+#     state lives in another `.squad/`, resolved relative to the project root.
+# In a fresh container neither of those directories exists (or if it did, it
+# would not belong to this checkout), so a session would either start without
+# the real team, or `squad init` would silently fabricate a NEW local team
+# that masks the problem. Worse, the governance hardening below targets
+# `${REPO_DIR}/.squad/...` paths that would not hold the real state at all --
+# the lock and the audit trail would be silently meaningless. Called AFTER
+# the repo is cloned/checked out (so it reads the config this session
+# actually targets) and BEFORE `squad init`, the health gate, or policy
+# hardening -- all of which assume local state and must never run against an
+# unsupported layout.
+#
+# Mirrors Squad's OWN config.json validation (verified against the published
+# @bradygaster/squad-sdk@0.13.1 package's dist/resolution.js: loadDirConfig()
+# only recognizes a config.json that has BOTH a numeric `version` and a
+# string `teamRoot` -- anything else, including no .squad/config.json at all,
+# resolves to ordinary local state exactly like Squad itself would resolve
+# it). Uses `node`, not grep, for the same reason the rest of this script
+# does: grepping for `stateLocation`/`teamRoot` would false-positive on those
+# strings appearing in comments or unrelated string values.
+squad_external_state_gate() {
+  local config_path="${REPO_DIR}/.squad/config.json"
+  [[ -f "$config_path" ]] || return 0
+
+  local reason
+  reason="$(SQUAD_EXTERNAL_STATE_CONFIG_PATH="$config_path" node -e '
+    const fs = require("fs");
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(process.env.SQUAD_EXTERNAL_STATE_CONFIG_PATH, "utf8"));
+    } catch {
+      process.exit(0);
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      process.exit(0);
+    }
+    const hasVersion = typeof parsed.version === "number";
+    const hasTeamRoot = typeof parsed.teamRoot === "string";
+    if (!hasVersion || !hasTeamRoot) {
+      // Not a config.json Squad itself would recognize; treat as local state.
+      process.exit(0);
+    }
+    if (parsed.stateLocation === "external") {
+      process.stdout.write("external\tstateLocation is \u0027external\u0027 (state was moved out of the repo by \u0027squad externalize\u0027, into a per-user app-data directory outside this checkout)");
+      process.exit(0);
+    }
+    if (parsed.teamRoot !== ".") {
+      process.stdout.write("remote-teamRoot\tteamRoot is \u0027" + parsed.teamRoot + "\u0027, not \u0027.\u0027 (a satellite/remote team root outside this checkout)");
+      process.exit(0);
+    }
+  ' 2>/dev/null)" || reason=""
+  [[ -n "$reason" ]] || return 0
+
+  local detail="${reason#*$'\t'}"
+  log "Externalized Squad state detected: ${detail}."
+  log "squad-aca only clones, hardens, and commits/pushes THIS checkout's .squad/ -- if the real Squad state lives elsewhere, the governance lock and audit trail would protect a directory that does not hold it, and writes here would not reach the real state. Run 'squad internalize' (or point teamRoot back at '.') before dispatching to ACA. Refusing to start."
+  exit 78
+}
+
+squad_external_state_gate
 
 CAPABILITY_PREFLIGHT_SCRIPT="/usr/local/lib/squad-on-aca/squad-capability-preflight.sh"
 CAPABILITY_MANIFEST_RELATIVE="${CAPABILITY_MANIFEST_PATH:-squad-capabilities.yml}"
@@ -262,6 +367,82 @@ if [[ -n "${SQUAD_TEAM:-}" ]]; then
   squad subsquads activate "$SQUAD_TEAM" || true
 fi
 
+# --- Session health gate (issue #116) ----------------------------------------
+# Squad 0.13 ships `squad health --json` (schema `squad-health/v1`): checks
+# team, registry-charters, routing, state-backend, and env-vars, and is built
+# for "gate dispatch on readiness" (verified against the published
+# @bradygaster/squad-cli@0.13.1 package's dist/cli/commands/health.js --
+# overall `status` is `pass`/`fail` only, no `warn`; each check's own
+# `status` is `pass`/`fail`/`skip`; failing check ids live at
+# `.checks[].id`). Gating here -- AFTER `squad init`/SubSquad activation
+# finishes writing the governance state those checks read, and BEFORE
+# squad_policy_harden -- means a session whose Squad state is already broken
+# fails before it ever hardens policy or runs an agent against repository
+# content, instead of surfacing as an obscure mid-run failure.
+#
+# Only the modes that actually run an agent pay for this: a one-shot
+# `copilot -p` (prompt, new-project) or a mode that owns its own
+# dispatch loop and spawns Copilot itself (loop, watch, triage). smoke,
+# telemetry-smoke, ralph, and shell never dispatch an agent against
+# repository content, so gating them would add a check with nothing at
+# stake.
+squad_health_gate_applies_to_mode() {
+  case "$1" in
+    prompt|new-project|loop|watch|triage) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Degrades honestly rather than failing unsafe in either direction: an older
+# Squad CLI that predates `squad health --json` (missing command/flag, or
+# output this parser cannot read as a `squad-health/v1` report) reports
+# UNAVAILABLE -- never silently treated as a pass, and never a hard failure
+# either, since a session on an older CLI still has to keep working. Only a
+# genuine, successfully-parsed `status: "fail"` fails closed (exit 78), and
+# it always logs the failing check ids so an operator can see what was wrong
+# -- never just "failed".
+squad_health_gate() {
+  local json rc=0
+  json="$(squad health --json 2>&1)" || rc=$?
+  local parsed parse_rc=0
+  parsed="$(SQUAD_HEALTH_GATE_JSON="$json" node -e '
+    let report;
+    try {
+      report = JSON.parse(process.env.SQUAD_HEALTH_GATE_JSON || "");
+    } catch {
+      process.exit(2);
+    }
+    if (!report || report.schema !== "squad-health/v1" || typeof report.status !== "string" || !Array.isArray(report.checks)) {
+      process.exit(2);
+    }
+    const failingIds = report.checks
+      .filter((check) => check && check.status === "fail")
+      .map((check) => check.id)
+      .join(",");
+    process.stdout.write(report.status + "\t" + failingIds);
+    process.exit(report.status === "fail" ? 1 : 0);
+  ' 2>/dev/null)" && parse_rc=0 || parse_rc=$?
+  if [[ "$parse_rc" -eq 2 ]]; then
+    log "Squad health: UNAVAILABLE -- 'squad health --json' (exit ${rc}) did not return a readable squad-health/v1 report; this CLI predates Squad 0.13's health gate, or does not support it. Continuing without a health gate -- an older CLI must still work."
+    return 0
+  fi
+  local status="${parsed%%$'\t'*}"
+  local failing="${parsed#*$'\t'}"
+  if [[ "$status" == "fail" ]]; then
+    log "Squad health: FAIL -- failing checks: ${failing:-<none reported>}"
+    log "A session whose Squad state is not ready must not dispatch an agent against it; refusing to start."
+    exit 78
+  fi
+  log "Squad health: ${status^^} -- all checks passed."
+  return 0
+}
+
+if squad_health_gate_applies_to_mode "${SQUAD_MODE:-smoke}"; then
+  squad_health_gate
+else
+  log "Squad health gate skipped: mode '${SQUAD_MODE:-smoke}' does not dispatch an agent."
+fi
+
 # --- Agent policy (issue #26, PRD #6) ----------------------------------------
 # Isolation is not authorization. Until now every session ran Copilot with
 # `--yolo` (== --allow-all-tools --allow-all-paths --allow-all-urls) on top of a
@@ -290,6 +471,78 @@ squad_policy_harden "$REPO_DIR"
 
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
+
+# --- watch/loop agent-cmd wrapper policy (issue #112) ------------------------
+# `squad watch` and `squad loop` own their own loop and spawn Copilot
+# themselves through Squad's `buildAdditionalMcpConfigArgs()`, which prepends
+# `--yolo` whenever the team root has a `.mcp.json` -- and `squad init` always
+# creates one. There is no flag that turns this off, so both modes are instead
+# pointed at /usr/local/lib/squad-on-aca/squad-agent via `--agent-cmd`, which
+# bypasses that code path entirely. See worker/squad-agent's own header for
+# the full rationale, including why it is registered with no `{prompt}` token.
+#
+# squad-agent does not re-derive policy; it reads the SAME resolver
+# squad_policy_resolve above already used, asked for the one JSON array it is
+# built to parse (`watch-agent-argv-json`). SQUAD_WATCH_STRICT_POLICY (default
+# false) picks which of agent-policy.js's two variants that resolves to:
+# PARITY (default) is today's effective deny set -- the squadFlags subset that
+# has always survived `squad --copilot-flags`'s whitespace split -- so turning
+# this fix on does not also start silently enforcing `shell(git push)` /
+# `shell(gh pr)` against a watch agent that legitimately pushes and opens PRs
+# today. STRICT closes that gap by handing squad-agent the FULL argv,
+# multi-word deny rules included. See agent-policy.js's `watchStrictPolicy` doc
+# and .squad/decisions/inbox/ for the follow-up this trade-off is tracked
+# under.
+SQUAD_WATCH_STRICT_POLICY="${SQUAD_WATCH_STRICT_POLICY:-false}"
+export SQUAD_WATCH_STRICT_POLICY
+
+SQUAD_AGENT_POLICY_ARGV_JSON="$(node "$SQUAD_POLICY_RESOLVER" watch-agent-argv-json 2>&1)"; rc=$?
+if [[ "$rc" -ne 0 || -z "$SQUAD_AGENT_POLICY_ARGV_JSON" ]]; then
+  squad_policy_abort "The policy resolver produced no watch/loop agent-cmd argv (exit ${rc}): ${SQUAD_AGENT_POLICY_ARGV_JSON}"
+fi
+export SQUAD_AGENT_POLICY_ARGV_JSON
+
+# The same directory every other mode clones into. squad-agent reads this
+# rather than re-deriving a workspace path from its own idea of $PWD or
+# $WORKDIR, so there is exactly one place that decides where the repo lives.
+SQUAD_AGENT_REPO_DIR="$REPO_DIR"
+export SQUAD_AGENT_REPO_DIR
+
+SQUAD_WATCH_AGENT_POLICY_MODE="$(node "$SQUAD_POLICY_RESOLVER" watch-agent-policy-mode 2>&1)"
+
+# SECURITY REVIEW F3 (security-review-112-113.md, HIGH, REJECTED #112):
+# `squad_policy_announce squad` used to be called on both the `loop)` and
+# `watch|triage)` branches below. It was removed because its "squad" branch
+# narrates "squad --copilot-flags" specifically -- which does not apply once
+# those two modes are pointed at the --agent-cmd wrapper -- but removing the
+# call also removed the ONLY place the parity gap was ever stated: "NOT
+# enforced on this path: ...". PARITY mode (the default) is deliberate and
+# stays exactly as it is: it keeps today's effective deny set (the same
+# subset `squad --copilot-flags` could ever carry), specifically so a
+# watch/loop agent can still push and open its own PRs the way it does
+# today. What must come back is the ANNOUNCEMENT of which multi-word deny
+# rules (shell(git push), shell(git config), shell(gh auth), ...) are
+# consequently NOT enforced on this path -- an operator reading the log
+# otherwise has no way to tell seven-plus deny rules were dropped from it.
+#
+# Implemented HERE, in entrypoint.sh, rather than by editing
+# squad_policy_announce in worker/lib/squad-policy.sh: that function's
+# existing branches do not know about SQUAD_WATCH_AGENT_POLICY_MODE, and this
+# review's reviewer-protocol lockout keeps this fix scoped to files this
+# agent owns. SQUAD_POLICY_UNDELIVERABLE is already populated above (by
+# squad_policy_resolve's bundle fetch) -- the exact same array
+# squad_policy_announce's "squad" branch itself reads -- so this is a
+# restoration of the old visibility, not a new computation.
+squad_watch_policy_announce_undelivered() {
+  if [[ "$SQUAD_WATCH_AGENT_POLICY_MODE" == "parity" ]]; then
+    if [[ "${#SQUAD_POLICY_UNDELIVERABLE[@]}" -gt 0 ]]; then
+      log "NOT enforced on this path: ${SQUAD_POLICY_UNDELIVERABLE[*]}"
+      log "  Reason: parity mode intentionally keeps the pre-#112 effective deny set (the same subset 'squad --copilot-flags' could ever carry), so a watch/loop agent can still push and open PRs as it does today. These rules are NOT enforced. Set SQUAD_WATCH_STRICT_POLICY=true to enforce them."
+    fi
+  else
+    log "Policy mode: strict -- the full deny set, including multi-word rules, is handed to squad-agent's resolved argv. Nothing is undeliverable on this path."
+  fi
+}
 
 # --- Squad Hub supervision (optional) ----------------------------------------
 # Loaded next to the policy it depends on, and BEFORE any mode runs an agent.
@@ -327,17 +580,121 @@ squad_credential_should_withhold() {
 # and at the end of every mode that runs an agent so a non-pushing session still
 # fails rather than reporting success.
 SQUAD_POLICY_VERIFIED=0
+SQUAD_POLICY_IN_VERIFY=0
 squad_policy_checkpoint() {
   if [[ "$SQUAD_POLICY_VERIFIED" -eq 1 ]]; then
     return 0
   fi
   SQUAD_POLICY_VERIFIED=1
+  SQUAD_POLICY_IN_VERIFY=1
   if ! squad_policy_verify "$REPO_DIR"; then
+    SQUAD_POLICY_IN_VERIFY=0
+    # F7: the report is written BEFORE the failing exit, in every mode -- a
+    # violation is exactly when it matters most.
+    squad_watch_governance_report_if_any "governance VIOLATION -- session failed (exit 78)" || true
     log "Session FAILED: a governance path was modified by this run. Nothing has been pushed."
     exit 78
   fi
+  SQUAD_POLICY_IN_VERIFY=0
   return 0
 }
+
+# squad_policy_verify aborts (78) on its own when the policy state itself was
+# tampered with; worker/lib/squad-policy.sh calls this hook first so that path
+# also leaves a report behind.
+squad_policy_on_abort() {
+  [[ "${SQUAD_POLICY_IN_VERIFY:-0}" -eq 1 ]] || return 0
+  squad_watch_governance_report_if_any "governance state TAMPERED -- session failed (exit 78)" || true
+}
+
+# Re-review N5. squad_run_foreground_with_signal_forwarding restores the
+# default TERM/INT disposition before it returns, so a shutdown signal landing
+# during the checkpoint would kill this shell mid-verify and skip the report.
+# Between these two calls TERM/INT are only RECORDED; once the checkpoint and
+# the report are done, a recorded signal ends the session (the work it asked to
+# stop has already drained). ACA's grace-period SIGKILL cannot be deferred.
+SQUAD_DEFERRED_SIGNAL=""
+squad_defer_shutdown_signals() {
+  SQUAD_DEFERRED_SIGNAL=""
+  trap 'SQUAD_DEFERRED_SIGNAL=TERM; log "SIGTERM received during the governance checkpoint; deferring it until the checkpoint and report complete."' TERM
+  trap 'SQUAD_DEFERRED_SIGNAL=INT; log "SIGINT received during the governance checkpoint; deferring it until the checkpoint and report complete."' INT
+}
+squad_release_shutdown_signals() {
+  trap - TERM INT
+  if [[ -n "$SQUAD_DEFERRED_SIGNAL" ]]; then
+    log "Honouring the deferred SIG${SQUAD_DEFERRED_SIGNAL}: governance checkpoint and report are complete; exiting."
+    exit 0
+  fi
+}
+
+# SECURITY REVIEW F7 (security-review-112-113.md, MEDIUM, REJECTED #112):
+# squad_policy_reported_changes_report() (worker/lib/squad-policy.sh) -- the
+# markdown summary of this session's "reported-mutable" governance changes
+# (issue #113: .squad/casting/*.json, .squad/identity/now.md) -- is only ever
+# appended to a PR body, inside commit_and_push_if_needed. The `loop)` and
+# `watch|triage)` branches below call squad_policy_checkpoint (which
+# populates SQUAD_POLICY_REPORTED_CHANGES as a side effect of
+# squad_policy_verify) but never commit_and_push_if_needed: `squad watch`/
+# `squad loop` open their OWN PRs through `gh`, driven entirely by Squad's
+# internal git state, not this container's. So on exactly the two modes #112
+# reworked, a reported-mutable change reaches the container log and nothing
+# durable -- not a PR body, not a branch, not any artefact a reviewer sees
+# once the container exits, on what can be a long-running session.
+#
+# The fix must NOT make watch/loop start pushing or opening PRs themselves --
+# that is a real behaviour change, out of scope here, and would duplicate the
+# PR watch/loop already opens on its own. Instead, the SAME report
+# squad_policy_reported_changes_report() would have put in a PR body is
+# appended (never overwritten) to a durable file and to the container log.
+#
+# Re-review N1 corrected where that file lives. SQUAD_POLICY_STATE_DIR is owned
+# by the agent's own uid, so a report there could simply be deleted. When the
+# container started as root, the report goes to the ROOT-OWNED sealed store
+# (worker/lib/squad-policy.sh section 4c) instead, which the agent cannot
+# touch; the state directory is only the fallback for a session that never
+# had root (local runs, tests) and is labelled as agent-writable in the log.
+# squad_policy_checkpoint also calls this, with a verdict, BEFORE its exit 78:
+# the violation path is where the report matters most.
+#
+# squad_policy_reported_changes_report is CALLED here, not edited: it already
+# does exactly the summarising this needs, and it lives in
+# worker/lib/squad-policy.sh, which this fix does not touch.
+squad_watch_governance_report_if_any() {
+  local verdict="${1:-}" report block
+  report="$(squad_policy_reported_changes_report)"
+  [[ -z "$report" && -z "$verdict" ]] && return 0
+
+  block="$(
+    printf '\n## Checkpoint at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ -n "$verdict" ]] && printf '\n**Verdict: %s**\n' "$verdict"
+    [[ -n "$report" ]] && printf '%s\n' "$report"
+    :
+  )"
+
+  # Re-review N1/F7: the durable copy lives in the ROOT-OWNED sealed store
+  # when this session has one -- the agent (another uid) cannot delete or
+  # rewrite it. The container log gets it too, unconditionally.
+  if squad_policy_seal_report "$block"; then
+    log "Governance report for this checkpoint was appended to the root-owned ${SQUAD_POLICY_SEALED_DIR}/reported-changes.md (not writable by the agent's uid):"
+    log "$block"
+    return 0
+  fi
+
+  if [[ -z "${SQUAD_POLICY_STATE_DIR:-}" || ! -d "$SQUAD_POLICY_STATE_DIR" ]]; then
+    log "Reported-mutable governance changes occurred this session, but no private policy state directory is available to durably record them. Logging the report inline instead:"
+    log "$block"
+    return 0
+  fi
+
+  # No root sealer (not started as root): best effort only. This directory is
+  # owned by the agent's own uid, so the copy here is NOT tamper-proof; the
+  # inline log line below is the durable record.
+  local report_file="${SQUAD_POLICY_STATE_DIR}/reported-changes.md"
+  printf '%s\n' "$block" >>"$report_file" || true
+  log "Reported-mutable governance changes this session were appended to ${report_file} (agent-writable; no root-sealed store in this session -- see F7 in security-review-112-113.md):"
+  log "$block"
+}
+
 
 # --- Lease heartbeat (Sprint 6, PRD #6) --------------------------------------
 # A session started by any dispatcher carries SQUAD_LEASE_KEY. Report liveness
@@ -563,7 +920,16 @@ commit_and_push_if_needed() {
     # at startup and an exported variable is frozen for the life of the shell.
     # Re-read the file into the environment immediately before the call.
     squad_credential_refresh_env || true
-    gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}" || true
+    # Issue #113: casting/*.json and identity/now.md are a NEW "reported-mutable"
+    # governance class -- changes are allowed (squad_policy_checkpoint above
+    # does not fail the session over them) but must be VISIBLE, not silently
+    # folded into "Created by Azure-hosted Squad session". squad_policy_verify
+    # (run by squad_policy_checkpoint) populates SQUAD_POLICY_REPORTED_CHANGES;
+    # the report function below is a no-op (empty string) when there were none,
+    # so a session that touched no reported-mutable path gets an unchanged body.
+    local pr_body="${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}"
+    pr_body+="$(squad_policy_reported_changes_report)"
+    gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "$pr_body" || true
   fi
 }
 
@@ -580,10 +946,11 @@ case "${SQUAD_MODE:-smoke}" in
     cat /tmp/repo.json
     squad status || true
     if [[ "${RUN_COPILOT_SMOKE:-false}" == "true" ]]; then
-      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-        copilot -p "You are validating a remote Squad container. Reply with a one-sentence status only." "${COPILOT_ARGV[@]}" --silent
+        squad_policy_exec_agent \
+          copilot -p "You are validating a remote Squad container. Reply with a one-sentence status only." "${COPILOT_ARGV[@]}" --silent )
     else
       log "Skipping Copilot prompt smoke. Set RUN_COPILOT_SMOKE=true to exercise Copilot."
     fi
@@ -691,13 +1058,14 @@ NODE
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      squad_hub_run "$SQUAD_PROMPT"
+      ( squad_policy_exec_agent squad_hub_run "$SQUAD_PROMPT" )
     else
       squad_policy_announce direct
-      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-        copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+        squad_policy_exec_agent \
+          copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}" )
     fi
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
@@ -726,13 +1094,14 @@ NODE
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      squad_hub_run "$SQUAD_PROMPT"
+      ( squad_policy_exec_agent squad_hub_run "$SQUAD_PROMPT" )
     else
       squad_policy_announce direct
-      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-        copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+        squad_policy_exec_agent \
+          copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}" )
     fi
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
@@ -747,7 +1116,21 @@ NODE
       sed -i 's/configured: false/configured: true/' loop.md
     fi
     log "Starting Squad loop."
-    squad_policy_announce squad
+    # Issue #112: `--agent-cmd`, NOT `--copilot-flags`. squad-agent now owns
+    # the whole resolved argv (read from SQUAD_AGENT_POLICY_ARGV_JSON, which
+    # was exported above); passing --copilot-flags here as well would be a
+    # second, competing source of truth for the same decision -- and the one
+    # this fix exists to stop using, since it is the path that cannot carry a
+    # multi-word deny pattern and the path squad-cli's --yolo injection was
+    # found on. squad_policy_announce is not called here for the same reason:
+    # its "squad" branch narrates --copilot-flags specifically, which no
+    # longer applies to this invocation, and its other branches describe the
+    # FULL argv regardless of the parity/strict choice squad-agent actually
+    # makes -- so the log line below reports what will truly be exec'd instead.
+    log "Tier: ${SQUAD_POLICY_TIER} (${SQUAD_POLICY_REASON})"
+    log "watch/loop agent-cmd policy mode: ${SQUAD_WATCH_AGENT_POLICY_MODE} (SQUAD_WATCH_STRICT_POLICY=${SQUAD_WATCH_STRICT_POLICY})"
+    log "watch/loop agent-cmd argv: ${SQUAD_AGENT_POLICY_ARGV_JSON}"
+    squad_watch_policy_announce_undelivered
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
     # Same shape as watch: the loop belongs to `squad`, so the container
@@ -756,8 +1139,19 @@ NODE
       squad_hub_supervise_ambient
       trap squad_hub_release_ambient EXIT
     fi
-    squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --copilot-flags "$SQUAD_COPILOT_FLAG_STRING"
+    # Issue #115: run in the background with SIGTERM/SIGINT forwarded, so ACA
+    # stopping this replica lets Squad drain instead of being killed abruptly
+    # mid-cycle. See squad_run_foreground_with_signal_forwarding above.
+    # squad_policy_exec_agent runs INSIDE the forwarding wrapper's background
+    # job, closes the policy sampler/seal descriptors there, then execs
+    # `squad` -- so `$!` is still squad's own pid and forwarding is unchanged.
+    squad_run_foreground_with_signal_forwarding \
+      squad_policy_exec_agent \
+      squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
+    squad_defer_shutdown_signals
     squad_policy_checkpoint
+    squad_watch_governance_report_if_any
+    squad_release_shutdown_signals
     ;;
   ralph)
     log "Starting scheduled Ralph dispatcher."
@@ -873,7 +1267,15 @@ NODE
     ;;
   watch|triage)
     log "Starting Squad watch."
-    squad_policy_announce squad
+    # Issue #112: `--agent-cmd`, NOT `--copilot-flags` -- see the matching
+    # comment in the `loop)` branch above for why both would be a double
+    # source of truth, and why squad_policy_announce is skipped in favour of
+    # the explicit lines below. F3: squad_watch_policy_announce_undelivered
+    # restores the parity-gap warning squad_policy_announce used to print.
+    log "Tier: ${SQUAD_POLICY_TIER} (${SQUAD_POLICY_REASON})"
+    log "watch/loop agent-cmd policy mode: ${SQUAD_WATCH_AGENT_POLICY_MODE} (SQUAD_WATCH_STRICT_POLICY=${SQUAD_WATCH_STRICT_POLICY})"
+    log "watch/loop agent-cmd argv: ${SQUAD_AGENT_POLICY_ARGV_JSON}"
+    squad_watch_policy_announce_undelivered
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
     # `squad watch` owns its own loop and spawns Copilot itself, so there is no
@@ -884,20 +1286,51 @@ NODE
       squad_hub_supervise_ambient
       trap squad_hub_release_ambient EXIT
     fi
-    squad watch \
+    # Issue #115: Squad 0.13 ships an UNDOCUMENTED `--sentinel-file <path>`
+    # flag (not listed by `squad watch --help`; found by reading
+    # dist/cli/commands/watch/index.js in the published @bradygaster/squad-cli
+    # package). Its semantics are the opposite of the naive reading: `watch`
+    # creates the file itself at startup if it doesn't exist, and a round stops
+    # the run once that file is REMOVED -- not once it is created. It is
+    # checked once at the START of each polling round (detectStopSignal, read
+    # before any work that round), so it is a between-round "don't start the
+    # next cycle" signal, complementary to -- and not a substitute for -- the
+    # SIGTERM forwarding above, which drains an ALREADY in-flight round.
+    #
+    # Wiring `squad-aca watch stop` (scripts/squad-aca.ps1) to delete this file
+    # is NOT implemented: the file lives inside this container's own ephemeral
+    # filesystem (${WORKDIR:-/workspace}/${SESSION_NAME}), and nothing mounts
+    # or exposes that path to a process running outside the container. Reaching
+    # it would require `az containerapp exec` (an Azure call, and one this
+    # container's user has no standing access path for from the local CLI) or
+    # a shared volume mount that does not exist in scripts/deploy.ps1 today.
+    # `squad-aca watch stop` already gets a REAL graceful stop today via the
+    # SIGTERM-forwarding fix above: it runs `az containerapp update --min-replicas 0`
+    # (scripts/start-watch.ps1), which ACA enacts by sending SIGTERM to this
+    # container -- now forwarded to Squad -- so that path does not need the
+    # sentinel file at all.
+    export SQUAD_WATCH_SENTINEL_FILE="${SQUAD_WATCH_SENTINEL_FILE:-${WORKDIR:-/workspace}/${SESSION_NAME}/watch-sentinel}"
+    mkdir -p "$(dirname "$SQUAD_WATCH_SENTINEL_FILE")"
+    squad_run_foreground_with_signal_forwarding \
+      squad_policy_exec_agent \
+      squad watch \
       --execute \
       --interval "${WATCH_INTERVAL_MINUTES:-5}" \
       --timeout "${WATCH_TIMEOUT_MINUTES:-45}" \
       --max-concurrent "${WATCH_MAX_CONCURRENT:-1}" \
-      --copilot-flags "$SQUAD_COPILOT_FLAG_STRING" \
+      --agent-cmd /usr/local/lib/squad-on-aca/squad-agent \
       --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
+      --sentinel-file "$SQUAD_WATCH_SENTINEL_FILE" \
       --verbose
+    squad_defer_shutdown_signals
     squad_policy_checkpoint
+    squad_watch_governance_report_if_any
+    squad_release_shutdown_signals
     ;;
   shell)
     log "Starting requested shell command."
     require REMOTE_SQUAD_COMMAND
-    bash -lc "$REMOTE_SQUAD_COMMAND"
+    ( squad_policy_exec_agent bash -lc "$REMOTE_SQUAD_COMMAND" )
     commit_and_push_if_needed
     ;;
   *)

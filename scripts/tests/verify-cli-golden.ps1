@@ -70,9 +70,12 @@ if (-not $isWindowsHost) {
 }
 
 $captureDir = Join-Path ([System.IO.Path]::GetTempPath()) ("squad-cli-golden-" + [guid]::NewGuid().ToString("N"))
+$scriptsMirror = $null
 try {
     Write-Host "Capturing squad-aca behaviour from the working tree..." -ForegroundColor Cyan
-    Invoke-CaptureSet -ScriptsRoot (Join-Path $RepoRoot "scripts") -OutDir $captureDir -Portable
+    $scriptsMirror = New-SquadCliStubEnvironment
+    $scriptsRoot = Split-Path -Parent (New-SquadCliScriptMirror -Stub $scriptsMirror -ScriptsRoot (Join-Path $RepoRoot "scripts"))
+    Invoke-CaptureSet -ScriptsRoot $scriptsRoot -OutDir $captureDir -Portable
 
     if ($Update) {
         New-Item -ItemType Directory -Force -Path $GoldenDir | Out-Null
@@ -131,4 +134,5 @@ try {
     exit 1
 } finally {
     Remove-Item -Recurse -Force $captureDir -ErrorAction SilentlyContinue
+    if ($scriptsMirror) { Remove-SquadCliStubEnvironment -Stub $scriptsMirror }
 }

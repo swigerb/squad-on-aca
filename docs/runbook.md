@@ -77,9 +77,31 @@ An attended session gets:
 --allow-all-tools --agent squad --remote --no-auto-update --deny-tool <pattern> ...
 ```
 
-An unattended session also gets `--no-ask-user` and a longer deny list. `--yolo` is not used. `COPILOT_ALLOW_ALL=true` is not set in `worker/Dockerfile`.
+An unattended session also gets `--no-ask-user` and a longer deny list. Neither attended nor unattended sessions pass `--yolo` to Copilot CLI. `COPILOT_ALLOW_ALL=true` is not set in `worker/Dockerfile`.
 
 Use `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` for Copilot CLI headless auth. Fine-grained PATs with the GitHub Copilot Requests permission are preferred.
+
+## Squad health gate
+
+For modes that run an agent (`prompt`, `new-project`, `loop`, `watch`, and `triage`), the worker runs `squad health --json` after clone, `squad init` if needed, and SubSquad activation, but before policy hardening and before any agent starts.
+
+The parsed report must use this schema:
+
+```json
+{ "schema": "squad-health/v1", "status": "pass", "checks": [{ "id": "team", "status": "pass", "message": "..." }] }
+```
+
+The overall status is `pass` or `fail`; check status is `pass`, `fail`, or `skip`. The check ids emitted by Squad 0.13.1 are `team`, `registry-charters`, `routing`, `state-backend`, and `env-vars`. There is no `warn` status.
+
+A parsed `status: "fail"` fails closed in the worker with exit `78` and logs the failing check ids:
+
+```text
+Squad health: FAIL -- failing checks: routing,state-backend
+A session whose Squad state is not ready must not dispatch an agent against it; refusing to start.
+```
+
+A CLI that predates `squad health --json`, or output that is not a readable `squad-health/v1` report, is logged as `UNAVAILABLE` and is not counted as a pass. `squad-aca doctor` has a matching `Squad health` row: `ok` for `pass`, `failed` with failing check ids for `fail`, and `unknown` for an unavailable or unreadable health report.
+
 
 ## Agent tool policy
 
@@ -102,27 +124,40 @@ Every session resolves a tier before the agent starts.
 | writes to a governance path | denied | denied |
 | appends to `.squad/agents/<name>/history.md` | allowed, append-only | allowed, append-only |
 
-Governance paths are made read-only before the agent starts and their SHA-256 hashes are recorded outside the checkout:
+Governance paths are classified before the agent starts:
 
-```text
-.squad/policies
-.squad/agents
-.squad/identity
-.squad/config.json
-.squad/routing.md
-.squad/casting-policy.json
-.squad/casting/policy.json
-.squad/memory/config.json
-.squad/memory/audit.jsonl
-.squad/fact-checker/policy.md
-.squad/fact-checker/audit-trail.md
-.squad/rai/policy.md
-.squad/rai/audit-trail.md
+| Class | Paths | Runtime behavior |
+| --- | --- | --- |
+| Locked | `.squad/policies`, `.squad/agents` except existing `.squad/agents/<name>/history.md`, `.squad/identity` except `.squad/identity/now.md`, `.squad/config.json`, `.squad/routing.md`, `.squad/casting-policy.json`, `.squad/memory/config.json`, `.squad/fact-checker/policy.md`, `.squad/fact-checker/audit-trail.md`, `.squad/rai/policy.md`, `.squad/rai/audit-trail.md` | Write bits are removed and any content, add, delete, or committed change is a governance violation. |
+| Append-only | `.squad/agents/<name>/history.md`, `.squad/memory/audit.jsonl` | Existing files may grow only; rewrite, deletion, or truncation below the recorded high-water mark fails the session. A new `history.md` that did not exist at hardening time cannot be created by the run. |
+| Reported-mutable | `.squad/casting/policy.json`, `.squad/casting/registry.json`, `.squad/casting/history.json`, `.squad/identity/now.md` | Changes are allowed, listed in the governance report, and appended to the PR body when the entrypoint creates the PR. Watch/loop also write the report to the root-sealed store. |
+
+The baseline is held in entrypoint memory and, in the container, sealed into a root-owned `0711` directory under `/run` before the `runuser` drop. Sealed files are root-owned `0644`: readable by design, because this is an integrity boundary, not a secrecy boundary. A policy failure or governance violation aborts with worker exit `78` and still tries to emit the governance report.
+
+`SQUAD_COPILOT_FLAGS` supports extras such as `--model` or `--log-level`. Permission-widening flags (`--yolo`, `--allow-all`, `--allow-all-paths`, `--allow-all-urls`, `--add-dir`) abort the worker session with exit `78`.
+
+## watch/loop policy
+
+The `watch` and `loop` modes run continuously and spawn their own Copilot CLI invocations. squad-on-aca routes these through a wrapper at `/usr/local/lib/squad-on-aca/squad-agent` (instead of the default `copilot` CLI path) that:
+
+1. Resolves the session's `attended` or `autonomous` policy tier (same rules as above).
+2. Execs `copilot -p <prompt>` with the resolved policy argv, so permission-widening flags abort with exit 78.
+3. Adds `--additional-mcp-config @<repo>/.mcp.json` itself (without `--yolo`) so `squad_state_*` tools keep working.
+4. Refuses to start (exit 78) if the policy cannot be resolved.
+
+This prevents watch/loop from inheriting the upstream Squad behavior of injecting `--yolo` whenever `.mcp.json` exists.
+
+### Policy gap: multi-word deny rules
+
+By default the watch/loop wrapper runs in **PARITY** mode: it uses the same effective deny-rule subset that the previous `squad --copilot-flags` path could deliver. Single-word deny rules such as `shell(sudo)`, `shell(az)`, `shell(curl)`, and `shell(wget)` are enforced. Multi-word deny rules are announced in the log as not enforced on this path; that includes `shell(git config)`, `shell(gh auth)`, `shell(gh secret)`, `shell(gh variable)`, `shell(gh api)`, `shell(gh repo delete)`, `shell(gh release delete)`, `shell(git push)`, and `shell(gh pr)`.
+
+To opt in to the full argv, including the multi-word deny rules, set:
+
+```powershell
+$env:SQUAD_WATCH_STRICT_POLICY = "true"
 ```
 
-`.squad/agents/<name>/history.md` is append-only. A `history.md` file that did not exist when the session started cannot be created by the run.
-
-`SQUAD_COPILOT_FLAGS` supports extras such as `--model` or `--log-level`. Permission-widening flags (`--yolo`, `--allow-all`, `--allow-all-paths`, `--add-dir`) abort the session with exit `78`.
+This makes `worker/entrypoint.sh` export the `watchAgentStrictArgv` from `worker/lib/agent-policy.js` instead of `watchAgentParityArgv`. By default, `SQUAD_WATCH_STRICT_POLICY` is unset or `false`, preserving today's effective single-word enforcement for backward compatibility.
 
 Policy output is prefixed `[squad-policy]`. Read it with:
 
@@ -138,12 +173,31 @@ $env:SQUAD_MODE = "ralph"; $env:SQUAD_DISPATCH_SOURCE = "ralph"
 node .\worker\lib\agent-policy.js json
 ```
 
+
+### Graceful watch/loop shutdown
+
+`worker/lib/squad-signal-forwarding.sh` runs `squad watch` and `squad loop` as a background child and forwards SIGTERM/SIGINT to that child, then waits for the child's real exit status. This lets Squad drain an in-flight turn when ACA stops or scales down the watcher. `deploy.ps1` sets `--termination-grace-period 300` on `ca-squad-aca-watch` so ACA gives the forwarded signal time to work.
+
+Squad 0.13 also has an undocumented `--sentinel-file` flag. Its behavior is inverted from the obvious reading: watch creates the sentinel file at startup and stops when the file is removed, checking between polling rounds. `squad-aca watch stop` is not wired to delete that file because the file lives inside the replica filesystem; doing so would need an exec channel such as `az containerapp exec` or a shared volume that this deployment does not create. The supported stop path is scaling the watcher to zero, which sends SIGTERM and uses the forwarding path above.
+
 Classify governance paths:
 
 ```powershell
 node .\worker\lib\agent-policy.js classify-governance-path .squad/agents/docs/history.md   # append-only
 node .\worker\lib\agent-policy.js classify-governance-path .squad/agents/docs/charter.md   # locked
 ```
+
+
+## Externalized Squad state refusal
+
+Squad on ACA only supports Squad state that lives in this repository's own `.squad/` directory. A `.squad/config.json` is considered live only when it has both a numeric `version` and a string `teamRoot`. Given a live config, these layouts are refused:
+
+- `stateLocation: "external"`, written by `squad externalize`.
+- `teamRoot` with any value other than `"."`, such as a remote/satellite team root.
+
+`squad-aca doctor` reports a failed `Squad state location` row; it does not use the worker's exit `78` for this local check. `squad-aca run` refuses before starting compute and surfaces a PowerShell `throw`, which exits `1`, not `78`. Inside ACA, `worker/entrypoint.sh` checks after clone and before `squad init`, the health gate, policy hardening, or the agent; that worker path fails closed with exit `78`.
+
+Remediate by running `squad internalize`, setting `teamRoot` back to `.`, or dispatching from the repository that actually owns the team state.
 
 ## Deploy
 
@@ -223,7 +277,7 @@ by hand.
 
 | Variable | Purpose |
 |---|---|
-| `SQUAD_MODE` | `prompt`, `new-project`, `loop`, `squad`, `shell`, `smoke`, `telemetry-smoke`, or `ralph`. |
+| `SQUAD_MODE` | `prompt`, `new-project`, `loop`, `watch`, `triage`, `shell`, `smoke`, `telemetry-smoke`, or `ralph`. |
 | `SQUAD_PROMPT` | What the session should do. Required by `prompt`. |
 | `SESSION_NAME` | Names the run in logs and in the hub. |
 | `SQUAD_POD_ID` | Identifies the pod for SubSquad routing. |

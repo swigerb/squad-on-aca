@@ -543,7 +543,11 @@ exit /b 0
     Set-Content -LiteralPath (Join-Path $binDir "squad.cmd") -Encoding ascii -Value @'
 @echo off
 >>"%SQUAD_STUB_SQUAD_LOG%" echo %*
+if "%~1"=="health" if "%~2"=="--json" goto sqhealth
 echo STUB-SQUAD-ACK
+exit /b 0
+:sqhealth
+echo {"schema":"squad-health/v1","status":"pass","checks":[{"id":"team","status":"pass","message":"stub team state is present"},{"id":"registry-charters","status":"pass","message":"stub registry charters are readable"},{"id":"routing","status":"pass","message":"stub routing is readable"},{"id":"state-backend","status":"pass","message":"stub state backend is local"},{"id":"env-vars","status":"pass","message":"stub environment is ready"}]}
 exit /b 0
 '@
 
@@ -852,6 +856,48 @@ function New-SquadCliDriftDeployment {
         sessionJob     = "caj-squad-aca-session"
     } | ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $repoRoot "deploy.outputs.json") -Encoding utf8
+
+    return (Join-Path $scriptsCopy "squad-aca.ps1")
+}
+
+function New-SquadCliScriptMirror {
+    <#
+    .SYNOPSIS
+        Mirrors the scripts/ tree under test into the throwaway stub root.
+
+    .DESCRIPTION
+        `squad-aca.ps1` resolves its repo root from its own location and reads
+        deploy.outputs.json there when present. Golden captures must never
+        depend on a developer's ignored local deployment record, so ordinary
+        captures run from this clean mirror. Drift captures use
+        New-SquadCliDriftDeployment instead because they intentionally add a
+        synthetic deploy.outputs.json beside the mirrored scripts.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object]$Stub,
+        [Parameter(Mandatory = $true)][string]$ScriptsRoot
+    )
+
+    $repoRoot = Join-Path $Stub.Root "repo-clean"
+    $scriptsCopy = Join-Path $repoRoot "scripts"
+    New-Item -ItemType Directory -Force -Path $scriptsCopy | Out-Null
+    Get-ChildItem -LiteralPath $ScriptsRoot -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $scriptsCopy -Force
+    }
+    Get-ChildItem -LiteralPath $ScriptsRoot -Directory | Where-Object { $_.Name -ne "tests" } | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $scriptsCopy -Recurse -Force
+    }
+    $sourceRepoRoot = Split-Path -Parent $ScriptsRoot
+    $sourceWorkerLib = Join-Path $sourceRepoRoot "worker\lib"
+    if (Test-Path -LiteralPath $sourceWorkerLib) {
+        $workerLibCopy = Join-Path $repoRoot "worker\lib"
+        New-Item -ItemType Directory -Force -Path $workerLibCopy | Out-Null
+        Copy-Item -Path (Join-Path $sourceWorkerLib "*") -Destination $workerLibCopy -Recurse -Force
+    }
+    $sourceConfig = Join-Path $sourceRepoRoot "config"
+    if (Test-Path -LiteralPath $sourceConfig) {
+        Copy-Item -LiteralPath $sourceConfig -Destination (Join-Path $repoRoot "config") -Recurse -Force
+    }
 
     return (Join-Path $scriptsCopy "squad-aca.ps1")
 }

@@ -203,6 +203,18 @@ assert_eq "78" "$(policy_status ralph  ralph    '--add-dir /etc' aca-job flags)"
 assert_eq "78" "$(policy_status ralph  ralph    '--add-dir=/etc' aca-job flags)"             "--add-dir=<path> aborts (the = form is not a different flag)"
 assert_eq "78" "$(policy_status ralph  ralph    '--model gpt-5 --yolo' aca-job flags)"       "--yolo hidden among legitimate extras still aborts"
 
+# Security review of #112/#113 (F2): `--allow-all-urls` is one third of what
+# `--yolo`/`--allow-all` expand to, and was previously missing from
+# FORBIDDEN_EXTRA_FLAGS -- reproducing the reviewer's exact proof that
+# SQUAD_COPILOT_FLAGS='--allow-all-urls --allow-tool shell' landed verbatim in
+# the resolved argv.
+assert_eq "78" "$(policy_status ralph  ralph    '--allow-all-urls' aca-job flags)"           "F2: --allow-all-urls in SQUAD_COPILOT_FLAGS aborts"
+assert_eq "78" "$(policy_status prompt local-cli '--allow-all-urls' aca-job flags)"          "F2: --allow-all-urls aborts for the attended tier too — parity"
+assert_eq "78" "$(policy_status ralph  ralph    '--allow-all-urls --allow-tool shell' aca-job flags)" \
+  "F2: the reviewer's exact reproduction (--allow-all-urls alongside a legitimate --allow-tool) still aborts"
+allowall_urls_rejected="$(policy ralph ralph '--allow-all-urls' aca-job flags)"
+assert_contains "$allowall_urls_rejected" "--allow-all-urls" "F2: the abort message names --allow-all-urls specifically"
+
 rejected="$(policy ralph ralph '--yolo' aca-job flags)"
 assert_contains "$rejected" "--yolo" "the abort message names the flag that was rejected"
 
@@ -251,6 +263,14 @@ for p in ".squad/policies" ".squad/agents" ".squad/identity" ".squad/config.json
 done
 assert_contains "$gov" ".squad/memory/audit.jsonl"        "audit state is protected"
 assert_contains "$gov" ".squad/fact-checker/audit-trail.md" "approval/audit trail state is protected"
+# Issue #113: casting/registry.json and casting/history.json are tracked
+# (protected) alongside casting/policy.json now, not left as an untracked blind
+# spot. "Protected" here means IN THE MANIFEST -- whether a given path then
+# stays locked or is classified reported-mutable is what classify-governance-path
+# answers, in section 6c below.
+assert_contains "$gov" ".squad/casting/policy.json"       "casting/policy.json is protected"
+assert_contains "$gov" ".squad/casting/registry.json"     "casting/registry.json is protected (new, Issue #113)"
+assert_contains "$gov" ".squad/casting/history.json"      "casting/history.json is protected (new, Issue #113)"
 
 # Identical in both tiers: an attended run is not licensed to rewrite the
 # policies that govern it either. If that ever diverges it must be a deliberate,
@@ -269,10 +289,30 @@ assert_eq "$(policy prompt local-cli '' aca-job governance-paths)" "$gov" \
 echo "-- append-only exclusion --"
 
 pat="$(policy ralph ralph '' aca-job mutable-governance-patterns)"
-assert_eq "^\\.squad/agents/[^/]+/history\\.md\$" "$pat" \
-  "the resolver publishes exactly one, fully anchored, append-only pattern"
+# Issue #113: `.squad/memory/audit.jsonl` joins history.md as a SECOND
+# append-only pattern -- the resolver now publishes two lines, not one, and an
+# exact-match assertion against the old single-pattern string must be updated
+# alongside the resolver or it is just restating the old answer.
+expected_pat="$(printf '^\\.squad/agents/[^/]+/history\\.md$\n^\\.squad/memory/audit\\.jsonl$')"
+assert_eq "$expected_pat" "$pat" \
+  "the resolver publishes exactly the two, fully anchored, append-only patterns"
 assert_eq "$(policy prompt local-cli '' aca-job mutable-governance-patterns)" "$pat" \
   "the append-only exclusion is identical for attended and autonomous runs"
+
+# ---------------------------------------------------------------------------
+# 6c. Issue #113 — the reported-mutable class
+# ---------------------------------------------------------------------------
+# casting/*.json and identity/now.md are a THIRD class, distinct from both
+# locked and append-only: freely rewritable, never a violation, but still
+# tracked (see governance-paths assertions above) and still reported.
+echo "-- reported-mutable class (Issue #113) --"
+
+rpat="$(policy ralph ralph '' aca-job reported-mutable-governance-patterns)"
+expected_rpat="$(printf '^\\.squad/identity/now\\.md$\n^\\.squad/casting/policy\\.json$\n^\\.squad/casting/registry\\.json$\n^\\.squad/casting/history\\.json$')"
+assert_eq "$expected_rpat" "$rpat" \
+  "the resolver publishes exactly the four reported-mutable patterns"
+assert_eq "$(policy prompt local-cli '' aca-job reported-mutable-governance-patterns)" "$rpat" \
+  "the reported-mutable set is identical for attended and autonomous runs"
 
 classify_path() {
   policy ralph ralph '' aca-job classify-governance-path "$1"
@@ -293,6 +333,75 @@ do
 done
 assert_eq "78" "$(policy_status ralph ralph '' aca-job classify-governance-path '')" \
   "classifying an empty path exits 78 rather than answering for it"
+
+# Issue #113: the three-way classification across all three classes, plus an
+# unrecognised path. (f) from the issue -- this resolver is the single source
+# of truth both squad-policy.sh and scripts/validate.ps1 consume, so if this is
+# wrong, both downstream consumers are wrong the same way.
+assert_eq "append-only"      "$(classify_path '.squad/memory/audit.jsonl')" \
+  "the audit trail classifies as append-only (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/casting/policy.json')" \
+  "casting/policy.json classifies as reported-mutable (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/casting/registry.json')" \
+  "casting/registry.json classifies as reported-mutable (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/casting/history.json')" \
+  "casting/history.json classifies as reported-mutable (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/identity/now.md')" \
+  "identity/now.md classifies as reported-mutable (Issue #113)"
+assert_eq "locked"           "$(classify_path '.squad/identity/mission.md')" \
+  "the REST of identity/ stays locked -- now.md is a narrow carve-out, not a blanket unlock"
+assert_eq "locked"           "$(classify_path '.squad/identity/identity.md')" \
+  "identity.md (what/who the team is) stays locked, unlike now.md (what it's focused on)"
+# Security review of #112/#113 (F5): this assertion used to read
+# `assert_eq "locked" ... "src/some/unknown/path.txt" ... "fail closed, not
+# 'uncovered'"` -- but 'locked' for an ordinary application path that is not
+# in GOVERNANCE_PATHS at all is not fail-closed, it is DISHONEST: nothing in
+# squad_policy_harden ever locks src/some/unknown/path.txt, so the classifier
+# was claiming a protection that does not exist. The review proved the exact
+# same false-locked answer for `.mcp.json` and `.squad/team.md` (see the F5
+# block below). The correct, honest answer for a real non-governance path is
+# `not-governance`; `locked` is reserved for paths this repo actually write-
+# locks, and `locked` for CRAFTED/traversal input is still asserted below so
+# the fail-safe property this assertion used to (mis)name is not lost, only
+# relocated to where it is actually true.
+assert_eq "not-governance"  "$(classify_path 'src/some/unknown/path.txt')" \
+  "an unrecognised, non-governance path classifies as not-governance -- locked would be a false claim of protection"
+
+# ---------------------------------------------------------------------------
+# 6d. Security review of #112/#113, F5 -- classify-governance-path honesty
+# ---------------------------------------------------------------------------
+# F5: `.mcp.json`, `.squad/team.md`, and `.squad/decisions.md` are real,
+# repo-controlled paths that are NOT in GOVERNANCE_PATHS -- squad_policy_harden
+# never locks them, yet the old classifier answered `locked` for all three.
+# They must now answer `not-governance`, honestly. Crafted/traversal input
+# must still fail safe to `locked`, unconditionally, so the honesty fix does
+# not reopen a hole the prior reviewer round already closed.
+echo "-- classify-governance-path honesty (Issue #112/#113 F5) --"
+for not_governed in '.mcp.json' '.squad/team.md' '.squad/decisions.md' '.squad/ralph-instructions.md'; do
+  assert_eq "not-governance" "$(classify_path "$not_governed")" \
+    "${not_governed} is not a governance path and must not be reported as locked"
+done
+# A real locked path, a real append-only path, and a real reported-mutable
+# path, named explicitly here so F5's fix is proven against all three
+# EXISTING classes in the same block as the new not-governance class.
+assert_eq "locked"           "$(classify_path '.squad/routing.md')" \
+  "a real governance file (routing.md) still classifies locked after the F5 fix"
+assert_eq "append-only"      "$(classify_path '.squad/agents/security/history.md')" \
+  "a real append-only path still classifies append-only after the F5 fix"
+assert_eq "reported-mutable" "$(classify_path '.squad/identity/now.md')" \
+  "a real reported-mutable path still classifies reported-mutable after the F5 fix"
+# Crafted/traversal input: must stay locked (fail safe), never
+# not-governance, even though none of these strings look like a governance
+# path at all -- the point is that this repo cannot safely reason about what
+# a traversal path resolves to, so it must not say "safe" about it.
+for crafted in '../../etc/passwd' '/etc/passwd' '.squad/../mcp.json' './../../x' '.squad/config.json/../../x'; do
+  assert_eq "locked" "$(classify_path "$crafted")" \
+    "crafted/traversal path '${crafted}' must still fail safe to locked, not not-governance"
+done
+# A Windows drive-absolute path is also crafted input relative to a repo-
+# relative contract, and must fail safe the same way.
+assert_eq "locked" "$(policy ralph ralph '' aca-job classify-governance-path 'C:\Windows\win.ini')" \
+  "a drive-absolute path is crafted input and must fail safe to locked"
 
 # ---------------------------------------------------------------------------
 # 7. Determinism
@@ -590,5 +699,98 @@ console.log(bad);
 " "$RESOLVER")"
 assert_eq "0" "$invariant_violations" \
   "no matrix row claims withheld:true while a shared, non-escape-hatched Copilot token stays exported"
+
+# ---------------------------------------------------------------------------
+# 13. Issue #112: watch/loop agent-cmd policy (parity vs strict)
+# ---------------------------------------------------------------------------
+# worker/squad-agent (the `--agent-cmd` wrapper watch/loop now run through)
+# does not re-derive policy -- it reads SQUAD_AGENT_POLICY_ARGV_JSON, which
+# worker/entrypoint.sh populates from exactly one of the two new exports below,
+# chosen by SQUAD_WATCH_STRICT_POLICY. SQUAD_DISPATCH_SOURCE is fixed at
+# 'watch' here (not in TRUSTED_SOURCES) so trust=untrusted, which is what puts
+# the multi-word `shell(git push)`/`shell(gh pr)` rules into the deny set in
+# the first place -- the realistic shape of a watch/loop session, not an
+# attended one.
+echo "-- watch-agent-* exports and SQUAD_WATCH_STRICT_POLICY (issue #112) --"
+
+# watch_policy <SQUAD_WATCH_STRICT_POLICY-value-or-__UNSET__> <subcommand>
+watch_policy() {
+  local strict_env="$1" sub="$2"
+  if [[ "$strict_env" == "__UNSET__" ]]; then
+    env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+        -u GH_TOKEN -u GITHUB_TOKEN -u COPILOT_GITHUB_TOKEN \
+        -u SQUAD_COPILOT_TOKEN_PROVENANCE -u SQUAD_ALLOW_SHARED_COPILOT_TOKEN \
+        -u SQUAD_WATCH_STRICT_POLICY \
+      SQUAD_MODE="watch" SQUAD_DISPATCH_SOURCE="watch" SQUAD_COPILOT_FLAGS="" SQUAD_EXECUTION_MODE="aca-job" \
+      node "$RESOLVER" "$sub" 2>&1
+  else
+    env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+        -u GH_TOKEN -u GITHUB_TOKEN -u COPILOT_GITHUB_TOKEN \
+        -u SQUAD_COPILOT_TOKEN_PROVENANCE -u SQUAD_ALLOW_SHARED_COPILOT_TOKEN \
+        -u SQUAD_WATCH_STRICT_POLICY \
+      SQUAD_MODE="watch" SQUAD_DISPATCH_SOURCE="watch" SQUAD_COPILOT_FLAGS="" SQUAD_EXECUTION_MODE="aca-job" \
+      SQUAD_WATCH_STRICT_POLICY="$strict_env" \
+      node "$RESOLVER" "$sub" 2>&1
+  fi
+}
+
+watch_policy_status() {
+  watch_policy "$@" >/dev/null 2>&1
+  printf '%s' "$?"
+}
+
+# SQUAD_WATCH_STRICT_POLICY=true selects STRICT, and the dedicated
+# watch-agent-argv-json alias agrees with watch-agent-strict-argv-json.
+assert_eq "strict" "$(watch_policy true watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY=true resolves to strict"
+strict_argv_true="$(watch_policy true watch-agent-argv-json)"
+assert_eq "$(watch_policy true watch-agent-strict-argv-json)" "$strict_argv_true" \
+  "watch-agent-argv-json matches watch-agent-strict-argv-json when SQUAD_WATCH_STRICT_POLICY=true"
+assert_contains "$strict_argv_true" "shell(git push)" "strict watch-agent-argv-json carries the multi-word deny rule"
+
+# unset / empty / "false" / garbage all fail closed to the NARROWER reading
+# (parity) -- consistent with every other boolean-flavoured environment input
+# this resolver reads (see resolvePolicyFromEnv's own doc comment on
+# watchStrictPolicy, and ATTENDED_SOURCES' comment above it).
+assert_eq "parity" "$(watch_policy __UNSET__ watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY unset resolves to parity"
+assert_eq "parity" "$(watch_policy ''        watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY='' resolves to parity"
+assert_eq "parity" "$(watch_policy 'false'   watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY=false resolves to parity"
+assert_eq "parity" "$(watch_policy 'nah'     watch-agent-policy-mode)" "SQUAD_WATCH_STRICT_POLICY=garbage resolves to parity"
+
+# normalize() trims and lowercases EVERY boolean-flavoured input this resolver
+# reads (see normalize()'s own definition) -- so "TRUE " (trailing whitespace,
+# wrong case) is NOT a 'garbage' value by this resolver's existing,
+# deliberately lenient contract: it normalizes to 'true' the same way it would
+# for SQUAD_ALLOW_SHARED_COPILOT_TOKEN or any other boolean env var here, and
+# resolves to STRICT. Asserted directly against the real resolver rather than
+# assumed, so this suite documents the actual contract instead of a guessed one.
+assert_eq "strict" "$(watch_policy 'TRUE ' watch-agent-policy-mode)" \
+  "SQUAD_WATCH_STRICT_POLICY='TRUE ' normalizes (trim+lowercase) to strict, matching this file's existing boolean-env convention"
+
+parity_argv_unset="$(watch_policy __UNSET__ watch-agent-argv-json)"
+assert_eq "$(watch_policy __UNSET__ watch-agent-parity-argv-json)" "$parity_argv_unset" \
+  "watch-agent-argv-json matches watch-agent-parity-argv-json by default (unset)"
+assert_not_contains "$parity_argv_unset" "shell(git push)" "default (unset) watch-agent-argv-json omits the multi-word deny rule"
+
+# The four new fields are also reachable on the whole resolvePolicy() object
+# (the `json` dump), not just through their dedicated CLI subcommands -- so a
+# caller reading the full policy object sees the same facts the dedicated
+# subcommands report.
+json_strict="$(watch_policy true json)"
+assert_contains "$json_strict" '"watchAgentPolicyMode": "strict"' "json: watchAgentPolicyMode field is present and 'strict'"
+assert_contains "$json_strict" '"watchAgentParityArgv"'            "json: watchAgentParityArgv field is present"
+assert_contains "$json_strict" '"watchAgentStrictArgv"'            "json: watchAgentStrictArgv field is present"
+assert_contains "$json_strict" '"watchAgentArgv"'                  "json: watchAgentArgv field is present"
+
+json_parity="$(watch_policy __UNSET__ json)"
+assert_contains "$json_parity" '"watchAgentPolicyMode": "parity"' "json (unset): watchAgentPolicyMode field is 'parity'"
+
+# An unknown subcommand still exits 78 after adding the four new verbs, and the
+# usage string lists all of them.
+unknown_out="$(watch_policy __UNSET__ no-such-subcommand)"
+assert_eq "78" "$(watch_policy_status __UNSET__ no-such-subcommand)" \
+  "an unknown resolver sub-command still exits 78 after adding the watch-agent-* verbs"
+for verb in watch-agent-argv-json watch-agent-parity-argv-json watch-agent-strict-argv-json watch-agent-policy-mode; do
+  assert_contains "$unknown_out" "$verb" "the usage string lists the new verb '${verb}'"
+done
 
 test_summary

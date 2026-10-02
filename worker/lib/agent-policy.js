@@ -422,11 +422,24 @@ const AUTONOMOUS_DENY_TOOLS = [
  * not touch policy (model selection, logging, effort), and REJECTED -- session
  * aborts, no blanket allow -- for anything that widens the permission surface.
  * The way to widen policy is to change this file and have the change reviewed.
+ *
+ * Security review of #112/#113 (F2): `--yolo` and `--allow-all` are
+ * documented (verified via `copilot --help` against the pinned CLI) as
+ * BOTH expanding to the exact same three flags: `--allow-all-tools
+ * --allow-all-paths --allow-all-urls`. This list used to carry `--yolo`,
+ * `--allow-all` and `--allow-all-paths` -- two of those three expanded
+ * flags -- but not `--allow-all-urls`, the third. `--allow-all-tools` is
+ * deliberately NOT here: resolvePolicy() always includes it itself (the
+ * CLI requires it for non-interactive mode), so rejecting it from operator
+ * input would refuse every session. The other two expanded flags have no
+ * such justification and must both be rejected, the same as the aliases
+ * that expand to them.
  */
 const FORBIDDEN_EXTRA_FLAGS = [
   '--yolo',
   '--allow-all',
   '--allow-all-paths',
+  '--allow-all-urls',
   '--add-dir',
 ];
 
@@ -453,6 +466,15 @@ const GOVERNANCE_PATHS = [
   '.squad/routing.md',
   '.squad/casting-policy.json',
   '.squad/casting/policy.json',
+  // Issue #113: Squad 0.13.1 ships fixes (#1876, #1898) so the coordinator can
+  // persist these two alongside casting/policy.json. They were not previously
+  // in this list at all, which meant they were untracked rather than
+  // protected -- a silent blind spot for exactly the casting state that
+  // policy.json already covered. They are tracked now, under the
+  // REPORTED_MUTABLE_GOVERNANCE_PATTERNS class below, not locked: casting is
+  // runtime state upstream, so the write must be allowed, just visible.
+  '.squad/casting/registry.json',
+  '.squad/casting/history.json',
   '.squad/memory/config.json',
   '.squad/memory/audit.jsonl',
   '.squad/fact-checker/policy.md',
@@ -499,8 +521,76 @@ const GOVERNANCE_PATHS = [
  * a JS RegExp, a POSIX ERE (bash `[[ =~ ]]`) and a .NET regex, because all
  * three consume it (this file, squad-policy.sh, scripts/validate.ps1). One
  * pattern, three readers, no restatement to drift.
+ *
+ * Issue #113: `.squad/memory/audit.jsonl` joins this list for the SAME reason
+ * `history.md` is here -- it is an append-only audit trail (`MemoryManager
+ * .audit()` in squad-sdk only ever appends a JSON line to it), not policy.
+ * What is NOT solved by this list alone is ROTATION: squad-sdk's
+ * `rotateAuditIfNeeded()` RENAMES audit.jsonl once it crosses
+ * `policy.auditMaxBytes`, and a rename is indistinguishable from "the file was
+ * deleted and a new one started" to the prefix-hash check below -- it would
+ * fail the session exactly like a real deletion. See pinMemoryAuditConfig
+ * below (applied by squad_policy_harden via the `harden-init` subcommand) for
+ * how rotation is made impossible for the session instead of merely detected
+ * after the fact.
  */
-const MUTABLE_GOVERNANCE_PATTERNS = ['^\\.squad/agents/[^/]+/history\\.md$'];
+const MUTABLE_GOVERNANCE_PATTERNS = [
+  '^\\.squad/agents/[^/]+/history\\.md$',
+  '^\\.squad/memory/audit\\.jsonl$',
+];
+
+/**
+ * Issue #113: a SECOND, DELIBERATELY DIFFERENT exclusion from the write lock.
+ *
+ * APPEND-ONLY (above) says "this file may only grow, and the bytes already
+ * written may never change" -- the right rule for an audit trail or a work
+ * log. It is the WRONG rule for state Squad 0.13 legitimately REWRITES, not
+ * just appends to:
+ *
+ *   .squad/casting/policy.json    Squad 0.13.1 (upstream fixes #1876/#1898)
+ *   .squad/casting/registry.json  persists casting state here across a
+ *   .squad/casting/history.json   session; a coordinator may rewrite the
+ *                                 whole file, not append a line to it.
+ *   .squad/identity/now.md        Squad's "what the team is focused on"
+ *                                 pointer, rewritten each session by design --
+ *                                 see the identity/ split below.
+ *
+ * A prefix-hash check would fail every one of these on the first legitimate
+ * write. So this class is REPORTED-MUTABLE instead: hashed at baseline the
+ * same as everything else, writable for the whole session (chmod u+w, not
+ * append-only), and a DIFFERENCE at verify time is never a violation -- it is
+ * collected and surfaced in the governance report and the PR body (see
+ * squad_policy_reported_changes_report in squad-policy.sh). "Allowed" is the
+ * whole point of the class; "invisible" is not, which is why it stays in the
+ * manifest and in the diff output instead of simply being left off
+ * GOVERNANCE_PATHS.
+ *
+ * WHY identity/now.md AND NOT THE REST OF identity/
+ * --------------------------------------------------
+ * `.squad/identity` stays a GOVERNANCE_PATHS entry (the whole directory), and
+ * every file under it stays LOCKED by default. `now.md` is carved out, by
+ * name, for the same reason squad-sdk's state tools put identity/ in their own
+ * mutable allowlist: it is the one file that is supposed to change constantly
+ * -- "what is the team focused on right now" is session state, not
+ * governance. Everything else under identity/ (identity.md, mission.md, and
+ * anything else) is stable governance describing WHO the team is; a session
+ * has no more business rewriting that than it does rewriting a charter. The
+ * pattern below is anchored to the exact filename for the same reason the
+ * append-only history.md pattern is anchored to one path segment: an
+ * unanchored `identity/**` would silently re-open the rest of the directory.
+ */
+const REPORTED_MUTABLE_GOVERNANCE_PATTERNS = [
+  '^\\.squad/identity/now\\.md$',
+  '^\\.squad/casting/policy\\.json$',
+  '^\\.squad/casting/registry\\.json$',
+  '^\\.squad/casting/history\\.json$',
+];
+
+function normalizeGovernanceRelPath(relativePath) {
+  return String(relativePath === undefined || relativePath === null ? '' : relativePath)
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '');
+}
 
 /**
  * True when a repository-relative path is a governance path that a session is
@@ -508,13 +598,114 @@ const MUTABLE_GOVERNANCE_PATTERNS = ['^\\.squad/agents/[^/]+/history\\.md$'];
  * classifies the same way as a container-produced one.
  */
 function isMutableGovernancePath(relativePath) {
-  const p = String(relativePath === undefined || relativePath === null ? '' : relativePath)
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '');
+  const p = normalizeGovernanceRelPath(relativePath);
   if (p === '') {
     return false;
   }
   return MUTABLE_GOVERNANCE_PATTERNS.some((pattern) => new RegExp(pattern).test(p));
+}
+
+/**
+ * True when a repository-relative path is a governance path that a session may
+ * freely REWRITE -- not just append to -- with the change reported rather than
+ * blocked. See REPORTED_MUTABLE_GOVERNANCE_PATTERNS above for which paths and
+ * why.
+ */
+function isReportedMutableGovernancePath(relativePath) {
+  const p = normalizeGovernanceRelPath(relativePath);
+  if (p === '') {
+    return false;
+  }
+  return REPORTED_MUTABLE_GOVERNANCE_PATTERNS.some((pattern) => new RegExp(pattern).test(p));
+}
+
+/**
+ * True when a normalised path is a GOVERNANCE_PATHS entry itself, or sits
+ * inside one of its directory entries. This is the question
+ * `classify-governance-path` (below) actually needs answered before it can
+ * say `locked` -- GOVERNANCE_PATHS is a flat list mixing files
+ * (`.squad/config.json`) and directories (`.squad/agents`); a plain string
+ * prefix check (`p === entry || p.startsWith(entry + '/')`) covers both
+ * shapes without needing to know, ahead of time, which is which.
+ */
+function isGovernancePath(normalizedPath) {
+  return GOVERNANCE_PATHS.some((entry) => normalizedPath === entry || normalizedPath.startsWith(`${entry}/`));
+}
+
+/**
+ * Security review of #112/#113 (F5, fail-safe half). A path this repo cannot
+ * safely reason about as "a plain path inside the checkout" -- absolute,
+ * drive-rooted, or containing a `.`/`..` segment -- must classify `locked`
+ * regardless of whether it also happens to look like a governance path or
+ * not. The alternative (running GOVERNANCE_PATHS prefix matching against an
+ * unnormalised traversal string) could, in principle, answer `not-governance`
+ * for something that traversal actually resolves INTO a governance path, and
+ * fail-open is not an acceptable failure mode for a protection boundary.
+ * `classify-governance-path` historically failed safe this way already (the
+ * prior reviewer round confirmed it); this function names and keeps exactly
+ * that property while F5's fix stops the SAME fail-safe default from also
+ * being returned for ordinary, non-traversal, non-governance paths like
+ * `.mcp.json`.
+ */
+function pathLooksUnsafe(normalizedPath) {
+  if (normalizedPath.startsWith('/')) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(normalizedPath)) {
+    return true;
+  }
+  return normalizedPath.split('/').some((segment) => segment === '' || segment === '.' || segment === '..');
+}
+
+/**
+ * `locked` | `append-only` | `reported-mutable` | `not-governance`.
+ *
+ * Security review of #112/#113 (F5). Before this function existed, the
+ * `classify-governance-path` CLI case defaulted every path that was not
+ * append-only or reported-mutable to `locked` -- including paths that are not
+ * governance paths AT ALL (`.mcp.json`, `.squad/team.md`,
+ * `.squad/decisions.md`, `.squad/ralph-instructions.md`,
+ * `.squad/casting-registry.json` all classified `locked` despite appearing
+ * nowhere in GOVERNANCE_PATHS, so none of them was ever hashed, manifested, or
+ * `chmod a-w`'d). That made the classifier's `locked` answer a false claim of
+ * protection rather than a report of one, which is actively worse than
+ * answering "I don't know" -- an operator (or `scripts/validate.ps1`) asking
+ * "is `.squad/team.md` locked?" got back "yes" for a path
+ * `squad_policy_harden` never touches.
+ *
+ * `locked` now means ONLY "this path is in GOVERNANCE_PATHS (directly, or
+ * inside a directory entry) and is not carved out of the write lock by either
+ * mutable class" -- i.e. it is an honest, checkable claim again. A path that
+ * is not governed at all answers `not-governance`, explicitly, rather than
+ * borrowing the locked class's fail-closed shape. Crafted/traversal input
+ * (see pathLooksUnsafe) still answers `locked`, unconditionally -- the
+ * honesty fix must not reopen the fail-safe behaviour the prior reviewer
+ * round already verified for that case.
+ */
+function classifyGovernancePath(relativePath) {
+  const p = normalizeGovernanceRelPath(relativePath);
+  if (p === '' || pathLooksUnsafe(p)) {
+    return 'locked';
+  }
+  if (isMutableGovernancePath(p)) {
+    return 'append-only';
+  }
+  if (isReportedMutableGovernancePath(p)) {
+    return 'reported-mutable';
+  }
+  // Security re-review N4. Membership is case-FOLDED (GOVERNANCE_PATHS is a
+  // fixed lowercase set, so folding can never produce a false
+  // `not-governance`): on a case-insensitive host (Windows, macOS -- where
+  // scripts/validate.ps1 runs) `.SQUAD/identity/mission.md` IS the governed
+  // file. The two mutable carve-outs above deliberately stay case-SENSITIVE,
+  // so a case variant is never excused as writable; it falls through to the
+  // fail-safe `locked`. The bare governance root `.squad` answers `locked`
+  // too, the same answer `.squad/` already gets.
+  const folded = p.toLowerCase();
+  if (folded === '.squad' || isGovernancePath(folded)) {
+    return 'locked';
+  }
+  return 'not-governance';
 }
 
 const TIER_ATTENDED = 'attended';
@@ -615,6 +806,18 @@ function validateExtraFlags(tokens) {
  * @param {boolean} [input.copilotTokenSharedAllowed] whether
  *   SQUAD_ALLOW_SHARED_COPILOT_TOKEN=true was set to explicitly accept a
  *   shared Copilot token remaining exported.
+ * @param {boolean} [input.watchStrictPolicy] issue #112: which argv
+ *   worker/squad-agent (the `--agent-cmd` wrapper `watch`/`loop` now run
+ *   through) should prefer. Default `false` selects PARITY -- the SAME
+ *   effective deny set `--copilot-flags` has always delivered on this path
+ *   (squadFlags, below), so turning this file's fix for #112 on does not also
+ *   silently start enforcing `shell(git push)` / `shell(gh pr)` against watch
+ *   agents that legitimately push and open PRs today. `true` selects STRICT --
+ *   the full argv, multi-word deny rules included -- which closes the
+ *   `undeliverableViaSquad` gap but is an opt-in tightening, not a default
+ *   one, because the wrapper execs `copilot` directly instead of going through
+ *   `squad --copilot-flags`'s whitespace split, so either set is deliverable
+ *   now; the field only decides which one entrypoint.sh asks for.
  */
 function resolvePolicy(input) {
   const opts = input || {};
@@ -700,6 +903,7 @@ function resolvePolicy(input) {
     denyTools,
     governancePaths: GOVERNANCE_PATHS.slice(),
     mutableGovernancePatterns: MUTABLE_GOVERNANCE_PATTERNS.slice(),
+    reportedMutableGovernancePatterns: REPORTED_MUTABLE_GOVERNANCE_PATTERNS.slice(),
     flags,
     // A single shell-ready string. Only safe where the caller can hand it to a
     // process as an argv array; see squadFlagString for the other path.
@@ -707,6 +911,18 @@ function resolvePolicy(input) {
     squadFlags,
     squadFlagString: squadFlags.join(' '),
     undeliverableViaSquad: undeliverable,
+    // Issue #112: the two argv variants worker/squad-agent (the `--agent-cmd`
+    // wrapper watch/loop run through, so Squad never gets a chance to inject
+    // its own `--yolo` on their behalf) can be told to exec `copilot` with,
+    // plus the field that picks between them. These are not new policy -- they
+    // are the SAME `squadFlags`/`flags` arrays already computed above, named
+    // for this specific caller so a reader of worker/entrypoint.sh or
+    // worker/squad-agent does not have to already know that "parity" means
+    // "the --copilot-flags-survivable subset" to find the right field.
+    watchAgentParityArgv: squadFlags.slice(),
+    watchAgentStrictArgv: flags.slice(),
+    watchAgentPolicyMode: opts.watchStrictPolicy ? 'strict' : 'parity',
+    watchAgentArgv: (opts.watchStrictPolicy ? flags : squadFlags).slice(),
     // The SAME policy, for a session supervised by Squad Hub.
     //
     // `--allow-all-tools` exists because a container has no TTY and no
@@ -762,6 +978,11 @@ function resolvePolicyFromEnv(env) {
     executionPlane: e.SQUAD_EXECUTION_MODE,
     copilotTokenShared,
     copilotTokenSharedAllowed: normalize(e.SQUAD_ALLOW_SHARED_COPILOT_TOKEN) === 'true',
+    // Issue #112: opt-in only. Absent, empty, or anything other than the
+    // literal string "true" is PARITY -- the same fail-closed-to-the-narrower-
+    // reading the rest of this file applies to every other boolean-flavoured
+    // environment input (see ATTENDED_SOURCES' comment above).
+    watchStrictPolicy: normalize(e.SQUAD_WATCH_STRICT_POLICY) === 'true',
   });
 }
 
@@ -809,6 +1030,86 @@ function buildPolicyMatrix() {
 
 const POLICY_MATRIX = buildPolicyMatrix();
 
+/**
+ * Issue #113 perf follow-up (worker/tests/test_governance_guard.sh timing
+ * regression). worker/lib/squad-policy.sh used to fork `node` once PER FIELD
+ * it needed (tier, reason, flags, argv, squad-flags, undeliverable,
+ * governance-paths, mutable-governance-patterns,
+ * reported-mutable-governance-patterns) -- up to nine forks for ONE
+ * harden/verify/resolve cycle. `node` startup is a rounding error on Linux CI
+ * but measured at several hundred ms to over a second under git-bash on
+ * Windows, and this suite's `make_repo`+`harden`(+`verify`) cycle runs that
+ * many times over. This function is not a new source of truth: every field it
+ * emits is copied verbatim from the SAME `policy` object the single-field
+ * subcommands below already read. Those subcommands (`tier`, `governance-
+ * paths`, `classify-governance-path`, etc.) are UNCHANGED and still exist on
+ * their own -- scripts/validate.ps1 calls several of them directly, and this
+ * bundle is additive, not a replacement.
+ *
+ * Line format (consumed by worker/lib/squad-policy.sh's
+ * squad_policy_parse_bundle -- the two must agree):
+ *   TIER <tier>
+ *   REASON <reason>
+ *   FLAGSTRING <flagString>
+ *   SQUADFLAGSTRING <squadFlagString>
+ *   ARGV <n>\n<n lines>
+ *   UNDELIVERABLE <n>\n<n lines>
+ *   GOVPATHS <n>\n<n lines>
+ *   MUTABLE <n>\n<n lines>
+ *   REPORTED <n>\n<n lines>
+ * Every scalar above is a single-line value by construction (resolveTier/
+ * resolveTrust/validateExtraFlags never emit embedded newlines), so a
+ * line-oriented bash reader can parse this without a JSON library.
+ */
+function serializeGovernanceBundle(policy) {
+  const lines = [
+    `TIER ${policy.tier}`,
+    `REASON ${policy.reason}`,
+    `FLAGSTRING ${policy.flagString}`,
+    `SQUADFLAGSTRING ${policy.squadFlagString}`,
+  ];
+  const block = (name, items) => {
+    lines.push(`${name} ${items.length}`);
+    for (const item of items) {
+      lines.push(item);
+    }
+  };
+  block('ARGV', policy.flags);
+  block('UNDELIVERABLE', policy.undeliverableViaSquad);
+  block('GOVPATHS', policy.governancePaths);
+  block('MUTABLE', policy.mutableGovernancePatterns);
+  block('REPORTED', policy.reportedMutableGovernancePatterns);
+  return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Issue #113: the audit-rotation pin that used to be an inline `node -e`
+ * string in worker/lib/squad-policy.sh's squad_policy_pin_memory_audit_config,
+ * now a named function so the `harden-init` subcommand below can fold it and
+ * the governance bundle into the SAME `node` process -- the one fork
+ * squad_policy_harden needs. See squad_policy_harden's doc in
+ * worker/lib/squad-policy.sh for WHY this pin exists (it disables
+ * squad-sdk's own audit.jsonl rotation; verified against
+ * @bradygaster/squad-sdk@0.13.1, dist/memory/index.js:
+ * `if (maxBytes <= 0) return;` in rotateAuditIfNeeded()).
+ */
+function pinMemoryAuditConfig(repoDir) {
+  const fs = require('fs');
+  const path = require('path');
+  const target = path.join(repoDir, '.squad', 'memory', 'config.json');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  let config = {};
+  if (fs.existsSync(target)) {
+    const raw = fs.readFileSync(target, 'utf8');
+    if (raw.trim() !== '') {
+      config = JSON.parse(raw);
+    }
+  }
+  config.policy = config.policy || {};
+  config.policy.auditMaxBytes = 0;
+  fs.writeFileSync(target, `${JSON.stringify(config, null, 2)}\n`);
+}
+
 module.exports = {
   ATTENDED_MODES,
   ATTENDED_SOURCES,
@@ -824,6 +1125,7 @@ module.exports = {
   FORBIDDEN_EXTRA_FLAGS,
   GOVERNANCE_PATHS,
   MUTABLE_GOVERNANCE_PATTERNS,
+  REPORTED_MUTABLE_GOVERNANCE_PATTERNS,
   TIER_ATTENDED,
   TIER_AUTONOMOUS,
   AgentPolicyError,
@@ -831,10 +1133,15 @@ module.exports = {
   resolveTrust,
   resolveCredentialProfile,
   isMutableGovernancePath,
+  isReportedMutableGovernancePath,
+  isGovernancePath,
+  classifyGovernancePath,
   resolvePolicy,
   resolvePolicyFromEnv,
   buildPolicyMatrix,
   POLICY_MATRIX,
+  serializeGovernanceBundle,
+  pinMemoryAuditConfig,
 };
 
 
@@ -903,16 +1210,53 @@ function main(argv) {
     case 'mutable-governance-patterns':
       process.stdout.write(`${policy.mutableGovernancePatterns.join('\n')}\n`);
       return 0;
-    // `classify-governance-path <relative-path>` -> `append-only` | `locked`.
+    // Issue #113: the REPORTED-MUTABLE sibling of the command above. One
+    // regular expression per line; a governance path that matches is excluded
+    // from the write lock AND from the append-only prefix rule -- it may be
+    // rewritten freely, and the rewrite is reported rather than blocked. See
+    // REPORTED_MUTABLE_GOVERNANCE_PATTERNS for which paths and why.
+    case 'reported-mutable-governance-patterns':
+      process.stdout.write(`${policy.reportedMutableGovernancePatterns.join('\n')}\n`);
+      return 0;
+    // `classify-governance-path <relative-path>` ->
+    // `append-only` | `reported-mutable` | `locked` | `not-governance`.
     // Exists so a test (and an operator diagnosing a run) can ask the SAME
-    // resolver the shell asks, rather than restating the pattern.
+    // resolver the shell asks, rather than restating the pattern. Security
+    // review of #112/#113 (F5): `not-governance` is a new answer -- see
+    // classifyGovernancePath's doc for why `locked` used to be returned, and
+    // was wrong, for paths outside GOVERNANCE_PATHS entirely.
     case 'classify-governance-path': {
       const target = argv[1];
       if (target === undefined || String(target).trim() === '') {
         process.stderr.write('Usage: agent-policy.js classify-governance-path <repo-relative-path>\n');
         return 78;
       }
-      process.stdout.write(`${isMutableGovernancePath(target) ? 'append-only' : 'locked'}\n`);
+      process.stdout.write(`${classifyGovernancePath(target)}\n`);
+      return 0;
+    }
+    // Issue #113 perf: every field `squad_policy_resolve` /
+    // `squad_policy_harden` / `squad_policy_verify` read individually above,
+    // in ONE process. See serializeGovernanceBundle's doc for the line
+    // format and why this exists.
+    case 'bundle':
+      process.stdout.write(serializeGovernanceBundle(policy));
+      return 0;
+    // Issue #113 perf: `bundle`, plus the audit-rotation pin
+    // (pinMemoryAuditConfig), in the SAME process -- the one `node` fork
+    // squad_policy_harden needs instead of four. <repo-dir> is required.
+    case 'harden-init': {
+      const repoDir = argv[1];
+      if (repoDir === undefined || String(repoDir).trim() === '') {
+        process.stderr.write('Usage: agent-policy.js harden-init <repo-dir>\n');
+        return 78;
+      }
+      try {
+        pinMemoryAuditConfig(repoDir);
+      } catch (error) {
+        process.stderr.write(`${error.message}\n`);
+        return 78;
+      }
+      process.stdout.write(serializeGovernanceBundle(policy));
       return 0;
     }
     // Issue #84 PI-2: the orthogonal trust axis, read the same way `tier` is.
@@ -948,11 +1292,41 @@ function main(argv) {
     case 'matrix':
       process.stdout.write(`${JSON.stringify(POLICY_MATRIX, null, 2)}\n`);
       return 0;
+    // Issue #112: the argv worker/squad-agent should exec `copilot` with, as
+    // a JSON array -- the shape `SQUAD_AGENT_POLICY_ARGV_JSON` takes, and the
+    // one the wrapper's `node -e` parser reads. Which of the two variants
+    // (see resolvePolicy's `watchStrictPolicy` doc) depends on
+    // SQUAD_WATCH_STRICT_POLICY in the SAME environment this invocation
+    // already reads everything else from -- there is no separate flag to this
+    // subcommand, because a resolver whose output depended on both its
+    // environment AND its argv would be two sources of truth for one answer.
+    case 'watch-agent-argv-json':
+      process.stdout.write(`${JSON.stringify(policy.watchAgentArgv)}\n`);
+      return 0;
+    // The two variants individually, for a test (or an operator) that wants
+    // to compare them without re-exporting SQUAD_WATCH_STRICT_POLICY and
+    // re-invoking the resolver.
+    case 'watch-agent-parity-argv-json':
+      process.stdout.write(`${JSON.stringify(policy.watchAgentParityArgv)}\n`);
+      return 0;
+    case 'watch-agent-strict-argv-json':
+      process.stdout.write(`${JSON.stringify(policy.watchAgentStrictArgv)}\n`);
+      return 0;
+    // `parity` | `strict`. worker/entrypoint.sh logs this at session start so
+    // which deny set a watch/loop session is actually running under is a
+    // fact in the session log, not something an operator has to infer from
+    // whether SQUAD_WATCH_STRICT_POLICY happens to be set.
+    case 'watch-agent-policy-mode':
+      process.stdout.write(`${policy.watchAgentPolicyMode}\n`);
+      return 0;
     default:
       process.stderr.write(
         'Usage: agent-policy.js [json|flags|argv|squad-flags|hub-argv-json|undeliverable|tier|reason|' +
           'trust|trust-reason|credential-profile|should-withhold-credential|copilot-token-shared|matrix|' +
-          'governance-paths|mutable-governance-patterns|classify-governance-path <path>]\n'
+          'governance-paths|mutable-governance-patterns|reported-mutable-governance-patterns|' +
+          'classify-governance-path <path>|bundle|harden-init <repo-dir>|' +
+          'watch-agent-argv-json|watch-agent-parity-argv-json|watch-agent-strict-argv-json|' +
+          'watch-agent-policy-mode]\n'
       );
       return 78;
   }

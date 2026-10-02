@@ -116,6 +116,7 @@ foreach ($file in $psFiles) {
 Write-Section "Worker bash scripts (bash -n)"
 $bashScripts = @(
     (Join-Path $RepoRoot "worker\entrypoint.sh"),
+    (Join-Path $RepoRoot "worker\squad-agent"),
     (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"),
     (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh"),
     (Join-Path $RepoRoot "worker\lib\git-checkout.sh"),
@@ -123,7 +124,8 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\tests\test_agent_policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh"),
     (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh"),
-    (Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh")
+    (Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_squad_agent_wrapper.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"
@@ -3265,6 +3267,132 @@ if (-not (Test-Path $harness)) {
 }
 
 # ---------------------------------------------------------------------------
+# 9a. Refuse externalized Squad state / remote teamRoot (issue #117)
+# ---------------------------------------------------------------------------
+# Squad 0.13's `squad externalize` can move a repo's mutable state to a
+# per-user app-data directory (`stateLocation: "external"`) or point
+# `teamRoot` at another `.squad/` directory entirely. Neither is supportable
+# here: the worker container hardens and commits THIS checkout's `.squad/`,
+# so if the real state lives elsewhere the governance lock is guarding a
+# directory Squad never actually reads or writes. `doctor` must report it,
+# `run` must refuse to dispatch rather than silently doing the wrong thing,
+# and both must still treat an ordinary repo (no config.json, or one with
+# neither key, or `teamRoot: "."`) as perfectly normal.
+Write-Section "squad-aca refuses externalized Squad state (issue #117)"
+$issue117NodeAvailable = [bool](Get-Command node -ErrorAction SilentlyContinue)
+if (-not ((Test-Path $harness) -and $IsWindowsHost -and $issue117NodeAvailable)) {
+    Write-Host "  [SKIP] issue #117 externalized-state checks require Windows + node" -ForegroundColor Yellow
+} else {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment
+        Initialize-SquadCliStubRepository -Stub $stub | Out-Null
+        $squadDir = Join-Path $stub.WorkDir ".squad"
+        $configPath = Join-Path $squadDir "config.json"
+
+        # Case 1: stateLocation: "external" -- doctor must fail the row, run
+        # must refuse before ever touching the dispatch plane.
+        Set-Content -LiteralPath $configPath -Value (@(
+            '{ "version": 1, "teamRoot": ".", "stateLocation": "external", "projectKey": "stub-project" }'
+        ) -join "`n") -Encoding utf8
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorExternal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorExternal.StdOut -match "Squad state location\s+failed" -and
+            $doctorExternal.StdOut -match "external") {
+            Add-Pass "squad-aca doctor reports a failed 'Squad state location' row for stateLocation: external, naming the cause"
+        } else {
+            Add-Fail "squad-aca doctor did not flag stateLocation: external. stdout=$($doctorExternal.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runExternal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-external", "do the thing")
+        $externalStartCalls = @($runExternal.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runExternal.ExitCode -ne 0 -and
+            "$($runExternal.StdErr)`n$($runExternal.StdOut)" -match "external" -and
+            $externalStartCalls.Count -eq 0) {
+            Add-Pass "squad-aca run refuses to dispatch when stateLocation is external, naming the cause, and never requests compute"
+        } else {
+            Add-Fail "squad-aca run did not refuse stateLocation: external (exit=$($runExternal.ExitCode), starts=$($externalStartCalls.Count))"
+        }
+
+        # Case 2: a non-'.' teamRoot (remote/satellite mode) -- same refusal.
+        Set-Content -LiteralPath $configPath -Value (@(
+            '{ "version": 1, "teamRoot": "../other-repo/.squad" }'
+        ) -join "`n") -Encoding utf8
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorRemote = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorRemote.StdOut -match "Squad state location\s+failed" -and
+            $doctorRemote.StdOut -match "\.\./other-repo/\.squad") {
+            Add-Pass "squad-aca doctor reports a failed 'Squad state location' row for a remote teamRoot, naming the configured path"
+        } else {
+            Add-Fail "squad-aca doctor did not flag a remote teamRoot. stdout=$($doctorRemote.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runRemote = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-remote", "do the thing")
+        $remoteStartCalls = @($runRemote.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runRemote.ExitCode -ne 0 -and
+            "$($runRemote.StdErr)`n$($runRemote.StdOut)" -match "\.\./other-repo/\.squad" -and
+            $remoteStartCalls.Count -eq 0) {
+            Add-Pass "squad-aca run refuses to dispatch for a remote teamRoot, naming the configured path, and never requests compute"
+        } else {
+            Add-Fail "squad-aca run did not refuse a remote teamRoot (exit=$($runRemote.ExitCode), starts=$($remoteStartCalls.Count))"
+        }
+
+        # Case 3: the common cases must still work -- no config.json at all,
+        # a config.json missing the version/teamRoot pair Squad itself
+        # requires to treat it as live, and the explicit local sentinel
+        # (teamRoot: "." + stateLocation other than external).
+        Remove-Item -LiteralPath $configPath -Force -ErrorAction SilentlyContinue
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorAbsent = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorAbsent.StdOut -match "Squad state location\s+ok") {
+            Add-Pass "squad-aca doctor reports 'Squad state location' ok when .squad/config.json is absent"
+        } else {
+            Add-Fail "squad-aca doctor misclassified an absent config.json. stdout=$($doctorAbsent.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runAbsent = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-absent", "do the thing")
+        $absentStartCalls = @($runAbsent.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runAbsent.ExitCode -eq 0 -and $absentStartCalls.Count -eq 1) {
+            Add-Pass "squad-aca run dispatches normally when .squad/config.json is absent"
+        } else {
+            Add-Fail "squad-aca run no longer dispatches with an absent config.json (exit=$($runAbsent.ExitCode), starts=$($absentStartCalls.Count))"
+        }
+
+        Set-Content -LiteralPath $configPath -Value (@(
+            '{ "version": 1, "teamRoot": ".", "stateLocation": "local" }'
+        ) -join "`n") -Encoding utf8
+
+        Reset-SquadCliStubLog -Stub $stub
+        $doctorLocal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("doctor")
+        if ($doctorLocal.StdOut -match "Squad state location\s+ok") {
+            Add-Pass "squad-aca doctor reports 'Squad state location' ok for teamRoot: '.' (the local sentinel)"
+        } else {
+            Add-Fail "squad-aca doctor misclassified teamRoot: '.'. stdout=$($doctorLocal.StdOut)"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $runLocal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-local-dot", "do the thing")
+        $localStartCalls = @($runLocal.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        if ($runLocal.ExitCode -eq 0 -and $localStartCalls.Count -eq 1) {
+            Add-Pass "squad-aca run dispatches normally for teamRoot: '.' (the local sentinel)"
+        } else {
+            Add-Fail "squad-aca run no longer dispatches with teamRoot: '.' (exit=$($runLocal.ExitCode), starts=$($localStartCalls.Count))"
+        }
+    } catch {
+        Add-Fail "issue #117 externalized-state checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 9b. Unified dispatch contract + durable leases (Sprint 6, PRD #6)
 # ---------------------------------------------------------------------------
 # Two things are proven here that no other check can prove:
@@ -4621,6 +4749,21 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
 # destroyed the audit trail PRD #6 asks for. The exclusion is only safe while it
 # stays anchored at both ends and stays inside the integrity check, so both
 # properties are asserted here against the REAL resolver rather than described.
+#
+# Issue #113: Squad 0.13.1 writes to two more paths during a normal session
+# that this section must now classify correctly, derived from the SAME
+# resolver rather than a second hand-maintained list (agent-policy.js is the
+# single source of truth; this section only asks it questions):
+#   - `.squad/memory/audit.jsonl` moved OUT of `locked` and into `append-only`,
+#     for the identical reason history.md is append-only: squad-sdk's
+#     `MemoryManager.audit()` only ever appends a line to it.
+#   - `.squad/casting/policy.json`, `registry.json`, `history.json`, and
+#     `.squad/identity/now.md` are a THIRD class, `reported-mutable`: Squad
+#     0.13 legitimately REWRITES these wholesale rather than appending, so the
+#     append-only prefix rule is the wrong rule for them. They are excluded
+#     from the write lock like append-only paths, but any change -- not just a
+#     prefix-preserving grow -- is permitted. See REPORTED_MUTABLE_GOVERNANCE_PATTERNS
+#     in worker/lib/agent-policy.js for the full reasoning.
 if ($nodeCmd -and (Test-Path $policyResolver)) {
     function Get-GovernanceClass {
         param([string]$Path)
@@ -4634,24 +4777,53 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
         Add-Fail "An agent history file is not classified append-only; autonomous runs cannot write .squad/agents/<name>/history.md and the audit trail is lost"
     }
 
+    # Issue #113: the audit trail is append-only too, now that Squad 0.13.1
+    # writes to it mid-session. This used to be in $mustStayLocked below (a
+    # `locked` audit.jsonl cannot be written at all); asserting it here instead
+    # is the actual fix, not a relocation of a stale comment.
+    if ((Get-GovernanceClass '.squad/memory/audit.jsonl') -eq 'append-only') {
+        Add-Pass "The audit trail (.squad/memory/audit.jsonl) is classified append-only, so Squad 0.13.1 can write to it during a normal session"
+    } else {
+        Add-Fail "The audit trail is not classified append-only; Squad 0.13.1 writes to .squad/memory/audit.jsonl mid-session and a locked file cannot be written at all"
+    }
+
+    # Issue #113: the reported-mutable class -- rewritable, never a violation,
+    # but still tracked and still reported. Asserted by name, one at a time, so
+    # a single mis-anchored pattern names exactly which path regressed.
+    $mustBeReportedMutable = @(
+        '.squad/casting/policy.json',
+        '.squad/casting/registry.json',
+        '.squad/casting/history.json',
+        '.squad/identity/now.md'
+    )
+    $notReported = @($mustBeReportedMutable | Where-Object { (Get-GovernanceClass $_) -ne 'reported-mutable' })
+    if ($notReported.Count -eq 0) {
+        Add-Pass "Casting state (policy/registry/history.json) and identity/now.md all classify reported-mutable: writable all session, changes surfaced rather than blocked"
+    } else {
+        Add-Fail "These Squad 0.13 runtime-state paths should classify reported-mutable but do not: $($notReported -join ', ')"
+    }
+
     # The thing it must NOT allow. A charter states what an agent is permitted to
     # do; an agent that can rewrite its charter has rewritten its authorisation.
+    # Issue #113: `.squad/identity/now.md` is carved out of identity/ above, by
+    # name, into reported-mutable -- `identity.md` and `mission.md` prove that
+    # carve-out did not become a blanket unlock of the rest of the directory.
     $mustStayLocked = @(
         @{ Path = '.squad/agents/security/charter.md';     Why = 'a charter defines what an agent is permitted to do' },
         @{ Path = '.squad/agents/security/history.md.bak'; Why = 'a lookalike filename must not inherit the exclusion' },
         @{ Path = '.squad/agents/history.md';              Why = 'the exclusion is anchored to <name>/history.md, not anything named history.md under .squad/agents' },
         @{ Path = '.squad/agents/a/b/history.md';          Why = 'exactly one path segment may stand for the agent name' },
         @{ Path = '.squad/policies/history.md';            Why = 'the exclusion is scoped to .squad/agents' },
-        @{ Path = '.squad/identity/identity.md';           Why = 'identity is governance' },
+        @{ Path = '.squad/identity/identity.md';           Why = 'identity is governance; now.md is a narrow carve-out, not a blanket unlock of identity/' },
+        @{ Path = '.squad/identity/mission.md';             Why = 'identity is governance; now.md is a narrow carve-out, not a blanket unlock of identity/' },
         @{ Path = '.squad/config.json';                    Why = 'config is governance' },
-        @{ Path = '.squad/routing.md';                     Why = 'routing is governance' },
-        @{ Path = '.squad/memory/audit.jsonl';             Why = 'audit state is governance' }
+        @{ Path = '.squad/routing.md';                     Why = 'routing is governance' }
     )
     $leaked = @($mustStayLocked | Where-Object { (Get-GovernanceClass $_.Path) -ne 'locked' })
     if ($leaked.Count -eq 0) {
-        Add-Pass "The append-only exclusion is anchored: all $($mustStayLocked.Count) neighbouring governance paths -- charter.md included -- stay locked"
+        Add-Pass "The append-only and reported-mutable exclusions are anchored: all $($mustStayLocked.Count) neighbouring governance paths -- charter.md and the rest of identity/ included -- stay locked"
     } else {
-        Add-Fail "The append-only exclusion is too wide; these should be locked but are not: $(($leaked | ForEach-Object { "$($_.Path) ($($_.Why))" }) -join '; ')"
+        Add-Fail "An exclusion is too wide; these should be locked but are not: $(($leaked | ForEach-Object { "$($_.Path) ($($_.Why))" }) -join '; ')"
     }
 
     # Widening the pattern to `.squad/agents/**` is the specific regression this
@@ -4659,11 +4831,23 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
     # classification -- a pattern that stopped anchoring the filename would fail
     # here even if someone also loosened the cases above.
     $patterns = @((& node $policyResolver mutable-governance-patterns 2>&1) | Where-Object { $_ -match '\S' })
-    $unanchored = @($patterns | Where-Object { $_ -notmatch 'history' -or $_ -notmatch '\$$' -or $_ -notmatch '\^' })
+    $unanchored = @($patterns | Where-Object { $_ -notmatch '\$$' -or $_ -notmatch '\^' })
     if ($patterns.Count -ge 1 -and $unanchored.Count -eq 0) {
-        Add-Pass "Every append-only pattern is fully anchored and filename-specific ($($patterns -join ', '))"
+        Add-Pass "Every append-only pattern is fully anchored ($($patterns -join ', '))"
     } else {
-        Add-Fail "An append-only pattern is unanchored or not filename-specific: $($unanchored -join ', '); a wildcard here re-opens charter.md"
+        Add-Fail "An append-only pattern is unanchored: $($unanchored -join ', '); a wildcard here re-opens charter.md"
+    }
+
+    # Issue #113: the reported-mutable patterns get the identical anchoring
+    # check. An unanchored entry here would re-open the rest of identity/ or
+    # casting/ the same way an unanchored append-only pattern would re-open
+    # charter.md.
+    $reportedPatterns = @((& node $policyResolver reported-mutable-governance-patterns 2>&1) | Where-Object { $_ -match '\S' })
+    $unanchoredReported = @($reportedPatterns | Where-Object { $_ -notmatch '\$$' -or $_ -notmatch '\^' })
+    if ($reportedPatterns.Count -ge 1 -and $unanchoredReported.Count -eq 0) {
+        Add-Pass "Every reported-mutable pattern is fully anchored ($($reportedPatterns -join ', '))"
+    } else {
+        Add-Fail "A reported-mutable pattern is unanchored: $($unanchoredReported -join ', '); a wildcard here re-opens the rest of identity/ or casting/"
     }
 }
 
@@ -5455,6 +5639,30 @@ if ($copyParseError) {
         Add-Fail "worker/Dockerfile CRLF-strips sandbox-classes.json; that list is for shell scripts, and adding data files to it hides which files actually need it"
     }
 
+    # --- 4b. squad-agent (issue #112) is shipped, de-CRLF'd, and executable --
+    # worker/squad-agent is the --agent-cmd wrapper entrypoint.sh hands to
+    # `squad watch`/`squad loop` so Squad cannot inject --yolo into those
+    # sessions. Unlike the catalog, this IS a shell script: it must ship into
+    # the image, survive a Windows checkout (sed -i CRLF-strip), and be
+    # executable (chmod +x), or the container's `--agent-cmd` invocation fails
+    # at the first watch/loop session with "Exec format error" or a CRLF
+    # shebang failure.
+    if ($libRecord -and ($libRecord.Sources -contains 'worker/squad-agent')) {
+        Add-Pass "worker/Dockerfile ships worker/squad-agent into /usr/local/lib/squad-on-aca/, the --agent-cmd wrapper entrypoint.sh invokes for watch/loop"
+    } else {
+        Add-Fail "worker/Dockerfile does not ship worker/squad-agent into /usr/local/lib/squad-on-aca/; entrypoint.sh's --agent-cmd would point at a file that is not in the image"
+    }
+    if ($sedLine -match 'squad-agent') {
+        Add-Pass "worker/Dockerfile CRLF-strips squad-agent, so a Windows checkout cannot break its shebang"
+    } else {
+        Add-Fail "worker/Dockerfile does not CRLF-strip squad-agent; a Windows checkout could leave a CRLF shebang that fails at exec time"
+    }
+    if ($chmodLine -match 'squad-agent') {
+        Add-Pass "worker/Dockerfile chmod +x's squad-agent, so it is executable as the --agent-cmd target"
+    } else {
+        Add-Fail "worker/Dockerfile does not chmod +x squad-agent; --agent-cmd would fail with permission denied on every watch/loop session"
+    }
+
     # --- 5. The build context can actually reach those sources ---------------
     # config/ is OUTSIDE worker/, and a COPY cannot reach above its context, so
     # the image can only be built from the repository root. Building from
@@ -5548,6 +5756,46 @@ if (-not (Test-Path $imageLayoutSuite)) {
         Add-Pass "test_image_layout.sh derives its layout from the Dockerfile COPY instructions rather than a hard-coded file list, so removing a file from COPY removes it from the test"
     } else {
         Add-Fail "test_image_layout.sh no longer reads the Dockerfile COPY instructions; a hard-coded file list would keep passing after the catalog was un-shipped"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Version pins (issue #114)
+# ---------------------------------------------------------------------------
+# No assertion previously pinned these versions in this file at all -- the
+# bump from squad-cli 0.11.0 / squad-hub@0.4.1 could have silently drifted
+# again with nothing here to catch it. These checks read worker/Dockerfile
+# directly (the single source of truth for what gets installed) rather than
+# hard-coding an expected string independent of it, so they fail if the
+# Dockerfile's own pins regress, not merely if this file's copy goes stale.
+Write-Section "Version pins (issue #114)"
+
+if (-not (Test-Path $workerDockerfileLayout)) {
+    Add-Fail "worker/Dockerfile is missing; the version pins it would otherwise assert could not be checked"
+} else {
+    $dockerfileText = Get-Content -LiteralPath $workerDockerfileLayout -Raw
+
+    if ($dockerfileText -match 'ARG SQUAD_HUB_SPEC=squad-hub@0\.5\.0') {
+        Add-Pass "worker/Dockerfile's default SQUAD_HUB_SPEC is pinned to squad-hub@0.5.0"
+    } else {
+        Add-Fail "worker/Dockerfile's default SQUAD_HUB_SPEC is not pinned to squad-hub@0.5.0 (issue #114); it has drifted from the version this image was last verified against"
+    }
+
+    if ($dockerfileText -match '@bradygaster/squad-cli@0\.13\.1') {
+        Add-Pass "worker/Dockerfile installs @bradygaster/squad-cli@0.13.1"
+    } else {
+        Add-Fail "worker/Dockerfile does not install @bradygaster/squad-cli@0.13.1 (issue #114); it has drifted from the version this image was last verified against"
+    }
+
+    # The Copilot CLI pin is DELIBERATELY independent of the squad-cli/squad-hub
+    # bump above (see the Dockerfile's own comment on the npm install line) --
+    # this assertion exists so that a future squad-cli/squad-hub bump cannot
+    # accidentally also bump this pin without a fresh compatibility check, not
+    # to force it to change here.
+    if ($dockerfileText -match '@github/copilot@1\.0\.69-2') {
+        Add-Pass "worker/Dockerfile installs @github/copilot@1.0.69-2, unchanged by the squad-cli/squad-hub bump in issue #114"
+    } else {
+        Add-Fail "worker/Dockerfile does not install @github/copilot@1.0.69-2; this pin is independent of issue #114's squad-cli/squad-hub bump and should not have moved alongside it"
     }
 }
 

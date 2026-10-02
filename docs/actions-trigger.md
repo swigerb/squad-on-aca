@@ -43,6 +43,59 @@ sequenceDiagram
 
 The workflow starts a job and exits. It does not wait for the session, poll it, or hold the session credential.
 
+## GitHub OIDC Subject Format
+
+GitHub Actions sends an OIDC token to authenticate to Azure. The token's `sub` (subject) claim takes one of two formats depending on the event type:
+
+| Subject Format | Event Type | Example |
+|---|---|---|
+| **Classic** | Push, schedule, workflow_dispatch | `repo:<owner>/<repo>:ref:refs/heads/main` |
+| **ID-based** | Issues (labeled, opened, etc.) | `repo:<owner>@<ownerId>/<repo>@<repoId>:ref:refs/heads/main` |
+
+The ID-based format (added by GitHub for `issues` events) includes the owner's and repository's numeric IDs, making the subject resistant to username/repo renames.
+
+### Federated Credential Setup
+
+You must configure your Azure Entra app with **both** subject formats as separate federated credentials:
+
+```bash
+# Classic credential (works for push, schedule, workflow_dispatch)
+az ad app federated-credential create \
+  --id <app-object-id> \
+  --parameters '{
+    "name": "squad-on-aca-github",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:<owner>/<repo>:ref:refs/heads/main",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+
+# ID-based credential (required for `issues` events)
+az ad app federated-credential create \
+  --id <app-object-id> \
+  --parameters '{
+    "name": "squad-on-aca-github-issues",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:<owner>@<ownerId>/<repo>@<repoId>:ref:refs/heads/main",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+```
+
+**Find your IDs:** Replace `<ownerId>` and `<repoId>` with the numeric IDs from:
+- `gh api repos/<owner>/<repo> --jq .owner.id,.id`
+
+### Why Both Credentials?
+
+Without the ID-based credential, Azure login from an `issues` event fails with:
+```
+AADSTS700213: No matching federated identity record found for presented assertion.
+```
+
+This was verified on `swigerb/arcade-hall-of-fame` on 2026-09-30.
+
+### Related
+
+See upstream issue [bradygaster/squad#2140](https://github.com/bradygaster/squad/issues/2140) for context on GitHub's OIDC subject format adoption.
+
 ## Triggers
 
 | Trigger | What happens |
@@ -56,6 +109,18 @@ The workflow starts a job and exits. It does not wait for the session, poll it, 
 The label and command prefix are configurable through repository variables `SQUAD_TRIGGER_LABEL` and `SQUAD_COMMAND_PREFIX`.
 
 Use `squad-aca` as the default label. Keep Ralph's `RALPH_LABELS` aligned with `SQUAD_TRIGGER_LABEL` so all dispatchers use the same lease key and marker label.
+
+## Command trigger matching and gh-aw compatibility
+
+### Does `/squad-aca` collide with Squad's own `/squad` gh-aw router?
+
+No. Squad 0.12+ repositories may also carry a GitHub Agentic Workflows (gh-aw) router that responds to `/squad`. squad-on-aca's trigger is the distinct command `/squad-aca`, and the two do not collide.
+
+gh-aw compiles `slash_command: name: squad` into a condition that requires a delimiter immediately after the command name — the comment body must start with `/squad ` (space), `/squad\n`, `/squad\r`, or equal `/squad` exactly. A comment body of `/squad-aca ...` satisfies none of those: the character right after `/squad` is `-`, not a delimiter.
+
+**Verification (high confidence):** The matching condition was verified against the compiled `squad.lock.yml` that github/gh-aw itself ships (checked 2026-10-01, <https://github.com/github/gh-aw/blob/main/.github/workflows/squad.lock.yml>, HTTP 200), which uses the same `slash_command: name: squad` frontmatter as `bradygaster/squad`'s router template. The compiled lock file shows the four-branch `startsWith` guard on line 115 — the authoritative evidence, since gh-aw is the actual compiler.
+
+**Caveat:** This is static compiled-code evidence, not a live two-workflow test in a single repository. If a future Squad release changes gh-aw's router-matching semantics (for example to a looser prefix match), this conclusion should be re-verified against that release's compiled lock file rather than assumed to still hold.
 
 ## Who may trigger a run
 
