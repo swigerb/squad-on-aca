@@ -112,3 +112,7 @@ original fix changed in that file's logic.
 **Verdict: ✅ six advisories closed; ready to commit**, with the
 `test_governance_guard.sh` timing-under-load caveat flagged for the
 coordinator to re-verify on an unloaded host/real CI runner.
+
+## 2026-10-02 (final) — Pin seal fix session conclusion
+
+Lockout chain: engineer (original impl) → lead (revision 1) → lead locked for re-review → reviewer (edit authority, closes all 6 advisories from security re-review). Commit b54b3be authorized, pushed on `fix/governance-pin-leak`. All 10 security findings from round 1 verified CLOSED in round 2. Full session documented in `.squad/log/2026-10-02T09-33-56Z-governance-pin-leak.md` and orchestration-log entries.

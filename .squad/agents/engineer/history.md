@@ -63,6 +63,9 @@ same 6 suites (`test_credential_withholding.sh`, `test_credentials.sh`,
 `test_uid_separation.sh` — all pre-existing environment gaps: no live network/
 GH API and no real multi-UID separation available in this sandbox) and skip
 the same 1 (`test_security_n1b_root_sealed_state.sh`, needs real root). Zero
+regressions. All assertions produced session artifacts stored in `.squad/agents/engineer/` session workspace with timestamped filenames.
+
+**Outcome:** Locked out by security REJECT protocol (finding 10). Lead took revision author. No further action engineer-side.
 new failures. The new suite passes 34/34 standalone and inside the full run.
 
 ## 2026-07-15: Initial charter
