@@ -82,4 +82,24 @@ assert_eq "nothing" "$(verdict "${WORK}/f" "")" "F: an empty unborn repo has not
 (cd "${WORK}/f" && echo boot >README.md && git add -A && git commit -qm boot)
 assert_eq "publish" "$(verdict "${WORK}/f" "")" "F: an agent commit on an unborn branch is published"
 
+# G: an attended agent that was allowed to push already published its own
+# commits. Publishing them again would open a duplicate pull request.
+git init -q --bare "${WORK}/g-remote.git"
+git clone -q "${WORK}/g-remote.git" "${WORK}/g" 2>/dev/null
+(cd "${WORK}/g" && echo one >f && git add -A && git commit -qm base && git push -q origin HEAD:main 2>/dev/null)
+base_g="$(git -C "${WORK}/g" rev-parse HEAD)"
+(cd "${WORK}/g" && git checkout -qb feature/y && echo feat >g && git add -A && git commit -qm feat)
+assert_eq "publish" "$(verdict "${WORK}/g" "$base_g")" "G: a local-only agent commit is published"
+git -C "${WORK}/g" push -q origin feature/y 2>/dev/null
+assert_eq "nothing" "$(verdict "${WORK}/g" "$base_g" 2>/dev/null)" "G: commits the agent already pushed are not published twice"
+echo more >"${WORK}/g/h"
+assert_eq "publish" "$(verdict "${WORK}/g" "$base_g")" "G: uncommitted work left after its own push is still published"
+
+# The prompt note: present exactly when the worker is the one publishing.
+note="$(PUSH_CHANGES=true squad_publish_contract_note)"
+assert_contains "$note" "Do not run git push or gh pr" "note: tells the agent not to push or open a PR"
+assert_contains "$note" "worker pushes the branch and opens the pull request" "note: says who publishes instead"
+assert_eq "" "$(PUSH_CHANGES=false squad_publish_contract_note)" "note: absent when the worker will not publish"
+assert_eq "" "$(unset PUSH_CHANGES; squad_publish_contract_note)" "note: absent when PUSH_CHANGES is unset"
+
 test_summary

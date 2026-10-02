@@ -81,6 +81,10 @@ An unattended session also gets `--no-ask-user` and a longer deny list. Neither 
 
 Use `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` for Copilot CLI headless auth. Fine-grained PATs with the GitHub Copilot Requests permission are preferred.
 
+### Who publishes
+
+In `prompt` and `new-project` mode with `PUSH_CHANGES=true`, the worker publishes, not the agent. The agent's prompt ends with a note telling it to leave its work in the checkout (committing is fine) and not to run `git push` or `gh pr`. After the agent exits, the worker publishes uncommitted changes, new files, and commits the agent made itself to `OUTPUT_BRANCH` and opens the pull request. Commits that are already on the remote (an attended agent you allowed to push) are not published a second time.
+
 ## Squad health gate
 
 For modes that run an agent (`prompt`, `new-project`, `loop`, `watch`, and `triage`), the worker runs `squad health --json` after clone, `squad init` if needed, and SubSquad activation, but before policy hardening and before any agent starts.
