@@ -5775,10 +5775,10 @@ if (-not (Test-Path $workerDockerfileLayout)) {
 } else {
     $dockerfileText = Get-Content -LiteralPath $workerDockerfileLayout -Raw
 
-    if ($dockerfileText -match 'ARG SQUAD_HUB_SPEC=squad-hub@0\.5\.0') {
-        Add-Pass "worker/Dockerfile's default SQUAD_HUB_SPEC is pinned to squad-hub@0.5.0"
+    if ($dockerfileText -match 'ARG SQUAD_HUB_SPEC=squad-hub@0\.6\.0') {
+        Add-Pass "worker/Dockerfile's default SQUAD_HUB_SPEC is pinned to squad-hub@0.6.0"
     } else {
-        Add-Fail "worker/Dockerfile's default SQUAD_HUB_SPEC is not pinned to squad-hub@0.5.0 (issue #114); it has drifted from the version this image was last verified against"
+        Add-Fail "worker/Dockerfile's default SQUAD_HUB_SPEC is not pinned to squad-hub@0.6.0 (issue #114); it has drifted from the version this image was last verified against"
     }
 
     if ($dockerfileText -match '@bradygaster/squad-cli@0\.13\.1') {
