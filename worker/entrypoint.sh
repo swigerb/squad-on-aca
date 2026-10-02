@@ -274,6 +274,82 @@ if [[ -n "${SQUAD_TEAM:-}" ]]; then
   squad subsquads activate "$SQUAD_TEAM" || true
 fi
 
+# --- Session health gate (issue #116) ----------------------------------------
+# Squad 0.13 ships `squad health --json` (schema `squad-health/v1`): checks
+# team, registry-charters, routing, state-backend, and env-vars, and is built
+# for "gate dispatch on readiness" (verified against the published
+# @bradygaster/squad-cli@0.13.1 package's dist/cli/commands/health.js --
+# overall `status` is `pass`/`fail` only, no `warn`; each check's own
+# `status` is `pass`/`fail`/`skip`; failing check ids live at
+# `.checks[].id`). Gating here -- AFTER `squad init`/SubSquad activation
+# finishes writing the governance state those checks read, and BEFORE
+# squad_policy_harden -- means a session whose Squad state is already broken
+# fails before it ever hardens policy or runs an agent against repository
+# content, instead of surfacing as an obscure mid-run failure.
+#
+# Only the modes that actually run an agent pay for this: a one-shot
+# `copilot -p` (prompt, new-project) or a mode that owns its own
+# dispatch loop and spawns Copilot itself (loop, watch, triage). smoke,
+# telemetry-smoke, ralph, and shell never dispatch an agent against
+# repository content, so gating them would add a check with nothing at
+# stake.
+squad_health_gate_applies_to_mode() {
+  case "$1" in
+    prompt|new-project|loop|watch|triage) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Degrades honestly rather than failing unsafe in either direction: an older
+# Squad CLI that predates `squad health --json` (missing command/flag, or
+# output this parser cannot read as a `squad-health/v1` report) reports
+# UNAVAILABLE -- never silently treated as a pass, and never a hard failure
+# either, since a session on an older CLI still has to keep working. Only a
+# genuine, successfully-parsed `status: "fail"` fails closed (exit 78), and
+# it always logs the failing check ids so an operator can see what was wrong
+# -- never just "failed".
+squad_health_gate() {
+  local json rc=0
+  json="$(squad health --json 2>&1)" || rc=$?
+  local parsed parse_rc=0
+  parsed="$(SQUAD_HEALTH_GATE_JSON="$json" node -e '
+    let report;
+    try {
+      report = JSON.parse(process.env.SQUAD_HEALTH_GATE_JSON || "");
+    } catch {
+      process.exit(2);
+    }
+    if (!report || report.schema !== "squad-health/v1" || typeof report.status !== "string" || !Array.isArray(report.checks)) {
+      process.exit(2);
+    }
+    const failingIds = report.checks
+      .filter((check) => check && check.status === "fail")
+      .map((check) => check.id)
+      .join(",");
+    process.stdout.write(report.status + "\t" + failingIds);
+    process.exit(report.status === "fail" ? 1 : 0);
+  ' 2>/dev/null)" && parse_rc=0 || parse_rc=$?
+  if [[ "$parse_rc" -eq 2 ]]; then
+    log "Squad health: UNAVAILABLE -- 'squad health --json' (exit ${rc}) did not return a readable squad-health/v1 report; this CLI predates Squad 0.13's health gate, or does not support it. Continuing without a health gate -- an older CLI must still work."
+    return 0
+  fi
+  local status="${parsed%%$'\t'*}"
+  local failing="${parsed#*$'\t'}"
+  if [[ "$status" == "fail" ]]; then
+    log "Squad health: FAIL -- failing checks: ${failing:-<none reported>}"
+    log "A session whose Squad state is not ready must not dispatch an agent against it; refusing to start."
+    exit 78
+  fi
+  log "Squad health: ${status^^} -- all checks passed."
+  return 0
+}
+
+if squad_health_gate_applies_to_mode "${SQUAD_MODE:-smoke}"; then
+  squad_health_gate
+else
+  log "Squad health gate skipped: mode '${SQUAD_MODE:-smoke}' does not dispatch an agent."
+fi
+
 # --- Agent policy (issue #26, PRD #6) ----------------------------------------
 # Isolation is not authorization. Until now every session ran Copilot with
 # `--yolo` (== --allow-all-tools --allow-all-paths --allow-all-urls) on top of a

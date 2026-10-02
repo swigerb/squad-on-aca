@@ -1446,6 +1446,41 @@ function Invoke-Doctor {
     $checks += [pscustomobject]@{ Check = "GitHub repo"; Status = if ($repo) { "ok" } else { "missing" }; Detail = if ($repo) { $repo } else { "Run squad-aca init or pass --repo" } }
     $checks += [pscustomobject]@{ Check = ".squad"; Status = if (Test-Path ".squad\team.md") { "ok" } else { "missing" }; Detail = "Required for existing-repo dispatch" }
 
+    # Issue #116: `squad health --json` (schema `squad-health/v1`, Squad
+    # 0.13+) is the same readiness gate worker/entrypoint.sh runs before
+    # hardening/dispatch -- surfacing it here in `doctor` too means a broken
+    # local Squad state (team.md, routing.md, the casting registry, ...) is
+    # visible BEFORE a session is ever started, not only inside a remote
+    # container's logs. Verified against the published
+    # @bradygaster/squad-cli@0.13.1 package's dist/cli/commands/health.js:
+    # overall `status` is `pass`/`fail` only (no `warn`); failing check ids
+    # live at `.checks[].id`. Same three honest states as the worker gate:
+    # "ok" (pass), "unknown" (CLI predates 0.13 or output is not a readable
+    # squad-health/v1 report -- never silently reported as "ok"), and
+    # "failed" (a genuine parsed status: "fail", with the failing check ids
+    # named, not just the word "failed").
+    if (Test-Command "squad") {
+        try {
+            $squadHealthOut = squad health --json 2>&1 | Out-String
+            $squadHealthParsed = $null
+            try { $squadHealthParsed = $squadHealthOut | ConvertFrom-Json } catch { $squadHealthParsed = $null }
+            if ($squadHealthParsed -and $squadHealthParsed.schema -eq "squad-health/v1" -and $squadHealthParsed.status) {
+                if ($squadHealthParsed.status -eq "fail") {
+                    $failingIds = ($squadHealthParsed.checks | Where-Object { $_.status -eq "fail" } | ForEach-Object { $_.id }) -join ", "
+                    $checks += [pscustomobject]@{ Check = "Squad health"; Status = "failed"; Detail = "failing checks: $failingIds" }
+                } else {
+                    $checks += [pscustomobject]@{ Check = "Squad health"; Status = "ok"; Detail = "squad health --json reports $($squadHealthParsed.status)" }
+                }
+            } else {
+                $checks += [pscustomobject]@{ Check = "Squad health"; Status = "unknown"; Detail = "squad health --json did not return a readable squad-health/v1 report; this CLI may predate Squad 0.13" }
+            }
+        } catch {
+            $checks += [pscustomobject]@{ Check = "Squad health"; Status = "unknown"; Detail = $_.Exception.Message }
+        }
+    } else {
+        $checks += [pscustomobject]@{ Check = "Squad health"; Status = "unknown"; Detail = "squad CLI not found" }
+    }
+
     try {
         gh auth status 1>$null 2>$null
         # A native command sets $LASTEXITCODE; it does not throw, so the catch
