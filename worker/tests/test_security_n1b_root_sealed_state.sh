@@ -62,15 +62,24 @@ fi
 source "${TEST_DIR}/lib/assert.sh"
 
 echo "== security re-review N1 layer 0: root-sealed governance state (real uid boundary) =="
+
+for sbin_dir in /usr/local/sbin /usr/sbin /sbin; do
+  case ":${PATH:-}:" in
+    *":${sbin_dir}:"*) ;;
+    *) PATH="${PATH:+${PATH}:}${sbin_dir}" ;;
+  esac
+done
+export PATH
+
 for dep in runuser node git sha256sum base64 stat awk; do
   if ! command -v "$dep" >/dev/null 2>&1; then
-    echo "SKIP: test_security_n1b_root_sealed_state.sh — NOT RUN: missing ${dep}"
-    exit 77
+    echo "FAIL: test_security_n1b_root_sealed_state.sh — missing ${dep}; this is unexpected on Linux after root/sudo setup."
+    exit 1
   fi
 done
 if ! id nobody >/dev/null 2>&1; then
-  echo "SKIP: test_security_n1b_root_sealed_state.sh — NOT RUN: no 'nobody' user to drop to"
-  exit 77
+  echo "FAIL: test_security_n1b_root_sealed_state.sh — no 'nobody' user to drop to; this is unexpected on Linux after root/sudo setup."
+  exit 1
 fi
 
 WORK="$(mktemp -d /tmp/squad-n1b.XXXXXXXX)"
