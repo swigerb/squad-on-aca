@@ -19,7 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # attaches to a hub is the normal case, and it must keep building and running
 # when squad-hub is unavailable, unpublished, or simply unwanted. So:
 #
-#   SQUAD_HUB_SPEC=squad-hub@0.5.0  (default) install the pinned npm version
+#   SQUAD_HUB_SPEC=squad-hub@0.6.0  (default) install the pinned npm version
 #   SQUAD_HUB_SPEC=none                       do not install it at all
 #   SQUAD_HUB_SPEC=github:owner/repo#<sha>    install from an immutable git ref
 #
@@ -52,7 +52,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # card itself (#144). None of that is a worker-side behaviour change -- it is
 # the hub becoming usable for the two modes (`watch`/`loop`) that this image
 # can only ever supervise, never hand a single session to.
-ARG SQUAD_HUB_SPEC=squad-hub@0.5.0
+ARG SQUAD_HUB_SPEC=squad-hub@0.6.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg openssh-client \

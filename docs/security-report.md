@@ -14,7 +14,7 @@ This report describes the controls that are currently implemented. It does not c
 | --- | --- |
 | Squad version | Worker installs `@bradygaster/squad-cli@0.13.1`. |
 | Copilot version | Worker installs `@github/copilot@1.0.69-2`; it was not bumped with Squad. |
-| Squad Hub | Docker build arg defaults to `SQUAD_HUB_SPEC=squad-hub@0.5.0`; `none` omits it. |
+| Squad Hub | Docker build arg defaults to `SQUAD_HUB_SPEC=squad-hub@0.6.0`; `none` omits it. |
 | watch/loop Copilot launch | `squad watch` and `squad loop` use `--agent-cmd /usr/local/lib/squad-on-aca/squad-agent`, not Squad's default Copilot command builder. |
 | Blanket permission flags | The worker does not pass `--yolo`, `--allow-all`, `--allow-all-paths`, or `--allow-all-urls`; policy resolution and the wrapper fail closed on those flags. |
 | Health gate | Modes that run an agent parse `squad health --json` before hardening and before the agent starts. Parsed `status: "fail"` exits `78` in the worker and logs failing check ids. |
