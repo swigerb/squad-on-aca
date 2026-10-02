@@ -88,6 +88,36 @@ squad_push_branch() {
     return "$SQUAD_EXIT_CREDENTIAL"
 }
 
+# Does the session have anything to publish? Returns 0 (yes) or 1 (no).
+#
+#   $1  repo directory
+#   $2  the commit HEAD pointed at before the agent ran ("" for an unborn
+#       branch, e.g. new-project)
+#
+# Three shapes of real work, all of which must publish:
+#   * modified or staged tracked files;
+#   * new UNTRACKED files only -- `git diff` cannot see these at all;
+#   * commits the agent made itself. An unattended agent is denied `git push`
+#     and `gh pr`, so a well-behaved one commits and stops, leaving a clean
+#     tree. Checking only the working tree discarded exactly that finished
+#     work as "No changes to push."
+squad_session_has_publishable_work() {
+    local repo_dir="$1" base="${2:-}" head
+
+    if [[ -n "$(git -C "$repo_dir" status --porcelain 2>/dev/null)" ]]; then
+        return 0
+    fi
+
+    head="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || head=""
+    if [[ -z "$head" ]]; then
+        return 1
+    fi
+    if [[ -z "$base" || "$head" != "$base" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # Push whatever exists RIGHT NOW to the session branch, best effort.
 #
 # The branch is the durable artifact. A credential that expires mid-run costs
