@@ -135,7 +135,7 @@ Exit-code honesty:
 
 `.squad/identity/now.md` is the only mutable file under `.squad/identity/`. Everything else under `.squad/identity/` remains locked.
 
-`.squad/memory/audit.jsonl` is append-only. Audit rotation is pinned off during hardening so a rename does not look like a legitimate fresh audit file.
+`.squad/memory/audit.jsonl` is append-only. Audit rotation is pinned off during hardening; the pin lives in the working tree only, is never committed by the worker, and is sealed from staging (`squad_policy_seal_memory_audit_config_pin`). The seal is an index property when the path is tracked at base and only an ignore rule when it is not. It is backed by in-session re-checks and re-pinning, a per-iteration check in `worker/squad-agent`, git hooks, and a push backstop in `squad_push_branch` (`squad_policy_assert_pin_unpublished`, exit `78`). Residual: an agent that holds the push credential (watch/loop/triage) can deliberately publish the untracked pin. This is not prevented; it is detected and fails the session while the break persists, but a publish-and-undo inside one sampler tick leaves no local trace.
 
 ---
 

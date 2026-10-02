@@ -1040,9 +1040,15 @@ squad_policy_highwater_sampler_start() {
       wait "$_sqp_sleep" 2>/dev/null
       _sqp_sleep=""
       squad_policy_highwater_scan
+      squad_policy_pin_tick
     done
     if [[ "$_sqp_dump" -eq 1 ]]; then
       squad_policy_highwater_scan
+      squad_policy_pin_tick
+      for _sqp_r in "${!SQUAD_POLICY_PIN_EVENTS[@]}"; do
+        printf 'pin-event %s %s\n' "$_sqp_r" "${SQUAD_POLICY_PIN_EVENTS[$_sqp_r]}"
+      done
+      printf 'pin-broken mask %s\n' "$SQUAD_POLICY_PIN_BROKEN_MASK"
       for _sqp_r in "${!SQUAD_POLICY_HWM_AO[@]}"; do
         printf 'hwm-ao %s %s\n' "$_sqp_r" "${SQUAD_POLICY_HWM_AO[$_sqp_r]}"
       done
@@ -1115,6 +1121,18 @@ squad_policy_highwater_collect() {
           ;;
         hwm-rp)
           [[ "$val" == 1 ]] && SQUAD_POLICY_HWM_RP["$rel"]=1
+          ;;
+        pin-event)
+          case "$rel" in
+            missing|recreated|altered|restore-failed)
+              if [[ "$val" -gt "${SQUAD_POLICY_PIN_EVENTS[$rel]:-0}" ]]; then
+                SQUAD_POLICY_PIN_EVENTS["$rel"]="$val"
+              fi
+              ;;
+          esac
+          ;;
+        pin-broken)
+          SQUAD_POLICY_PIN_BROKEN_MASK=$(( SQUAD_POLICY_PIN_BROKEN_MASK | (val & 63) ))
           ;;
         *) : ;;
       esac
@@ -1408,49 +1426,586 @@ squad_policy_write_manifest_file_lines() {
 # fork in this file. It is now applied by agent-policy.js's
 # pinMemoryAuditConfig(), called as part of the single `harden-init` fork
 # squad_policy_harden makes (pin + governance bundle together, one process).
-# squad_policy_commit_memory_audit_config_pin below is the part that stays in
-# bash: it shells out to `git`, not `node`, to commit the pin before
-# `base-commit` is captured.
+# squad_policy_seal_memory_audit_config_pin below is the part that stays in
+# bash: it shells out to `git`, not `node`, to keep the pin OUT of git's index
+# before `base-commit` is captured, rather than committing it.
+#
+# WHY THIS IS A SEAL, NOT A COMMIT (the pin publication leak, fixed here)
+# ------------------------------------------------------------------------
+# This used to COMMIT the pin before `base-commit` was captured, on the
+# reasoning that an uncommitted change to a LOCKED path, sitting in the
+# working tree at session start, would be swept into the session's own
+# `git add -A && git commit` and flagged by detector (c) as a violation the
+# CONTROL caused, not the agent. That reasoning was correct about detector
+# (c); it missed that the commit it produced is ANCESTRY. Every branch this
+# container, or an agent running `squad watch`/`squad loop`, ever pushed
+# carried that commit forward, so the pin shipped in the net diff of every
+# published PR -- not as a false governance violation, but as a real,
+# user-visible `auditMaxBytes: 1048576 -> 0` diff with no corresponding
+# agent action. Live evidence: swigerb/arcade-hall-of-fame#7.
+#
+# The pin now lives in the WORKING TREE only -- squad-sdk 0.13.1 only ever
+# reads `.squad/memory/config.json` off disk (verified: no env var, no
+# alternate config path), so the worktree file is the only place the pin
+# needs to be for rotation to stay off -- and is kept out of git by one of
+# two seals. THE TWO ARE NOT EQUALLY STRONG, and what follows states exactly
+# what each one guarantees (security review of the pin seal, findings 1, 2
+# and 10; an earlier version of this comment claimed both were "a property
+# of the INDEX" that "no git porcelain can ever stage". That was false for
+# the untracked case):
+#
+#   TRACKED at base (SQUAD_POLICY_PIN_SEAL_MODE=skip-worktree). The index
+#     entry is reset to the base blob and marked --skip-worktree. This one
+#     IS an index property: `add -A`, `add -f`, `add --sparse -f`,
+#     `commit -a`, `checkout -- .`, `restore .`, `checkout HEAD -- <path>`,
+#     `reset --hard`, `stash -u`, `clean -fdx` and a forced branch switch
+#     all leave the pin out of every commit (security re-derived this
+#     against git 2.55). Only a deliberate `update-index --no-skip-worktree`
+#     (or a rewritten index) exposes it. The cost, accepted in
+#     docs/security.md (finding 5): git refuses a checkout/merge/rebase that
+#     would change this ONE path, because the worktree differs on purpose.
+#
+#   UNTRACKED at base, or no HEAD yet (SQUAD_POLICY_PIN_SEAL_MODE=exclude).
+#     The path is dropped from the index and ignored by an anchored
+#     `.git/info/exclude` line. This is an IGNORE RULE, NOT an index
+#     property, and it does not stop a deliberate defeat: `git add -f
+#     <path>`, `git add -f .squad`, or a `.gitignore` negation
+#     (`!.squad/memory/config.json`, at any depth) added mid-session and
+#     followed by a plain `git add -A` all stage the pin, and `git clean -x`
+#     deletes the file. It DOES stop the ordinary case (`add -A`, `add .`,
+#     `commit -a`). Making it an index property was tried and rejected:
+#     intent-to-add + --skip-worktree defeats `add -f`, the negation and
+#     `clean -x`, but breaks `stash`, `reset --hard` and `pull --rebase` in
+#     exactly the modes where the agent drives git (evidence in
+#     .squad/decisions/inbox/lead-pin-seal-revision.md). The only remaining
+#     way to make the path tracked is to publish a worker commit -- the
+#     original bug.
+#
+# The untracked seal is therefore backed by CONTINUOUS enforcement rather
+# than a one-time harden check, so that a defeat is DETECTED while it
+# persists -- even when this container never runs the push (watch/loop/
+# triage) -- not only if it happens to still be there at harden or verify
+# (see RESIDUAL below for the one window this does not close):
+#
+#   1. The in-session sampler (section 4b) re-runs the seal predicate
+#      (squad_policy_pin_seal_check) every interval for the whole session
+#      and remembers any break, so squad_policy_verify reports it as a
+#      violation even if it was undone before verify ran.
+#   2. The same sampler RE-PINS the file if it vanishes or is replaced
+#      (`git clean -x`, or squad-sdk re-creating it with its 1048576
+#      default), so rotation stays off for the whole session rather than
+#      only until the first `clean -x` (finding 3). Deletion of the
+#      UNTRACKED pin is reported, not a violation (git hygiene, not
+#      tampering); deletion of the TRACKED pin, and any other content change
+#      in either mode, stays a violation.
+#   3. worker/squad-agent runs the predicate before EVERY watch/loop
+#      iteration and refuses (78) to start the agent on a broken seal or an
+#      un-pinned file.
+#   4. Worker-generated pre-commit and pre-push hooks
+#      (squad_policy_pin_install_hooks) refuse a commit whose index carries
+#      the pin, and a push whose RANGE of newly-pushed commits (bounded by
+#      the session's base commit, or by every ancestor of the tip when no
+#      base was recorded -- a new/unborn branch) carries it on ANY commit,
+#      not only the tip (R5) -- and say why. Prevention for the accidental
+#      case.
+#   5. squad_push_branch (worker/lib/squad-push.sh) refuses to push on a
+#      broken seal (squad_policy_assert_pin_unpublished), which likewise
+#      walks the commit range being published rather than checking only
+#      HEAD (R5).
+#   6. git's own "Use -f if you really want to add them" / "--sparse" hints
+#      are switched off in this clone (advice.addIgnoredFile,
+#      advice.updateSparsePath), so git stops steering an agent at the
+#      bypass (findings 1 and 5).
+#
+# RESIDUAL, stated plainly: an agent that DELIBERATELY stages the pin and
+# publishes it itself -- `git commit --no-verify` + `git push --no-verify`,
+# deleting the hooks, or `gh api` -- in a mode where it holds the push
+# credential (watch/loop/triage) CAN get it onto the remote before verify
+# runs. That is not PREVENTED. It is DETECTED (and fails the session) if
+# the break is still in place when verify runs, or lasts long enough for one
+# sampler tick (default 1s) or one squad-agent iteration check to see it, OR
+# if ANY commit still reachable from HEAD at verify time ever carried the
+# pin (the range walk, R5) -- even one later undone by a further commit. The
+# one window this does not close: a scripted stage-commit-push-undo that
+# finishes and is rolled back inside a single sub-second tick, where the
+# intermediate commit is rewritten out of local history (not merely undone
+# by a further commit) before any check observes it (`--no-verify` on both
+# the offending commit and the push). The offending commit itself SURVIVES
+# in local history and on the remote in the ordinary "commit, undo with a
+# further commit" case above; it is only this narrower rewrite-and-push race
+# that nothing in this checkout can see -- only the remote branch would show
+# it. Nothing inside a single-uid container can stop a
+# process from using a credential it holds; this is the same boundary every
+# other governance path in this file has (see "HONEST BOUNDARY" at the top).
 #
 # `.squad/memory/config.json` stays a plain LOCKED governance path (it is
 # not append-only, and it is not the casting/identity runtime state Issue
 # #113 made reported-mutable) -- an agent has no business changing its own
-# audit-rotation policy mid-session. But THIS write happens before the lock
-# is even applied, as part of hardening itself, and `squad_policy_harden`
-# records `base-commit` for the "was a protected path changed in a commit
-# made during this session" detector (c) right after this function returns.
-# Left uncommitted, this pin would be an uncommitted change to a LOCKED path
-# sitting in the working tree at session start; the session's own
-# `git add -A && git commit` (worker/entrypoint.sh) would then sweep it in,
-# and detector (c) would flag it as a governance violation every single run
-# -- not because the agent did anything, but because the CONTROL did.
-# Committing the pin here, before `base-commit` is captured, makes it part
-# of the commit the session starts FROM rather than a change the session
-# made, so the real question -- did the AGENT touch a locked path -- stays
-# answerable. If git is unavailable or this is not a git checkout, there is
-# nothing to commit against and the working-tree write still stands (and is
-# still picked up by the baseline manifest a few lines later in
-# `squad_policy_harden`).
-squad_policy_commit_memory_audit_config_pin() {
-  local repo_dir="$1"
-  if command -v git >/dev/null 2>&1 && git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
-    # Issue #113 perf: this used to run `git diff --quiet` and, if THAT found
-    # no difference (true for an untracked file -- `git diff` does not cover
-    # untracked paths), a SECOND detection fork (`git ls-files
-    # --error-unmatch`) before ever staging anything. `git add` is a safe
-    # no-op when the file is already tracked and unchanged, so staging it
-    # unconditionally and then asking ONE question -- "is anything staged for
-    # this path?" (`git diff --cached --quiet`) -- replaces both detection
-    # forks with the one check that actually decides whether a commit is
-    # needed, for every case (new file, changed file, unchanged file) alike.
-    git -C "$repo_dir" add -- .squad/memory/config.json 2>/dev/null || true
-    if ! git -C "$repo_dir" diff --cached --quiet -- .squad/memory/config.json 2>/dev/null; then
-      git -C "$repo_dir" -c user.name="${GIT_AUTHOR_NAME:-squad-policy}" \
-          -c user.email="${GIT_AUTHOR_EMAIL:-squad-policy@local}" \
-          commit -m "chore(governance): pin audit.jsonl rotation off for this session (#113)" \
-          -- .squad/memory/config.json >/dev/null 2>&1 || true
+# audit-rotation policy mid-session. The baseline manifest in
+# `squad_policy_harden` still hashes the pinned on-disk content, so an agent
+# EDIT is still a manifest violation, and detector (c) still flags a COMMIT
+# of the path, because `base-commit` (captured right after this function
+# returns) is simply the clone's own HEAD.
+#
+# Fail CLOSED: if the seal cannot be established and verified, hardening
+# aborts (exit 78). The checkout ROOT must be `repo_dir` itself (finding 7):
+# every check here is path-relative to the root, and a `repo_dir` that is a
+# subdirectory of some other checkout is refused rather than guessed at. A
+# `repo_dir` that is not a git checkout at all has nothing to seal and
+# nothing to publish (SQUAD_POLICY_PIN_SEAL_MODE=none); one that HAS a
+# `.git` but cannot be inspected by git is refused (finding 8).
+SQUAD_POLICY_PIN_REL=".squad/memory/config.json"
+SQUAD_POLICY_PIN_HOOK_MARKER="squad-on-aca: session-only memory audit pin seal hook"
+# `JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n'` from @bradygaster/squad-sdk
+# 0.13.1 dist/memory/index.js -- the exact bytes ensureInitialized() writes
+# when it finds config.json missing. The sampler uses it to tell "deleted and
+# re-created by the SDK" (reported, re-pinned) from "rewritten" (violation).
+# worker/tests/test_memory_audit_pin_publication.sh checks this constant
+# against the real SDK.
+SQUAD_POLICY_SDK_DEFAULT_MEMORY_CONFIG=$'{\n  "version": 1,\n  "defaultProvider": "local",\n  "promptOnlyFallback": true,\n  "externalProviders": {\n    "hostInjectedCopilotAdapter": {\n      "enabled": false,\n      "requireApproval": true\n    }\n  },\n  "policy": {\n    "rejectForbidden": true,\n    "rejectTransientDurableWrites": true,\n    "auditContent": false,\n    "auditMaxBytes": 1048576,\n    "auditMaxArchives": 3\n  }\n}\n'
+# Exported by the seal (worker/squad-agent and the push library read them);
+# preserved rather than reset when this file is sourced, because squad-agent
+# sources it inside a session that already hardened.
+SQUAD_POLICY_PIN_SEAL_MODE="${SQUAD_POLICY_PIN_SEAL_MODE:-}"
+SQUAD_POLICY_PIN_REPO_DIR="${SQUAD_POLICY_PIN_REPO_DIR:-}"
+SQUAD_POLICY_PIN_BASE_BLOB="${SQUAD_POLICY_PIN_BASE_BLOB:-}"
+SQUAD_POLICY_PIN_SHA256="${SQUAD_POLICY_PIN_SHA256:-}"
+# In memory only.
+SQUAD_POLICY_PIN_BYTES=""
+SQUAD_POLICY_PIN_SEAL_MASK=0
+SQUAD_POLICY_PIN_BROKEN_MASK=0
+declare -gA SQUAD_POLICY_PIN_EVENTS=()
+
+# The seal predicate. cwd-independent (`git -C <root>`, root-relative path).
+# Sets SQUAD_POLICY_PIN_SEAL_MASK and returns 0 only when the mask is 0:
+#    1  skip-worktree: the --skip-worktree bit is not set
+#       (`ls-files -v` tag must be `S`, or `s` when --assume-unchanged is ALSO
+#       set -- finding 4; `h`/`H` mean exposed)
+#    2  skip-worktree: the index blob is not the base blob (something is staged)
+#    4  exclude: the path is in the index at all (`add -f`, intent-to-add, ...)
+#    8  exclude: the path is no longer ignored (exclude line removed, or a
+#       `.gitignore` negation at any depth re-includes it -- finding 2)
+#   16  HEAD's copy differs from the base (the pin, or any change, committed)
+#   32  git could not answer, or the mode is unknown -- fail CLOSED
+#   64  R5: an INTERMEDIATE commit between the base and HEAD carries a pin
+#       that differs from the base, even though HEAD itself does not (e.g. a
+#       `--no-verify` commit later undone by a further commit). Walks
+#       SQUAD_POLICY_BASE_COMMIT..HEAD (or every ancestor of HEAD when no base
+#       was recorded -- the no-base/new-branch case) rather than trusting the
+#       tip alone.
+squad_policy_pin_seal_check() {
+  local top="$1" mode="$2" base_blob="$3" rel="$SQUAD_POLICY_PIN_REL"
+  local mask=0 out="" tag="" fmode="" blob="" extra="" head_blob=""
+  case "$mode" in
+    skip-worktree)
+      out="$(git -C "$top" ls-files -s -v -- "$rel" 2>/dev/null)" || mask=$((mask | 32))
+      read -r tag fmode blob extra <<<"${out%%$'\n'*}" || :
+      [[ -n "$out" && "$tag" == [Ss] ]] || mask=$((mask | 1))
+      [[ -n "$out" && "$out" != *$'\n'* && "$blob" == "$base_blob" ]] || mask=$((mask | 2))
+      ;;
+    exclude)
+      out="$(git -C "$top" ls-files -s -- "$rel" 2>/dev/null)" || mask=$((mask | 32))
+      [[ -z "$out" ]] || mask=$((mask | 4))
+      git -C "$top" check-ignore -q --no-index -- "$rel" >/dev/null 2>&1 || mask=$((mask | 8))
+      ;;
+    *)
+      mask=$((mask | 32))
+      ;;
+  esac
+  head_blob="$(git -C "$top" rev-parse -q --verify "HEAD:${rel}" 2>/dev/null)" || head_blob=""
+  if [[ "$base_blob" == absent ]]; then
+    [[ -z "$head_blob" ]] || mask=$((mask | 16))
+  else
+    [[ -n "$base_blob" && "$head_blob" == "$base_blob" ]] || mask=$((mask | 16))
+  fi
+  # R5: walk the full commit range, not just the tip. A commit made with
+  # `--no-verify` and later undone (git rm --cached; commit again) leaves
+  # HEAD clean but still has a commit object, reachable from HEAD, whose tree
+  # carries the pin. Bounded by SQUAD_POLICY_BASE_COMMIT when one was
+  # recorded; otherwise (no base / new/unborn branch) every ancestor of HEAD
+  # is in scope, since there is no known-good point to bound the walk by.
+  if git -C "$top" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    local range_spec cblob c
+    if [[ -n "$SQUAD_POLICY_BASE_COMMIT" ]]; then
+      range_spec="${SQUAD_POLICY_BASE_COMMIT}..HEAD"
+    else
+      range_spec="HEAD"
+    fi
+    while IFS= read -r c; do
+      [[ -n "$c" ]] || continue
+      cblob="$(git -C "$top" rev-parse -q --verify "${c}:${rel}" 2>/dev/null)" || cblob=""
+      if [[ "$base_blob" == absent ]]; then
+        [[ -z "$cblob" ]] || { mask=$((mask | 64)); break; }
+      else
+        [[ "$cblob" == "$base_blob" ]] || { mask=$((mask | 64)); break; }
+      fi
+    done < <(git -C "$top" rev-list "$range_spec" 2>/dev/null)
+  fi
+  SQUAD_POLICY_PIN_SEAL_MASK="$mask"
+  [[ "$mask" -eq 0 ]]
+}
+
+# One line per bit set in $1.
+squad_policy_pin_seal_describe() {
+  local mask="${1:-0}" rel="$SQUAD_POLICY_PIN_REL"
+  if (( mask & 1 )); then printf '%s\n' "the --skip-worktree bit on ${rel} was cleared, so git staging can pick up the session-only pin"; fi
+  if (( mask & 2 )); then printf '%s\n' "the index entry for ${rel} no longer matches the base commit (the pin, or another change to it, is staged)"; fi
+  if (( mask & 4 )); then printf '%s\n' "${rel} is staged in the index (for example by 'git add -f')"; fi
+  if (( mask & 8 )); then printf '%s\n' "${rel} is no longer ignored: the .git/info/exclude entry was removed, or a .gitignore negation re-includes it"; fi
+  if (( mask & 16 )); then printf '%s\n' "HEAD's ${rel} differs from the base commit: the session-only pin (or another change to it) was committed"; fi
+  if (( mask & 32 )); then printf '%s\n' "git could not inspect ${rel}'s seal"; fi
+  if (( mask & 64 )); then printf '%s\n' "an intermediate commit between the session base and HEAD carries a ${rel} that differs from the base (committed, then undone, e.g. with --no-verify)"; fi
+  return 0
+}
+
+# Puts the recorded pin bytes back at $1 atomically (write beside it, then
+# rename over it, so squad-sdk never observes a missing file mid-restore).
+# Never follows a symlink: a link at the path is removed, and EVERY directory
+# component from the repo root down to (and including) the immediate parent
+# is refused if it is a symlink -- not only the immediate parent `.squad/
+# memory` (R7), so a symlinked `.squad` itself (consistent with the S1
+# symlink refusal in squad_policy_harden) cannot redirect the restore write
+# either. $1 is always `${SQUAD_POLICY_PIN_REPO_DIR}/${SQUAD_POLICY_PIN_REL}`
+# (set by squad_policy_pin_tick), so the repo root is recovered by stripping
+# SQUAD_POLICY_PIN_REL's path depth from the end of $1.
+squad_policy_pin_restore() {
+  local f="$1" d tmp top depth seg check
+  [[ -n "$SQUAD_POLICY_PIN_BYTES" ]] || return 1
+  d="${f%/*}"
+  top="$SQUAD_POLICY_PIN_REPO_DIR"
+  if [[ -n "$top" && "$f" == "$top"/* ]]; then
+    check="$top"
+    [[ -L "$check" ]] && return 1
+    depth="${SQUAD_POLICY_PIN_REL%/*}"
+    while [[ "$depth" == */* ]]; do
+      seg="${depth%%/*}"
+      depth="${depth#*/}"
+      check="${check}/${seg}"
+      [[ -L "$check" ]] && return 1
+    done
+    seg="$depth"
+    [[ -n "$seg" ]] && check="${check}/${seg}" && { [[ -L "$check" ]] && return 1; }
+  else
+    [[ -L "$d" ]] && return 1
+  fi
+  if [[ ! -d "$d" ]]; then
+    mkdir -p "$d" 2>/dev/null || return 1
+  fi
+  if [[ -L "$f" ]]; then
+    rm -f "$f" 2>/dev/null || return 1
+  fi
+  [[ -d "$f" ]] && return 1
+  tmp="${d}/.config.json.squad-pin.${BASHPID}"
+  rm -f "$tmp" 2>/dev/null
+  if ! printf '%s' "$SQUAD_POLICY_PIN_BYTES" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  chmod a-w "$tmp" 2>/dev/null || :
+  if ! mv -f "$tmp" "$f" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+# One sampler tick for the pin (called from the sampler loop, section 4b).
+# Content: fork-free compare against the in-memory pin bytes; re-pin on any
+# difference and count WHY. Seal: the predicate above, OR'd into a sticky
+# mask. Never repairs the seal itself -- a broken seal is the agent's doing
+# and is reported, not silently undone.
+squad_policy_pin_tick() {
+  [[ -n "$SQUAD_POLICY_PIN_REPO_DIR" ]] || return 0
+  case "$SQUAD_POLICY_PIN_SEAL_MODE" in
+    skip-worktree|exclude) ;;
+    *) return 0 ;;
+  esac
+  local f="${SQUAD_POLICY_PIN_REPO_DIR}/${SQUAD_POLICY_PIN_REL}" cur="" state=ok
+  if [[ -L "$f" || ! -e "$f" ]]; then
+    state=missing
+  elif [[ ! -f "$f" ]]; then
+    state=altered
+  else
+    IFS= read -r -d '' cur <"$f" 2>/dev/null || :
+    if [[ "$cur" != "$SQUAD_POLICY_PIN_BYTES" ]]; then
+      if [[ "$cur" == "$SQUAD_POLICY_SDK_DEFAULT_MEMORY_CONFIG" ]]; then
+        state=recreated
+      else
+        state=altered
+      fi
     fi
   fi
+  if [[ "$state" != ok ]]; then
+    SQUAD_POLICY_PIN_EVENTS["$state"]=$(( ${SQUAD_POLICY_PIN_EVENTS[$state]:-0} + 1 ))
+    if ! squad_policy_pin_restore "$f"; then
+      SQUAD_POLICY_PIN_EVENTS[restore-failed]=$(( ${SQUAD_POLICY_PIN_EVENTS[restore-failed]:-0} + 1 ))
+    fi
+  fi
+  if ! squad_policy_pin_seal_check "$SQUAD_POLICY_PIN_REPO_DIR" "$SQUAD_POLICY_PIN_SEAL_MODE" "$SQUAD_POLICY_PIN_BASE_BLOB"; then
+    SQUAD_POLICY_PIN_BROKEN_MASK=$(( SQUAD_POLICY_PIN_BROKEN_MASK | SQUAD_POLICY_PIN_SEAL_MASK ))
+  fi
+  return 0
+}
+
+# Best-effort, worker-generated pre-commit / pre-push hooks with this
+# session's base blob baked in. PREVENTION FOR THE ACCIDENTAL CASE ONLY: an
+# agent can bypass a hook (`--no-verify`, `core.hooksPath`, deleting it), and
+# that bypass is what the sampler and verify exist to detect. Never replaces
+# a hook it did not write, and never writes outside this checkout's own git
+# directory (a `core.hooksPath` elsewhere is left alone). Always returns 0;
+# what it did or skipped is logged.
+squad_policy_pin_install_hooks() {
+  local top="$1" base_blob="$2" dirs git_dir common_dir hooks_cfg hooks name target
+  # R5: the pre-push hook needs a bound for its commit-range walk. Computed
+  # here (not read from SQUAD_POLICY_BASE_COMMIT) because hooks are installed
+  # from squad_policy_seal_memory_audit_config_pin, which runs during harden
+  # BEFORE SQUAD_POLICY_BASE_COMMIT is captured -- but it is the same value
+  # (HEAD at seal time), so there is no drift. Empty on an unborn branch.
+  local base_commit
+  base_commit="$(git -C "$top" rev-parse -q --verify HEAD 2>/dev/null)" || base_commit=""
+  # Decided from configuration, not by comparing path strings: git may spell
+  # the same directory two ways (e.g. `/tmp/...` vs `C:/...` under Git for
+  # Windows), and a string mismatch must not silently skip the hooks.
+  if hooks_cfg="$(git -C "$top" config --get core.hooksPath 2>/dev/null)" && [[ -n "$hooks_cfg" ]]; then
+    squad_policy_log "squad-policy: pin seal hooks not installed: core.hooksPath is set ('${hooks_cfg}'); the sampler and verify still detect a published pin"
+    return 0
+  fi
+  dirs="$(git -C "$top" rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null)" || dirs=""
+  git_dir="${dirs%%$'\n'*}"
+  common_dir="${dirs#*$'\n'}"
+  if [[ -z "$dirs" || "$dirs" != *$'\n'* || -z "$git_dir" || -z "$common_dir" ]]; then
+    squad_policy_log "squad-policy: pin seal hooks not installed: could not resolve the git directory"
+    return 0
+  fi
+  # A linked worktree's hooks live in the SHARED common directory; writing
+  # there would affect every other worktree of the repository.
+  if [[ "$git_dir" != "$common_dir" ]]; then
+    squad_policy_log "squad-policy: pin seal hooks not installed: ${top} is a linked worktree (hooks are shared with ${common_dir}); the sampler and verify still detect a published pin"
+    return 0
+  fi
+  hooks="${git_dir}/hooks"
+  mkdir -p "$hooks" 2>/dev/null || {
+    squad_policy_log "squad-policy: pin seal hooks not installed: could not create ${hooks}"
+    return 0
+  }
+  for name in pre-commit pre-push; do
+    target="${hooks}/${name}"
+    if [[ -e "$target" || -L "$target" ]] && ! grep -qF "$SQUAD_POLICY_PIN_HOOK_MARKER" "$target" 2>/dev/null; then
+      squad_policy_log "squad-policy: pin seal ${name} hook not installed: the repository already has one; the sampler and verify still detect a published pin"
+      continue
+    fi
+    rm -f "$target" 2>/dev/null
+    if ! squad_policy_pin_hook_body "$name" "$base_blob" "$base_commit" >"$target" 2>/dev/null || ! chmod 0755 "$target" 2>/dev/null; then
+      rm -f "$target" 2>/dev/null
+      squad_policy_log "squad-policy: pin seal ${name} hook not installed: could not write ${target}"
+    fi
+  done
+  return 0
+}
+
+squad_policy_pin_hook_body() {
+  local name="$1" base_blob="$2" base_commit="$3"
+  printf '#!/bin/sh\n# %s\n' "$SQUAD_POLICY_PIN_HOOK_MARKER"
+  printf '# Generated for ONE session by worker/lib/squad-policy.sh (squad_policy_pin_install_hooks).\n'
+  printf "rel='%s'\nbase='%s'\nbasecommit='%s'\n" "$SQUAD_POLICY_PIN_REL" "$base_blob" "$base_commit"
+  cat <<'HOOK_COMMON'
+refuse() {
+  echo "squad-on-aca: $1 refused. ${rel} holds a SESSION-ONLY governance pin" >&2
+  echo "  (policy.auditMaxBytes=0, which keeps squad-sdk from rotating the append-only audit log)." >&2
+  echo "  It must never be committed or published. $2" >&2
+  echo "  Bypassing this hook (--no-verify, core.hooksPath) does not help: the session's governance" >&2
+  echo "  sampler and final verification detect a published pin and fail the session." >&2
+  exit 1
+}
+HOOK_COMMON
+  if [[ "$name" == pre-commit ]]; then
+    cat <<'HOOK_PRE_COMMIT'
+idx=$(git ls-files -s -- "$rel" 2>/dev/null) || refuse "commit" "git could not read the index."
+blob=$(printf '%s\n' "$idx" | awk 'NR==1 {print $2}')
+n=$(printf '%s' "$idx" | grep -c .)
+if [ "$base" = absent ]; then
+  [ -z "$idx" ] && exit 0
+else
+  [ "$n" -eq 1 ] && [ "$blob" = "$base" ] && exit 0
+fi
+refuse "commit" "Unstage it with: git reset -q -- ${rel}"
+HOOK_PRE_COMMIT
+  else
+    cat <<'HOOK_PRE_PUSH'
+while read -r lref lsha rref rsha; do
+  case "$lsha" in *[!0]*) ;; *) continue ;; esac
+  if [ -n "$basecommit" ]; then
+    range="${basecommit}..${lsha}"
+  else
+    range="$lsha"
+  fi
+  for c in $(git rev-list "$range" 2>/dev/null); do
+    got=$(git rev-parse -q --verify "${c}:${rel}" 2>/dev/null) || got=''
+    if [ "$base" = absent ]; then
+      [ -z "$got" ] && continue
+    else
+      [ "$got" = "$base" ] && continue
+    fi
+    refuse "push of ${lref}" "Commit ${c} (not just the tip) carries a ${rel} that differs from the session's base commit."
+  done
+done
+exit 0
+HOOK_PRE_PUSH
+  fi
+}
+
+squad_policy_seal_memory_audit_config_pin() {
+  local repo_dir="$1"
+  local rel="$SQUAD_POLICY_PIN_REL" top phys mode base_blob desc sum
+
+  SQUAD_POLICY_PIN_SEAL_MODE=none
+  SQUAD_POLICY_PIN_REPO_DIR=""
+  SQUAD_POLICY_PIN_BASE_BLOB=""
+  SQUAD_POLICY_PIN_SHA256=""
+  SQUAD_POLICY_PIN_BYTES=""
+  SQUAD_POLICY_PIN_BROKEN_MASK=0
+  SQUAD_POLICY_PIN_EVENTS=()
+  export SQUAD_POLICY_PIN_SEAL_MODE SQUAD_POLICY_PIN_REPO_DIR SQUAD_POLICY_PIN_BASE_BLOB SQUAD_POLICY_PIN_SHA256
+
+  # Finding 8: "no git" is only a legitimate no-op when there is no checkout.
+  if ! command -v git >/dev/null 2>&1; then
+    if [[ -e "${repo_dir}/.git" ]]; then
+      squad_policy_log "squad-policy: refusing to harden: ${repo_dir} is a git checkout but git is not available, so the session-only memory audit pin cannot be sealed"
+      return 1
+    fi
+    return 0
+  fi
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [[ -e "${repo_dir}/.git" ]]; then
+      squad_policy_log "squad-policy: refusing to harden: ${repo_dir} has a .git but git cannot inspect it, so the session-only memory audit pin cannot be sealed"
+      return 1
+    fi
+    return 0
+  fi
+
+  # Finding 7: everything below is root-relative; refuse a subdirectory.
+  top="$(git -C "$repo_dir" rev-parse --show-toplevel 2>/dev/null)" || top=""
+  phys="$(cd "$repo_dir" 2>/dev/null && pwd -P)" || phys=""
+  if [[ -n "$top" ]]; then
+    top="$(cd "$top" 2>/dev/null && pwd -P)" || top=""
+  fi
+  if [[ -z "$top" || -z "$phys" || "$top" != "$phys" ]]; then
+    squad_policy_log "squad-policy: refusing to harden: ${repo_dir} is not the root of its git checkout (root: ${top:-unknown}); cannot keep session-only memory audit pin (${rel}) out of git staging"
+    return 1
+  fi
+
+  if [[ "$(git -C "$top" config --bool core.sparseCheckout 2>/dev/null)" == "true" ]]; then
+    squad_policy_log "squad-policy: refusing to harden: sparse checkout is enabled; cannot seal session-only memory audit pin"
+    return 1
+  fi
+
+  # Findings 1 and 5: stop git from suggesting the bypass. Best effort -- the
+  # predicate, not the advice setting, is the control.
+  git -C "$top" config advice.addIgnoredFile false >/dev/null 2>&1 || :
+  git -C "$top" config advice.updateSparsePath false >/dev/null 2>&1 || :
+
+  # The exclude line is applied unconditionally, in BOTH states: harmless for
+  # a tracked path (skip-worktree already keeps it out of `add -A`), essential
+  # for an untracked one.
+  local exclude_file
+  exclude_file="$(git -C "$top" rev-parse --git-path info/exclude 2>/dev/null)" || {
+    squad_policy_log "squad-policy: refusing to harden: could not resolve .git/info/exclude"
+    return 1
+  }
+  case "$exclude_file" in
+    /*) : ;;
+    *) exclude_file="${top}/${exclude_file}" ;;
+  esac
+  mkdir -p "$(dirname "$exclude_file")" 2>/dev/null || {
+    squad_policy_log "squad-policy: refusing to harden: could not create $(dirname "$exclude_file")"
+    return 1
+  }
+  if ! grep -qxF "/${rel}" "$exclude_file" 2>/dev/null; then
+    printf '/%s\n' "$rel" >>"$exclude_file" || {
+      squad_policy_log "squad-policy: refusing to harden: could not append to ${exclude_file}"
+      return 1
+    }
+  fi
+
+  if git -C "$top" cat-file -e "HEAD:${rel}" 2>/dev/null; then
+    # Tracked at HEAD: index := HEAD's blob, then --skip-worktree.
+    git -C "$top" reset -q HEAD -- "$rel" 2>/dev/null || {
+      squad_policy_log "squad-policy: refusing to harden: could not reset the index for ${rel}"
+      return 1
+    }
+    git -C "$top" update-index --skip-worktree -- "$rel" 2>/dev/null || {
+      squad_policy_log "squad-policy: refusing to harden: could not set --skip-worktree on ${rel}"
+      return 1
+    }
+    mode=skip-worktree
+    base_blob="$(git -C "$top" rev-parse -q --verify "HEAD:${rel}" 2>/dev/null)" || base_blob=""
+    if [[ -z "$base_blob" ]]; then
+      squad_policy_log "squad-policy: refusing to harden: could not resolve the base blob of ${rel}"
+      return 1
+    fi
+  else
+    # Absent at HEAD (or no HEAD yet): drop any stray staged copy; the
+    # exclude line above covers it from here on (see the doc above for how
+    # far that goes).
+    git -C "$top" rm -q --cached --ignore-unmatch -- "$rel" 2>/dev/null || {
+      squad_policy_log "squad-policy: refusing to harden: could not unstage ${rel}"
+      return 1
+    }
+    mode=exclude
+    base_blob=absent
+  fi
+
+  # Fail-closed self-check.
+  if [[ -n "$(git -C "$top" status --porcelain --untracked-files=all -- "$rel" 2>/dev/null)" ]]; then
+    squad_policy_log "squad-policy: refusing to harden: cannot keep session-only memory audit pin (${rel}) out of git staging (git status still reports it)"
+    return 1
+  fi
+  # The same predicate the sampler, squad-agent and the push backstop use.
+  # Catches a `.gitignore` negation already present at harden time (mask 8)
+  # without the old cwd-relative `add -A --dry-run | grep` (finding 7).
+  if ! squad_policy_pin_seal_check "$top" "$mode" "$base_blob"; then
+    while IFS= read -r desc; do
+      [[ -n "$desc" ]] && squad_policy_log "squad-policy: refusing to harden: cannot keep session-only memory audit pin (${rel}) out of git staging: ${desc}"
+    done < <(squad_policy_pin_seal_describe "$SQUAD_POLICY_PIN_SEAL_MASK")
+    return 1
+  fi
+  if git -C "$top" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    if ! git -C "$top" diff --quiet HEAD -- "$rel" 2>/dev/null; then
+      squad_policy_log "squad-policy: refusing to harden: cannot keep session-only memory audit pin (${rel}) out of git staging (worktree differs from HEAD outside the index)"
+      return 1
+    fi
+    if ! git -C "$top" diff --cached --quiet HEAD -- "$rel" 2>/dev/null; then
+      squad_policy_log "squad-policy: refusing to harden: cannot keep session-only memory audit pin (${rel}) out of git staging (the index still differs from HEAD)"
+      return 1
+    fi
+  fi
+  # The on-disk file must still hold the pin.
+  if [[ -L "${top}/${rel}" ]] || ! node -e '
+      const fs = require("fs");
+      const raw = fs.readFileSync(process.argv[1], "utf8");
+      const cfg = raw.trim() === "" ? {} : JSON.parse(raw);
+      process.exit(cfg && cfg.policy && cfg.policy.auditMaxBytes === 0 ? 0 : 1);
+    ' "${top}/${rel}" 2>/dev/null; then
+    squad_policy_log "squad-policy: refusing to harden: ${rel} does not hold policy.auditMaxBytes === 0 after sealing"
+    return 1
+  fi
+
+  # Record what the sampler re-pins and squad-agent checks (finding 3).
+  IFS= read -r -d '' SQUAD_POLICY_PIN_BYTES <"${top}/${rel}" || :
+  sum="$(sha256sum "${top}/${rel}" 2>/dev/null)" || sum=""
+  sum="${sum%% *}"
+  if [[ -z "$SQUAD_POLICY_PIN_BYTES" || ! "$sum" =~ ^[0-9a-f]{64}$ ]]; then
+    squad_policy_log "squad-policy: refusing to harden: could not record the pinned content of ${rel}"
+    return 1
+  fi
+
+  SQUAD_POLICY_PIN_SEAL_MODE="$mode"
+  SQUAD_POLICY_PIN_REPO_DIR="$top"
+  SQUAD_POLICY_PIN_BASE_BLOB="$base_blob"
+  SQUAD_POLICY_PIN_SHA256="$sum"
+  export SQUAD_POLICY_PIN_SEAL_MODE SQUAD_POLICY_PIN_REPO_DIR SQUAD_POLICY_PIN_BASE_BLOB SQUAD_POLICY_PIN_SHA256
+
+  squad_policy_pin_install_hooks "$top" "$base_blob"
   return 0
 }
 
@@ -1480,7 +2035,9 @@ squad_policy_harden() {
   fi
   squad_policy_parse_bundle <<<"$bundle_output"
 
-  squad_policy_commit_memory_audit_config_pin "$repo_dir"
+  if ! squad_policy_seal_memory_audit_config_pin "$repo_dir"; then
+    squad_policy_abort "Could not seal .squad/memory/config.json out of git staging; refusing to run with the session-only audit-rotation pin publishable."
+  fi
 
   state="$(squad_policy_state_dir "$repo_dir")" || \
     squad_policy_abort "Could not create a private policy state directory outside the checkout."
@@ -1697,6 +2254,54 @@ squad_policy_harden() {
 # directory are tripwires: missing or altered => GOVERNANCE STATE TAMPERED and
 # an abort (78) after the detectors have logged what else changed. Nothing is
 # written to the state directory here.
+# Push backstop: called by squad_push_branch / squad_push_checkpoint
+# (worker/lib/squad-push.sh) before every push THIS container makes (prompt,
+# new-project, shell, and the shutdown checkpoint). It refuses whenever the
+# seal predicate fails -- which includes both "HEAD's copy differs from the
+# base" (mask bit 16) AND "an intermediate commit between the base and HEAD
+# differs from the base" (mask bit 64, R5), so a pin committed past the
+# pre-commit hook with `--no-verify` and later undone by a further commit is
+# still refused here, not only a pin still present at the tip. It does NOT
+# cover a push the AGENT makes itself in watch/loop/triage (the agent holds
+# the credential there); that path is covered by detection -- the in-session
+# sampler and squad_policy_verify -- not by this function. See the seal doc
+# above for the complete statement of what is prevented and what is only
+# detected.
+#
+# Fail CLOSED (finding 8): a checkout git cannot inspect, a seal that was never
+# recorded, or an unparseable base blob all refuse. Only a directory with no
+# `.git` at all -- nothing that could be published -- is a no-op.
+squad_policy_assert_pin_unpublished() {
+  local repo_dir="${1:-${SQUAD_POLICY_PIN_REPO_DIR:-$PWD}}"
+  local mode="$SQUAD_POLICY_PIN_SEAL_MODE" base_blob="$SQUAD_POLICY_PIN_BASE_BLOB" desc
+
+  if ! command -v git >/dev/null 2>&1 || ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [[ -e "${repo_dir}/.git" ]]; then
+      squad_policy_log "refusing to push: git cannot inspect ${repo_dir}, so the session-only memory audit pin cannot be shown to be unpublished"
+      return 1
+    fi
+    return 0
+  fi
+  case "$mode" in
+    skip-worktree|exclude) ;;
+    *)
+      squad_policy_log "refusing to push: no session-only memory audit pin seal was recorded for this session (mode '${mode:-unset}')"
+      return 1
+      ;;
+  esac
+  if [[ ! "$base_blob" =~ ^([0-9a-f]{40,64}|absent)$ ]]; then
+    squad_policy_log "refusing to push: the recorded memory audit pin base ('${base_blob}') is not valid"
+    return 1
+  fi
+  if ! squad_policy_pin_seal_check "${SQUAD_POLICY_PIN_REPO_DIR:-$repo_dir}" "$mode" "$base_blob"; then
+    while IFS= read -r desc; do
+      [[ -n "$desc" ]] && squad_policy_log "refusing to push: session-only memory audit pin would be published: ${desc}"
+    done < <(squad_policy_pin_seal_describe "$SQUAD_POLICY_PIN_SEAL_MASK")
+    return 1
+  fi
+  return 0
+}
+
 squad_policy_verify() {
   local repo_dir="$1"
   local state="$SQUAD_POLICY_STATE_DIR"
@@ -1911,6 +2516,62 @@ squad_policy_verify() {
       squad_policy_log "Reported-mutable change (permitted): ${rel} was created during this session."
     fi
   done <<<"$current"
+
+  # --- (e) memory audit pin seal integrity ------------------------------------
+  # Closes what detector (c) below cannot see on its own: the seal
+  # squad_policy_seal_memory_audit_config_pin established at harden time being
+  # defeated BEFORE anything is committed (--skip-worktree cleared, the
+  # exclude line removed, a `.gitignore` negation added, `git add -f`), and
+  # being defeated and then put back before this ran. The final state is
+  # checked here with the same predicate the sampler ran every interval; the
+  # sampler's sticky mask carries every break it saw in between, so restoring
+  # the bit / exclude line before verify does not hide a break (it does hide
+  # one shorter than one sampler interval -- the residual the seal doc states).
+  local pin_rel="$SQUAD_POLICY_PIN_REL" pin_mask=0 pin_desc
+  local pin_missing=0 pin_altered=0 pin_restore_failed=0
+  case "$SQUAD_POLICY_PIN_SEAL_MODE" in
+    skip-worktree|exclude)
+      if ! squad_policy_pin_seal_check "$SQUAD_POLICY_PIN_REPO_DIR" "$SQUAD_POLICY_PIN_SEAL_MODE" "$SQUAD_POLICY_PIN_BASE_BLOB"; then
+        pin_mask="$SQUAD_POLICY_PIN_SEAL_MASK"
+      fi
+      ;;
+  esac
+  pin_mask=$(( pin_mask | SQUAD_POLICY_PIN_BROKEN_MASK ))
+  if [[ "$pin_mask" -ne 0 ]]; then
+    violated=1
+    while IFS= read -r pin_desc; do
+      [[ -n "$pin_desc" ]] && squad_policy_log "GOVERNANCE VIOLATION: memory audit pin seal broken: ${pin_desc}."
+    done < <(squad_policy_pin_seal_describe "$pin_mask")
+  fi
+  # The pin FILE (finding 3): the sampler re-pinned it whenever it vanished or
+  # changed, so rotation stayed off; here we say what happened.
+  pin_missing=$(( ${SQUAD_POLICY_PIN_EVENTS[missing]:-0} + ${SQUAD_POLICY_PIN_EVENTS[recreated]:-0} ))
+  pin_altered="${SQUAD_POLICY_PIN_EVENTS[altered]:-0}"
+  pin_restore_failed="${SQUAD_POLICY_PIN_EVENTS[restore-failed]:-0}"
+  if [[ "$pin_altered" -gt 0 ]]; then
+    violated=1
+    squad_policy_log "GOVERNANCE VIOLATION: ${pin_rel} (the session-only memory audit pin) was rewritten during this session (${pin_altered} sample(s)); the in-session sampler restored the pin."
+  fi
+  if [[ "$pin_restore_failed" -gt 0 ]]; then
+    violated=1
+    squad_policy_log "GOVERNANCE VIOLATION: ${pin_rel} (the session-only memory audit pin) could not be restored during this session (${pin_restore_failed} sample(s)); squad-sdk audit rotation may have been re-enabled."
+  fi
+  if [[ "$pin_missing" -gt 0 ]]; then
+    if [[ "$SQUAD_POLICY_PIN_SEAL_MODE" == exclude ]]; then
+      # An ignored file deleted by `git clean -x` is ordinary git hygiene, not
+      # tampering; what matters is that rotation never got to run, which the
+      # restore guarantees to within one sampler interval.
+      reported_count=$((reported_count + 1))
+      SQUAD_POLICY_REPORTED_CHANGES+=("${pin_rel} (session-only pin deleted and restored)")
+      squad_policy_log "Reported change: ${pin_rel} (the session-only, git-ignored memory audit pin) was deleted (e.g. git clean -x) during this session and restored by the in-session sampler (${pin_missing} sample(s))."
+    else
+      violated=1
+      squad_policy_log "GOVERNANCE VIOLATION: ${pin_rel} (the session-only memory audit pin) was deleted during this session (${pin_missing} sample(s)); the in-session sampler restored the pin."
+    fi
+  fi
+  if [[ $(( pin_missing + pin_altered + pin_restore_failed )) -gt 0 && "$violated" -eq 1 ]]; then
+    squad_policy_log "Note: while ${pin_rel} was missing or un-pinned (up to one sampler interval at a time), squad-sdk may have rotated .squad/memory/audit.jsonl; an append-only violation on that log may be caused by that window rather than by an edit."
+  fi
 
   # --- (c) committed changes -------------------------------------------------
   # A change that was committed rather than left in the working tree. The base

@@ -1084,14 +1084,33 @@ function serializeGovernanceBundle(policy) {
 
 /**
  * Issue #113: the audit-rotation pin that used to be an inline `node -e`
- * string in worker/lib/squad-policy.sh's squad_policy_pin_memory_audit_config,
- * now a named function so the `harden-init` subcommand below can fold it and
- * the governance bundle into the SAME `node` process -- the one fork
- * squad_policy_harden needs. See squad_policy_harden's doc in
- * worker/lib/squad-policy.sh for WHY this pin exists (it disables
- * squad-sdk's own audit.jsonl rotation; verified against
+ * string in worker/lib/squad-policy.sh, now a named function so the
+ * `harden-init` subcommand below can fold it and the governance bundle into
+ * the SAME `node` process -- the one fork squad_policy_harden needs. See
+ * squad_policy_harden's doc in worker/lib/squad-policy.sh for WHY this pin
+ * exists (it disables squad-sdk's own audit.jsonl rotation; verified against
  * @bradygaster/squad-sdk@0.13.1, dist/memory/index.js:
  * `if (maxBytes <= 0) return;` in rotateAuditIfNeeded()).
+ *
+ * This writes ONLY to the working tree, never to git's index, and is never
+ * committed BY THE WORKER: squad_policy_seal_memory_audit_config_pin
+ * (worker/lib/squad-policy.sh), called right after this, seals the path out
+ * of git staging. The two seals are NOT equally strong. When the path is
+ * tracked at HEAD it is reset to the base blob and marked --skip-worktree --
+ * an index property that ordinary porcelain (`add -A`, `add -f`, `commit -a`,
+ * `reset --hard`, `stash -u`, `clean -fdx`, forced switches) cannot defeat.
+ * When it is NOT tracked it is only an ignore rule (`.git/info/exclude`):
+ * that stops `add -A`, but a deliberate `git add -f`, a `.gitignore`
+ * negation, or `git clean -x` (which deletes the pin) does defeat it. Those
+ * defeats are DETECTED while they persist (sampler, per-iteration check in
+ * worker/squad-agent, squad_policy_verify), the file is re-pinned if
+ * deleted, and this container's own pushes refuse -- but an agent that
+ * deliberately commits and pushes the pin itself in watch/loop/triage is
+ * not prevented, and one that also undoes it within a single sampler tick
+ * is not detected locally either. See the seal's doc for the full statement.
+ * squad-sdk 0.13.1 only ever reads
+ * this file off disk (no env var, no alternate config path), so the worktree
+ * write below is what keeps rotation off.
  */
 function pinMemoryAuditConfig(repoDir) {
   const fs = require('fs');
