@@ -28,16 +28,40 @@ set -uo pipefail
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKER_DIR="$(cd "${TEST_DIR}/.." && pwd)"
 
+if [[ "$(id -u)" -ne 0 ]]; then
+  if [[ "${SQUAD_N1B_ROOT_REEXEC:-0}" != "1" ]] && command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    bash_bin="$(command -v bash)"
+    sudo_env=(
+      "SQUAD_N1B_ROOT_REEXEC=1"
+      "PATH=${PATH:-}"
+    )
+    for name in TMPDIR TEMP TMP; do
+      if [[ -v "$name" ]]; then
+        sudo_env+=("${name}=${!name}")
+      fi
+    done
+    while IFS= read -r name; do
+      [[ "$name" == SQUAD_N1B_ROOT_REEXEC ]] && continue
+      sudo_env+=("${name}=${!name}")
+    done < <(compgen -e SQUAD_ | sort)
+
+    echo "INFO: test_security_n1b_root_sealed_state.sh — re-execing under passwordless sudo to exercise the real uid boundary."
+    exec sudo -n /usr/bin/env "${sudo_env[@]}" "$bash_bin" "${BASH_SOURCE[0]}" "$@"
+    rc=$?
+    echo "FAIL: sudo re-exec failed with exit ${rc}"
+    exit "$rc"
+  fi
+
+  echo "SKIP: test_security_n1b_root_sealed_state.sh — NOT RUN: needs real root to create a root-owned store and drop privileges."
+  echo "SKIP:   run it as root on Linux, e.g.: wsl -u root -e bash worker/tests/test_security_n1b_root_sealed_state.sh"
+  echo "SKIP:   on CI/Linux with passwordless sudo, run it normally and it will re-exec itself under sudo."
+  exit 77
+fi
+
 # shellcheck source=lib/assert.sh
 source "${TEST_DIR}/lib/assert.sh"
 
 echo "== security re-review N1 layer 0: root-sealed governance state (real uid boundary) =="
-
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "SKIP: test_security_n1b_root_sealed_state.sh — NOT RUN: needs real root to create a root-owned store and drop privileges."
-  echo "SKIP:   run it as root on Linux, e.g.: wsl -u root -e bash worker/tests/test_security_n1b_root_sealed_state.sh"
-  exit 77
-fi
 for dep in runuser node git sha256sum base64 stat awk; do
   if ! command -v "$dep" >/dev/null 2>&1; then
     echo "SKIP: test_security_n1b_root_sealed_state.sh — NOT RUN: missing ${dep}"
