@@ -240,6 +240,11 @@ if [[ -n "${GITHUB_REF:-}" ]]; then
   fi
 fi
 
+# What HEAD was before anyone worked in this checkout. Commits the agent makes
+# itself are measured against this when deciding whether there is anything to
+# publish (see squad_session_has_publishable_work).
+SQUAD_SESSION_BASE_COMMIT="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+
 # --- Externalized Squad state gate (issue #117) ------------------------------
 # squad-aca clones this repo into THIS ephemeral container, hardens `.squad/`
 # in THIS checkout, then commits and pushes from THIS checkout. Squad 0.13
@@ -878,15 +883,19 @@ commit_and_push_if_needed() {
     return 0
   fi
 
-  if git diff --quiet && git diff --cached --quiet; then
+  if ! squad_session_has_publishable_work "$REPO_DIR" "${SQUAD_SESSION_BASE_COMMIT:-}"; then
     log "No changes to push."
     return 0
   fi
 
   local branch="${OUTPUT_BRANCH:-squad/${SESSION_NAME}}"
   git checkout -B "$branch"
-  git add -A
-  git commit -m "${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}"
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git add -A
+    git commit -m "${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}"
+  else
+    log "Publishing the commits the agent made itself."
+  fi
 
   # THE PUSH IS THE MOMENT THE CREDENTIAL IS FIRST REALLY TESTED (issue #32).
   # Everything before it -- including the clone -- succeeds against a public
