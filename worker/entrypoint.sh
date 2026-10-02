@@ -17,6 +17,27 @@ sanitize_name() {
   printf '%s' "${1:-session}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed -E 's/^-+|-+$//g' | cut -c 1-48
 }
 
+# Re-review N1 (the uid boundary). Runs AS ROOT, inside the privilege-drop
+# block below, immediately before `runuser`: creates the root-owned 0711
+# policy state directory and the root sealer that alone writes into it (see
+# section 4c of worker/lib/squad-policy.sh). Everything after the drop --
+# including the agent -- runs as a uid that cannot create, rewrite, rename or
+# delete anything there. A container started as root that cannot set this up
+# refuses to start rather than silently running without the boundary.
+squad_root_seal_policy_state() {
+  local lib="${SQUAD_POLICY_LIB:-/usr/local/lib/squad-on-aca/squad-policy.sh}"
+  if [[ ! -f "$lib" ]]; then
+    log "Agent policy library not found at ${lib}; cannot create the root-owned policy state store. Refusing to start."
+    exit 78
+  fi
+  # shellcheck source=lib/squad-policy.sh
+  source "$lib"
+  if ! squad_policy_sealer_start "${SQUAD_POLICY_SEAL_BASE:-/run}"; then
+    log "Could not create the root-owned policy state store under ${SQUAD_POLICY_SEAL_BASE:-/run}. Refusing to start without the governance uid boundary."
+    exit 78
+  fi
+}
+
 # PC-2 (issue #86): a second boundary, now required rather than optional.
 #
 # PC-1's live ACA diagnostic (docs/security-report.md; the exact deployed
@@ -41,8 +62,13 @@ sanitize_name() {
 # runs. The image's container-default user is root (worker/Dockerfile has no
 # trailing USER) SOLELY so this one `exec` can drop to the correct
 # unprivileged user before a single credential, child process, or byte of
-# user-influenced input is touched. `exec runuser` REPLACES this process
-# outright -- there is no root parent left running afterward, in any mode.
+# user-influenced input is touched. `exec runuser` replaces THIS shell, but
+# runuser itself forks: it stays alive as a ROOT parent that waits for the
+# dropped child and relays its exit status (util-linux; verified: `runuser -u
+# nobody -- sleep 3` shows a root `runuser` pid with the `nobody` child under
+# it). That root parent runs no script code and reads no input. The only other
+# root process is the policy sealer started just before the drop (re-review
+# N1), which reads one pipe and writes only into its own root-owned directory.
 # If the container is ever started as a non-root user directly (e.g. a
 # developer running this script locally), `id -u` is already non-zero and
 # this block is a no-op: nothing below depends on having been root.
@@ -51,13 +77,11 @@ if [[ "$(id -u)" -eq 0 ]]; then
   if [[ "${SQUAD_MODE:-smoke}" == "ralph" ]]; then
     SQUAD_RUNTIME_USER="squad-identity"
   fi
-  # `-p`/`--preserve-environment` is required so every ACA-injected variable
-  # (GITHUB_TOKEN, IDENTITY_ENDPOINT, SQUAD_MODE, ...) survives the switch --
-  # but "preserve" is literal: it also carries over root's own HOME (which
-  # this container's base image sets to /root) into the now-unprivileged
-  # process, which cannot write there. `env -u HOME` clears it BEFORE
-  # runuser runs, so the HOME fallback a few lines below resolves it fresh,
-  # from the ACTUAL user this process now runs as.
+  squad_root_seal_policy_state
+  # `-p` keeps every ACA-injected variable (and SQUAD_POLICY_SEAL_FD /
+  # SQUAD_POLICY_SEALED_DIR) across the switch, but would also carry root's
+  # HOME (/root) into a process that cannot write there. `env -u HOME` clears
+  # it so the fallback below resolves HOME from the user this process becomes.
   exec env -u HOME runuser -p -u "$SQUAD_RUNTIME_USER" -- "$0" "$@"
 fi
 
@@ -556,16 +580,51 @@ squad_credential_should_withhold() {
 # and at the end of every mode that runs an agent so a non-pushing session still
 # fails rather than reporting success.
 SQUAD_POLICY_VERIFIED=0
+SQUAD_POLICY_IN_VERIFY=0
 squad_policy_checkpoint() {
   if [[ "$SQUAD_POLICY_VERIFIED" -eq 1 ]]; then
     return 0
   fi
   SQUAD_POLICY_VERIFIED=1
+  SQUAD_POLICY_IN_VERIFY=1
   if ! squad_policy_verify "$REPO_DIR"; then
+    SQUAD_POLICY_IN_VERIFY=0
+    # F7: the report is written BEFORE the failing exit, in every mode -- a
+    # violation is exactly when it matters most.
+    squad_watch_governance_report_if_any "governance VIOLATION -- session failed (exit 78)" || true
     log "Session FAILED: a governance path was modified by this run. Nothing has been pushed."
     exit 78
   fi
+  SQUAD_POLICY_IN_VERIFY=0
   return 0
+}
+
+# squad_policy_verify aborts (78) on its own when the policy state itself was
+# tampered with; worker/lib/squad-policy.sh calls this hook first so that path
+# also leaves a report behind.
+squad_policy_on_abort() {
+  [[ "${SQUAD_POLICY_IN_VERIFY:-0}" -eq 1 ]] || return 0
+  squad_watch_governance_report_if_any "governance state TAMPERED -- session failed (exit 78)" || true
+}
+
+# Re-review N5. squad_run_foreground_with_signal_forwarding restores the
+# default TERM/INT disposition before it returns, so a shutdown signal landing
+# during the checkpoint would kill this shell mid-verify and skip the report.
+# Between these two calls TERM/INT are only RECORDED; once the checkpoint and
+# the report are done, a recorded signal ends the session (the work it asked to
+# stop has already drained). ACA's grace-period SIGKILL cannot be deferred.
+SQUAD_DEFERRED_SIGNAL=""
+squad_defer_shutdown_signals() {
+  SQUAD_DEFERRED_SIGNAL=""
+  trap 'SQUAD_DEFERRED_SIGNAL=TERM; log "SIGTERM received during the governance checkpoint; deferring it until the checkpoint and report complete."' TERM
+  trap 'SQUAD_DEFERRED_SIGNAL=INT; log "SIGINT received during the governance checkpoint; deferring it until the checkpoint and report complete."' INT
+}
+squad_release_shutdown_signals() {
+  trap - TERM INT
+  if [[ -n "$SQUAD_DEFERRED_SIGNAL" ]]; then
+    log "Honouring the deferred SIG${SQUAD_DEFERRED_SIGNAL}: governance checkpoint and report are complete; exiting."
+    exit 0
+  fi
 }
 
 # SECURITY REVIEW F7 (security-review-112-113.md, MEDIUM, REJECTED #112):
@@ -586,37 +645,54 @@ squad_policy_checkpoint() {
 # that is a real behaviour change, out of scope here, and would duplicate the
 # PR watch/loop already opens on its own. Instead, the SAME report
 # squad_policy_reported_changes_report() would have put in a PR body is
-# written to a durable file under SQUAD_POLICY_STATE_DIR: a private (0700),
-# per-session directory outside the checkout that squad_policy_state_dir()
-# already creates specifically so the agent's own file tools cannot reach it
-# (see worker/lib/squad-policy.sh, "2. State directory"). That directory
-# already outlives the working tree for the life of this container, which is
-# exactly the durability this needs: appended to (never overwritten) so a
-# long watch/loop session accumulates every reported-mutable change across
-# every checkpoint, and its path is logged so an operator -- or a sidecar
-# that ships $HOME out of the container -- has somewhere concrete to look
-# instead of grepping container logs.
+# appended (never overwritten) to a durable file and to the container log.
+#
+# Re-review N1 corrected where that file lives. SQUAD_POLICY_STATE_DIR is owned
+# by the agent's own uid, so a report there could simply be deleted. When the
+# container started as root, the report goes to the ROOT-OWNED sealed store
+# (worker/lib/squad-policy.sh section 4c) instead, which the agent cannot
+# touch; the state directory is only the fallback for a session that never
+# had root (local runs, tests) and is labelled as agent-writable in the log.
+# squad_policy_checkpoint also calls this, with a verdict, BEFORE its exit 78:
+# the violation path is where the report matters most.
 #
 # squad_policy_reported_changes_report is CALLED here, not edited: it already
 # does exactly the summarising this needs, and it lives in
 # worker/lib/squad-policy.sh, which this fix does not touch.
 squad_watch_governance_report_if_any() {
-  local report
+  local verdict="${1:-}" report block
   report="$(squad_policy_reported_changes_report)"
-  [[ -z "$report" ]] && return 0
+  [[ -z "$report" && -z "$verdict" ]] && return 0
 
-  if [[ -z "${SQUAD_POLICY_STATE_DIR:-}" || ! -d "$SQUAD_POLICY_STATE_DIR" ]]; then
-    log "Reported-mutable governance changes occurred this session, but no private policy state directory is available to durably record them. Logging the report inline instead:"
-    log "$report"
+  block="$(
+    printf '\n## Checkpoint at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ -n "$verdict" ]] && printf '\n**Verdict: %s**\n' "$verdict"
+    [[ -n "$report" ]] && printf '%s\n' "$report"
+    :
+  )"
+
+  # Re-review N1/F7: the durable copy lives in the ROOT-OWNED sealed store
+  # when this session has one -- the agent (another uid) cannot delete or
+  # rewrite it. The container log gets it too, unconditionally.
+  if squad_policy_seal_report "$block"; then
+    log "Governance report for this checkpoint was appended to the root-owned ${SQUAD_POLICY_SEALED_DIR}/reported-changes.md (not writable by the agent's uid):"
+    log "$block"
     return 0
   fi
 
+  if [[ -z "${SQUAD_POLICY_STATE_DIR:-}" || ! -d "$SQUAD_POLICY_STATE_DIR" ]]; then
+    log "Reported-mutable governance changes occurred this session, but no private policy state directory is available to durably record them. Logging the report inline instead:"
+    log "$block"
+    return 0
+  fi
+
+  # No root sealer (not started as root): best effort only. This directory is
+  # owned by the agent's own uid, so the copy here is NOT tamper-proof; the
+  # inline log line below is the durable record.
   local report_file="${SQUAD_POLICY_STATE_DIR}/reported-changes.md"
-  {
-    printf '\n## Checkpoint at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '%s\n' "$report"
-  } >>"$report_file"
-  log "Reported-mutable governance changes this session were appended to ${report_file} (watch/loop does not open its own PR for this -- see F7 in security-review-112-113.md)."
+  printf '%s\n' "$block" >>"$report_file" || true
+  log "Reported-mutable governance changes this session were appended to ${report_file} (agent-writable; no root-sealed store in this session -- see F7 in security-review-112-113.md):"
+  log "$block"
 }
 
 
@@ -870,10 +946,11 @@ case "${SQUAD_MODE:-smoke}" in
     cat /tmp/repo.json
     squad status || true
     if [[ "${RUN_COPILOT_SMOKE:-false}" == "true" ]]; then
-      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-        copilot -p "You are validating a remote Squad container. Reply with a one-sentence status only." "${COPILOT_ARGV[@]}" --silent
+        squad_policy_exec_agent \
+          copilot -p "You are validating a remote Squad container. Reply with a one-sentence status only." "${COPILOT_ARGV[@]}" --silent )
     else
       log "Skipping Copilot prompt smoke. Set RUN_COPILOT_SMOKE=true to exercise Copilot."
     fi
@@ -981,13 +1058,14 @@ NODE
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      squad_hub_run "$SQUAD_PROMPT"
+      ( squad_policy_exec_agent squad_hub_run "$SQUAD_PROMPT" )
     else
       squad_policy_announce direct
-      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-        copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+        squad_policy_exec_agent \
+          copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}" )
     fi
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
@@ -1016,13 +1094,14 @@ NODE
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      squad_hub_run "$SQUAD_PROMPT"
+      ( squad_policy_exec_agent squad_hub_run "$SQUAD_PROMPT" )
     else
       squad_policy_announce direct
-      OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
         COPILOT_OTEL_ENABLED=true \
         COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
-        copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}"
+        squad_policy_exec_agent \
+          copilot -p "$SQUAD_PROMPT" "${COPILOT_ARGV[@]}" )
     fi
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
@@ -1063,10 +1142,16 @@ NODE
     # Issue #115: run in the background with SIGTERM/SIGINT forwarded, so ACA
     # stopping this replica lets Squad drain instead of being killed abruptly
     # mid-cycle. See squad_run_foreground_with_signal_forwarding above.
+    # squad_policy_exec_agent runs INSIDE the forwarding wrapper's background
+    # job, closes the policy sampler/seal descriptors there, then execs
+    # `squad` -- so `$!` is still squad's own pid and forwarding is unchanged.
     squad_run_foreground_with_signal_forwarding \
+      squad_policy_exec_agent \
       squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
+    squad_defer_shutdown_signals
     squad_policy_checkpoint
     squad_watch_governance_report_if_any
+    squad_release_shutdown_signals
     ;;
   ralph)
     log "Starting scheduled Ralph dispatcher."
@@ -1227,6 +1312,7 @@ NODE
     export SQUAD_WATCH_SENTINEL_FILE="${SQUAD_WATCH_SENTINEL_FILE:-${WORKDIR:-/workspace}/${SESSION_NAME}/watch-sentinel}"
     mkdir -p "$(dirname "$SQUAD_WATCH_SENTINEL_FILE")"
     squad_run_foreground_with_signal_forwarding \
+      squad_policy_exec_agent \
       squad watch \
       --execute \
       --interval "${WATCH_INTERVAL_MINUTES:-5}" \
@@ -1236,13 +1322,15 @@ NODE
       --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
       --sentinel-file "$SQUAD_WATCH_SENTINEL_FILE" \
       --verbose
+    squad_defer_shutdown_signals
     squad_policy_checkpoint
     squad_watch_governance_report_if_any
+    squad_release_shutdown_signals
     ;;
   shell)
     log "Starting requested shell command."
     require REMOTE_SQUAD_COMMAND
-    bash -lc "$REMOTE_SQUAD_COMMAND"
+    ( squad_policy_exec_agent bash -lc "$REMOTE_SQUAD_COMMAND" )
     commit_and_push_if_needed
     ;;
   *)

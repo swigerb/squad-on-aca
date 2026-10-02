@@ -112,6 +112,13 @@ squad_policy_log() {
 squad_policy_abort() {
   squad_policy_log "$@"
   squad_policy_log "Refusing to run the session. A session whose policy cannot be applied must not run with blanket allow."
+  # Lets the caller (worker/entrypoint.sh) emit its governance report on an
+  # abort raised from inside squad_policy_verify -- the F7 report matters most
+  # exactly when the session is failing. Runs at most once.
+  if [[ "${SQUAD_POLICY_ABORT_HOOK_RAN:-0}" != 1 ]] && declare -F squad_policy_on_abort >/dev/null 2>&1; then
+    SQUAD_POLICY_ABORT_HOOK_RAN=1
+    squad_policy_on_abort || true
+  fi
   exit 78
 }
 
@@ -572,14 +579,28 @@ squad_policy_parent_dir_is_locked() {
 # base commit and the F4/F6 high-water marks in that directory, and the
 # security re-review proved one `rm` undid all of them (A2, A4, A5b, A5c).
 #
-# WHERE AUTHORITY LIVES NOW. A uid boundary (root-owned state written before
-# the drop, or a separate supervisor uid) is the textbook fix, but there is no
-# privileged process left by the time this file runs, and creating one is a
-# worker/entrypoint.sh change. What the agent CANNOT reach without ptrace is the
-# MEMORY of the entrypoint shell that runs both squad_policy_harden and
-# squad_policy_verify (the agent is a DESCENDANT of it, and Yama's default
-# ptrace_scope=1 forbids a descendant attaching to an ancestor; /proc/<pid>/mem
-# is gated by the same ptrace check). So:
+# WHERE AUTHORITY LIVES NOW. Two independent layers, either of which alone
+# defeats A2/A4/A5b/A5c:
+#
+#   0. THE UID BOUNDARY (section 4c). When worker/entrypoint.sh starts as root
+#      (the container default), it creates a root-owned 0711 directory under
+#      /run and a ROOT sealer process, BEFORE `runuser` drops to `squad`. Only
+#      the sealer (uid 0) ever writes there. At the end of harden -- before
+#      any agent exists -- this process hands the baseline to the sealer over
+#      a pipe, waits for the sealed root-owned 0644 copies, and reads them
+#      back against memory. The agent (uid `squad`) cannot unlink, rename,
+#      create or rewrite anything there: unlink/rename/create need write on a
+#      root-owned 0711 directory, and rewrite needs write on a root-owned 0644
+#      file. verify and worker/squad-agent then require the sealed copies to
+#      still match. Without root at container start (a developer running the
+#      script directly, the test suites) there is no sealer and layers 1-4
+#      stand alone -- that is logged, never silent.
+#
+# What the agent also CANNOT reach without ptrace is the MEMORY of the
+# entrypoint shell that runs both squad_policy_harden and squad_policy_verify
+# (the agent is a DESCENDANT of it, and Yama's default ptrace_scope=1 forbids
+# a descendant attaching to an ancestor; /proc/<pid>/mem is gated by the same
+# ptrace check). So, as defence in depth:
 #
 #   1. AUTHORITATIVE state is held ONLY in non-exported shell variables of the
 #      hardening process: the baseline manifest
@@ -611,10 +632,10 @@ squad_policy_parent_dir_is_locked() {
 #
 # RESIDUAL (asserted, not hidden): a same-uid process that can ptrace the
 # entrypoint shell (kernel.yama.ptrace_scope=0, or CAP_SYS_PTRACE) can rewrite
-# this memory. A genuine uid boundary needs worker/entrypoint.sh to keep a
-# privileged step (or a second uid) for state, and `chattr +a` on append-only
-# files needs CAP_LINUX_IMMUTABLE at harden time -- both are entrypoint
-# changes, out of this file's reach, and are recorded as the follow-up.
+# this memory -- but NOT the root-sealed copies (layer 0), which verify also
+# requires. `chattr +a` on append-only files would need CAP_LINUX_IMMUTABLE,
+# which Docker's and ACA's default capability set does not grant and this
+# image cannot verify it has; it is a documented residual, not code.
 #
 # NOTHING IN THIS SECTION MAY BE "OPTIMISED" BACK ONTO DISK. If a value has to
 # be shared with another process, pass it by environment at spawn time (as in
@@ -624,7 +645,10 @@ unset SQUAD_POLICY_BASELINE_MANIFEST SQUAD_POLICY_BASELINE_TAKEN SQUAD_POLICY_BA
       SQUAD_POLICY_SAMPLER_NONCE SQUAD_POLICY_SAMPLER_COLLECTED SQUAD_POLICY_SAMPLER_VERDICT \
       SQUAD_POLICY_FINGERPRINTS SQUAD_POLICY_HWM_AO SQUAD_POLICY_HWM_RP \
       SQUAD_POLICY_HWM_AO_REL SQUAD_POLICY_HWM_AO_ABS SQUAD_POLICY_HWM_AO_BLEN \
-      SQUAD_POLICY_HWM_RP_REL SQUAD_POLICY_HWM_RP_ABS SQUAD_POLICY_HWM_RP_BSUM 2>/dev/null
+      SQUAD_POLICY_HWM_RP_REL SQUAD_POLICY_HWM_RP_ABS SQUAD_POLICY_HWM_RP_BSUM \
+      SQUAD_POLICY_SEAL_EXPECTED SQUAD_POLICY_HARDEN_SHELL_PID 2>/dev/null
+SQUAD_POLICY_SEAL_EXPECTED=0
+SQUAD_POLICY_HARDEN_SHELL_PID=""
 SQUAD_POLICY_BASELINE_MANIFEST=""
 SQUAD_POLICY_BASELINE_TAKEN=0
 SQUAD_POLICY_BASE_COMMIT=""
@@ -663,6 +687,225 @@ squad_policy_fingerprints() {
 }
 
 # ---------------------------------------------------------------------------
+# 4c. Root-sealed state: the uid boundary (re-review N1; layer 0 above)
+# ---------------------------------------------------------------------------
+# worker/entrypoint.sh, while still root, calls squad_policy_sealer_start:
+# a fresh root-owned 0711 directory (mktemp under /run, so nothing can
+# pre-create or pre-link it) and a ROOT process reading records from a pipe.
+# The write end is exported as SQUAD_POLICY_SEAL_FD and survives the
+# `runuser` drop. Records, one per line:
+#   FILE <name> <base64>  each of SQUAD_POLICY_SEAL_NAMES exactly once;
+#   SEAL                  writes the root-owned 0644 copies, then the
+#                         `sealed` marker LAST. A malformed, unknown,
+#                         duplicate or missing record before SEAL writes
+#                         `seal-error` instead and the sealer exits, so
+#                         harden aborts (78);
+#   REPORT <base64>       after SEAL only: appended to reported-changes.md
+#                         (the F7 governance report), size-capped.
+# After SEAL, FILE/SEAL are ignored: nothing can change a sealed copy.
+# Framing is by record, not EOF: root's `runuser` parent also holds the write
+# end for the whole session, so EOF only arrives when the session ends.
+#
+# Who holds the write end: the entrypoint shell, plus whatever it spawned
+# BEFORE harden (bootstrap). The agent is started through
+# squad_policy_exec_agent, which closes it. A process that does reach it can
+# only (a) seal FIRST with forged content -- harden reads the sealed copies
+# back against memory and aborts: a denial of service, not a bypass -- or (b)
+# append noise to the report. It cannot alter or remove a sealed copy: only
+# uid 0 can write that directory or those files.
+#
+# Readable (0711 dir, 0644 files) on purpose: worker/squad-agent and verify run
+# as the unprivileged uid and must READ the sealed copies. The threat is
+# integrity, not secrecy -- every value here is recomputable by the agent.
+SQUAD_POLICY_SEAL_NAMES=(governance.sha256 mcp-config.sha256 base-commit)
+
+# Runs AS ROOT, in its own process, reading records on stdin.
+squad_policy_sealer_main() {
+  local dir="$1" max="${SQUAD_POLICY_SEAL_REPORT_MAX_BYTES:-4194304}"
+  local line verb rest name payload n sealed=0 size=0 full=0 report
+  local -A pending=()
+  set +eEu +o pipefail 2>/dev/null
+  trap - ERR EXIT RETURN DEBUG
+  trap '' TERM INT HUP PIPE
+  umask 022
+  report="${dir}/reported-changes.md"
+  _sqp_seal_fail() {
+    printf '%s\n' "$1" >"${dir}/.seal-error.tmp" 2>/dev/null
+    mv -f "${dir}/.seal-error.tmp" "${dir}/seal-error" 2>/dev/null
+    exit 0
+  }
+  while IFS= read -r line; do
+    verb="${line%% *}"
+    rest=""
+    [[ "$line" == *" "* ]] && rest="${line#* }"
+    if [[ "$sealed" -eq 0 ]]; then
+      case "$verb" in
+        FILE)
+          [[ "$rest" == *" "* ]] || _sqp_seal_fail "malformed FILE record"
+          name="${rest%% *}"
+          payload="${rest#* }"
+          case "$name" in
+            governance.sha256|mcp-config.sha256|base-commit) ;;
+            *) _sqp_seal_fail "FILE record names an unknown file" ;;
+          esac
+          [[ -z "${pending[$name]+x}" ]] || _sqp_seal_fail "duplicate FILE record for ${name}"
+          [[ "$payload" =~ ^[A-Za-z0-9+/]*=*$ ]] || _sqp_seal_fail "FILE record for ${name} is not base64"
+          pending["$name"]="$payload"
+          ;;
+        SEAL)
+          for n in "${SQUAD_POLICY_SEAL_NAMES[@]}"; do
+            [[ -n "${pending[$n]+x}" ]] || _sqp_seal_fail "SEAL before a FILE record for ${n}"
+          done
+          for n in "${SQUAD_POLICY_SEAL_NAMES[@]}"; do
+            printf '%s' "${pending[$n]}" | base64 -d >"${dir}/.${n}.tmp" 2>/dev/null || \
+              _sqp_seal_fail "could not decode ${n}"
+            chmod 0644 "${dir}/.${n}.tmp" && mv -f "${dir}/.${n}.tmp" "${dir}/${n}" || \
+              _sqp_seal_fail "could not write ${n}"
+          done
+          : >"${dir}/.sealed.tmp" && chmod 0644 "${dir}/.sealed.tmp" && \
+            mv -f "${dir}/.sealed.tmp" "${dir}/sealed" || _sqp_seal_fail "could not write the sealed marker"
+          sealed=1
+          ;;
+        *) _sqp_seal_fail "unexpected record before SEAL" ;;
+      esac
+      continue
+    fi
+    [[ "$verb" == REPORT && "$full" -eq 0 ]] || continue
+    [[ "$rest" =~ ^[A-Za-z0-9+/]*=*$ ]] || continue
+    printf '%s' "$rest" | base64 -d 2>/dev/null | head -c "$((max - size))" >>"$report"
+    chmod 0644 "$report" 2>/dev/null
+    size="$(stat -c '%s' -- "$report" 2>/dev/null || echo "$max")"
+    if [[ "$size" -ge "$max" ]]; then
+      printf '\n[report truncated at %s bytes]\n' "$max" >>"$report"
+      full=1
+    fi
+  done
+  [[ "$sealed" -eq 1 ]] || _sqp_seal_fail "the seal channel closed before SEAL"
+  exit 0
+}
+
+# Called by worker/entrypoint.sh AS ROOT, before the privilege drop. Leaves
+# SQUAD_POLICY_SEAL_FD (write end) and SQUAD_POLICY_SEALED_DIR exported.
+squad_policy_sealer_start() {
+  local base="${1:-/run}" dir
+  [[ "$(id -u)" -eq 0 ]] || return 1
+  dir="$(mktemp -d "${base}/squad-policy.XXXXXXXX")" || return 1
+  chown 0:0 "$dir" && chmod 0711 "$dir" || return 1
+  exec {SQUAD_POLICY_SEAL_FD}> >(squad_policy_sealer_main "$dir" >/dev/null 2>&1)
+  [[ -n "${SQUAD_POLICY_SEAL_FD:-}" ]] || return 1
+  SQUAD_POLICY_SEALED_DIR="$dir"
+  export SQUAD_POLICY_SEAL_FD SQUAD_POLICY_SEALED_DIR
+  return 0
+}
+
+squad_policy_seal_send() {
+  local fd="${SQUAD_POLICY_SEAL_FD:-}"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+  ( trap '' PIPE; printf '%s\n' "$1" >&"$fd" ) 2>/dev/null
+}
+
+# One line per problem; no output means the sealed copies are intact and match
+# this process's in-memory baseline.
+squad_policy_seal_problems() {
+  local dir="${SQUAD_POLICY_SEALED_DIR:-}" i name f got
+  local -a want=("$SQUAD_POLICY_BASELINE_MANIFEST" "$SQUAD_POLICY_MCP_DIGEST" "$SQUAD_POLICY_BASE_COMMIT")
+  [[ -f "${dir}/sealed" ]] || echo "the root-sealed marker ${dir}/sealed is missing"
+  for i in 0 1 2; do
+    name="${SQUAD_POLICY_SEAL_NAMES[$i]}"
+    f="${dir}/${name}"
+    if [[ ! -f "$f" ]]; then
+      echo "the root-sealed ${name} is missing"
+      continue
+    fi
+    [[ "$(stat -c '%u' -- "$f" 2>/dev/null)" == 0 ]] || echo "the root-sealed ${name} is not owned by root"
+    got="$(<"$f")"
+    [[ "$got" == "${want[$i]}" ]] || echo "the root-sealed ${name} does not match the harden-time value"
+  done
+}
+
+# Last step of harden, before any agent exists. Fail closed: a session that
+# was promised a uid boundary (either variable set) and cannot get one aborts.
+squad_policy_seal_commit() {
+  local fd="${SQUAD_POLICY_SEAL_FD:-}" dir="${SQUAD_POLICY_SEALED_DIR:-}"
+  local timeout="${SQUAD_POLICY_SEAL_TIMEOUT_SECONDS:-10}" owner i problems
+  SQUAD_POLICY_SEAL_EXPECTED=0
+  if [[ -z "$fd" && -z "$dir" ]]; then
+    squad_policy_log "No root-sealed state store: this process was not started as root by worker/entrypoint.sh, so there is no uid boundary; governance state relies on the in-memory baseline and tripwires only."
+    return 0
+  fi
+  if [[ ! "$fd" =~ ^[0-9]+$ || -z "$dir" ]]; then
+    squad_policy_abort "The root-sealed state store is half-configured (SQUAD_POLICY_SEAL_FD='${fd}', SQUAD_POLICY_SEALED_DIR='${dir}')."
+  fi
+  if [[ -L "$dir" || ! -d "$dir" ]] || ! owner="$(stat -c '%u' -- "$dir" 2>/dev/null)" || [[ "$owner" != 0 ]]; then
+    squad_policy_abort "The root-sealed state store ${dir} is not a root-owned directory; it is not a uid boundary."
+  fi
+  if [[ -w "$dir" ]]; then
+    squad_policy_abort "The root-sealed state store ${dir} is writable by uid $(id -u); it is not a uid boundary."
+  fi
+  local -a vals=("$SQUAD_POLICY_BASELINE_MANIFEST" "$SQUAD_POLICY_MCP_DIGEST" "$SQUAD_POLICY_BASE_COMMIT")
+  for i in 0 1 2; do
+    squad_policy_seal_send "FILE ${SQUAD_POLICY_SEAL_NAMES[$i]} $(printf '%s\n' "${vals[$i]}" | base64 -w0)" || \
+      squad_policy_abort "Could not hand the governance baseline to the root sealer."
+  done
+  squad_policy_seal_send "SEAL" || squad_policy_abort "Could not hand the governance baseline to the root sealer."
+  for ((i = 0; i < timeout * 10; i++)); do
+    [[ -e "${dir}/sealed" || -e "${dir}/seal-error" ]] && break
+    sleep 0.1
+  done
+  if [[ -e "${dir}/seal-error" ]]; then
+    squad_policy_abort "The root sealer refused the governance baseline: $(head -c 200 "${dir}/seal-error" 2>/dev/null)"
+  fi
+  [[ -e "${dir}/sealed" ]] || squad_policy_abort "The root sealer did not seal the governance baseline within ${timeout}s."
+  problems="$(squad_policy_seal_problems)"
+  if [[ -n "$problems" ]]; then
+    squad_policy_abort "The root-sealed governance baseline does not match this process's (something sealed first): ${problems//$'\n'/; }"
+  fi
+  SQUAD_POLICY_SEAL_EXPECTED=1
+  squad_policy_log "Governance baseline sealed in root-owned ${dir} (uid $(id -u) cannot write, rename or delete it)."
+  return 0
+}
+
+# F7: hands a report block to the root sealer. Non-zero when there is no
+# sealed store (the caller falls back).
+squad_policy_seal_report() {
+  [[ "${SQUAD_POLICY_SEAL_EXPECTED:-0}" == 1 ]] || return 1
+  local f="${SQUAD_POLICY_SEALED_DIR}/reported-changes.md" before now i
+  before="$(stat -c '%s' -- "$f" 2>/dev/null || echo 0)"
+  squad_policy_seal_send "REPORT $(printf '%s\n' "$1" | base64 -w0)" || return 1
+  # The entrypoint usually exits right after this, and with it the container;
+  # give the sealer a moment to land the append first.
+  for ((i = 0; i < 30; i++)); do
+    now="$(stat -c '%s' -- "$f" 2>/dev/null || echo 0)"
+    [[ "$now" != "$before" ]] && return 0
+    sleep 0.1
+  done
+  return 0
+}
+
+# Starts an agent (or anything that will run one) with this shell's private
+# policy descriptors closed: the sampler's read end (stealing its answer is a
+# violation, i.e. a DoS) and the seal channel. MUST run in a child -- a
+# `( ... )` subshell or a background job -- because it execs or exits; it
+# refuses to run in the hardening shell itself.
+squad_policy_exec_agent() {
+  if [[ "$BASHPID" == "$$" || "$BASHPID" == "${SQUAD_POLICY_HARDEN_SHELL_PID:-}" ]]; then
+    squad_policy_abort "squad_policy_exec_agent was called in the hardening shell itself; it must run in a subshell or background job."
+  fi
+  if [[ -n "${SQUAD_POLICY_SAMPLER_FD:-}" ]]; then
+    exec {SQUAD_POLICY_SAMPLER_FD}<&-
+  fi
+  if [[ -n "${SQUAD_POLICY_SEAL_FD:-}" ]]; then
+    exec {SQUAD_POLICY_SEAL_FD}>&-
+  fi
+  unset SQUAD_POLICY_SEAL_FD
+  if declare -F -- "$1" >/dev/null 2>&1; then
+    "$@"
+    exit $?
+  fi
+  exec "$@"
+}
+
+# ---------------------------------------------------------------------------
 # 4b. In-session high-water tracking (F4, F6; re-review N2)
 # ---------------------------------------------------------------------------
 # What end state alone cannot show: an append-only file grown during the
@@ -679,7 +922,7 @@ squad_policy_fingerprints() {
 # and modify-then-revert are caught by the ctime fingerprint (4a) regardless
 # of timing. The only true fix for the residual is kernel-enforced append-only
 # (`chattr +a`, CAP_LINUX_IMMUTABLE before the privilege drop) or inotify --
-# see the trust-boundary note above for why neither is reachable from here.
+# see the trust-boundary note above for why chattr is a documented residual.
 #
 # The sampler is a process substitution, so:
 #   - it inherits the in-memory baseline by fork() and never reads disk state;
@@ -775,13 +1018,16 @@ squad_policy_highwater_sampler_start() {
   SQUAD_POLICY_SAMPLER_COLLECTED=0
   SQUAD_POLICY_SAMPLER_VERDICT=""
   if [[ -n "$SQUAD_POLICY_SAMPLER_FD" ]]; then
-    exec {SQUAD_POLICY_SAMPLER_FD}<&- 2>/dev/null || true
+    exec {SQUAD_POLICY_SAMPLER_FD}<&-
     SQUAD_POLICY_SAMPLER_FD=""
   fi
   squad_policy_highwater_prepare "$repo_dir"
   # shellcheck disable=SC2064
   exec {SQUAD_POLICY_SAMPLER_FD}< <(
     exec </dev/null 2>/dev/null
+    if [[ -n "${SQUAD_POLICY_SEAL_FD:-}" ]]; then
+      exec {SQUAD_POLICY_SEAL_FD}>&-
+    fi
     set +eEu +o pipefail 2>/dev/null
     trap - ERR EXIT RETURN DEBUG
     trap '' TERM INT HUP PIPE
@@ -844,7 +1090,15 @@ squad_policy_highwater_collect() {
     while :; do
       remaining=$((deadline - SECONDS))
       [[ "$remaining" -gt 0 ]] || break
-      IFS= read -r -t "$remaining" -u "$fd" line || break
+      local read_rc=0
+      IFS= read -r -t "$remaining" -u "$fd" line || read_rc=$?
+      if [[ "$read_rc" -ne 0 ]]; then
+        # >128 is a timeout OR a trapped signal interrupting the read (the
+        # entrypoint defers shutdown TERM/INT during the checkpoint, re-review
+        # N5): retry until the deadline instead of reporting a mute sampler.
+        [[ "$read_rc" -gt 128 ]] && continue
+        break
+      fi
       n=$((n + 1))
       [[ "$n" -le 100000 ]] || break
       if [[ "$line" == "END ${nonce}" ]]; then
@@ -870,7 +1124,9 @@ squad_policy_highwater_collect() {
     fi
   fi
   if [[ -n "$fd" ]]; then
-    exec {fd}<&- 2>/dev/null || true
+    # No redirection on this `exec`: `exec {fd}<&- 2>/dev/null` would also
+    # silence this shell's stderr for the rest of the session.
+    exec {fd}<&-
   fi
   SQUAD_POLICY_SAMPLER_FD=""
   if [[ -n "$reason" ]]; then
@@ -1360,6 +1616,11 @@ squad_policy_harden() {
     squad_policy_abort "Could not start the in-session governance sampler."
   fi
   SQUAD_POLICY_BASELINE_TAKEN=1
+  SQUAD_POLICY_HARDEN_SHELL_PID="$BASHPID"
+
+  # Layer 0 (section 4c): hand the baseline to the root sealer, if this
+  # session has one, and confirm it sealed exactly what is in memory.
+  squad_policy_seal_commit
 
   if [[ "${#SQUAD_POLICY_HARDENED_PATHS[@]}" -gt 0 ]]; then
     squad_policy_log "Governance paths locked read-only: ${SQUAD_POLICY_HARDENED_PATHS[*]}"
@@ -1481,6 +1742,14 @@ squad_policy_verify() {
   fi
   if [[ "${SQUAD_POLICY_MCP_CONFIG_SHA256:-}" != "$SQUAD_POLICY_MCP_DIGEST" ]]; then
     tampered+=("SQUAD_POLICY_MCP_CONFIG_SHA256 no longer matches the harden-time .mcp.json digest")
+  fi
+  # Layer 0: the root-sealed copies. Only uid 0 can change them, so a problem
+  # here means the boundary itself failed -- still never "nothing to check".
+  if [[ "$SQUAD_POLICY_SEAL_EXPECTED" == 1 ]]; then
+    local seal_problem
+    while IFS= read -r seal_problem; do
+      [[ -n "$seal_problem" ]] && tampered+=("$seal_problem")
+    done < <(squad_policy_seal_problems)
   fi
   if [[ "${#tampered[@]}" -gt 0 ]]; then
     violated=1

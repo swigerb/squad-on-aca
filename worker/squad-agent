@@ -253,7 +253,7 @@ fi
 #     squad_policy_harden at all -- skips the check.
 mcp_current="absent"
 [[ "$mcp_present" -eq 1 ]] && mcp_current="$mcp_hash"
-if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" || -n "${SQUAD_POLICY_MCP_CONFIG_SHA256:-}" ]]; then
+if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" || -n "${SQUAD_POLICY_MCP_CONFIG_SHA256:-}" || -n "${SQUAD_POLICY_SEALED_DIR:-}" ]]; then
   mcp_baseline="${SQUAD_POLICY_MCP_CONFIG_SHA256:-}"
   if [[ ! "$mcp_baseline" =~ ^([0-9a-f]{64}|absent)$ ]]; then
     squad_agent_abort "This session was hardened but carries no valid .mcp.json baseline (SQUAD_POLICY_MCP_CONFIG_SHA256='${mcp_baseline}'). Missing integrity state is a violation; refusing to run."
@@ -269,6 +269,19 @@ if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" || -n "${SQUAD_POLICY_MCP_CONFIG_SHA256:-
     mcp_tripwire="$(cat "$mcp_baseline_file" 2>/dev/null || true)"
     if [[ "$mcp_tripwire" != "$mcp_baseline" ]]; then
       squad_agent_abort "The .mcp.json baseline tripwire ${mcp_baseline_file} was REWRITTEN during this session (recorded '${mcp_baseline}', file now '${mcp_tripwire}'). Governance policy state was tampered with; refusing to run."
+    fi
+  fi
+  # Re-review N1 (layer 0): when the container started as root, the
+  # harden-time digest was also sealed into a ROOT-OWNED directory the agent's
+  # uid cannot write, rename or delete in (worker/lib/squad-policy.sh section
+  # 4c). It must be sealed and must agree with the environment copy.
+  if [[ -n "${SQUAD_POLICY_SEALED_DIR:-}" ]]; then
+    if [[ ! -f "${SQUAD_POLICY_SEALED_DIR}/sealed" || ! -f "${SQUAD_POLICY_SEALED_DIR}/mcp-config.sha256" ]]; then
+      squad_agent_abort "This session has a root-sealed policy store (${SQUAD_POLICY_SEALED_DIR}) but its .mcp.json baseline is not sealed there. Missing integrity state is a violation; refusing to run."
+    fi
+    mcp_sealed="$(cat "${SQUAD_POLICY_SEALED_DIR}/mcp-config.sha256" 2>/dev/null || true)"
+    if [[ "$mcp_sealed" != "$mcp_baseline" ]]; then
+      squad_agent_abort "The root-sealed .mcp.json baseline ('${mcp_sealed}') does not match this session's ('${mcp_baseline}'); refusing to run."
     fi
   fi
 fi
