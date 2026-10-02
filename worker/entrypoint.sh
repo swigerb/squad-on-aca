@@ -165,6 +165,18 @@ fi
 # shellcheck source=lib/squad-push.sh
 source "$SQUAD_PUSH_LIB"
 
+# Issue #115: forwards SIGTERM/SIGINT from this script to the backgrounded
+# `squad watch`/`squad loop` child so Squad can drain instead of being killed
+# abruptly when ACA stops this replica. See worker/lib/squad-signal-forwarding.sh.
+SQUAD_SIGNAL_FORWARDING_LIB="${SQUAD_SIGNAL_FORWARDING_LIB:-/usr/local/lib/squad-on-aca/squad-signal-forwarding.sh}"
+if [[ ! -f "$SQUAD_SIGNAL_FORWARDING_LIB" ]]; then
+  log "Signal forwarding library not found at ${SQUAD_SIGNAL_FORWARDING_LIB}."
+  log "Without it watch/loop would run as this script's foreground child, which never receives a forwarded SIGTERM, so ACA stopping this replica would kill Squad mid-turn instead of letting it drain. Refusing to start."
+  exit 78
+fi
+# shellcheck source=lib/squad-signal-forwarding.sh
+source "$SQUAD_SIGNAL_FORWARDING_LIB"
+
 # PC-1 (issue #86): the process-isolation probe. Sourced (not executed) so its
 # functions are available to call after the identity drop, below. A missing
 # probe library never blocks a session -- unlike the credential/push libraries
@@ -816,7 +828,11 @@ NODE
       squad_hub_supervise_ambient
       trap squad_hub_release_ambient EXIT
     fi
-    squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
+    # Issue #115: run in the background with SIGTERM/SIGINT forwarded, so ACA
+    # stopping this replica lets Squad drain instead of being killed abruptly
+    # mid-cycle. See squad_run_foreground_with_signal_forwarding above.
+    squad_run_foreground_with_signal_forwarding \
+      squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
     squad_policy_checkpoint
     ;;
   ralph)
@@ -950,13 +966,40 @@ NODE
       squad_hub_supervise_ambient
       trap squad_hub_release_ambient EXIT
     fi
-    squad watch \
+    # Issue #115: Squad 0.13 ships an UNDOCUMENTED `--sentinel-file <path>`
+    # flag (not listed by `squad watch --help`; found by reading
+    # dist/cli/commands/watch/index.js in the published @bradygaster/squad-cli
+    # package). Its semantics are the opposite of the naive reading: `watch`
+    # creates the file itself at startup if it doesn't exist, and a round stops
+    # the run once that file is REMOVED -- not once it is created. It is
+    # checked once at the START of each polling round (detectStopSignal, read
+    # before any work that round), so it is a between-round "don't start the
+    # next cycle" signal, complementary to -- and not a substitute for -- the
+    # SIGTERM forwarding above, which drains an ALREADY in-flight round.
+    #
+    # Wiring `squad-aca watch stop` (scripts/squad-aca.ps1) to delete this file
+    # is NOT implemented: the file lives inside this container's own ephemeral
+    # filesystem (${WORKDIR:-/workspace}/${SESSION_NAME}), and nothing mounts
+    # or exposes that path to a process running outside the container. Reaching
+    # it would require `az containerapp exec` (an Azure call, and one this
+    # container's user has no standing access path for from the local CLI) or
+    # a shared volume mount that does not exist in scripts/deploy.ps1 today.
+    # `squad-aca watch stop` already gets a REAL graceful stop today via the
+    # SIGTERM-forwarding fix above: it runs `az containerapp update --min-replicas 0`
+    # (scripts/start-watch.ps1), which ACA enacts by sending SIGTERM to this
+    # container -- now forwarded to Squad -- so that path does not need the
+    # sentinel file at all.
+    export SQUAD_WATCH_SENTINEL_FILE="${SQUAD_WATCH_SENTINEL_FILE:-${WORKDIR:-/workspace}/${SESSION_NAME}/watch-sentinel}"
+    mkdir -p "$(dirname "$SQUAD_WATCH_SENTINEL_FILE")"
+    squad_run_foreground_with_signal_forwarding \
+      squad watch \
       --execute \
       --interval "${WATCH_INTERVAL_MINUTES:-5}" \
       --timeout "${WATCH_TIMEOUT_MINUTES:-45}" \
       --max-concurrent "${WATCH_MAX_CONCURRENT:-1}" \
       --agent-cmd /usr/local/lib/squad-on-aca/squad-agent \
       --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
+      --sentinel-file "$SQUAD_WATCH_SENTINEL_FILE" \
       --verbose
     squad_policy_checkpoint
     ;;
