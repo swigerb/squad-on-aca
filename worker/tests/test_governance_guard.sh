@@ -185,6 +185,23 @@ harden_out="$(scenario "$REPO" "$STATE" 'squad_policy_harden "'"$REPO"'"; echo "
 assert_contains "$harden_out" "HARDEN_RC=0"                  "hardening succeeds on a well-formed repository"
 assert_contains "$harden_out" "Governance paths locked read-only" "hardening reports which paths it locked"
 
+# Security review of #112/#113 (F9): the harden log must not CLAIM a
+# containing directory stays locked when it does not. `.squad/agents/security`
+# (history.md's parent) sits under the `.squad/agents` GOVERNANCE_PATHS
+# directory entry, so it IS genuinely locked by the `chmod -R a-w` --
+# `.squad/casting` and `.squad/memory` are not GOVERNANCE_PATHS entries
+# themselves, so their containing directories are honestly reported as NOT
+# locked, even though the FILES directly inside them stay append-only/
+# reported-mutable as always.
+assert_contains "$harden_out" "Their containing directories stay locked, so no file can be created or deleted beside them: .squad/agents/security/history.md" \
+  "F9: history.md's parent (.squad/agents/security, nested under .squad/agents) is honestly reported as genuinely locked"
+assert_contains "$harden_out" "Their containing directories do NOT stay locked" \
+  "F9: the harden log distinguishes directories that are NOT genuinely locked"
+assert_contains "$harden_out" ".squad/memory/audit.jsonl" \
+  "F9: audit.jsonl (parent .squad/memory, which is not a GOVERNANCE_PATHS entry) appears in the NOT-locked list"
+assert_contains "$harden_out" ".squad/casting/policy.json" \
+  "F9: casting/policy.json (parent .squad/casting, which is not a GOVERNANCE_PATHS entry) appears in the NOT-locked list"
+
 for f in "${GOVERNANCE_FILES[@]}"; do
   # Overwrite, the way `echo ... > file` from a shell tool would. stderr is
   # discarded because "Permission denied" is the EXPECTED outcome here; the
@@ -304,7 +321,14 @@ assert_eq "reported-mutable"  "$(classify '.squad/casting/registry.json')"     "
 assert_eq "reported-mutable"  "$(classify '.squad/casting/history.json')"      "the resolver classifies casting/history.json as reported-mutable"
 assert_eq "reported-mutable"  "$(classify '.squad/identity/now.md')"           "the resolver classifies identity/now.md as reported-mutable"
 assert_eq "locked"            "$(classify '.squad/identity/mission.md')"      "the resolver keeps the REST of identity/ locked, not just identity.md"
-assert_eq "locked"            "$(classify 'src/some/unknown/path.txt')"       "an unknown, non-governance path classifies as locked (fail closed, not 'uncovered')"
+# Security review of #112/#113 (F5): classify-governance-path used to answer
+# "locked" for ANY path not append-only/reported-mutable, including paths that
+# are not governance paths at all -- actively misleading (it claimed files
+# like .squad/team.md were locked when squad_policy_harden never locks them).
+# The crafted/traversal fail-safe-to-locked property (section 6d below, and
+# squad_policy_classify_path's own tests) is preserved; only a genuine,
+# well-formed, non-governance repo path now answers honestly.
+assert_eq "not-governance"    "$(classify 'src/some/unknown/path.txt')"       "an unknown, well-formed, non-governance path classifies as not-governance (not falsely claimed locked)"
 
 # ---------------------------------------------------------------------------
 # 2. DETECTIVE — a governance change fails the session
@@ -517,6 +541,84 @@ assert_contains "$(cat "${STATE}/governance.sha256" 2>/dev/null)" "file .squad/a
   "the baseline still pins charter.md as immutable"
 
 # ---------------------------------------------------------------------------
+# 2b-ii. Security review of #112/#113 (F4/F6) — high-water-mark exploits
+# ---------------------------------------------------------------------------
+# F4's exact exploit: append (grow past baseline), let a sampler tick observe
+# the grown length, THEN truncate back to precisely the baseline length/hash
+# (or to some intermediate point still above it) before verification runs.
+# `csum == bsum` alone used to make the append-only loop `continue` silently
+# -- indistinguishable from a session that never touched the file. We call
+# squad_policy_highwater_scan directly to stand in for "the background
+# sampler happened to tick" without this suite needing to sleep past
+# SQUAD_POLICY_HIGHWATER_INTERVAL_SECONDS.
+#
+# F6's exploit is the reported-mutable sibling: a change-then-revert to the
+# exact baseline bytes used to be wholly invisible because detector (d) only
+# compares the FINAL state. The sticky `everdiffered` flag set by
+# squad_policy_highwater_scan survives the revert.
+#
+# Both findings share one mechanism (squad_policy_highwater_scan's sticky
+# per-file state), so one VIOLATING repo and one CLEAN repo -- each touching
+# two independent governed files at once -- prove every case below without
+# paying for five separate make_repo/harden/verify round trips.
+echo "-- Security review F4/F6: high-water-mark tracking catches truncation and reports reverts --"
+
+# -- Violating repo: history.md truncated BACK TO EXACTLY its baseline after
+# growing (F4's headline exploit); audit.jsonl grown then PARTIALLY truncated
+# -- still above baseline length, still a valid baseline prefix, so the
+# pre-fix REWRITTEN check (hash-mismatch-only) would have waved both through.
+REPO="${TEST_TMP_ROOT}/repo-f4-f6-violate"; STATE="${TEST_TMP_ROOT}/state-f4-f6-violate"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  printf "## Session 1\nDid the work.\n" >> "'"$REPO"'/.squad/agents/security/history.md"
+  printf "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n" >> "'"$REPO"'/.squad/memory/audit.jsonl"
+  # Stand in for the background sampler ticking while both files are grown.
+  squad_policy_highwater_scan "'"$REPO"'" "'"$STATE"'/governance.sha256" "'"$STATE"'"
+  # history.md: truncate back to EXACTLY the baseline bytes.
+  printf "original .squad/agents/security/history.md\n" > "'"$REPO"'/.squad/agents/security/history.md"
+  # audit.jsonl: keep the baseline prefix, but drop part of what was appended
+  # (partial truncation, still above the original baseline length).
+  printf "original .squad/memory/audit.jsonl\n{\"a\":1}\n" > "'"$REPO"'/.squad/memory/audit.jsonl"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1" \
+  "F4: verify FAILS when append-only files are truncated back below their observed high-water mark"
+assert_contains "$out" "grew to" \
+  "F4: the violation names the high-water mark the file reached before being truncated back"
+assert_contains "$out" "TRUNCATED BACK to its exact baseline length and hash" \
+  "F4: the violation describes the grow-then-revert-to-baseline exploit specifically"
+assert_contains "$out" "TRUNCATED to" \
+  "F4: the violation describes the partial-truncation-below-high-water case"
+
+# -- Clean repo: history.md grows legitimately across two sampler-observed
+# writes (must NOT false-positive); registry.json is rewritten then reverted
+# to its exact baseline bytes (F6: permitted, but must be REPORTED, not
+# silent); policy.json is never touched at all (must stay silent -- the
+# sticky flag must not false-positive on a file nobody changed).
+REPO="${TEST_TMP_ROOT}/repo-f4-f6-clean"; STATE="${TEST_TMP_ROOT}/state-f4-f6-clean"; rm -rf "$STATE"
+make_repo "$REPO" >/dev/null
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'" >/dev/null
+  printf "## Session 1\n" >> "'"$REPO"'/.squad/agents/security/history.md"
+  printf "{\"rewritten\": true}" > "'"$REPO"'/.squad/casting/registry.json"
+  squad_policy_highwater_scan "'"$REPO"'" "'"$STATE"'/governance.sha256" "'"$STATE"'"
+  printf "## Session 2\n" >> "'"$REPO"'/.squad/agents/security/history.md"
+  printf "original .squad/casting/registry.json\n" > "'"$REPO"'/.squad/casting/registry.json"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=0" \
+  "F4/F6: a sampler tick observing legitimate growth and a since-reverted reported-mutable change is not a violation"
+assert_not_contains "$out" "GOVERNANCE VIOLATION" \
+  "F4/F6: neither the growing append-only file nor the reverted reported-mutable file is reported as a violation"
+assert_contains "$out" ".squad/casting/registry.json was modified during this session and reverted to its baseline value before verification." \
+  "F6: the report explicitly names the change-then-revert, so it is not invisible to an operator"
+assert_not_contains "$out" ".squad/casting/policy.json was modified during this session and reverted" \
+  "F6: a reported-mutable file nobody touched is never reported as modified-then-reverted"
+
+# ---------------------------------------------------------------------------
 # 2c. Issue #113 — .squad/memory/audit.jsonl: append-only, rotation impossible
 # ---------------------------------------------------------------------------
 # The chosen design is PREVENTION, not detection: `squad_policy_harden` pins
@@ -689,6 +791,86 @@ assert_not_contains "$out" "GOVERNANCE VIOLATION"         "a clean session repor
 # Write bits are restored afterwards, or teardown and diagnostics break.
 assert_eq "1" "$([[ -w "${REPO}/.squad/config.json" ]] && echo 1 || echo 0)" \
   "verify restores write access when the session is clean"
+
+# ---------------------------------------------------------------------------
+# 2e. Security review of #112/#113 (S1) — a symlinked governance directory
+# ---------------------------------------------------------------------------
+# "Suspected, needs a test": does `squad_policy_write_manifest`'s
+# `find "${dir_targets[@]}" -type f` descend into a governance directory that
+# is itself a SYMLINK, and does `chmod -R a-w` on that same path lock the
+# files it points at? Verified independently against real GNU find/chmod on
+# Linux (WSL Ubuntu) during this fix: `find <symlink-to-dir> -type f` DOES
+# walk into it and list every file beneath it (this is GNU find's documented
+# behaviour for symlinks named directly as command-line operands, which is
+# NOT governed by -P/-H/-L — only symlinks *encountered during the walk* are),
+# and `chmod -R a-w <symlink-to-dir>` DOES recursively strip the write bit
+# from the real target tree. So the manifest the review worried would hold
+# only a bare `dir` line in fact holds a `file`/`append-only` line per file
+# underneath, identically to a real directory — CONCLUSION: handled fully,
+# not a gap; this test proves it rather than leaving it "probably fine".
+echo "-- Security review S1: a symlinked governance directory is fully manifested and locked --"
+
+REPO="${TEST_TMP_ROOT}/repo-s1-symlink"; STATE="${TEST_TMP_ROOT}/state-s1-symlink"
+REAL_AGENTS="${TEST_TMP_ROOT}/s1-real-agents"
+rm -rf "$STATE" "$REAL_AGENTS"
+make_repo "$REPO" >/dev/null
+# Replace the plain .squad/agents directory with a symlink to an identical
+# tree living OUTSIDE .squad, the way a repo that vendors/shares its agent
+# definitions from elsewhere on disk might ship it.
+rm -rf "${REPO}/.squad/agents"
+mkdir -p "${REAL_AGENTS}/security"
+printf 'original .squad/agents/security/charter.md\n' >"${REAL_AGENTS}/security/charter.md"
+printf 'original .squad/agents/security/history.md\n' >"${REAL_AGENTS}/security/history.md"
+ln -s "$REAL_AGENTS" "${REPO}/.squad/agents"
+( cd "$REPO" && git add -A && git commit --quiet -m "agents as a symlink" )
+
+out="$(scenario "$REPO" "$STATE" '
+  squad_policy_harden "'"$REPO"'"
+  echo "HARDEN_RC=$?"
+')"
+assert_contains "$out" "HARDEN_RC=0" "S1: hardening succeeds when a governance directory is a symlink"
+manifest="$(cat "${STATE}/governance.sha256" 2>/dev/null)"
+assert_contains "$manifest" "file .squad/agents/security/charter.md" \
+  "S1: the manifest holds a per-FILE line for charter.md reached THROUGH the symlink, not just a bare 'dir' line"
+assert_contains "$manifest" "append-only .squad/agents/security/history.md" \
+  "S1: history.md reached through the symlink still gets its append-only manifest line"
+
+# Preventive: writing through the symlink must be blocked exactly like a real
+# directory.
+( printf 'TAMPERED\n' >"${REPO}/.squad/agents/security/charter.md" ) 2>/dev/null
+assert_eq "original .squad/agents/security/charter.md" "$(cat "${REPO}/.squad/agents/security/charter.md" 2>/dev/null)" \
+  "S1: a governance file reached through a symlinked directory cannot be overwritten"
+
+# Detective: append-only still applies to history.md through the symlink.
+out="$(scenario "$REPO" "$STATE" '
+  printf "## appended\n" >> "'"$REPO"'/.squad/agents/security/history.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=0" \
+  "S1: appending to history.md through the symlinked directory still passes verification"
+assert_not_contains "$out" "GOVERNANCE VIOLATION" \
+  "S1: the permitted append through the symlink is not reported as a violation"
+
+# Detective: a REWRITE through the symlink (not just an append) is still
+# caught, proving the manifest's per-file hash — not merely the directory lock
+# — is what is doing the work. Reuses the SAME repo/baseline as the append
+# check above (no rebuild): the prior append touched only history.md, so
+# charter.md is still at its hardened baseline, and one more harden+verify
+# round trip is unnecessary -- unlocking the directory and rewriting the file
+# is enough to prove the per-file hash (not merely the directory lock) is
+# what catches it.
+out="$(scenario "$REPO" "$STATE" '
+  chmod -R u+w "'"$REPO"'/.squad/agents"
+  printf "REWRITTEN THROUGH SYMLINK\n" > "'"$REPO"'/.squad/agents/security/charter.md"
+  squad_policy_verify "'"$REPO"'"
+  echo "VERIFY_RC=$?"
+')"
+assert_contains "$out" "VERIFY_RC=1" \
+  "S1: a rewrite of charter.md reached through the symlinked directory is still caught as a violation"
+assert_contains "$out" ".squad/agents/security/charter.md" \
+  "S1: the violation names the file, proving the per-file manifest line (not just the dir lock) is what caught it"
+rm -rf "$REAL_AGENTS"
 
 # ---------------------------------------------------------------------------
 # 3. FAIL CLOSED — an unapplicable policy aborts, it does not proceed

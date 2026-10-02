@@ -241,8 +241,14 @@ squad_policy_resolve() {
   # A resolver that ever emitted a blanket-allow flag would silently undo this
   # whole change, so the caller checks rather than trusts. This is cheap and it
   # is the last line of defence before the flags reach `copilot`.
+  #
+  # Security review of #112/#113 (F2): `--allow-all-urls` is added here too.
+  # `copilot --help` documents `--yolo`/`--allow-all` as both expanding to
+  # `--allow-all-tools --allow-all-paths --allow-all-urls` -- this case used to
+  # catch two of those three expanded flags and miss the third, which is the
+  # URL-exfiltration half of `--yolo`.
   case " $SQUAD_POLICY_FLAGS " in
-    *" --yolo "*|*" --allow-all "*|*" --allow-all-paths "*)
+    *" --yolo "*|*" --allow-all "*|*" --allow-all-paths "*|*" --allow-all-urls "*)
       squad_policy_abort "The resolved flag set contains a blanket-allow flag: ${SQUAD_POLICY_FLAGS}"
       ;;
   esac
@@ -320,6 +326,36 @@ squad_policy_state_dir() {
   esac
 
   printf '%s' "$real_state"
+  return 0
+}
+
+# Security review of #112/#113 (F8). `.mcp.json` is repo-controlled and is
+# deliberately NOT a governance path (it is not in GOVERNANCE_PATHS, not
+# append-only, not reported-mutable -- Squad itself may legitimately need to
+# add an MCP server to it). That means nothing stops an autonomous session
+# from rewriting it mid-loop to point at an attacker-controlled MCP server --
+# and worker/squad-agent, run fresh for every `squad watch`/`squad loop`
+# iteration, would otherwise load whatever is on disk at THAT moment with no
+# check at all. squad_policy_verify cannot close this alone: it runs exactly
+# once, after the whole session's `squad watch`/`loop` process exits, which is
+# too late to stop the NEXT spawn within that same session from already having
+# read a rewritten .mcp.json.
+#
+# This records a SHA-256 baseline (or the literal sentinel `absent` when the
+# file does not exist yet at harden time) into the SAME private state
+# directory the governance baseline lives in -- outside the agent's file-tool
+# reach for the identical reason squad_policy_state_dir gives above. It is
+# written ONCE, at harden time, before the agent ever runs; worker/squad-agent
+# only ever READS it.
+squad_policy_record_mcp_config_baseline() {
+  local repo_dir="$1" state="$2" mcp="${1}/.mcp.json" hash
+  if [[ -f "$mcp" ]]; then
+    hash="$(sha256sum "$mcp" 2>/dev/null | awk '{print $1}')" || return 1
+    [[ -n "$hash" ]] || return 1
+  else
+    hash="absent"
+  fi
+  printf '%s\n' "$hash" > "${state}/mcp-config.sha256" || return 1
   return 0
 }
 
@@ -461,6 +497,295 @@ squad_policy_prefix_sha() {
 
 squad_policy_byte_len() {
   wc -c <"$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+# Security review of #112/#113 (F9). squad_policy_harden's own log used to
+# claim, for EVERY append-only/reported-mutable exception, "Their containing
+# directories stay locked, so no file can be created or deleted beside them."
+# That is true for `.squad/agents/<name>/history.md` (parent `.squad/agents`)
+# and `.squad/identity/now.md` (parent `.squad/identity`) -- both parents are
+# themselves GOVERNANCE_PATHS directory entries, so squad_policy_harden's
+# `chmod -R a-w` genuinely locks them. It is FALSE for
+# `.squad/memory/audit.jsonl` (parent `.squad/memory`) and
+# `.squad/casting/*.json` (parent `.squad/casting`): neither `.squad/memory`
+# nor `.squad/casting` is itself a GOVERNANCE_PATHS entry -- only the
+# individual FILES under them are -- so neither directory is ever passed to
+# `chmod -R a-w`, and a new file beside audit.jsonl or any casting/*.json CAN
+# be freely created or removed.
+#
+# The fix taken here is to CORRECT THE CLAIM rather than lock the two
+# directories: locking them would need a POSIX directory permission bit,
+# which `test_governance_guard.sh` already documents does not hold on Windows
+# (7 pre-existing directory-permission assertions are skipped-as-failing
+# there for exactly this reason) -- adding two more untestable-on-Windows
+# directory locks would only grow that list, not shrink it, and this review
+# round is explicit that no NEW failures of that kind should be introduced.
+# Correctness here is therefore an honest LOG MESSAGE, split by whether the
+# containing directory is actually one of GOVERNANCE_PATHS (or nested under
+# one), checked against the real, already-loaded
+# SQUAD_POLICY_GOVERNANCE_PATHS array -- not a hand-maintained second list
+# that could drift from it.
+squad_policy_parent_dir_is_locked() {
+  local rel="$1" parent="${rel%/*}" p
+  for p in "${SQUAD_POLICY_GOVERNANCE_PATHS[@]:-}"; do
+    [[ -n "$p" ]] || continue
+    if [[ "$parent" == "$p" || "$parent" == "$p"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# 4a. Security review of #112/#113 (F4, F6) -- in-session high-water tracking
+# ---------------------------------------------------------------------------
+# squad_policy_verify runs EXACTLY ONCE per session, after the single
+# `squad watch`/`squad loop` child process exits (worker/entrypoint.sh calls
+# each mode's squad_policy_checkpoint exactly once). A comparison only at that
+# one instant cannot see a path that changed and then changed BACK before
+# verify ran:
+#
+#   F4 (HIGH): an append-only file (.squad/memory/audit.jsonl,
+#   .squad/agents/<name>/history.md) grown during the session and then
+#   TRUNCATED BACK to exactly its baseline length+hash passes both existing
+#   checks in squad_policy_verify's detector (b) -- `csum == bsum` short-
+#   circuits before the prefix/length checks ever run. The commit message for
+#   #112/#113 claimed "truncate refused"; only truncate-to-ZERO (or to any
+#   OTHER length that does not reproduce the baseline hash) was actually
+#   refused.
+#
+#   F6 (MEDIUM): a reported-mutable file (.squad/identity/now.md,
+#   .squad/casting/*.json) modified and then reverted to its baseline hash
+#   before verify is invisible to detector (d) -- `now_sum != bsum` is the
+#   ONLY thing that makes a change visible there, and a revert makes that
+#   comparison come back clean.
+#
+# Both gaps share one root cause (a single end-of-session snapshot cannot see
+# session-internal history) and one fix: record a high-water mark for each
+# path WHILE THE SESSION RUNS, not just at hardening and at verify.
+# squad_policy_highwater_scan (below) is that one sampling pass; it is called:
+#   - once at harden time (seeding maxlen=<baseline length> /
+#     everdiffered=0), by squad_policy_harden;
+#   - periodically, by a background poller squad_policy_highwater_sampler_start
+#     starts (bash sleep loop -- inotify-tools is not in this image, and
+#     worker/Dockerfile is owned by a different reviewer in this round, so no
+#     new system package can be added to get an event-driven alternative);
+#   - once, synchronously, at the START of squad_policy_verify, closing the
+#     race between the sampler's last tick and the comparison.
+#
+# WHERE THE STATE LIVES, AND WHY THAT IS SAFE. The high-water files live under
+# "${SQUAD_POLICY_STATE_DIR}/highwater/", the SAME private (0700), outside-the-
+# checkout directory the governance.sha256 baseline already lives in (see
+# squad_policy_state_dir above). That is the existing, already-reviewed trust
+# boundary this file relies on everywhere else -- dropping `--allow-all-paths`
+# confines the agent's structured file tools to the repository working
+# directory, so SQUAD_POLICY_STATE_DIR is out of their reach the same way
+# governance.sha256 already is. This fix adds no NEW trust assumption; it
+# reuses the one this file already depends on. A monotonic high-water mark
+# (max-of-stored-and-current, never decreased) cannot be "laundered" by an
+# agent that CAN reach it, because there is no operation on this state that
+# moves it backward -- only squad_policy_highwater_scan ever writes it, and it
+# only ever writes max(old, new).
+squad_policy_highwater_dir() {
+  printf '%s/highwater' "$1"
+}
+
+# ONE consolidated state file, "<rel> maxlen" / "<rel> everdiffered" lines,
+# rather than one file per governance path. Governance-relative paths here
+# come ONLY from squad_policy_load_governance_paths / the manifest walk (our
+# own enumeration, never attacker-controlled), so there is nothing unsafe
+# about every path sharing one file; the reason to consolidate is purely
+# performance -- on Windows/MSYS a fork is measured in tens of milliseconds,
+# and a scan that wrote one file PER path needed one `mv` fork per path, on
+# every scan, which is what made the first working version of this function
+# cost roughly (governance-path-count x ~100ms) per call. A single
+# read-everything / write-everything-back pass needs exactly one `mv` no
+# matter how many paths this repository has.
+squad_policy_highwater_state_file() {
+  printf '%s/highwater.state' "$1"
+}
+
+# Loads the consolidated state file (if any) into two caller-provided
+# associative arrays (by nameref), keyed by governance-relative path:
+#   ao_out[rel]=<maxlen bytes>         rp_out[rel]=<0|1 everdiffered>
+# Plain `read` against a direct redirection -- no fork.
+squad_policy_highwater_load() {
+  local state="$1"
+  local -n _ao_out="$2" _rp_out="$3"
+  local f kind rel val
+  f="$(squad_policy_highwater_state_file "$state")"
+  [[ -f "$f" ]] || return 0
+  while read -r kind rel val; do
+    case "$kind" in
+      append-only) _ao_out["$rel"]="$val" ;;
+      reported)    _rp_out["$rel"]="$val" ;;
+      *) : ;;
+    esac
+  done <"$f"
+  return 0
+}
+
+# One sampling pass over every append-only / reported-mutable path named in
+# <baseline>. Write-then-rename (never a direct overwrite) so a concurrent
+# reader -- squad_policy_verify's own synchronous call, racing the background
+# sampler's last tick -- never observes a half-written state file.
+#
+# Batched exactly the way squad_policy_write_manifest_file_lines already
+# batches hashing/length-checking: ONE `wc -c` fork for every append-only
+# target that currently exists, ONE `sha256sum` fork for every
+# reported-mutable target that currently exists, and ONE `mv` for the whole
+# scan (see squad_policy_highwater_state_file's doc) -- not one fork of each
+# per path. This runs on every sampler tick during a real session (where the
+# interval is seconds, so per-tick cost barely matters) AND synchronously,
+# twice, in every test scenario that hardens and verifies (seed at harden,
+# final scan at verify) -- where it does matter, directly against this
+# review round's 120s/suite budget.
+squad_policy_highwater_scan() {
+  local repo_dir="$1" baseline="$2" state="$3"
+  [[ -f "$baseline" ]] || return 0
+  [[ -d "$state" ]] || mkdir -p "$state" 2>/dev/null || return 1
+
+  local -a ao_rel=() ao_bsum=() ao_blen=() ao_abs=()
+  local -a rp_rel=() rp_bsum=() rp_abs=()
+  local kind rel bsum blen
+  # Reading the baseline directly (no `awk` pre-filter fork) and discarding
+  # non-matching `kind` values in bash itself: one fewer process per scan,
+  # same effect, since `dir`/`file`/`absent` lines just fall through `case`.
+  while read -r kind rel bsum blen; do
+    case "$kind" in
+      append-only)
+        ao_rel+=("$rel"); ao_bsum+=("$bsum"); ao_blen+=("$blen"); ao_abs+=("${repo_dir}/${rel}")
+        ;;
+      reported)
+        rp_rel+=("$rel"); rp_bsum+=("$bsum"); rp_abs+=("${repo_dir}/${rel}")
+        ;;
+      *) : ;;
+    esac
+  done <"$baseline"
+
+  local -A ao_hwm=() rp_diff=()
+  squad_policy_highwater_load "$state" ao_hwm rp_diff
+
+  local p i len maxlen csum everdiff
+
+  if [[ "${#ao_rel[@]}" -gt 0 ]]; then
+    local -A curlen=()
+    local -a existing_ao=()
+    for p in "${ao_abs[@]}"; do
+      [[ -f "$p" ]] && existing_ao+=("$p")
+    done
+    if [[ "${#existing_ao[@]}" -gt 0 ]]; then
+      local wc_len rest
+      # Same right-justified-count caveat squad_policy_write_manifest_file_lines
+      # documents: plain word-splitting `read`, not `${line%% *}`.
+      while read -r wc_len rest; do
+        [[ -n "$wc_len" ]] || continue
+        [[ "$rest" == total ]] && continue
+        curlen["$rest"]="$wc_len"
+      done < <(wc -c "${existing_ao[@]}" 2>/dev/null)
+    fi
+    for ((i = 0; i < ${#ao_rel[@]}; i++)); do
+      rel="${ao_rel[$i]}"; blen="${ao_blen[$i]}"
+      len="${curlen[${ao_abs[$i]}]:-0}"
+      maxlen="${ao_hwm[$rel]:-$blen}"
+      [[ -n "$maxlen" ]] || maxlen="$blen"
+      if [[ "$len" -gt "$maxlen" ]]; then
+        maxlen="$len"
+      fi
+      ao_hwm["$rel"]="$maxlen"
+    done
+  fi
+
+  if [[ "${#rp_rel[@]}" -gt 0 ]]; then
+    local -A cursum=()
+    local -a existing_rp=()
+    for p in "${rp_abs[@]}"; do
+      [[ -f "$p" ]] && existing_rp+=("$p")
+    done
+    if [[ "${#existing_rp[@]}" -gt 0 ]]; then
+      local line sum rest
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        sum="${line%% *}"
+        rest="${line#* }"
+        rest="${rest# }"
+        rest="${rest#\*}"
+        cursum["$rest"]="$sum"
+      done < <(sha256sum "${existing_rp[@]}" 2>/dev/null)
+    fi
+    for ((i = 0; i < ${#rp_rel[@]}; i++)); do
+      rel="${rp_rel[$i]}"; bsum="${rp_bsum[$i]}"
+      csum="${cursum[${rp_abs[$i]}]:-}"
+      everdiff="${rp_diff[$rel]:-0}"
+      if [[ "$everdiff" != "1" && "$csum" != "$bsum" ]]; then
+        everdiff=1
+      fi
+      rp_diff["$rel"]="$everdiff"
+    done
+  fi
+
+  local f tmp r
+  f="$(squad_policy_highwater_state_file "$state")"
+  tmp="${f}.tmp"
+  : >"$tmp"
+  {
+    for r in "${!ao_hwm[@]}"; do
+      printf 'append-only %s %s\n' "$r" "${ao_hwm[$r]}"
+    done
+    for r in "${!rp_diff[@]}"; do
+      printf 'reported %s %s\n' "$r" "${rp_diff[$r]}"
+    done
+  } >>"$tmp"
+  mv -f "$tmp" "$f"
+
+  return 0
+}
+
+# Background poller: re-runs squad_policy_highwater_scan every
+# SQUAD_POLICY_HIGHWATER_INTERVAL_SECONDS (default 5; tests override this to
+# something sub-second for determinism and speed) until the private state
+# directory it reads from is gone. That self-check -- not a signal, not a
+# parent-death notification bash cannot portably get without extra tooling --
+# is deliberate: several existing call sites harden a session and never verify
+# it (the governance-guard suite has scenarios like this on purpose, to test
+# the preventive lock in isolation), which would otherwise leak this poller
+# for the life of the test process. Once ${state} is removed (the session's
+# own cleanup, or a test's `rm -rf` of its scratch root), the poller notices
+# on its NEXT tick and exits on its own -- a bounded leak of at most one
+# interval, not a permanent one. `exec </dev/null >/dev/null 2>&1` detaches
+# from whatever stdout/stderr this function was called with, so launching it
+# from inside a `$(...)` command substitution (as every scenario in
+# test_governance_guard.sh does) does not hang waiting for the backgrounded
+# subshell to close an inherited pipe.
+squad_policy_highwater_sampler_start() {
+  local repo_dir="$1" baseline="$2" state="$3"
+  local interval="${SQUAD_POLICY_HIGHWATER_INTERVAL_SECONDS:-5}"
+  (
+    exec </dev/null >/dev/null 2>&1
+    while [[ -d "$state" ]]; do
+      sleep "$interval"
+      [[ -d "$state" ]] || break
+      squad_policy_highwater_scan "$repo_dir" "$baseline" "$state"
+    done
+  ) &
+  printf '%s' "$!" >"${state}/highwater.sampler.pid" 2>/dev/null || true
+  disown "$!" 2>/dev/null || true
+  return 0
+}
+
+# Stops the poller started above (if any) and waits for it, so
+# squad_policy_verify's own final, synchronous squad_policy_highwater_scan
+# call never races a sampler tick still in flight.
+squad_policy_highwater_sampler_stop() {
+  local state="$1" pidfile pid
+  pidfile="${state}/highwater.sampler.pid"
+  [[ -f "$pidfile" ]] || return 0
+  read -r pid <"$pidfile" 2>/dev/null
+  rm -f "$pidfile" 2>/dev/null
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -765,10 +1090,35 @@ squad_policy_harden() {
   state="$(squad_policy_state_dir "$repo_dir")" || \
     squad_policy_abort "Could not create a private policy state directory outside the checkout."
   SQUAD_POLICY_STATE_DIR="$state"
+  # Security review of #112/#113 (F8): exported (not just set in this
+  # process) specifically so worker/squad-agent -- a CHILD process `squad
+  # watch`/`squad loop` spawns fresh for every iteration -- can find this same
+  # private directory and check the .mcp.json baseline recorded below. Before
+  # this, SQUAD_POLICY_STATE_DIR only lived in entrypoint.sh's own shell; a
+  # grandchild process never saw it.
+  export SQUAD_POLICY_STATE_DIR
 
   if ! squad_policy_write_manifest "$repo_dir" "${state}/governance.sha256"; then
     squad_policy_abort "Could not record the governance integrity baseline."
   fi
+
+  if ! squad_policy_record_mcp_config_baseline "$repo_dir" "$state"; then
+    squad_policy_abort "Could not record the .mcp.json integrity baseline."
+  fi
+
+  # Security review of #112/#113 (F4, F6): seed the in-session high-water
+  # state from the baseline we just wrote (maxlen=<baseline length> for every
+  # append-only path, everdiffered=0 for every reported-mutable path), then
+  # start the background sampler that keeps it current for the rest of the
+  # session. Both run in the already-hardened baseline's own private state
+  # directory; see squad_policy_highwater_scan's doc above for why that is
+  # safe. Seeding failure aborts hardening the same way the two baselines
+  # above do; the sampler itself is best-effort (its own doc above covers the
+  # bounded-leak case of a session that hardens and never verifies).
+  if ! squad_policy_highwater_scan "$repo_dir" "${state}/governance.sha256" "$state"; then
+    squad_policy_abort "Could not seed the in-session high-water integrity state."
+  fi
+  squad_policy_highwater_sampler_start "$repo_dir" "${state}/governance.sha256" "$state"
 
   # The commit the session started from. Catches a governance change that the
   # agent COMMITS -- the working tree would look clean, but this does not.
@@ -842,11 +1192,40 @@ squad_policy_harden() {
   fi
   if [[ "${#SQUAD_POLICY_UNLOCKED_FILES[@]}" -gt 0 ]]; then
     squad_policy_log "Append-only exception (work log, not policy; still integrity-checked): ${SQUAD_POLICY_UNLOCKED_FILES[*]}"
-    squad_policy_log "  Their containing directories stay locked, so no file can be created or deleted beside them."
+    # Security review of #112/#113 (F9): split by whether the containing
+    # directory is ACTUALLY a locked governance path, rather than claiming it
+    # for all of them. See squad_policy_parent_dir_is_locked's doc above.
+    local -a ao_dir_locked=() ao_dir_open=() rel
+    for rel in "${SQUAD_POLICY_UNLOCKED_FILES[@]}"; do
+      if squad_policy_parent_dir_is_locked "$rel"; then
+        ao_dir_locked+=("$rel")
+      else
+        ao_dir_open+=("$rel")
+      fi
+    done
+    if [[ "${#ao_dir_locked[@]}" -gt 0 ]]; then
+      squad_policy_log "  Their containing directories stay locked, so no file can be created or deleted beside them: ${ao_dir_locked[*]}"
+    fi
+    if [[ "${#ao_dir_open[@]}" -gt 0 ]]; then
+      squad_policy_log "  Their containing directories do NOT stay locked (not a GOVERNANCE_PATHS directory entry) -- a file CAN be created or deleted beside them, though the files themselves stay append-only: ${ao_dir_open[*]}"
+    fi
   fi
   if [[ "${#SQUAD_POLICY_REPORTED_MUTABLE_FILES[@]}" -gt 0 ]]; then
     squad_policy_log "Reported-mutable exception (Squad 0.13 runtime state; writable this session, changes listed in the governance report and the PR body): ${SQUAD_POLICY_REPORTED_MUTABLE_FILES[*]}"
-    squad_policy_log "  Their containing directories stay locked, so no file can be created or deleted beside them."
+    local -a rm_dir_locked=() rm_dir_open=()
+    for rel in "${SQUAD_POLICY_REPORTED_MUTABLE_FILES[@]}"; do
+      if squad_policy_parent_dir_is_locked "$rel"; then
+        rm_dir_locked+=("$rel")
+      else
+        rm_dir_open+=("$rel")
+      fi
+    done
+    if [[ "${#rm_dir_locked[@]}" -gt 0 ]]; then
+      squad_policy_log "  Their containing directories stay locked, so no file can be created or deleted beside them: ${rm_dir_locked[*]}"
+    fi
+    if [[ "${#rm_dir_open[@]}" -gt 0 ]]; then
+      squad_policy_log "  Their containing directories do NOT stay locked (not a GOVERNANCE_PATHS directory entry) -- a file CAN be created or deleted beside them, though changing the files themselves still only ever REPORTS, never blocks: ${rm_dir_open[*]}"
+    fi
   fi
   squad_policy_log "Governance baseline recorded at ${state}/governance.sha256"
   return 0
@@ -893,6 +1272,15 @@ squad_policy_verify() {
     squad_policy_abort "Could not recompute the governance manifest; this session cannot be verified."
   fi
 
+  # Security review of #112/#113 (F4, F6): stop the background sampler FIRST
+  # (so it cannot write a stale tick after this point), then run ONE final,
+  # synchronous squad_policy_highwater_scan against the manifest we just
+  # recomputed above. That ordering closes the race between "sampler's last
+  # tick" and "the comparisons below" -- the state the (b)/(d) loops read is
+  # never older than the `current` manifest they are read alongside.
+  squad_policy_highwater_sampler_stop "$state"
+  squad_policy_highwater_scan "$repo_dir" "$baseline" "$state" || true
+
   # --- (a) the immutable half -----------------------------------------------
   # Append-only and reported-mutable PATHS are held out of this comparison ON
   # PURPOSE and checked by (b)/(d) instead. This filters by PATH, not by the
@@ -919,7 +1307,14 @@ squad_policy_verify() {
   fi
 
   # --- (b) the append-only half ---------------------------------------------
-  local kind rel bsum blen csum clen now_line
+  # Security review of #112/#113 (F4, F6): load the in-session high-water
+  # state ONCE (not once per path) -- the state file itself is small, but on
+  # Windows/MSYS loading it with a per-path fork rather than one bash `read`
+  # pass is the difference this review round's perf budget cares about.
+  local -A SQUAD_POLICY_HWM_AO=() SQUAD_POLICY_HWM_RP=()
+  squad_policy_highwater_load "$state" SQUAD_POLICY_HWM_AO SQUAD_POLICY_HWM_RP
+
+  local kind rel bsum blen csum clen now_line hwm
   while read -r kind rel bsum blen; do
     [[ "$kind" == "append-only" ]] || continue
     now_line="$(awk -v P="$rel" '$1=="append-only" && $2==P {print $3" "$4; exit}' "$current")"
@@ -930,12 +1325,38 @@ squad_policy_verify() {
     fi
     csum="${now_line%% *}"
     clen="${now_line##* }"
-    [[ "$csum" == "$bsum" ]] && continue
+    # Security review of #112/#113 (F4): the in-session high-water mark for
+    # this path, seeded at harden time and kept current by the background
+    # sampler (squad_policy_highwater_scan). It is NEVER smaller than `blen`
+    # (seeded from it) and is only ever revised upward, so `hwm > blen` is
+    # itself proof that the file grew past baseline length at some point
+    # during the session, independent of whatever length/hash it holds now.
+    hwm="${SQUAD_POLICY_HWM_AO[$rel]:-$blen}"
+    [[ -n "$hwm" ]] || hwm="$blen"
+    if [[ "$csum" == "$bsum" ]]; then
+      if [[ "$hwm" -gt "$blen" ]]; then
+        # THE EXACT F4 EXPLOIT: grow during the session, then truncate back
+        # to precisely the baseline length and hash. `csum == bsum` alone
+        # used to short-circuit this whole loop with a silent `continue` --
+        # looking identical to a session that never touched the file at all.
+        violated=1
+        squad_policy_log "GOVERNANCE VIOLATION: ${rel} grew to ${hwm} bytes during this session and was then TRUNCATED BACK to its exact baseline length and hash (${blen} bytes / ${bsum}). A work log that can be restored to its starting point after growing is not an audit trail."
+      fi
+      continue
+    fi
     if [[ "$clen" -lt "$blen" ]] || [[ "$(squad_policy_prefix_sha "${repo_dir}/${rel}" "$blen")" != "$bsum" ]]; then
       violated=1
       squad_policy_log "GOVERNANCE VIOLATION: ${rel} was REWRITTEN, not appended to. A work log an agent can edit is not an audit trail."
       squad_policy_log "  baseline: ${blen} bytes / ${bsum}"
       squad_policy_log "  now:      ${clen} bytes / ${csum}"
+      continue
+    fi
+    if [[ "$clen" -lt "$hwm" ]]; then
+      # Still a valid baseline-prefix and still longer than the baseline, but
+      # SHORTER than what was observed mid-session: some of what was appended
+      # during the session was removed again before verification.
+      violated=1
+      squad_policy_log "GOVERNANCE VIOLATION: ${rel} grew to ${hwm} bytes during this session and was TRUNCATED to ${clen} bytes before verification. Data appended during the session was removed; a work log may only grow."
       continue
     fi
     appended=$((appended + 1))
@@ -962,7 +1383,7 @@ squad_policy_verify() {
   # squad_policy_reported_changes_report below), rather than silently allowed.
   while read -r kind rel bsum; do
     [[ "$kind" == "reported" ]] || continue
-    local now_sum
+    local now_sum everdiff
     now_sum="$(awk -v P="$rel" '$1=="reported" && $2==P {print $3; exit}' "$current")"
     if [[ -z "$now_sum" ]]; then
       reported_count=$((reported_count + 1))
@@ -974,6 +1395,22 @@ squad_policy_verify() {
       reported_count=$((reported_count + 1))
       SQUAD_POLICY_REPORTED_CHANGES+=("${rel} (modified)")
       squad_policy_log "Reported-mutable change (permitted): ${rel} was modified during this session."
+      continue
+    fi
+    # Security review of #112/#113 (F6): `now_sum == bsum` here means the
+    # FINAL state matches the baseline -- exactly what a change-then-revert
+    # looks like, same as what left this path invisible before. `everdiffered`
+    # is a STICKY flag the background sampler (squad_policy_highwater_scan)
+    # only ever sets to 1, never clears, the first time a mid-session sample
+    # did not match the baseline hash -- so it survives the revert even
+    # though this final comparison no longer can. Reported-mutable changes
+    # are never violations (that is the whole point of the class), so this
+    # still never sets `violated`; it only makes the change VISIBLE.
+    everdiff="${SQUAD_POLICY_HWM_RP[$rel]:-0}"
+    if [[ "$everdiff" == "1" ]]; then
+      reported_count=$((reported_count + 1))
+      SQUAD_POLICY_REPORTED_CHANGES+=("${rel} (modified then reverted)")
+      squad_policy_log "Reported-mutable change (permitted): ${rel} was modified during this session and reverted to its baseline value before verification."
     fi
   done <"$baseline"
 

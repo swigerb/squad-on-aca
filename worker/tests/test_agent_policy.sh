@@ -203,6 +203,18 @@ assert_eq "78" "$(policy_status ralph  ralph    '--add-dir /etc' aca-job flags)"
 assert_eq "78" "$(policy_status ralph  ralph    '--add-dir=/etc' aca-job flags)"             "--add-dir=<path> aborts (the = form is not a different flag)"
 assert_eq "78" "$(policy_status ralph  ralph    '--model gpt-5 --yolo' aca-job flags)"       "--yolo hidden among legitimate extras still aborts"
 
+# Security review of #112/#113 (F2): `--allow-all-urls` is one third of what
+# `--yolo`/`--allow-all` expand to, and was previously missing from
+# FORBIDDEN_EXTRA_FLAGS -- reproducing the reviewer's exact proof that
+# SQUAD_COPILOT_FLAGS='--allow-all-urls --allow-tool shell' landed verbatim in
+# the resolved argv.
+assert_eq "78" "$(policy_status ralph  ralph    '--allow-all-urls' aca-job flags)"           "F2: --allow-all-urls in SQUAD_COPILOT_FLAGS aborts"
+assert_eq "78" "$(policy_status prompt local-cli '--allow-all-urls' aca-job flags)"          "F2: --allow-all-urls aborts for the attended tier too — parity"
+assert_eq "78" "$(policy_status ralph  ralph    '--allow-all-urls --allow-tool shell' aca-job flags)" \
+  "F2: the reviewer's exact reproduction (--allow-all-urls alongside a legitimate --allow-tool) still aborts"
+allowall_urls_rejected="$(policy ralph ralph '--allow-all-urls' aca-job flags)"
+assert_contains "$allowall_urls_rejected" "--allow-all-urls" "F2: the abort message names --allow-all-urls specifically"
+
 rejected="$(policy ralph ralph '--yolo' aca-job flags)"
 assert_contains "$rejected" "--yolo" "the abort message names the flag that was rejected"
 
@@ -340,8 +352,56 @@ assert_eq "locked"           "$(classify_path '.squad/identity/mission.md')" \
   "the REST of identity/ stays locked -- now.md is a narrow carve-out, not a blanket unlock"
 assert_eq "locked"           "$(classify_path '.squad/identity/identity.md')" \
   "identity.md (what/who the team is) stays locked, unlike now.md (what it's focused on)"
-assert_eq "locked"           "$(classify_path 'src/some/unknown/path.txt')" \
-  "an unrecognised, non-governance path classifies as locked -- fail closed, not 'uncovered'"
+# Security review of #112/#113 (F5): this assertion used to read
+# `assert_eq "locked" ... "src/some/unknown/path.txt" ... "fail closed, not
+# 'uncovered'"` -- but 'locked' for an ordinary application path that is not
+# in GOVERNANCE_PATHS at all is not fail-closed, it is DISHONEST: nothing in
+# squad_policy_harden ever locks src/some/unknown/path.txt, so the classifier
+# was claiming a protection that does not exist. The review proved the exact
+# same false-locked answer for `.mcp.json` and `.squad/team.md` (see the F5
+# block below). The correct, honest answer for a real non-governance path is
+# `not-governance`; `locked` is reserved for paths this repo actually write-
+# locks, and `locked` for CRAFTED/traversal input is still asserted below so
+# the fail-safe property this assertion used to (mis)name is not lost, only
+# relocated to where it is actually true.
+assert_eq "not-governance"  "$(classify_path 'src/some/unknown/path.txt')" \
+  "an unrecognised, non-governance path classifies as not-governance -- locked would be a false claim of protection"
+
+# ---------------------------------------------------------------------------
+# 6d. Security review of #112/#113, F5 -- classify-governance-path honesty
+# ---------------------------------------------------------------------------
+# F5: `.mcp.json`, `.squad/team.md`, and `.squad/decisions.md` are real,
+# repo-controlled paths that are NOT in GOVERNANCE_PATHS -- squad_policy_harden
+# never locks them, yet the old classifier answered `locked` for all three.
+# They must now answer `not-governance`, honestly. Crafted/traversal input
+# must still fail safe to `locked`, unconditionally, so the honesty fix does
+# not reopen a hole the prior reviewer round already closed.
+echo "-- classify-governance-path honesty (Issue #112/#113 F5) --"
+for not_governed in '.mcp.json' '.squad/team.md' '.squad/decisions.md' '.squad/ralph-instructions.md'; do
+  assert_eq "not-governance" "$(classify_path "$not_governed")" \
+    "${not_governed} is not a governance path and must not be reported as locked"
+done
+# A real locked path, a real append-only path, and a real reported-mutable
+# path, named explicitly here so F5's fix is proven against all three
+# EXISTING classes in the same block as the new not-governance class.
+assert_eq "locked"           "$(classify_path '.squad/routing.md')" \
+  "a real governance file (routing.md) still classifies locked after the F5 fix"
+assert_eq "append-only"      "$(classify_path '.squad/agents/security/history.md')" \
+  "a real append-only path still classifies append-only after the F5 fix"
+assert_eq "reported-mutable" "$(classify_path '.squad/identity/now.md')" \
+  "a real reported-mutable path still classifies reported-mutable after the F5 fix"
+# Crafted/traversal input: must stay locked (fail safe), never
+# not-governance, even though none of these strings look like a governance
+# path at all -- the point is that this repo cannot safely reason about what
+# a traversal path resolves to, so it must not say "safe" about it.
+for crafted in '../../etc/passwd' '/etc/passwd' '.squad/../mcp.json' './../../x' '.squad/config.json/../../x'; do
+  assert_eq "locked" "$(classify_path "$crafted")" \
+    "crafted/traversal path '${crafted}' must still fail safe to locked, not not-governance"
+done
+# A Windows drive-absolute path is also crafted input relative to a repo-
+# relative contract, and must fail safe the same way.
+assert_eq "locked" "$(policy ralph ralph '' aca-job classify-governance-path 'C:\Windows\win.ini')" \
+  "a drive-absolute path is crafted input and must fail safe to locked"
 
 # ---------------------------------------------------------------------------
 # 7. Determinism

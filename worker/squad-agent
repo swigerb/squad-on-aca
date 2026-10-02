@@ -153,6 +153,28 @@ if (parsed.some((t) => typeof t !== "string")) {
   process.stderr.write("squad-agent: SQUAD_AGENT_POLICY_ARGV_JSON must be an array of strings only.\n");
   process.exit(78);
 }
+// Security review of #112/#113 (F10). The transport below this point is
+// newline-delimited (one argv element per line, read into a bash array with
+// `while IFS= read -r`) because that is what lets a multi-word deny pattern
+// such as "shell(git push)" survive as ONE argv element -- see the header
+// comment above. That same delimiter choice cannot represent an EMPTY argv
+// element (the read loop used to silently drop it) or an element containing
+// its own embedded newline (the read loop used to silently split it into two
+// elements, indistinguishable from two real, separate tokens the resolver
+// never produced). Both are mangling, not transport: the bytes that reach
+// `copilot` argv would not be the bytes agent-policy.js resolved. Reject
+// here, in the one process that still holds the real JSON array (and can
+// still tell an empty/newline-bearing element apart from a boundary), rather
+// than downstream in bash where the two cases are already indistinguishable
+// from legitimate input.
+if (parsed.some((t) => t === "")) {
+  process.stderr.write("squad-agent: SQUAD_AGENT_POLICY_ARGV_JSON contains an empty-string argv element, which the newline-delimited transport to bash cannot represent without being silently dropped. Refusing rather than mangling it.\n");
+  process.exit(78);
+}
+if (parsed.some((t) => t.includes("\n"))) {
+  process.stderr.write("squad-agent: SQUAD_AGENT_POLICY_ARGV_JSON contains an argv element with an embedded newline, which the newline-delimited transport to bash cannot represent without being silently split into extra elements. Refusing rather than mangling it.\n");
+  process.exit(78);
+}
 process.stdout.write(parsed.join("\n"));
 ')"; then
   squad_agent_abort "SQUAD_AGENT_POLICY_ARGV_JSON could not be parsed (see the diagnostic above)."
@@ -162,6 +184,12 @@ fi
 # ONE argv element instead of being re-split on whitespace -- the exact bug
 # `--copilot-flags` has (see agent-policy.js's `squadFlags` comment). Mirrors
 # worker/lib/squad-policy.sh's `squad_policy_resolve` reading of `... argv`.
+# Security review of #112/#113 (F10): the `[[ -n "$token" ]]` guard below is
+# now pure defense in depth -- the node step above already rejects an empty
+# argv element outright, so this can no longer SILENTLY drop one for
+# legitimate input. It stays as a second line of defense rather than being
+# removed, the same reasoning as every other "re-check what upstream should
+# have already enforced" gate in this script.
 POLICY_ARGV=()
 while IFS= read -r token; do
   [[ -n "$token" ]] && POLICY_ARGV+=("$token")
@@ -171,14 +199,55 @@ if [[ "${#POLICY_ARGV[@]}" -eq 0 ]]; then
   squad_agent_abort "SQUAD_AGENT_POLICY_ARGV_JSON parsed to zero usable tokens."
 fi
 
-# `--additional-mcp-config @<repo>/.mcp.json`, WITHOUT `--yolo` -- this is the
-# whole point of issue #112. `<repo>` is the SAME directory
-# worker/entrypoint.sh clones into for every mode ($REPO_DIR), passed in
-# explicitly rather than this script guessing a workspace path from $PWD or
-# $WORKDIR, so there is exactly one place that decides where the repo lives.
+# Security review of #112/#113 (F8 -- TOCTOU half). The previous version of
+# this block used `[[ -f "${REPO_DIR}/.mcp.json" ]]` as a SEPARATE existence
+# test, then built an argv element pointing at the same path for `copilot` to
+# open moments later -- two different operations against the same path, with
+# a window between them. This version does exactly one read of .mcp.json
+# (sha256sum reads the whole file; a missing file is its own well-defined
+# failure rather than a silent "not present" default from a separate stat),
+# and that SAME read is what both the existence decision and the F8 integrity
+# check below are based on.
 MCP_ARGV=()
 REPO_DIR="${SQUAD_AGENT_REPO_DIR:-}"
-if [[ -n "$REPO_DIR" && -f "${REPO_DIR}/.mcp.json" ]]; then
+mcp_present=0
+mcp_hash="absent"
+if [[ -n "$REPO_DIR" ]]; then
+  if hash_out="$(sha256sum "${REPO_DIR}/.mcp.json" 2>/dev/null)" && [[ -n "$hash_out" ]]; then
+    mcp_present=1
+    mcp_hash="${hash_out%% *}"
+  fi
+fi
+
+# Security review of #112/#113 (F8 -- integrity half). `.mcp.json` is
+# repo-controlled and is deliberately NOT a governance path (see
+# worker/lib/squad-policy.sh's squad_policy_record_mcp_config_baseline), so an
+# autonomous session could otherwise rewrite it mid-loop to point at an
+# attacker-controlled MCP server, and THIS script -- run fresh for the very
+# next `squad watch`/`squad loop` iteration -- would load it via
+# `--additional-mcp-config` with no check at all; that is remote code
+# execution via the next spawn's MCP connection. squad_policy_harden records a
+# SHA-256 baseline of .mcp.json (or the sentinel "absent") in
+# SQUAD_POLICY_STATE_DIR at harden time, before the agent ever runs, and now
+# exports that variable so this CHILD process can find it. If a baseline
+# exists and disagrees with what .mcp.json hashes to right now, this refuses
+# to exec copilot at all -- fail closed, same exit code (78) as every other
+# policy failure in this script. A MISSING baseline (an older harden that
+# predates this fix, or a mode that never calls squad_policy_harden at all) is
+# not itself a violation: there is nothing recorded to compare against, so
+# this stays a detector, not a new hard requirement that harden must always
+# run first.
+mcp_baseline_file="${SQUAD_POLICY_STATE_DIR:-}/mcp-config.sha256"
+if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" && -f "$mcp_baseline_file" ]]; then
+  mcp_baseline="$(cat "$mcp_baseline_file" 2>/dev/null)"
+  mcp_current="absent"
+  [[ "$mcp_present" -eq 1 ]] && mcp_current="$mcp_hash"
+  if [[ "$mcp_current" != "$mcp_baseline" ]]; then
+    squad_agent_abort ".mcp.json has changed since this session was hardened (baseline '${mcp_baseline}', now '${mcp_current}'). It may have been rewritten to point at an attacker-controlled MCP server; refusing to load it."
+  fi
+fi
+
+if [[ "$mcp_present" -eq 1 ]]; then
   MCP_ARGV=(--additional-mcp-config "@${REPO_DIR}/.mcp.json")
 fi
 
@@ -197,7 +266,15 @@ fi
 # not a defence, it is an outage. It is NOT exempted from the check against
 # Squad's own trailing arguments below, where nothing legitimate should ever
 # introduce it.
-POLICY_ARGV_FORBIDDEN=(--yolo --allow-all --allow-all-paths --add-dir)
+#
+# Security review of #112/#113 (F2): `--allow-all-urls` is one of the three
+# flags `copilot --help` documents `--yolo`/`--allow-all` as expanding to
+# (`--allow-all-tools --allow-all-paths --allow-all-urls`) and was missing
+# from both lists below -- an unreviewed `SQUAD_COPILOT_FLAGS` could carry it
+# straight through to `copilot` even though the other two expanded flags were
+# already caught. It is added to both gates now, the same as the aliases that
+# expand to it.
+POLICY_ARGV_FORBIDDEN=(--yolo --allow-all --allow-all-paths --allow-all-urls --add-dir)
 for token in "${POLICY_ARGV[@]}"; do
   bare="${token%%=*}"
   for bad in "${POLICY_ARGV_FORBIDDEN[@]}"; do
@@ -207,7 +284,7 @@ for token in "${POLICY_ARGV[@]}"; do
   done
 done
 
-TRAILING_ARGV_FORBIDDEN=(--yolo --allow-all --allow-all-tools --allow-all-paths --add-dir)
+TRAILING_ARGV_FORBIDDEN=(--yolo --allow-all --allow-all-tools --allow-all-paths --allow-all-urls --add-dir)
 for token in "$@"; do
   bare="${token%%=*}"
   for bad in "${TRAILING_ARGV_FORBIDDEN[@]}"; do

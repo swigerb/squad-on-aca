@@ -422,11 +422,24 @@ const AUTONOMOUS_DENY_TOOLS = [
  * not touch policy (model selection, logging, effort), and REJECTED -- session
  * aborts, no blanket allow -- for anything that widens the permission surface.
  * The way to widen policy is to change this file and have the change reviewed.
+ *
+ * Security review of #112/#113 (F2): `--yolo` and `--allow-all` are
+ * documented (verified via `copilot --help` against the pinned CLI) as
+ * BOTH expanding to the exact same three flags: `--allow-all-tools
+ * --allow-all-paths --allow-all-urls`. This list used to carry `--yolo`,
+ * `--allow-all` and `--allow-all-paths` -- two of those three expanded
+ * flags -- but not `--allow-all-urls`, the third. `--allow-all-tools` is
+ * deliberately NOT here: resolvePolicy() always includes it itself (the
+ * CLI requires it for non-interactive mode), so rejecting it from operator
+ * input would refuse every session. The other two expanded flags have no
+ * such justification and must both be rejected, the same as the aliases
+ * that expand to them.
  */
 const FORBIDDEN_EXTRA_FLAGS = [
   '--yolo',
   '--allow-all',
   '--allow-all-paths',
+  '--allow-all-urls',
   '--add-dir',
 ];
 
@@ -604,6 +617,86 @@ function isReportedMutableGovernancePath(relativePath) {
     return false;
   }
   return REPORTED_MUTABLE_GOVERNANCE_PATTERNS.some((pattern) => new RegExp(pattern).test(p));
+}
+
+/**
+ * True when a normalised path is a GOVERNANCE_PATHS entry itself, or sits
+ * inside one of its directory entries. This is the question
+ * `classify-governance-path` (below) actually needs answered before it can
+ * say `locked` -- GOVERNANCE_PATHS is a flat list mixing files
+ * (`.squad/config.json`) and directories (`.squad/agents`); a plain string
+ * prefix check (`p === entry || p.startsWith(entry + '/')`) covers both
+ * shapes without needing to know, ahead of time, which is which.
+ */
+function isGovernancePath(normalizedPath) {
+  return GOVERNANCE_PATHS.some((entry) => normalizedPath === entry || normalizedPath.startsWith(`${entry}/`));
+}
+
+/**
+ * Security review of #112/#113 (F5, fail-safe half). A path this repo cannot
+ * safely reason about as "a plain path inside the checkout" -- absolute,
+ * drive-rooted, or containing a `.`/`..` segment -- must classify `locked`
+ * regardless of whether it also happens to look like a governance path or
+ * not. The alternative (running GOVERNANCE_PATHS prefix matching against an
+ * unnormalised traversal string) could, in principle, answer `not-governance`
+ * for something that traversal actually resolves INTO a governance path, and
+ * fail-open is not an acceptable failure mode for a protection boundary.
+ * `classify-governance-path` historically failed safe this way already (the
+ * prior reviewer round confirmed it); this function names and keeps exactly
+ * that property while F5's fix stops the SAME fail-safe default from also
+ * being returned for ordinary, non-traversal, non-governance paths like
+ * `.mcp.json`.
+ */
+function pathLooksUnsafe(normalizedPath) {
+  if (normalizedPath.startsWith('/')) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(normalizedPath)) {
+    return true;
+  }
+  return normalizedPath.split('/').some((segment) => segment === '' || segment === '.' || segment === '..');
+}
+
+/**
+ * `locked` | `append-only` | `reported-mutable` | `not-governance`.
+ *
+ * Security review of #112/#113 (F5). Before this function existed, the
+ * `classify-governance-path` CLI case defaulted every path that was not
+ * append-only or reported-mutable to `locked` -- including paths that are not
+ * governance paths AT ALL (`.mcp.json`, `.squad/team.md`,
+ * `.squad/decisions.md`, `.squad/ralph-instructions.md`,
+ * `.squad/casting-registry.json` all classified `locked` despite appearing
+ * nowhere in GOVERNANCE_PATHS, so none of them was ever hashed, manifested, or
+ * `chmod a-w`'d). That made the classifier's `locked` answer a false claim of
+ * protection rather than a report of one, which is actively worse than
+ * answering "I don't know" -- an operator (or `scripts/validate.ps1`) asking
+ * "is `.squad/team.md` locked?" got back "yes" for a path
+ * `squad_policy_harden` never touches.
+ *
+ * `locked` now means ONLY "this path is in GOVERNANCE_PATHS (directly, or
+ * inside a directory entry) and is not carved out of the write lock by either
+ * mutable class" -- i.e. it is an honest, checkable claim again. A path that
+ * is not governed at all answers `not-governance`, explicitly, rather than
+ * borrowing the locked class's fail-closed shape. Crafted/traversal input
+ * (see pathLooksUnsafe) still answers `locked`, unconditionally -- the
+ * honesty fix must not reopen the fail-safe behaviour the prior reviewer
+ * round already verified for that case.
+ */
+function classifyGovernancePath(relativePath) {
+  const p = normalizeGovernanceRelPath(relativePath);
+  if (p === '' || pathLooksUnsafe(p)) {
+    return 'locked';
+  }
+  if (isMutableGovernancePath(p)) {
+    return 'append-only';
+  }
+  if (isReportedMutableGovernancePath(p)) {
+    return 'reported-mutable';
+  }
+  if (isGovernancePath(p)) {
+    return 'locked';
+  }
+  return 'not-governance';
 }
 
 const TIER_ATTENDED = 'attended';
@@ -1032,6 +1125,8 @@ module.exports = {
   resolveCredentialProfile,
   isMutableGovernancePath,
   isReportedMutableGovernancePath,
+  isGovernancePath,
+  classifyGovernancePath,
   resolvePolicy,
   resolvePolicyFromEnv,
   buildPolicyMatrix,
@@ -1115,22 +1210,19 @@ function main(argv) {
       process.stdout.write(`${policy.reportedMutableGovernancePatterns.join('\n')}\n`);
       return 0;
     // `classify-governance-path <relative-path>` ->
-    // `append-only` | `reported-mutable` | `locked`.
+    // `append-only` | `reported-mutable` | `locked` | `not-governance`.
     // Exists so a test (and an operator diagnosing a run) can ask the SAME
-    // resolver the shell asks, rather than restating the pattern.
+    // resolver the shell asks, rather than restating the pattern. Security
+    // review of #112/#113 (F5): `not-governance` is a new answer -- see
+    // classifyGovernancePath's doc for why `locked` used to be returned, and
+    // was wrong, for paths outside GOVERNANCE_PATHS entirely.
     case 'classify-governance-path': {
       const target = argv[1];
       if (target === undefined || String(target).trim() === '') {
         process.stderr.write('Usage: agent-policy.js classify-governance-path <repo-relative-path>\n');
         return 78;
       }
-      let cls = 'locked';
-      if (isMutableGovernancePath(target)) {
-        cls = 'append-only';
-      } else if (isReportedMutableGovernancePath(target)) {
-        cls = 'reported-mutable';
-      }
-      process.stdout.write(`${cls}\n`);
+      process.stdout.write(`${classifyGovernancePath(target)}\n`);
       return 0;
     }
     // Issue #113 perf: every field `squad_policy_resolve` /
