@@ -163,10 +163,42 @@ RUN apt-get update \
 # agent-policy.js (required by node) or squad-policy.sh (sourced by
 # entrypoint.sh), so it needs the same CRLF-strip and +x treatment below that
 # every other directly-executed script in this image gets.
-COPY --chown=squad:squad worker/entrypoint.sh /usr/local/bin/squad-on-aca
-COPY --chown=squad:squad worker/squad-agent worker/lib/squad-capability-preflight.sh worker/lib/squad-token-preflight.sh worker/lib/squad-credentials.sh worker/lib/squad-push.sh worker/lib/squad-signal-forwarding.sh worker/lib/squad-git-credential-helper.sh worker/lib/parse-capabilities.js worker/lib/locate-manifest.js worker/lib/resolve-capability-route.js worker/lib/dispatch-decision.js worker/lib/dispatch-lease.js worker/lib/squad-dispatch.js worker/lib/ralph-dispatch.sh worker/lib/git-checkout.sh worker/lib/agent-policy.js worker/lib/squad-policy.sh worker/lib/squad-hub.sh worker/lib/proc-isolation-probe.sh config/sandbox-classes.json /usr/local/lib/squad-on-aca/
+# SECURITY REVIEW F1 (security-review-112-113.md, CRITICAL, REJECTED #112):
+# these two COPY lines used to read `--chown=squad:squad`. That left
+# /usr/local/lib/squad-on-aca/squad-agent OWNED by the exact unprivileged user
+# `squad` that worker/entrypoint.sh drops watch/loop to -- so the agent could
+# overwrite its own `--agent-cmd` leash with no `chmod`/`chown` needed (it
+# already owned the file), and `squad watch`/`squad loop` re-exec that path on
+# EVERY spawn for the life of the container. The path is outside `.squad/`, so
+# no governance manifest, hash, or detector ever sees the rewrite. `squad` is
+# in neither the `root` user nor the `root` group, so chown=root:root alone
+# already drops squad to "other" (no write bit via the chmod pass below); the
+# explicit `chmod -R a-w` after it is belt-and-suspenders so this holds even if
+# a future COPY/RUN edit here accidentally reintroduces an owner- or group-
+# writable file. The thing being protected (`copilot`, installed by
+# `npm install -g` as root, a few RUN steps above) is already root-owned; nothing
+# executed on its behalf may be weaker than that. Every RUN in this Dockerfile
+# runs as root (there is no USER instruction until the runtime drop inside
+# entrypoint.sh), so chown=root:root here, and the root-run sed/chmod pass
+# below, both still work exactly as before -- only the final ownership and
+# writability of what ships changes. worker/tests/test_image_layout.sh asserts
+# chown=root:root on both COPY lines and that the final RUN strips every write
+# bit under both destinations.
+COPY --chown=root:root worker/entrypoint.sh /usr/local/bin/squad-on-aca
+COPY --chown=root:root worker/squad-agent worker/lib/squad-capability-preflight.sh worker/lib/squad-token-preflight.sh worker/lib/squad-credentials.sh worker/lib/squad-push.sh worker/lib/squad-signal-forwarding.sh worker/lib/squad-git-credential-helper.sh worker/lib/parse-capabilities.js worker/lib/locate-manifest.js worker/lib/resolve-capability-route.js worker/lib/dispatch-decision.js worker/lib/dispatch-lease.js worker/lib/squad-dispatch.js worker/lib/ralph-dispatch.sh worker/lib/git-checkout.sh worker/lib/agent-policy.js worker/lib/squad-policy.sh worker/lib/squad-hub.sh worker/lib/proc-isolation-probe.sh config/sandbox-classes.json /usr/local/lib/squad-on-aca/
 RUN sed -i 's/\r$//' /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-agent /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-credentials.sh /usr/local/lib/squad-on-aca/squad-push.sh /usr/local/lib/squad-on-aca/squad-signal-forwarding.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/ralph-dispatch.sh /usr/local/lib/squad-on-aca/git-checkout.sh /usr/local/lib/squad-on-aca/squad-policy.sh /usr/local/lib/squad-on-aca/squad-hub.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh \
-    && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-agent /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh
+    && chmod +x /usr/local/bin/squad-on-aca /usr/local/lib/squad-on-aca/squad-agent /usr/local/lib/squad-on-aca/squad-capability-preflight.sh /usr/local/lib/squad-on-aca/squad-token-preflight.sh /usr/local/lib/squad-on-aca/squad-git-credential-helper.sh /usr/local/lib/squad-on-aca/proc-isolation-probe.sh \
+    # F1 fix, continued: strip every write bit under both destinations, for
+    # EVERY shipped file -- not just the ones chmod +x'd above. This also
+    # covers config/sandbox-classes.json and the node modules (agent-policy.js,
+    # squad-dispatch.js, ...) that are read by `node`/`require()` rather than
+    # exec'd directly: those were equally squad-writable before this fix, and
+    # a review recommendation (lower urgency, since they are consumed once at
+    # container start rather than re-exec'd per agent spawn) asked for the same
+    # treatment. 0555/0444 (whatever chmod +x above left as the base) with the
+    # write bit removed, owned by root: readable and, where applicable,
+    # executable by `squad`, writable by nobody at runtime.
+    && chmod -R a-w /usr/local/lib/squad-on-aca /usr/local/bin/squad-on-aca
 
 # PC-2 (issue #86): this image's default runtime user is intentionally left
 # as root (no trailing USER instruction). worker/entrypoint.sh's own FIRST

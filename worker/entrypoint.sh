@@ -341,6 +341,40 @@ export SQUAD_AGENT_REPO_DIR
 
 SQUAD_WATCH_AGENT_POLICY_MODE="$(node "$SQUAD_POLICY_RESOLVER" watch-agent-policy-mode 2>&1)"
 
+# SECURITY REVIEW F3 (security-review-112-113.md, HIGH, REJECTED #112):
+# `squad_policy_announce squad` used to be called on both the `loop)` and
+# `watch|triage)` branches below. It was removed because its "squad" branch
+# narrates "squad --copilot-flags" specifically -- which does not apply once
+# those two modes are pointed at the --agent-cmd wrapper -- but removing the
+# call also removed the ONLY place the parity gap was ever stated: "NOT
+# enforced on this path: ...". PARITY mode (the default) is deliberate and
+# stays exactly as it is: it keeps today's effective deny set (the same
+# subset `squad --copilot-flags` could ever carry), specifically so a
+# watch/loop agent can still push and open its own PRs the way it does
+# today. What must come back is the ANNOUNCEMENT of which multi-word deny
+# rules (shell(git push), shell(git config), shell(gh auth), ...) are
+# consequently NOT enforced on this path -- an operator reading the log
+# otherwise has no way to tell seven-plus deny rules were dropped from it.
+#
+# Implemented HERE, in entrypoint.sh, rather than by editing
+# squad_policy_announce in worker/lib/squad-policy.sh: that function's
+# existing branches do not know about SQUAD_WATCH_AGENT_POLICY_MODE, and this
+# review's reviewer-protocol lockout keeps this fix scoped to files this
+# agent owns. SQUAD_POLICY_UNDELIVERABLE is already populated above (by
+# squad_policy_resolve's bundle fetch) -- the exact same array
+# squad_policy_announce's "squad" branch itself reads -- so this is a
+# restoration of the old visibility, not a new computation.
+squad_watch_policy_announce_undelivered() {
+  if [[ "$SQUAD_WATCH_AGENT_POLICY_MODE" == "parity" ]]; then
+    if [[ "${#SQUAD_POLICY_UNDELIVERABLE[@]}" -gt 0 ]]; then
+      log "NOT enforced on this path: ${SQUAD_POLICY_UNDELIVERABLE[*]}"
+      log "  Reason: parity mode intentionally keeps the pre-#112 effective deny set (the same subset 'squad --copilot-flags' could ever carry), so a watch/loop agent can still push and open PRs as it does today. These rules are NOT enforced. Set SQUAD_WATCH_STRICT_POLICY=true to enforce them."
+    fi
+  else
+    log "Policy mode: strict -- the full deny set, including multi-word rules, is handed to squad-agent's resolved argv. Nothing is undeliverable on this path."
+  fi
+}
+
 # --- Squad Hub supervision (optional) ----------------------------------------
 # Loaded next to the policy it depends on, and BEFORE any mode runs an agent.
 # Absent library with a hub configured is a refusal, not a downgrade: the whole
@@ -388,6 +422,58 @@ squad_policy_checkpoint() {
   fi
   return 0
 }
+
+# SECURITY REVIEW F7 (security-review-112-113.md, MEDIUM, REJECTED #112):
+# squad_policy_reported_changes_report() (worker/lib/squad-policy.sh) -- the
+# markdown summary of this session's "reported-mutable" governance changes
+# (issue #113: .squad/casting/*.json, .squad/identity/now.md) -- is only ever
+# appended to a PR body, inside commit_and_push_if_needed. The `loop)` and
+# `watch|triage)` branches below call squad_policy_checkpoint (which
+# populates SQUAD_POLICY_REPORTED_CHANGES as a side effect of
+# squad_policy_verify) but never commit_and_push_if_needed: `squad watch`/
+# `squad loop` open their OWN PRs through `gh`, driven entirely by Squad's
+# internal git state, not this container's. So on exactly the two modes #112
+# reworked, a reported-mutable change reaches the container log and nothing
+# durable -- not a PR body, not a branch, not any artefact a reviewer sees
+# once the container exits, on what can be a long-running session.
+#
+# The fix must NOT make watch/loop start pushing or opening PRs themselves --
+# that is a real behaviour change, out of scope here, and would duplicate the
+# PR watch/loop already opens on its own. Instead, the SAME report
+# squad_policy_reported_changes_report() would have put in a PR body is
+# written to a durable file under SQUAD_POLICY_STATE_DIR: a private (0700),
+# per-session directory outside the checkout that squad_policy_state_dir()
+# already creates specifically so the agent's own file tools cannot reach it
+# (see worker/lib/squad-policy.sh, "2. State directory"). That directory
+# already outlives the working tree for the life of this container, which is
+# exactly the durability this needs: appended to (never overwritten) so a
+# long watch/loop session accumulates every reported-mutable change across
+# every checkpoint, and its path is logged so an operator -- or a sidecar
+# that ships $HOME out of the container -- has somewhere concrete to look
+# instead of grepping container logs.
+#
+# squad_policy_reported_changes_report is CALLED here, not edited: it already
+# does exactly the summarising this needs, and it lives in
+# worker/lib/squad-policy.sh, which this fix does not touch.
+squad_watch_governance_report_if_any() {
+  local report
+  report="$(squad_policy_reported_changes_report)"
+  [[ -z "$report" ]] && return 0
+
+  if [[ -z "${SQUAD_POLICY_STATE_DIR:-}" || ! -d "$SQUAD_POLICY_STATE_DIR" ]]; then
+    log "Reported-mutable governance changes occurred this session, but no private policy state directory is available to durably record them. Logging the report inline instead:"
+    log "$report"
+    return 0
+  fi
+
+  local report_file="${SQUAD_POLICY_STATE_DIR}/reported-changes.md"
+  {
+    printf '\n## Checkpoint at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "$report"
+  } >>"$report_file"
+  log "Reported-mutable governance changes this session were appended to ${report_file} (watch/loop does not open its own PR for this -- see F7 in security-review-112-113.md)."
+}
+
 
 # --- Lease heartbeat (Sprint 6, PRD #6) --------------------------------------
 # A session started by any dispatcher carries SQUAD_LEASE_KEY. Report liveness
@@ -820,6 +906,7 @@ NODE
     log "Tier: ${SQUAD_POLICY_TIER} (${SQUAD_POLICY_REASON})"
     log "watch/loop agent-cmd policy mode: ${SQUAD_WATCH_AGENT_POLICY_MODE} (SQUAD_WATCH_STRICT_POLICY=${SQUAD_WATCH_STRICT_POLICY})"
     log "watch/loop agent-cmd argv: ${SQUAD_AGENT_POLICY_ARGV_JSON}"
+    squad_watch_policy_announce_undelivered
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
     # Same shape as watch: the loop belongs to `squad`, so the container
@@ -834,6 +921,7 @@ NODE
     squad_run_foreground_with_signal_forwarding \
       squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
     squad_policy_checkpoint
+    squad_watch_governance_report_if_any
     ;;
   ralph)
     log "Starting scheduled Ralph dispatcher."
@@ -952,10 +1040,12 @@ NODE
     # Issue #112: `--agent-cmd`, NOT `--copilot-flags` -- see the matching
     # comment in the `loop)` branch above for why both would be a double
     # source of truth, and why squad_policy_announce is skipped in favour of
-    # the explicit lines below.
+    # the explicit lines below. F3: squad_watch_policy_announce_undelivered
+    # restores the parity-gap warning squad_policy_announce used to print.
     log "Tier: ${SQUAD_POLICY_TIER} (${SQUAD_POLICY_REASON})"
     log "watch/loop agent-cmd policy mode: ${SQUAD_WATCH_AGENT_POLICY_MODE} (SQUAD_WATCH_STRICT_POLICY=${SQUAD_WATCH_STRICT_POLICY})"
     log "watch/loop agent-cmd argv: ${SQUAD_AGENT_POLICY_ARGV_JSON}"
+    squad_watch_policy_announce_undelivered
     export OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_GRPC_ENDPOINT"
     export COPILOT_OTEL_ENABLED=false
     # `squad watch` owns its own loop and spawns Copilot itself, so there is no
@@ -1002,6 +1092,7 @@ NODE
       --sentinel-file "$SQUAD_WATCH_SENTINEL_FILE" \
       --verbose
     squad_policy_checkpoint
+    squad_watch_governance_report_if_any
     ;;
   shell)
     log "Starting requested shell command."
