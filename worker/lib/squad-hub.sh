@@ -77,6 +77,39 @@ squad_hub_device_id() {
   printf '%s%s' "$SQUAD_HUB_DEVICE_ID_PREFIX" "$unique" | tr '[:upper:]' '[:lower:]'
 }
 
+# Pin the id the squad-hub DAEMON registers under (issue #126).
+#
+# `squad_hub_run` hands the id to `squad-hub oneshot` through
+# SQUAD_HUB_DEVICE_ID, which oneshot reads. The ambient path cannot: it goes
+# through `squad-hub connect`, whose `--name` sets only the DISPLAY name. The
+# daemon `connect` starts registers under its stable `config.deviceId`, and when
+# that is unset squad-hub derives one -- sha1(hostname|user), 16 hex characters
+# that can never begin with "aca-". `connect` validates the token with a probe
+# whose id IS built from the token's prefix, so the probe passes and only the
+# real attach is refused: "this token may not register that device id", on
+# every watch cycle, for as long as the token was prefix-bound.
+#
+# squad-hub keeps `deviceId` across `connect` (it only patches server, token
+# and name), so writing it into squad-hub's own config before connecting is
+# enough. Same file squad-hub reads: SQUAD_HUB_HOME, else ~/.squad-hub.
+squad_hub_seed_device_id() {
+  local home="${SQUAD_HUB_HOME:-${HOME}/.squad-hub}"
+  mkdir -p "$home" || return 1
+  SQUAD_HUB_CONFIG_FILE="${home}/config.json" \
+  SQUAD_HUB_SEED_DEVICE_ID="$(squad_hub_device_id)" \
+  node -e '
+    const fs = require("fs");
+    const file = process.env.SQUAD_HUB_CONFIG_FILE;
+    let cfg = {};
+    try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) {
+      if (e.code !== "ENOENT") { console.error(`unreadable ${file}: ${e.message}`); process.exit(1); }
+    }
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) cfg = {};
+    cfg.deviceId = process.env.SQUAD_HUB_SEED_DEVICE_ID;
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+  '
+}
+
 squad_hub_log() {
   printf '[squad-hub] %s\n' "$*"
 }
@@ -243,6 +276,12 @@ squad_hub_supervise_ambient() {
 
   squad_hub_log "Supervising this container with the hub at ${SQUAD_HUB_URL}."
   squad_hub_log "Attaching as device $(squad_hub_device_id)."
+
+  if ! squad_hub_seed_device_id; then
+    squad_hub_abort \
+      "Could not set the squad-hub device id to $(squad_hub_device_id)." \
+      "Without it the daemon registers under a hex id that an aca- bound token refuses."
+  fi
 
   # `connect`, not `start`. Two reasons, both found by reading the CLI rather
   # than assuming:
