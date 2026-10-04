@@ -29,6 +29,48 @@
       "persistent_name": "docs",
       "universe": "preset:default",
       "status": "active"
+    },
+    "advisor": {
+      "persistent_name": "advisor",
+      "universe": "preset:default",
+      "created_at": "2026-10-04T16:39:43.790Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "engineer": {
+      "persistent_name": "engineer",
+      "universe": "preset:default",
+      "created_at": "2026-10-04T16:39:43.791Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "fact-checker": {
+      "persistent_name": "Fact Checker",
+      "universe": "builtin",
+      "created_at": "2026-10-04T16:39:43.791Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "rai": {
+      "persistent_name": "Rai",
+      "universe": "builtin",
+      "created_at": "2026-10-04T16:39:44.200Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "ralph": {
+      "persistent_name": "Ralph",
+      "universe": "builtin",
+      "created_at": "2026-10-04T16:39:44.200Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    "scribe": {
+      "persistent_name": "Scribe",
+      "universe": "builtin",
+      "created_at": "2026-10-04T16:39:44.200Z",
+      "legacy_named": false,
+      "status": "active"
     }
   }
 }
