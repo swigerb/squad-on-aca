@@ -81,6 +81,7 @@
 #>
 
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here.
+. (Join-Path (Split-Path -Parent $PSScriptRoot) "session-env.ps1")
 
 $script:SandboxProviderId = "sandbox"
 
@@ -2080,7 +2081,7 @@ function New-SandboxWorkerEnvironment {
         SQUAD_GIT_TOKEN_FILE = "$($Context.StateDir)/$($script:SandboxGitTokenFileName)"
     }
     if ($Request.repository.ref) { $vars["GITHUB_REF"] = [string]$Request.repository.ref }
-    if ($prefs.subSquad) { $vars["SQUAD_SUB_SQUAD"] = [string]$prefs.subSquad }
+    if ($prefs.subSquad) { $vars["SQUAD_TEAM"] = [string]$prefs.subSquad }
     if ($Request.task.prompt) { $vars["SQUAD_PROMPT"] = [string]$Request.task.prompt }
 
     # Credentials are DELIBERATELY absent here. An `env NAME=value` assignment in
@@ -2090,7 +2091,7 @@ function New-SandboxWorkerEnvironment {
     # git/`gh` plane is staged by a stdin-fed exec into a umask-077 file that the
     # launch command sources and deletes. Nothing secret belongs in this map --
     # adding a token back here silently re-opens the disclosure.
-    return $vars
+    return (Protect-SquadTextEnvForTransport -EnvVars $vars)
 }
 
 function New-SandboxLaunchCommand {

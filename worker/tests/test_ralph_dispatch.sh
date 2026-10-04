@@ -29,7 +29,7 @@ mkdir -p "$FAKE_BIN"
 cat > "${FAKE_BIN}/az" <<'AZ'
 #!/usr/bin/env bash
 # Fake `az`. Records `containerapp job start` calls and fails when the current
-# --env-vars set contains SESSION_NAME=issue-${AZ_FAIL_ISSUE}-...
+# --env-vars set carries the lease for issue ${AZ_FAIL_ISSUE}.
 if [[ "${1:-}" == "containerapp" && "${2:-}" == "job" && "${3:-}" == "start" ]]; then
   # One fixed marker line per start call; args contain multi-line prompts, so
   # never echo "$*" (it would inflate line counts).
@@ -42,7 +42,7 @@ if [[ "${1:-}" == "containerapp" && "${2:-}" == "job" && "${3:-}" == "start" ]];
   fi
   if [[ -n "${AZ_FAIL_ISSUE:-}" ]]; then
     for arg in "$@"; do
-      if [[ "$arg" == "SESSION_NAME=issue-${AZ_FAIL_ISSUE}-"* ]]; then
+      if [[ "$arg" == "SQUAD_LEASE_KEY=issue-${AZ_FAIL_ISSUE}" ]]; then
         echo "fake az: simulated start failure" >&2
         exit 1
       fi
@@ -139,6 +139,8 @@ assert_eq "1" "$rc" "failed start: dispatch returns non-zero"
 assert_eq "1" "$(grep -c '^start$' "$AZ_START_LOG")" "failed start: az job start was attempted"
 assert_eq "0" "$(grep -c '^11$' "$GH_LABEL_LOG")" "failed start: issue #11 was NOT labeled"
 assert_contains "$out" "failed to start" "failed start: logs the start failure"
+lease_after_failed_start="$(node "$SQUAD_DISPATCH_CLI" list --repository "$GITHUB_REPOSITORY")"
+assert_not_contains "$lease_after_failed_start" '"key":"issue-11"' "failed start: the claimed lease is released immediately"
 
 # ---------------------------------------------------------------------------
 # 3. Malformed template env prevents dispatch entirely: no job start, no label,
@@ -191,7 +193,14 @@ env_out="$(SJ_ENV="$RALPH_SESSION_JOB_ENV_JSON" \
   ralph_build_session_env | tr '\0' '\n')"
 rc=$?
 assert_eq "0" "$rc" "env build: valid env exits 0"
-assert_contains "$env_out" "SESSION_NAME=issue-99-xyz" "env build: fresh SESSION_NAME overlaid"
+assert_not_contains "$env_out" "SESSION_NAME=issue-99-xyz" "env build: raw SESSION_NAME is not sent through the shell transport"
+assert_not_contains "$env_out" "SQUAD_PROMPT=do the thing" "env build: raw prompts are not sent through the shell transport"
+session_b64="$(printf '%s\n' "$env_out" | awk -F= '/^SESSION_NAME_B64=/{sub(/^SESSION_NAME_B64=/, ""); print; exit}')"
+prompt_b64="$(printf '%s\n' "$env_out" | awk -F= '/^SQUAD_PROMPT_B64=/{sub(/^SQUAD_PROMPT_B64=/, ""); print; exit}')"
+decoded_session="$(SQUAD_B64="$session_b64" node -e 'process.stdout.write(Buffer.from(process.env.SQUAD_B64 || "", "base64").toString("utf8"))')"
+decoded_prompt="$(SQUAD_B64="$prompt_b64" node -e 'process.stdout.write(Buffer.from(process.env.SQUAD_B64 || "", "base64").toString("utf8"))')"
+assert_eq "issue-99-xyz" "$decoded_session" "env build: SESSION_NAME_B64 decodes to the original bytes"
+assert_eq "do the thing" "$decoded_prompt" "env build: SQUAD_PROMPT_B64 decodes to the original bytes"
 assert_not_contains "$env_out" "SESSION_NAME=smoke-template" "env build: stale template SESSION_NAME stripped"
 assert_contains "$env_out" "ASPIRE_OTLP_GRPC_ENDPOINT=http://ca-squad-aspire:18889" "env build: non-managed template var carried forward"
 

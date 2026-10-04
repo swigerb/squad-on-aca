@@ -43,8 +43,6 @@ $sessionEnv = [ordered]@{
     "SQUAD_MODE"                 = $Mode
     "SESSION_NAME"               = $SessionName
     "SQUAD_DEPLOYMENT_MODE"      = "squad-per-pod"
-    "SQUAD_POD_ID"               = $SessionName
-    "OTEL_SERVICE_NAME"          = "squad-$SessionName"
     "ENABLE_GITHUB_REMOTE"       = "true"
     "GITHUB_TOKEN"               = "secretref:github-token"
     "COPILOT_GITHUB_TOKEN"       = "secretref:copilot-github-token"
@@ -92,3 +90,6 @@ $startArgs = @(
 if ($NoWait) { $startArgs += "--no-wait" }
 
 az @startArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "az containerapp job start failed with exit code $LASTEXITCODE."
+}

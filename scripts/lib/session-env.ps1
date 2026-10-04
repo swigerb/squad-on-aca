@@ -40,8 +40,10 @@
 $script:SessionManagedEnvKeys = @(
     "GITHUB_REPOSITORY",
     "GITHUB_REF",
+    "GITHUB_REF_B64",
     "SQUAD_MODE",
     "SESSION_NAME",
+    "SESSION_NAME_B64",
     "SQUAD_DEPLOYMENT_MODE",
     "SQUAD_POD_ID",
     "OTEL_SERVICE_NAME",
@@ -50,19 +52,96 @@ $script:SessionManagedEnvKeys = @(
     "COPILOT_GITHUB_TOKEN",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "SQUAD_PROMPT",
+    "SQUAD_PROMPT_B64",
     "SQUAD_TEAM",
+    "SQUAD_TEAM_B64",
     "RUN_COPILOT_SMOKE",
     "PUSH_CHANGES",
     "OUTPUT_BRANCH",
+    "OUTPUT_BRANCH_B64",
     "PR_TITLE",
+    "PR_TITLE_B64",
     "PR_BODY",
+    "PR_BODY_B64",
     "COMMIT_MESSAGE",
+    "COMMIT_MESSAGE_B64",
     "RALPH_LABELS",
     "RALPH_MAX_ISSUES",
     "SQUAD_DISPATCH_ROUTE",
     "SQUAD_DISPATCH_SOURCE",
     "SQUAD_LEASE_KEY"
 )
+
+$script:SessionTransportBase64KeyMap = [ordered]@{
+    "GITHUB_REF"     = "GITHUB_REF_B64"
+    "SESSION_NAME"   = "SESSION_NAME_B64"
+    "SQUAD_PROMPT"   = "SQUAD_PROMPT_B64"
+    "SQUAD_TEAM"     = "SQUAD_TEAM_B64"
+    "OUTPUT_BRANCH"  = "OUTPUT_BRANCH_B64"
+    "PR_TITLE"       = "PR_TITLE_B64"
+    "PR_BODY"        = "PR_BODY_B64"
+    "COMMIT_MESSAGE" = "COMMIT_MESSAGE_B64"
+}
+
+$script:SessionTransportMaxEncodedChars = 16384
+$script:SessionTransportMaxUtf8Bytes = 12288
+
+function Get-SessionTransportMaxEncodedChars {
+    return $script:SessionTransportMaxEncodedChars
+}
+
+function Get-SessionTransportMaxUtf8Bytes {
+    return $script:SessionTransportMaxUtf8Bytes
+}
+
+function Protect-SquadTextEnvForTransport {
+    <#
+    .SYNOPSIS
+        Rewrites free-text env vars to UTF-8/base64 transport-safe companions.
+
+    .DESCRIPTION
+        Windows launches `az` through `az.cmd`, so every `--env-vars NAME=VALUE`
+        token is re-parsed by cmd.exe before Azure CLI sees it. Raw prompts,
+        branch names, session names, and other free-text values therefore lose
+        quotes, expand `%VAR%`, and can truncate the remaining argv on embedded
+        newlines. This helper keeps those values byte-for-byte by sending only a
+        base64 encoding of their UTF-8 bytes (`*_B64`) across shell boundaries.
+
+        The worker decodes these transport vars back onto their legacy names and
+        still accepts the plain names for backward compatibility with older
+        dispatchers.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$EnvVars
+    )
+
+    $protected = [ordered]@{}
+    foreach ($key in $EnvVars.Keys) {
+        $value = [string]$EnvVars[$key]
+        if ($script:SessionTransportBase64KeyMap.Contains($key)) {
+            $utf8 = [System.Text.Encoding]::UTF8.GetBytes($value)
+            if ($utf8.Length -gt $script:SessionTransportMaxUtf8Bytes) {
+                throw ("$key is $($utf8.Length) UTF-8 bytes, which exceeds the safe dispatch limit of " +
+                    "$($script:SessionTransportMaxUtf8Bytes) bytes. Azure Container Apps does not document " +
+                    "a larger per-env-var limit, so squad-on-aca caps free-text values at the documented " +
+                    "16 KiB transport ceiling after base64 expansion (~4/3 overhead). Shorten the value " +
+                    "or move large context into repository files or the GitHub issue.")
+            }
+
+            $encoded = [Convert]::ToBase64String($utf8)
+            if ($encoded.Length -gt $script:SessionTransportMaxEncodedChars) {
+                throw ("$key expands to $($encoded.Length) base64 characters, which exceeds the safe dispatch " +
+                    "limit of $($script:SessionTransportMaxEncodedChars) characters.")
+            }
+
+            $protected[$script:SessionTransportBase64KeyMap[$key]] = $encoded
+        } else {
+            $protected[$key] = $value
+        }
+    }
+
+    return $protected
+}
 
 function Get-JobTemplateEnvVars {
     <#
@@ -120,9 +199,10 @@ function ConvertTo-EnvVarTokens {
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$EnvVars
     )
 
+    $safeEnvVars = Protect-SquadTextEnvForTransport -EnvVars $EnvVars
     $tokens = @()
-    foreach ($key in $EnvVars.Keys) {
-        $tokens += ("{0}={1}" -f $key, $EnvVars[$key])
+    foreach ($key in $safeEnvVars.Keys) {
+        $tokens += ("{0}={1}" -f $key, $safeEnvVars[$key])
     }
     return $tokens
 }

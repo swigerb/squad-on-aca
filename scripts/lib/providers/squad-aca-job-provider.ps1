@@ -384,6 +384,24 @@ function New-AcaJobExecutionHandle {
     })
 }
 
+function Get-AcaExecutionEnvValue {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Env,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $encodedName = "${Name}_B64"
+    if ($Env.ContainsKey($encodedName) -and $Env[$encodedName]) {
+        try {
+            return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$Env[$encodedName]))
+        } catch {
+            return [string]$Env[$Name]
+        }
+    }
+
+    return [string]$Env[$Name]
+}
+
 function ConvertTo-AcaJobExecutionRecord {
     <#
     .SYNOPSIS
@@ -414,10 +432,10 @@ function ConvertTo-AcaJobExecutionRecord {
     $display = [pscustomobject]@{
         Execution = $Name
         Status = $Execution.properties.status
-        Session = $env["SESSION_NAME"]
+        Session = Get-AcaExecutionEnvValue -Env $env -Name "SESSION_NAME"
         Mode = $env["SQUAD_MODE"]
         Repository = $env["GITHUB_REPOSITORY"]
-        Branch = $env["GITHUB_REF"]
+        Branch = Get-AcaExecutionEnvValue -Env $env -Name "GITHUB_REF"
         Started = $Execution.properties.startTime
         Ended = $Execution.properties.endTime
         Route = $env["SQUAD_DISPATCH_ROUTE"]

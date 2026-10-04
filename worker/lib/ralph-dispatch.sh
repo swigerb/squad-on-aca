@@ -36,8 +36,10 @@
 RALPH_MANAGED_ENV_KEYS=(
   GITHUB_REPOSITORY
   GITHUB_REF
+  GITHUB_REF_B64
   SQUAD_MODE
   SESSION_NAME
+  SESSION_NAME_B64
   SQUAD_DEPLOYMENT_MODE
   SQUAD_POD_ID
   OTEL_SERVICE_NAME
@@ -46,13 +48,19 @@ RALPH_MANAGED_ENV_KEYS=(
   COPILOT_GITHUB_TOKEN
   OTEL_EXPORTER_OTLP_HEADERS
   SQUAD_PROMPT
+  SQUAD_PROMPT_B64
   SQUAD_TEAM
+  SQUAD_TEAM_B64
   RUN_COPILOT_SMOKE
   PUSH_CHANGES
   OUTPUT_BRANCH
+  OUTPUT_BRANCH_B64
   PR_TITLE
+  PR_TITLE_B64
   PR_BODY
+  PR_BODY_B64
   COMMIT_MESSAGE
+  COMMIT_MESSAGE_B64
   RALPH_LABELS
   RALPH_MAX_ISSUES
   SQUAD_DISPATCH_ROUTE
@@ -165,6 +173,18 @@ ralph_build_session_env() {
 
   RALPH_MANAGED_JSON="$managed_json" node - <<'NODE'
 const managed = new Set(JSON.parse(process.env.RALPH_MANAGED_JSON || '[]'));
+const transportMap = new Map([
+  ['GITHUB_REF', 'GITHUB_REF_B64'],
+  ['SESSION_NAME', 'SESSION_NAME_B64'],
+  ['SQUAD_PROMPT', 'SQUAD_PROMPT_B64'],
+  ['SQUAD_TEAM', 'SQUAD_TEAM_B64'],
+  ['OUTPUT_BRANCH', 'OUTPUT_BRANCH_B64'],
+  ['PR_TITLE', 'PR_TITLE_B64'],
+  ['PR_BODY', 'PR_BODY_B64'],
+  ['COMMIT_MESSAGE', 'COMMIT_MESSAGE_B64'],
+]);
+const maxUtf8Bytes = 12288;
+const maxEncodedChars = 16384;
 
 let template;
 try {
@@ -198,7 +218,30 @@ if (missing.length) {
 }
 
 const out = [];
-for (const [k, v] of merged) out.push(`${k}=${v}`);
+for (const [k, v] of merged) {
+  if (transportMap.has(k)) {
+    const raw = String(v ?? '');
+    const buf = Buffer.from(raw, 'utf8');
+    if (buf.length > maxUtf8Bytes) {
+      process.stderr.write(
+        `ralph: refusing to dispatch; ${k} is ${buf.length} UTF-8 bytes, exceeding the safe limit ` +
+        `${maxUtf8Bytes} bytes (base64 transport ceiling ${maxEncodedChars} chars).\n`
+      );
+      process.exit(1);
+    }
+    const encoded = buf.toString('base64');
+    if (encoded.length > maxEncodedChars) {
+      process.stderr.write(
+        `ralph: refusing to dispatch; ${k} expands to ${encoded.length} base64 chars, exceeding the safe limit ` +
+        `${maxEncodedChars} chars.\n`
+      );
+      process.exit(1);
+    }
+    out.push(`${transportMap.get(k)}=${encoded}`);
+    continue;
+  }
+  out.push(`${k}=${v}`);
+}
 process.stdout.write(out.join('\0'));
 NODE
 }
@@ -287,9 +330,7 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
        OV_GITHUB_REF="${GITHUB_REF:-${GITHUB_BASE_BRANCH:-main}}" \
        OV_SQUAD_MODE="prompt" \
        OV_SESSION_NAME="$session_name" \
-       OV_SQUAD_POD_ID="$session_name" \
        OV_SQUAD_DEPLOYMENT_MODE="squad-per-pod" \
-       OV_OTEL_SERVICE_NAME="squad-$session_name" \
        OV_ENABLE_GITHUB_REMOTE="true" \
        OV_GITHUB_TOKEN="secretref:github-token" \
        OV_COPILOT_GITHUB_TOKEN="secretref:copilot-github-token" \

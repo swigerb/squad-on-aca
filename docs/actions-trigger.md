@@ -24,7 +24,7 @@ sequenceDiagram
     AAD-->>GA: federated access token<br/>(no stored credential)
     GA->>GH: claim the shared lease<br/>(squad-dispatch.js)
     GH-->>GA: outcome: created / repaired / active
-    GA->>ACA: az containerapp job start<br/>(complete container spec + merged env)
+    GA->>ACA: az containerapp job start<br/>(complete container spec + merged env,<br/>free-text values sent as UTF-8/base64)
     ACA-->>GA: execution name
     GA->>GH: comment the session and execution on the issue
     GA->>GH: label `squad-aca:dispatched`
@@ -42,6 +42,8 @@ sequenceDiagram
 | Decide the route, run the agent, push | Azure Container Apps | The session credential, delivered as an ACA secret |
 
 The workflow starts a job and exits. It does not wait for the session, poll it, or hold the session credential.
+
+Prompts, session names, branch names, team names, and other free-text session values are sent to the worker as base64 of their UTF-8 bytes (`*_B64` env vars). This keeps the GitHub Actions path byte-safe and avoids `az.cmd`/`cmd.exe` re-parsing on Windows in the local CLI path.
 
 ## GitHub OIDC Subject Format
 
@@ -224,7 +226,7 @@ Ralph and Actions can see the same issue. Two mechanisms prevent duplicate sessi
 | Window | Mechanism |
 |---|---|
 | Concurrent dispatch | The shared lease. The workflow runs `squad-dispatch.js decide --dispatch-source actions` and claims the lease before requesting compute. Losing the race stands the trigger down. |
-| Sequential dispatch | The `squad-aca:dispatched` label is applied only after a confirmed start. |
+| Sequential dispatch | The `squad-aca:dispatched` label is applied only after a confirmed start, and a failed `job start` immediately releases the claimed lease for retry. |
 
 `actions` is a first-class value in `DISPATCH_SOURCES`.
 

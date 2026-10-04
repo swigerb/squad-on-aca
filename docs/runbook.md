@@ -35,6 +35,10 @@ OTEL_SERVICE_NAME=squad-<session name>
 
 Dispatch uses a per-execution `az containerapp job start --env-vars` override. It reads the template, strips session-managed keys, overlays fresh session values, and passes a complete execution container spec with image, CPU, and memory.
 
+Free-text session values are transported as UTF-8/base64 companion variables (`*_B64`) before they cross a shell boundary. This avoids `az.cmd` on Windows re-parsing prompts, branch names, session names, and team names before Azure CLI sees them. The worker decodes the `*_B64` values back onto their legacy names and still accepts the plain names for backward compatibility.
+
+Because Azure Container Apps does not document a larger per-environment-variable value limit, squad-on-aca enforces a conservative safe ceiling of **16,384 base64 characters**, which is **12,288 UTF-8 bytes before base64 expansion**. For ASCII prompts that is 12,288 characters; for non-ASCII text it is fewer characters because UTF-8 uses multiple bytes. Oversize prompts fail fast in the dispatcher with an actionable error instead of reaching Azure and failing later.
+
 Session size comes from the job template, so `deploy.ps1 -SessionCpu` sets it for every dispatcher. The default is 2 vCPU / 4 GiB, enough for a Squad fan-out of several Copilot CLI agents. Memory is derived as 2x CPU (the ACA Consumption ratio); re-running `deploy.ps1` applies a new size to an existing job.
 
 ```powershell
@@ -288,8 +292,10 @@ by hand.
 | Variable | Purpose |
 |---|---|
 | `SQUAD_MODE` | `prompt`, `new-project`, `loop`, `watch`, `triage`, `shell`, `smoke`, `telemetry-smoke`, or `ralph`. |
-| `SQUAD_PROMPT` | What the session should do. Required by `prompt`. |
-| `SESSION_NAME` | Names the run in logs and in the hub. |
+| `SQUAD_PROMPT_B64` | Preferred transport for the prompt. Base64 of the prompt's UTF-8 bytes. Required for new dispatchers in `prompt` mode. |
+| `SQUAD_PROMPT` | Legacy/back-compat prompt variable. Still accepted by the worker, but new dispatchers send `SQUAD_PROMPT_B64` instead. |
+| `SESSION_NAME_B64` / `GITHUB_REF_B64` / `SQUAD_TEAM_B64` / `OUTPUT_BRANCH_B64` | Preferred transport for other free-text values that must survive shell boundaries byte-for-byte. |
+| `SESSION_NAME` | Names the run in logs and in the hub after decode. |
 | `SQUAD_POD_ID` | Identifies the pod for SubSquad routing. |
 | `GITHUB_REPOSITORY` | The `owner/repo` the session works in. |
 | `SQUAD_DISPATCH_SOURCE` | Who started the run: `local-cli`, `ralph`, or `actions`. Feeds the tool policy. |
@@ -299,6 +305,8 @@ by hand.
 | `AZURE_RESOURCE_GROUP`, `AZURE_CLIENT_ID`, `ACA_SESSION_JOB_NAME` | Used by `ralph` to start session jobs. |
 | `RALPH_LABELS` | Issue labels Ralph dispatches. Default `squad-aca`. |
 | `RALPH_MAX_ISSUES` | Issues per Ralph run. Default `3`. |
+
+`SQUAD_PROMPT_B64` and the other `*_B64` variables are capped at **12,288 UTF-8 bytes before encoding** (16,384 base64 characters after encoding).
 
 Developer flow:
 
@@ -821,4 +829,3 @@ Full detail: [actions-trigger.md](actions-trigger.md#who-may-trigger-a-run).
 - OTLP auth modes are `BrowserToken` for UI and `ApiKey` for OTLP. OTLP ports stay internal to the ACA environment.
 - `squad-aca sync --sync-all` blocks obvious secret files and inline tokens before staging. Override only for known-private repos with `SQUAD_ACA_ALLOW_UNSAFE_SYNC=1`.
 - Run `scripts/validate.ps1` before pushing.
-

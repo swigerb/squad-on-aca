@@ -96,7 +96,6 @@ export GH_CONFIG_DIR="${GH_CONFIG_DIR:-$HOME/.config/gh}"
 export ASPIRE_OTLP_GRPC_ENDPOINT="${ASPIRE_OTLP_GRPC_ENDPOINT:-http://ca-squad-aspire:18889}"
 export ASPIRE_OTLP_HTTP_ENDPOINT="${ASPIRE_OTLP_HTTP_ENDPOINT:-http://ca-squad-aspire:18890}"
 export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-$ASPIRE_OTLP_GRPC_ENDPOINT}"
-export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-squad-$(sanitize_name "${SESSION_NAME:-remote}")}"
 export COPILOT_OTEL_ENABLED="${COPILOT_OTEL_ENABLED:-false}"
 export OTEL_METRIC_EXPORT_INTERVAL_MILLIS="${OTEL_METRIC_EXPORT_INTERVAL_MILLIS:-5000}"
 
@@ -129,11 +128,29 @@ elif [[ -n "${GH_TOKEN:-}" ]]; then
 fi
 export SQUAD_COPILOT_TOKEN_PROVENANCE
 
+SQUAD_SESSION_ENV_TRANSPORT_LIB="${SQUAD_SESSION_ENV_TRANSPORT_LIB:-/usr/local/lib/squad-on-aca/session-env-transport.sh}"
+if [[ ! -f "$SQUAD_SESSION_ENV_TRANSPORT_LIB" ]]; then
+  log "Session env transport library not found at ${SQUAD_SESSION_ENV_TRANSPORT_LIB}."
+  log "Without it the worker cannot decode the shell-safe base64 session env transport. Refusing to start."
+  exit 78
+fi
+# shellcheck source=lib/session-env-transport.sh
+source "$SQUAD_SESSION_ENV_TRANSPORT_LIB"
+
+for encoded_var in SESSION_NAME_B64 GITHUB_REF_B64 SQUAD_PROMPT_B64 SQUAD_TEAM_B64 OUTPUT_BRANCH_B64 PR_TITLE_B64 PR_BODY_B64 COMMIT_MESSAGE_B64; do
+  plain_var="${encoded_var%_B64}"
+  if ! squad_decode_b64_env "$encoded_var" "$plain_var"; then
+    log "Invalid base64 transport value in ${encoded_var}."
+    exit 64
+  fi
+done
+
 require GITHUB_REPOSITORY
 
 SESSION_NAME="$(sanitize_name "${SESSION_NAME:-$(date +%Y%m%d-%H%M%S)}")"
 SQUAD_POD_ID="$(sanitize_name "${SQUAD_POD_ID:-${CONTAINER_APP_JOB_EXECUTION_NAME:-${CONTAINER_APP_REPLICA_NAME:-$SESSION_NAME}}}")"
 export SQUAD_DEPLOYMENT_MODE="${SQUAD_DEPLOYMENT_MODE:-squad-per-pod}"
+export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-squad-$SESSION_NAME}"
 export SQUAD_POD_ID
 REPO_DIR="${WORKDIR:-/workspace}/${SESSION_NAME}/repo"
 mkdir -p "$(dirname "$REPO_DIR")"

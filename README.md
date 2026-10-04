@@ -129,6 +129,8 @@ Before dispatching, `squad-aca`:
 
 If ACA has not been deployed or configured, it stops with a deploy/configure message.
 
+Free-text dispatch values (prompt, session name, branch, team, output branch) are transported as UTF-8/base64 `*_B64` environment variables so Windows `az.cmd` cannot strip quotes, truncate on newlines, or expand `%VAR%` before Azure CLI sees them. The dispatcher caps these values at 12,288 UTF-8 bytes (16,384 base64 characters) and fails fast when they are larger.
+
 To point the command at an existing ACA deployment:
 
 ```powershell
@@ -386,4 +388,3 @@ Both implement the same Squad agent model and team structure. To learn more abou
 ## License
 
 MIT. See [LICENSE](LICENSE).
-

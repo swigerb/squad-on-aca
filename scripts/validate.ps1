@@ -119,12 +119,14 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\squad-agent"),
     (Join-Path $RepoRoot "worker\lib\squad-capability-preflight.sh"),
     (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh"),
+    (Join-Path $RepoRoot "worker\lib\session-env-transport.sh"),
     (Join-Path $RepoRoot "worker\lib\git-checkout.sh"),
     (Join-Path $RepoRoot "worker\lib\squad-policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_agent_policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh"),
     (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh"),
     (Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_session_env_transport.sh"),
     (Join-Path $RepoRoot "worker\tests\test_squad_agent_wrapper.sh")
 )
 if ($SkipBash) {
@@ -3261,6 +3263,140 @@ if (-not (Test-Path $harness)) {
         }
     } catch {
         Add-Fail "CLI behaviour regression checks threw: $($_.Exception.Message)"
+    } finally {
+        if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 9a. Safe free-text dispatch transport (issue #129)
+# ---------------------------------------------------------------------------
+Write-Section "Safe free-text dispatch transport"
+$sessionEnvLib = Join-Path $RepoRoot "scripts\lib\session-env.ps1"
+if (-not (Test-Path $sessionEnvLib)) {
+    Add-Fail "scripts/lib/session-env.ps1 is missing (safe free-text transport cannot be verified)"
+} else {
+    . $sessionEnvLib
+    try {
+        $transportCases = @(
+            @{ Name = "double quotes"; Value = 'He said "ship it"' }
+            @{ Name = "newlines"; Value = "first line`nsecond line" }
+            @{ Name = "percent tokens"; Value = "%PATH% %GITHUB_TOKEN%" }
+            @{ Name = "shell metacharacters"; Value = '&|^!<>' }
+            @{ Name = "backslashes"; Value = 'C:\repo\path\branch' }
+            @{ Name = "non-ASCII"; Value = "café 東京" }
+        )
+        $transportFailures = @()
+        foreach ($case in $transportCases) {
+            $envMap = [ordered]@{
+                SQUAD_PROMPT  = [string]$case.Value
+                SESSION_NAME  = "session-$($case.Name)"
+                GITHUB_REF    = "feature/$($case.Value)"
+                SQUAD_TEAM    = "team-$($case.Value)"
+                OUTPUT_BRANCH = "squad/$($case.Value)"
+            }
+            $safeMap = Protect-SquadTextEnvForTransport -EnvVars $envMap
+            foreach ($pair in @(
+                @{ Plain = "SQUAD_PROMPT"; Encoded = "SQUAD_PROMPT_B64"; Expected = [string]$case.Value }
+                @{ Plain = "SESSION_NAME"; Encoded = "SESSION_NAME_B64"; Expected = "session-$($case.Name)" }
+                @{ Plain = "GITHUB_REF"; Encoded = "GITHUB_REF_B64"; Expected = "feature/$($case.Value)" }
+                @{ Plain = "SQUAD_TEAM"; Encoded = "SQUAD_TEAM_B64"; Expected = "team-$($case.Value)" }
+                @{ Plain = "OUTPUT_BRANCH"; Encoded = "OUTPUT_BRANCH_B64"; Expected = "squad/$($case.Value)" }
+            )) {
+                if ($safeMap.Contains($pair.Plain)) {
+                    $transportFailures += "$($case.Name): raw key '$($pair.Plain)' survived transport protection"
+                    continue
+                }
+                if (-not $safeMap.Contains($pair.Encoded)) {
+                    $transportFailures += "$($case.Name): encoded key '$($pair.Encoded)' missing"
+                    continue
+                }
+                $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$safeMap[$pair.Encoded]))
+                if ($decoded -cne $pair.Expected) {
+                    $transportFailures += "$($case.Name): $($pair.Encoded) did not round-trip exactly"
+                }
+            }
+        }
+        if ($transportFailures.Count -eq 0) {
+            Add-Pass "Free-text session values are base64-transported and round-trip exactly for quotes, newlines, percent tokens, shell metacharacters, backslashes, and non-ASCII text"
+        } else {
+            Add-Fail "Free-text session transport changed: $($transportFailures -join '; ')"
+        }
+
+        $tooLarge = "a" * ((Get-SessionTransportMaxUtf8Bytes) + 1)
+        $threw = $false
+        $message = ""
+        try {
+            Protect-SquadTextEnvForTransport -EnvVars ([ordered]@{ SQUAD_PROMPT = $tooLarge }) | Out-Null
+        } catch {
+            $threw = $true
+            $message = [string]$_.Exception.Message
+        }
+        if ($threw -and $message -match [regex]::Escape([string](Get-SessionTransportMaxUtf8Bytes))) {
+            Add-Pass "Oversize prompts fail fast with the documented UTF-8 byte limit instead of reaching Azure and failing later"
+        } else {
+            Add-Fail "Oversize prompt protection changed (threw=$threw, message='$message')"
+        }
+    } catch {
+        Add-Fail "Free-text transport checks threw: $($_.Exception.Message)"
+    }
+}
+
+# Runtime: the real Windows .cmd shim that used to expand %VAR% or drop later
+# --env-vars tokens must now see only base64 transport values.
+if (-not $IsWindowsHost) {
+    Write-Host "  [SKIP] Windows cmd.exe free-text transport regression checks require Windows (.cmd stub)" -ForegroundColor Yellow
+} elseif ((Test-Path $harness) -and (Test-Path $cliScript)) {
+    . $harness
+    $stub = $null
+    try {
+        $stub = New-SquadCliStubEnvironment
+        Initialize-SquadCliStubRepository -Stub $stub | Out-Null
+
+        $windowsPromptCases = @(
+            @{ Name = "quotes"; Value = 'He said "ship it"'; Session = "safe-quotes" }
+            @{ Name = "newlines"; Value = "first line`nsecond line"; Session = "safe-newlines" }
+            @{ Name = "percent"; Value = "%PATH% %GITHUB_TOKEN%"; Session = "safe-percent" }
+            @{ Name = "metacharacters"; Value = '&|^!<>'; Session = "safe-meta" }
+            @{ Name = "backslashes"; Value = 'C:\repo\path\branch'; Session = "safe-slashes" }
+            @{ Name = "non-ASCII"; Value = "café 東京"; Session = "safe-unicode" }
+        )
+        $cmdFailures = @()
+        foreach ($case in $windowsPromptCases) {
+            Reset-SquadCliStubLog -Stub $stub
+            $run = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", $case.Session, [string]$case.Value)
+            $startCall = @($run.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+            if ($run.ExitCode -ne 0 -or $startCall.Count -ne 1) {
+                $cmdFailures += "$($case.Name): run exit/start mismatch (exit=$($run.ExitCode), starts=$($startCall.Count))"
+                continue
+            }
+            $line = $startCall[0]
+            if ($line -notmatch 'SQUAD_PROMPT_B64=' -or $line -notmatch 'SESSION_NAME_B64=' -or $line -notmatch 'GITHUB_REF_B64=') {
+                $cmdFailures += "$($case.Name): start call did not use base64 transport keys"
+                continue
+            }
+            if ($line -match [regex]::Escape([string]$case.Value) -or $line -match '%PATH%' -or $line -match '%GITHUB_TOKEN%') {
+                $cmdFailures += "$($case.Name): raw prompt text reached az.cmd"
+            }
+        }
+        if ($cmdFailures.Count -eq 0) {
+            Add-Pass "A real az.cmd shim now receives only base64 transport values for the prompt classes that previously triggered quote stripping, newline truncation, and %VAR% expansion"
+        } else {
+            Add-Fail "Windows cmd.exe transport regression: $($cmdFailures -join '; ')"
+        }
+
+        Reset-SquadCliStubLog -Stub $stub
+        $failedStart = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript `
+            -CliArguments @("run", "--repo", "octo/demo", "--name", "safe-start-fail", "failure path %GITHUB_TOKEN%") `
+            -StartExitCode 5
+        $callLog = if (Test-Path $stub.CallLog) { Get-Content -LiteralPath $stub.CallLog -Raw } else { "" }
+        if ($failedStart.ExitCode -eq 1 -and $callLog -match 'gh lease-delete session-safe-start-fail\.json') {
+            Add-Pass "A failed local CLI job start exits non-zero and releases its claimed lease immediately"
+        } else {
+            Add-Fail "Failed local CLI start no longer releases its lease immediately (exit=$($failedStart.ExitCode), calls=$($callLog -replace "`r?`n", ' | '))"
+        }
+    } catch {
+        Add-Fail "Windows cmd.exe free-text transport checks threw: $($_.Exception.Message)"
     } finally {
         if ($stub) { Remove-SquadCliStubEnvironment -Stub $stub }
     }

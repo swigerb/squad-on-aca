@@ -240,9 +240,7 @@ jobs:
             OV_GITHUB_REF="${BASE_REF}" \
             OV_SQUAD_MODE="prompt" \
             OV_SESSION_NAME="$SESSION" \
-            OV_SQUAD_POD_ID="$SESSION" \
             OV_SQUAD_DEPLOYMENT_MODE="squad-per-pod" \
-            OV_OTEL_SERVICE_NAME="squad-${SESSION}" \
             OV_ENABLE_GITHUB_REMOTE="true" \
             OV_GITHUB_TOKEN="secretref:github-token" \
             OV_COPILOT_GITHUB_TOKEN="secretref:copilot-github-token" \
@@ -280,6 +278,17 @@ jobs:
           echo "exec=${exec_name}" >>"$GITHUB_OUTPUT"
           echo "Started ACA execution: ${exec_name}"
           echo "The control plane is now Azure. This workflow's job is done."
+
+      - name: Release the lease if start failed
+        if: failure() && steps.lease.outputs.action == 'start'
+        env:
+          LEASE_KEY: ${{ steps.lease.outputs.leaseKey }}
+        run: |
+          set -euo pipefail
+          node worker/lib/squad-dispatch.js release \
+            --repository "${GITHUB_REPOSITORY}" \
+            --lease-key "${LEASE_KEY}" \
+            --reason "actions-start-failed"
 
       - name: Mark the issue as dispatched
         if: steps.lease.outputs.action == 'start' && steps.start.outputs.exec != ''

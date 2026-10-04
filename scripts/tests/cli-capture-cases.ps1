@@ -82,6 +82,13 @@ $Cases = @(
     # of this committed golden directly, so regenerating the goldens cannot
     # quietly bless a downgrade.
     @{ Id = "27-doctor-drift";    Args = @("doctor"); Drift = $true }
+    # --- Free-text prompt transport (issue #129) -----------------------------
+    @{ Id = "28-run-prompt-quotes"; Args = @("run", 'He said "ship it"', "--name", "fixedquotes"); NeedsRepo = $true; Display = 'run <quoted prompt> --name fixedquotes' }
+    @{ Id = "29-run-prompt-newlines"; Args = @("run", "line 1`nline 2", "--name", "fixednewline"); NeedsRepo = $true; Display = 'run <multiline prompt> --name fixednewline' }
+    @{ Id = "30-run-prompt-percent"; Args = @("run", "%PATH% %GITHUB_TOKEN%", "--name", "fixedpercent"); NeedsRepo = $true; Display = 'run <percent prompt> --name fixedpercent' }
+    @{ Id = "31-run-prompt-metacharacters"; Args = @("run", '&|^!<>', "--name", "fixedmeta"); NeedsRepo = $true; Display = 'run <metachar prompt> --name fixedmeta' }
+    @{ Id = "32-run-prompt-backslashes"; Args = @("run", 'C:\repo\path\branch', "--name", "fixedslash"); NeedsRepo = $true; Display = 'run <backslash prompt> --name fixedslash' }
+    @{ Id = "33-run-prompt-unicode"; Args = @("run", "café 東京", "--name", "fixedunicode"); NeedsRepo = $true; Display = 'run <unicode prompt> --name fixedunicode' }
 )
 
 function Get-NormalizedCapture {
@@ -92,7 +99,17 @@ function Get-NormalizedCapture {
     #>
     param([AllowNull()][string]$Text, [string]$ScriptsRoot)
     if ($null -eq $Text) { return "" }
-    $t = [regex]::Replace($Text, '\d{8}-\d{6}', '<TS>')
+    $t = [regex]::Replace($Text, '([A-Z0-9_]+_B64)=([A-Za-z0-9+/=]+)', {
+        param($m)
+        try {
+            $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($m.Groups[2].Value))
+            $normalized = [regex]::Replace($decoded, '\d{8}-\d{6}', '<TS>')
+            return "{0}={1}" -f $m.Groups[1].Value, [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($normalized))
+        } catch {
+            return $m.Value
+        }
+    })
+    $t = [regex]::Replace($t, '\d{8}-\d{6}', '<TS>')
     $t = [regex]::Replace($t, [regex]::Escape($ScriptsRoot), '<SCRIPTS>')
     $t = [regex]::Replace($t, 'squad-cli-stub-[0-9a-f]{32}', '<STUB>')
     return ($t -replace "`r`n", "`n")
@@ -250,7 +267,8 @@ function Invoke-CaptureSet {
                 -StopExitCode $stopRc -StartExitCode $startRc -DriftMode $driftMode
 
             $sb = New-Object System.Text.StringBuilder
-            [void]$sb.AppendLine("### CASE $($case.Id): squad-aca $($case.Args -join ' ')")
+            $displayArgs = if ($case.ContainsKey("Display")) { [string]$case.Display } else { $case.Args -join ' ' }
+            [void]$sb.AppendLine("### CASE $($case.Id): squad-aca $displayArgs")
             [void]$sb.AppendLine("### EXITCODE: $($r.ExitCode)")
             [void]$sb.AppendLine("### AZ CALLS")
             foreach ($line in $r.AzCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
