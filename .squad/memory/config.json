@@ -12,7 +12,7 @@
     "rejectForbidden": true,
     "rejectTransientDurableWrites": true,
     "auditContent": false,
-    "auditMaxBytes": 1048576,
+    "auditMaxBytes": 0,
     "auditMaxArchives": 3
   }
 }
