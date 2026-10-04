@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-hp-squad-on-a-1253",
+  "sessionId": "hp-squad-on-a-1253",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-10-04T16:54:14.738Z",
+  "lastHeartbeatAt": "2026-10-04T16:54:14.738Z",
+  "updatedAt": "2026-10-04T16:54:14.738Z",
+  "terminalReason": null,
+  "executionRef": null
+}
