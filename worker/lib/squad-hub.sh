@@ -42,6 +42,23 @@
 # be a device and nothing else -- it cannot read the hub's API, drive another
 # device, or watch anyone's sessions. Shipping a personal token to a container
 # instead would hand a job everything its owner can do.
+#
+# WATCH-ONLY (SQUAD_HUB_APPROVAL=auto)
+# ------------------------------------
+# Opt-in, per deployment. The session still attaches to the hub, so it is
+# visible there and can be stopped from there, but nothing waits for a person:
+#
+#   * one-shot sessions keep `--allow-all-tools`, so Copilot raises no
+#     permission request;
+#   * watch/loop install every reporting hook EXCEPT `preToolUse`, the only
+#     one that blocks the agent for an answer.
+#
+# The deny list is identical in both modes and stays a hard floor: a denied
+# tool is refused outright whichever mode is set. What watch-only gives up is
+# the human decision on UNGATED tools -- which is exactly what an operator who
+# sets it is asking for, so it is announced in every session log, never
+# implied. Any value other than `ask` (the default) or `auto` aborts.
+SQUAD_HUB_APPROVAL="${SQUAD_HUB_APPROVAL:-ask}"
 
 SQUAD_HUB_EXIT_NO_APPROVER=75
 SQUAD_HUB_EXIT_REFUSED=77
@@ -151,7 +168,33 @@ squad_hub_preflight() {
   if ! command -v squad-hub >/dev/null 2>&1; then
     squad_hub_abort "squad-hub is not installed in this image, so the session cannot be supervised."
   fi
+  squad_hub_approval_mode >/dev/null
   return 0
+}
+
+# `ask` (default) or `auto` (watch-only). Anything else is a typo in a security
+# setting, and guessing which one was meant is how a session ends up less
+# supervised than its operator believes -- so it aborts.
+squad_hub_approval_mode() {
+  case "${SQUAD_HUB_APPROVAL:-ask}" in
+    ask|"") printf 'ask' ;;
+    auto) printf 'auto' ;;
+    *)
+      squad_hub_abort \
+        "SQUAD_HUB_APPROVAL='${SQUAD_HUB_APPROVAL}' is not a known approval mode." \
+        "Use 'ask' (a person approves ungated tools) or 'auto' (watch-only: visible in the hub, nothing waits)."
+      ;;
+  esac
+}
+
+# Is this the watch-only mode? Decided in THIS shell, never in a `$(...)`
+# subshell, so an invalid value aborts the session instead of only the subshell.
+squad_hub_auto_approve() {
+  case "${SQUAD_HUB_APPROVAL:-ask}" in
+    auto) return 0 ;;
+    ask|"") return 1 ;;
+    *) squad_hub_approval_mode >/dev/null; return 1 ;;
+  esac
 }
 
 # The resolved policy, as JSON, for the hub's own argv channel.
@@ -173,6 +216,16 @@ squad_hub_policy_json() {
     # all of the cost and none of the benefit.
     squad_hub_abort "The hub policy still contains --allow-all-tools, so no approval would ever be raised."
   fi
+  if squad_hub_auto_approve; then
+    # Watch-only, asked for explicitly. Restore exactly the one flag the hub
+    # variant removed, in the position the direct path uses, and nothing else:
+    # every deny pattern in the resolver's output is carried over untouched.
+    json="$(SQUAD_HUB_POLICY_JSON="$json" node -e '
+      const argv = JSON.parse(process.env.SQUAD_HUB_POLICY_JSON);
+      if (!Array.isArray(argv)) process.exit(2);
+      process.stdout.write(JSON.stringify(["--allow-all-tools", ...argv]));
+    ')" || squad_hub_abort "Could not build the watch-only hub argv."
+  fi
   printf '%s' "$json"
 }
 
@@ -188,9 +241,15 @@ squad_hub_run() {
 
   squad_hub_log "Supervising this session with the hub at ${SQUAD_HUB_URL}."
   squad_hub_log "Registering as device $(squad_hub_device_id)."
-  squad_hub_log "Tool policy: --allow-all-tools dropped, deny list intact."
-  squad_hub_log "  A denied tool is still refused outright and is never offered to a human."
-  squad_hub_log "  Anything else now asks, and waits for a person to answer."
+  if squad_hub_auto_approve; then
+    squad_hub_log "Approval mode: auto (watch-only, SQUAD_HUB_APPROVAL=auto)."
+    squad_hub_log "  The session is visible in the hub and can be stopped there; nothing waits for a person."
+    squad_hub_log "  Tool policy: --allow-all-tools kept, deny list intact. A denied tool is still refused outright."
+  else
+    squad_hub_log "Tool policy: --allow-all-tools dropped, deny list intact."
+    squad_hub_log "  A denied tool is still refused outright and is never offered to a human."
+    squad_hub_log "  Anything else now asks, and waits for a person to answer."
+  fi
 
   local rc=0
   # Same telemetry wiring as the unsupervised `copilot -p` path in entrypoint.sh.
@@ -313,9 +372,53 @@ squad_hub_supervise_ambient() {
     squad_hub_abort "Could not install the Copilot hooks, so sessions this mode starts would not be visible."
   fi
 
+  if squad_hub_auto_approve; then
+    if ! squad_hub_hooks_observe_only; then
+      squad_hub_abort \
+        "Could not make the installed hooks watch-only, so sessions would still wait for approval." \
+        "Use SQUAD_HUB_APPROVAL=ask, or check the squad-hub hook file format for this image's squad-hub."
+    fi
+    squad_hub_log "Approval mode: auto (watch-only, SQUAD_HUB_APPROVAL=auto)."
+    squad_hub_log "Every Copilot session started here will register itself and report what it is doing."
+    squad_hub_log "Nothing waits for a person; the deny list still refuses forbidden tools outright."
+    return 0
+  fi
+
   squad_hub_log "Every Copilot session started here will register itself, report what it is doing,"
   squad_hub_log "and ask before it acts. An approval nobody answers is refused, never granted."
   return 0
+}
+
+# Watch-only for the ambient path: drop the ONE hook that blocks for an answer.
+#
+# Watch/loop agents run with `--allow-all-tools`; squad-hub's `preToolUse` hook
+# is what turns each tool call into an approval card (its "ask" overrides
+# allow-all). Every other hook only REPORTS -- registration, prompts, tool
+# results, turn ends -- and is what keeps the session visible. Removing exactly
+# `preToolUse` therefore keeps the visibility and removes the wait.
+#
+# Edits squad-hub's own file in Copilot's hooks dir (COPILOT_HOME, else
+# ~/.copilot, the same resolution squad-hub uses), and refuses any shape it does
+# not recognise rather than guessing: an unexpected format must not leave a
+# session believed watch-only that still blocks, or the reverse.
+squad_hub_hooks_observe_only() {
+  local file="${COPILOT_HOME:-${HOME}/.copilot}/hooks/squad-hub.json"
+  SQUAD_HUB_HOOK_FILE="$file" node -e '
+    const fs = require("fs");
+    const file = process.env.SQUAD_HUB_HOOK_FILE;
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) {
+      console.error(`cannot read ${file}: ${e.message}`); process.exit(1);
+    }
+    const hooks = cfg && cfg.hooks;
+    if (!cfg || cfg.version !== 1 || !hooks || typeof hooks !== "object" || !hooks.sessionStart) {
+      console.error(`${file} is not a squad-hub v1 hook file`); process.exit(1);
+    }
+    delete hooks.preToolUse;
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+    const check = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (check.hooks.preToolUse || !check.hooks.sessionStart) process.exit(1);
+  '
 }
 
 # Detach, on the way out.

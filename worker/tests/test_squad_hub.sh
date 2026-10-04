@@ -245,6 +245,102 @@ assert_eq "78" "$allow_all_leak_status" \
   "a hub argv that still contains --allow-all-tools is refused, not run"
 
 # ---------------------------------------------------------------------------
+# 4b. Watch-only (SQUAD_HUB_APPROVAL=auto)
+# ---------------------------------------------------------------------------
+# Opt-in: the session stays visible in the hub, nothing waits for a person, and
+# the deny list is byte-for-byte the same as in ask mode.
+echo "-- watch-only approval mode --"
+
+approval_status() {
+  (
+    source "$HUB_LIB"
+    command() { if [[ "${2:-}" == "squad-hub" ]]; then return 0; fi; builtin command "$@"; }
+    SQUAD_HUB_APPROVAL="$1" SQUAD_HUB_TOKEN='sqhd1.eyJhIjoxfQ.sig' squad_hub_preflight
+  ) >/dev/null 2>&1
+  printf '%s' "$?"
+}
+assert_eq "0"  "$(approval_status '')"     "an unset approval mode is accepted (default: ask)"
+assert_eq "0"  "$(approval_status ask)"    "SQUAD_HUB_APPROVAL=ask is accepted"
+assert_eq "0"  "$(approval_status auto)"   "SQUAD_HUB_APPROVAL=auto is accepted"
+assert_eq "78" "$(approval_status Auto)"   "an unknown approval mode (wrong case) aborts rather than being guessed"
+assert_eq "78" "$(approval_status yes)"    "an unknown approval mode aborts rather than being guessed"
+
+hub_json_for() {
+  env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+    SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=local-cli SQUAD_HUB_APPROVAL="$1" \
+    SQUAD_POLICY_RESOLVER="$RESOLVER" \
+    bash -c 'source "'"$HUB_LIB"'"; squad_hub_policy_json' 2>&1
+}
+ASK_JSON="$(hub_json_for ask)"
+AUTO_JSON="$(hub_json_for auto)"
+assert_not_contains "$ASK_JSON" '"--allow-all-tools"' \
+  "ask mode still drops --allow-all-tools, so ungated tools raise approval cards"
+assert_contains "$AUTO_JSON" '"--allow-all-tools"' \
+  "watch-only keeps --allow-all-tools, so nothing waits for a person"
+SAME_DENY="$(ASK="$ASK_JSON" AUTO="$AUTO_JSON" node -e '
+  const a = JSON.parse(process.env.ASK), b = JSON.parse(process.env.AUTO);
+  const rest = b.filter((x, i) => !(i === 0 && x === "--allow-all-tools"));
+  console.log(JSON.stringify(a) === JSON.stringify(rest) ? "identical" : "differs");
+')"
+assert_eq "identical" "$SAME_DENY" \
+  "watch-only adds exactly --allow-all-tools and nothing else: deny list and flags are unchanged"
+assert_contains "$AUTO_JSON" '"shell(git config)"' \
+  "watch-only still carries multi-word deny patterns whole"
+
+# The resolver guard still applies in watch-only: the RESOLVER must never emit
+# --allow-all-tools for the hub; only this explicit opt-in may add it.
+STUB_DIR="$(mktemp -d)"
+printf '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(["--allow-all-tools","--agent","squad"]) + "\\n");\n' > "${STUB_DIR}/leaky.js"
+( source "$HUB_LIB"; SQUAD_HUB_APPROVAL=auto SQUAD_POLICY_RESOLVER="${STUB_DIR}/leaky.js" squad_hub_policy_json ) >/dev/null 2>&1
+leak_auto_status="$?"
+( source "$HUB_LIB"; SQUAD_HUB_APPROVAL=bogus SQUAD_POLICY_RESOLVER="$RESOLVER" squad_hub_policy_json ) >/dev/null 2>&1
+bogus_policy_status="$?"
+rm -rf "$STUB_DIR"
+assert_eq "78" "$leak_auto_status" \
+  "a resolver that leaks --allow-all-tools is refused in watch-only mode too"
+assert_eq "78" "$bogus_policy_status" \
+  "building the hub argv with an unknown approval mode aborts, even outside preflight"
+
+# The log must state the policy that actually applies.
+announce_for() {
+  env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+    SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=ralph SQUAD_HUB_APPROVAL="$1" \
+    bash -c 'source "'"${WORKER_DIR}/lib/squad-policy.sh"'"; squad_policy_resolve >/dev/null 2>&1; squad_policy_announce hub' 2>&1
+}
+AUTO_ANNOUNCE="$(announce_for auto)"
+assert_contains "$(printf '%s\n' "$AUTO_ANNOUNCE" | grep 'Copilot flags (via Squad Hub')" "--allow-all-tools" \
+  "the watch-only announcement lists --allow-all-tools, because the session has it"
+assert_contains "$AUTO_ANNOUNCE" "WATCH-ONLY" \
+  "the watch-only announcement says so, in every session log"
+assert_not_contains "$AUTO_ANNOUNCE" "a human at the hub answers" \
+  "the watch-only announcement does not claim a human approves tools"
+assert_contains "$(announce_for ask)" "MINUS --allow-all-tools" \
+  "ask mode's announcement is unchanged"
+
+# Ambient path: exactly the blocking hook goes, every reporting hook stays.
+HOOK_HOME="$(mktemp -d)"
+mkdir -p "$HOOK_HOME/hooks"
+node -e '
+  const ev = ["sessionStart","sessionEnd","userPromptSubmitted","postToolUse","agentStop","preToolUse"];
+  const hooks = {}; for (const e of ev) hooks[e] = [{ type: "command", bash: `squad-hub hook ${e}`, timeoutSec: e === "preToolUse" ? 300 : 5 }];
+  require("fs").writeFileSync(process.argv[1], JSON.stringify({ version: 1, hooks }));
+' "$HOOK_HOME/hooks/squad-hub.json"
+( source "$HUB_LIB"; COPILOT_HOME="$HOOK_HOME" squad_hub_hooks_observe_only ) >/dev/null 2>&1
+observe_status="$?"
+HOOK_KEYS="$(node -e 'console.log(Object.keys(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).hooks).sort().join(","))' "$HOOK_HOME/hooks/squad-hub.json")"
+assert_eq "0" "$observe_status" "watch-only hook rewrite succeeds on a squad-hub v1 hook file"
+assert_eq "agentStop,postToolUse,sessionEnd,sessionStart,userPromptSubmitted" "$HOOK_KEYS" \
+  "watch-only removes ONLY preToolUse; every reporting hook stays, so the session stays visible"
+
+printf '{"version":2,"hooks":{"preToolUse":[]}}' > "$HOOK_HOME/hooks/squad-hub.json"
+( source "$HUB_LIB"; COPILOT_HOME="$HOOK_HOME" squad_hub_hooks_observe_only ) >/dev/null 2>&1
+assert_ne "0" "$?" "an unrecognised hook file format is refused rather than guessed at"
+rm -f "$HOOK_HOME/hooks/squad-hub.json"
+( source "$HUB_LIB"; COPILOT_HOME="$HOOK_HOME" squad_hub_hooks_observe_only ) >/dev/null 2>&1
+assert_ne "0" "$?" "a missing hook file is refused rather than reported as watch-only"
+rm -rf "$HOOK_HOME"
+
+# ---------------------------------------------------------------------------
 # 5. The entrypoint wiring
 # ---------------------------------------------------------------------------
 echo "-- entrypoint wiring --"
@@ -608,6 +704,18 @@ assert_eq "before" "$seed_order" \
 seed_guard="$(printf '%s\n' "$AMBIENT_FN" | awk '/squad_hub_seed_device_id/{f=1} f{print} f&&/^  fi/{exit}')"
 assert_contains "$seed_guard" "squad_hub_abort" \
   "a failed seed aborts rather than attaching under an id the hub will refuse"
+
+# Watch-only on the ambient path: the blocking hook is removed AFTER the install
+# that writes it (or the install would put it straight back), and a failure to
+# remove it aborts rather than leaving sessions that still wait for approval.
+install_line="$(printf '%s\n' "$AMBIENT_FN" | grep -n 'hooks install' | head -1 | cut -d: -f1)"
+observe_line="$(printf '%s\n' "$AMBIENT_FN" | grep -n 'squad_hub_hooks_observe_only' | head -1 | cut -d: -f1)"
+if [[ -n "$install_line" && -n "$observe_line" && "$install_line" -lt "$observe_line" ]]; then observe_order=after; else observe_order=before-or-missing; fi
+assert_eq "after" "$observe_order" \
+  "watch-only removes preToolUse after 'hooks install', not before it"
+observe_guard="$(printf '%s\n' "$AMBIENT_FN" | awk '/squad_hub_hooks_observe_only/{f=1} f{print} f&&/^    fi/{exit}')"
+assert_contains "$observe_guard" "squad_hub_abort" \
+  "a failed watch-only rewrite aborts instead of running sessions that still block"
 
 echo ""
 echo "squad-hub supervision: ${TESTS_RUN} assertions, ${TESTS_FAILED} failed"
