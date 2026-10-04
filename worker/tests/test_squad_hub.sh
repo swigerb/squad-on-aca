@@ -557,6 +557,58 @@ assert_not_contains "$AMBIENT_FN" "squad-hub start" \
 assert_contains "$AMBIENT_FN" 'name "$(squad_hub_device_id)"' \
   "the container attaches under a nameable device id, not the replica hostname"
 
+# ---------------------------------------------------------------------------
+# Issue #126: the DAEMON must register under the aca- id, not squad-hub's hex
+# ---------------------------------------------------------------------------
+# `connect --name` sets only the display name. The daemon registers under
+# config.deviceId, which squad-hub otherwise derives as 16 hex characters --
+# refused by every token bound with `--prefix aca-`. Asserted by behaviour: run
+# the seed against a scratch SQUAD_HUB_HOME and read back what squad-hub would.
+echo "-- ambient device id (#126) --"
+
+seed_in() {
+  local home="$1"
+  env -u CONTAINER_APP_JOB_EXECUTION_NAME SQUAD_HUB_HOME="$home" \
+    CONTAINER_APP_REPLICA_NAME="ca-squad-aca-watch--0000006-ABC12" \
+    bash -c 'source "'"$HUB_LIB"'"; squad_hub_seed_device_id' 2>&1
+}
+read_cfg() {
+  node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); console.log(c[process.argv[2]] ?? "")' "$1/config.json" "$2"
+}
+
+SEED_HOME="$(mktemp -d)"
+seed_in "$SEED_HOME/fresh" >/dev/null
+assert_eq "aca-ca-squad-aca-watch--0000006-abc12" "$(read_cfg "$SEED_HOME/fresh" deviceId)" \
+  "a fresh squad-hub home gets the lowercased aca- device id the token allows"
+
+mkdir -p "$SEED_HOME/existing"
+printf '{"deviceId":"b2c77510dbf04f68","deviceName":"keep me","server":"https://hub.example"}' > "$SEED_HOME/existing/config.json"
+seed_in "$SEED_HOME/existing" >/dev/null
+assert_eq "aca-ca-squad-aca-watch--0000006-abc12" "$(read_cfg "$SEED_HOME/existing" deviceId)" \
+  "a stale hex device id is replaced, so a restarted replica cannot keep the refused one"
+assert_eq "keep me" "$(read_cfg "$SEED_HOME/existing" deviceName)" \
+  "seeding the id leaves every other squad-hub setting alone"
+assert_eq "https://hub.example" "$(read_cfg "$SEED_HOME/existing" server)" \
+  "seeding the id does not drop the configured hub"
+
+mkdir -p "$SEED_HOME/corrupt"
+printf 'not json' > "$SEED_HOME/corrupt/config.json"
+seed_rc=0; seed_in "$SEED_HOME/corrupt" >/dev/null || seed_rc=$?
+assert_ne "0" "$seed_rc" \
+  "an unreadable squad-hub config fails the seed instead of being silently overwritten"
+rm -rf "$SEED_HOME"
+
+# Order matters: the id must be in place BEFORE connect starts the daemon, or
+# the first attach (the one connect waits on) still goes out under the hex id.
+seed_line="$(printf '%s\n' "$AMBIENT_FN" | grep -n 'squad_hub_seed_device_id' | head -1 | cut -d: -f1)"
+connect_line="$(printf '%s\n' "$AMBIENT_FN" | grep -n 'squad-hub connect' | head -1 | cut -d: -f1)"
+if [[ -n "$seed_line" && -n "$connect_line" && "$seed_line" -lt "$connect_line" ]]; then seed_order=before; else seed_order=after-or-missing; fi
+assert_eq "before" "$seed_order" \
+  "ambient supervision seeds the daemon's device id before 'squad-hub connect'"
+seed_guard="$(printf '%s\n' "$AMBIENT_FN" | awk '/squad_hub_seed_device_id/{f=1} f{print} f&&/^  fi/{exit}')"
+assert_contains "$seed_guard" "squad_hub_abort" \
+  "a failed seed aborts rather than attaching under an id the hub will refuse"
+
 echo ""
 echo "squad-hub supervision: ${TESTS_RUN} assertions, ${TESTS_FAILED} failed"
 exit $(( TESTS_FAILED > 0 ? 1 : 0 ))
