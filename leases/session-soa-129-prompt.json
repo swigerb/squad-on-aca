@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-soa-129-prompt",
+  "sessionId": "soa-129-prompt",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-10-04T21:09:53.679Z",
+  "lastHeartbeatAt": "2026-10-04T21:09:53.679Z",
+  "updatedAt": "2026-10-04T21:09:53.679Z",
+  "terminalReason": null,
+  "executionRef": null
+}
