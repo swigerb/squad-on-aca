@@ -29,10 +29,24 @@ param(
     #   squad-hub device-token --hub <url> --token <your own token> \
     #       --label "aca jobs" --prefix aca- --ttl-hours 4
     [string]$SquadHubUrl = "",
-    [string]$SquadHubToken = ""
+    [string]$SquadHubToken = "",
+    # --- Session size ------------------------------------------------------------
+    # CPU and memory for each agent session (caj-<prefix>-session). Every
+    # dispatcher (squad-aca run, Ralph, Actions) copies these from the job
+    # template, so this is the one place a session's size is set. A Squad
+    # session fans out several Copilot CLI agents in parallel, which 1 vCPU /
+    # 2 GiB could not hold. Must be a valid ACA Consumption pair (memory = 2x CPU).
+    [ValidateSet("0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0")]
+    [string]$SessionCpu = "2.0",
+    [string]$SessionMemory = ""
 )
 
 $ErrorActionPreference = "Stop"
+$expectedSessionMemory = [string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:0.0}Gi", [double]::Parse($SessionCpu, [Globalization.CultureInfo]::InvariantCulture) * 2)
+if (-not $SessionMemory) { $SessionMemory = $expectedSessionMemory }
+if ($SessionMemory -ne $expectedSessionMemory) {
+    throw "-SessionMemory '$SessionMemory' is not valid with -SessionCpu $SessionCpu. ACA Consumption requires memory = 2x CPU: use $expectedSessionMemory."
+}
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $azureDir = Join-Path $repoRoot ".azure"
 New-Item -ItemType Directory -Force -Path $azureDir | Out-Null
@@ -719,15 +733,15 @@ if (-not $existingJobImage) {
         --replica-completion-count 1 `
         --parallelism 1 `
         --image $image `
-        --cpu 1.0 `
-        --memory 2.0Gi `
+        --cpu $SessionCpu `
+        --memory $SessionMemory `
         --mi-user-assigned $identityId `
         --registry-server $loginServer `
         --registry-identity $identityId `
         --secrets @jobAndWatcherSecrets `
         --env-vars @commonEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" "SQUAD_POD_ID=smoke-template" | Out-Null
 } else {
-    az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --set-env-vars @commonEnv | Out-Null
+    az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --cpu $SessionCpu --memory $SessionMemory --set-env-vars @commonEnv | Out-Null
     az containerapp job secret set --name $jobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 

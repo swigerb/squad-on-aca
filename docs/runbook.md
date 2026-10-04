@@ -35,6 +35,12 @@ OTEL_SERVICE_NAME=squad-<session name>
 
 Dispatch uses a per-execution `az containerapp job start --env-vars` override. It reads the template, strips session-managed keys, overlays fresh session values, and passes a complete execution container spec with image, CPU, and memory.
 
+Session size comes from the job template, so `deploy.ps1 -SessionCpu` sets it for every dispatcher. The default is 2 vCPU / 4 GiB, enough for a Squad fan-out of several Copilot CLI agents. Memory is derived as 2x CPU (the ACA Consumption ratio); re-running `deploy.ps1` applies a new size to an existing job.
+
+```powershell
+.\scripts\deploy.ps1 -SessionCpu 4.0   # 4 vCPU / 8 GiB sessions
+```
+
 ## Scale-to-zero behavior
 
 | Component | Idle behavior |
