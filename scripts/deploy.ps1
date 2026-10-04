@@ -30,6 +30,13 @@ param(
     #       --label "aca jobs" --prefix aca- --ttl-hours 4
     [string]$SquadHubUrl = "",
     [string]$SquadHubToken = "",
+    # How a hub-supervised session handles tools that are not on the deny list.
+    #   ask  (default) a person approves each one in the hub.
+    #   auto watch-only: the session is visible in the hub and can be stopped
+    #        there, but nothing waits for approval. The deny list is unchanged.
+    # Ignored when no hub is configured.
+    [ValidateSet("ask", "auto")]
+    [string]$SquadHubApproval = "ask",
     # --- Session size ------------------------------------------------------------
     # CPU and memory for each agent session (caj-<prefix>-session). Every
     # dispatcher (squad-aca run, Ralph, Actions) copies these from the job
@@ -710,6 +717,7 @@ $commonEnv = @(
     # nothing else, and cannot read the hub's API or drive another device.
     "SQUAD_HUB_URL=$SquadHubUrl",
     "SQUAD_HUB_TOKEN=$(if ($SquadHubToken) { 'secretref:squad-hub-token' } else { '' })",
+    "SQUAD_HUB_APPROVAL=$SquadHubApproval",
     "AZURE_SUBSCRIPTION_ID=$SubscriptionId",
     "AZURE_RESOURCE_GROUP=$ResourceGroupName",
     "AZURE_CLIENT_ID=$identityClientId",

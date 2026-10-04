@@ -288,6 +288,12 @@ squad_policy_announce() {
       squad_policy_log "NOT enforced on this path: ${SQUAD_POLICY_UNDELIVERABLE[*]}"
       squad_policy_log "  Reason: 'squad --copilot-flags' splits its value on whitespace, so a multi-word deny pattern cannot survive it. Governance-path enforcement below is unaffected."
     fi
+  elif [[ "$via" == "hub" && "${SQUAD_HUB_APPROVAL:-ask}" == "auto" ]]; then
+    # Watch-only (SQUAD_HUB_APPROVAL=auto): the hub sees the session, but the
+    # agent keeps --allow-all-tools, so print the flags exactly as applied.
+    squad_policy_log "Copilot flags (via Squad Hub, ACP, watch-only): ${SQUAD_POLICY_FLAGS}"
+    squad_policy_log "  WATCH-ONLY: visible in the hub, nothing waits for approval (SQUAD_HUB_APPROVAL=auto)."
+    squad_policy_log "  Deny patterns are unchanged and are still refused outright."
   elif [[ "$via" == "hub" ]]; then
     # The hub path carries the SAME policy minus --allow-all-tools, over a JSON
     # channel that keeps multi-word deny patterns whole -- so nothing is

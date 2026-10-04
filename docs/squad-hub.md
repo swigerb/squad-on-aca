@@ -15,6 +15,26 @@ A supervised session drops `--allow-all-tools` and keeps the deny list.
 | A tool on the deny list | Refused by policy. No approval request is created. |
 | An ungated tool | Approval request is sent to the hub with the literal command. |
 
+## Watch-only mode
+
+Set `SQUAD_HUB_APPROVAL=auto` to keep sessions visible in the hub, and stoppable from it, without approving tools one by one. The default is `ask`.
+
+| | `ask` (default) | `auto` (watch-only) |
+|---|---|---|
+| Session visible in the hub, can be stopped there | yes | yes |
+| A tool on the deny list | refused outright | refused outright |
+| An ungated tool | waits for a person in the hub | runs |
+| One-shot (`prompt`, `new-project`) | `--allow-all-tools` dropped | `--allow-all-tools` kept |
+| `watch` / `loop` | every hook, including the blocking `preToolUse` | every reporting hook; `preToolUse` removed |
+
+The deny list is identical in both modes. Every session log states the mode (`WATCH-ONLY` in the policy announcement). Any other value exits `78`.
+
+In a watch-only `watch`/`loop` container, `squad-hub hooks status` reports `missing preToolUse`. That is the intended state, not a broken install.
+
+```powershell
+./scripts/deploy.ps1 -SquadHubUrl https://your-hub.example -SquadHubToken sqhd1.... -SquadHubApproval auto
+```
+
 ## Enable supervision
 
 Mint a device token bound to the `aca-` prefix:
@@ -75,8 +95,8 @@ Supervision applies to ACA Jobs and to one-shot agent modes `prompt` and `new-pr
 
 | File | Purpose |
 |---|---|
-| `worker/lib/squad-hub.sh` | Supervision path: preflight, device identity, policy transport, exit-code mapping. |
+| `worker/lib/squad-hub.sh` | Supervision path: preflight, device identity, policy transport, approval mode, exit-code mapping. |
 | `worker/lib/agent-policy.js` | `hub-argv-json`: same policy, minus `--allow-all-tools`. |
 | `worker/tests/test_squad_hub.sh` | Hub behavior tests. |
 | `worker/Dockerfile` | `SQUAD_HUB_SPEC`: pinned npm package by default, `none`, or a git ref. |
-| `scripts/deploy.ps1` | `-SquadHubUrl`, `-SquadHubToken`, credential preflight, and device-prefix check. |
+| `scripts/deploy.ps1` | `-SquadHubUrl`, `-SquadHubToken`, `-SquadHubApproval`, credential preflight, and device-prefix check. |
