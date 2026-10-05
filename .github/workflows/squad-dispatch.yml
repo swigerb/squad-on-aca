@@ -69,12 +69,23 @@ jobs:
             --command-prefix "${SQUAD_COMMAND_PREFIX}" \
             --bot-login "${SQUAD_BOT_LOGIN}")"
           echo "verdict: ${verdict}"
+          # The prompt is free text and can span lines, so it goes out as a
+          # heredoc with a random delimiter. A plain key=value line would let a
+          # later prompt line such as issue=42 forge another output.
+          prompt="$(printf '%s' "$verdict" | jq -r '.prompt // ""')"
+          delim="SQUAD_EOF_$(openssl rand -hex 16)"
+          if grep -qxF "$delim" <<<"$prompt"; then
+            echo "::error::The prompt contains the output delimiter; refusing to dispatch."
+            exit 1
+          fi
           {
             echo "dispatch=$(printf '%s' "$verdict" | jq -r '.dispatch')"
             echo "reason=$(printf '%s' "$verdict" | jq -r '.reason')"
             echo "session=$(printf '%s' "$verdict" | jq -r '.sessionName // ""')"
             echo "issue=$(printf '%s' "$verdict" | jq -r '.issueNumber // ""')"
-            echo "prompt=$(printf '%s' "$verdict" | jq -r '.prompt // ""')"
+            echo "prompt<<${delim}"
+            printf '%s\n' "$prompt"
+            echo "${delim}"
             echo "requester=$(printf '%s' "$verdict" | jq -r '.requester // ""')"
           } >>"$GITHUB_OUTPUT"
 
@@ -131,11 +142,16 @@ jobs:
           fi
 
           prompt_bytes="$(squad_assert_prompt_byte_cap "$prompt" "SQUAD_PROMPT")"
+          delim="SQUAD_EOF_$(openssl rand -hex 16)"
+          if grep -qxF "$delim" <<<"$prompt"; then
+            echo "::error::The prompt contains the output delimiter; refusing to dispatch."
+            exit 1
+          fi
           {
             echo "promptBytes=${prompt_bytes}"
-            echo "preparedPrompt<<__SQUAD_PROMPT__"
+            echo "preparedPrompt<<${delim}"
             printf '%s\n' "$prompt"
-            echo "__SQUAD_PROMPT__"
+            echo "${delim}"
           } >>"$GITHUB_OUTPUT"
 
       - name: Claim the shared lease

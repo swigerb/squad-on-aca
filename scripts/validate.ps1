@@ -5255,6 +5255,16 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "The dispatch workflow does not enforce the measured 100000-byte UTF-8 prompt cap before lease claim"
     }
 
+    # A multi-line prompt written to $GITHUB_OUTPUT as `prompt=...` fails the
+    # step or, worse, lets a prompt line such as `issue=42` forge another
+    # output. Both prompt outputs must use a random heredoc delimiter.
+    $randomDelims = [regex]::Matches($wf, 'delim="SQUAD_EOF_\$\(openssl rand -hex 16\)"').Count
+    if ($randomDelims -ge 2 -and $wf -match 'echo "prompt<<\$\{delim\}"' -and $wf -match 'echo "preparedPrompt<<\$\{delim\}"' -and $wf -notmatch 'echo "prompt=\$\(' -and $wf -notmatch '__SQUAD_PROMPT__') {
+        Add-Pass "The dispatch workflow writes both prompt outputs as heredocs with a random delimiter, so a multi-line prompt cannot break the step or forge another output"
+    } else {
+        Add-Fail "The dispatch workflow writes a prompt to GITHUB_OUTPUT without a random heredoc delimiter; a multi-line prompt breaks the step or forges outputs"
+    }
+
     # A requester who sees a label change and then silence cannot tell a running
     # session from a trigger that quietly refused.
     if ($wf -match 'gh issue comment' -and $wf -match 'ACA execution') {
