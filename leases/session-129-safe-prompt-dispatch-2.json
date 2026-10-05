@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-129-safe-prompt-dispatch-2",
+  "sessionId": "129-safe-prompt-dispatch-2",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-10-05T03:02:39.202Z",
+  "lastHeartbeatAt": "2026-10-05T03:02:39.202Z",
+  "updatedAt": "2026-10-05T03:02:39.202Z",
+  "terminalReason": null,
+  "executionRef": null
+}
