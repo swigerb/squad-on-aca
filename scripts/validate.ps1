@@ -121,6 +121,8 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\lib\ralph-dispatch.sh"),
     (Join-Path $RepoRoot "worker\lib\git-checkout.sh"),
     (Join-Path $RepoRoot "worker\lib\squad-policy.sh"),
+    (Join-Path $RepoRoot "worker\lib\squad-deadline.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_session_deadline.sh"),
     (Join-Path $RepoRoot "worker\tests\test_agent_policy.sh"),
     (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh"),
     (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh"),
@@ -4724,6 +4726,47 @@ if ($deployText -match 'Removing the old resource-group Contributor grant') {
     Add-Pass "deploy.ps1 removes a previously granted resource-group Contributor, so already-deployed environments are narrowed too"
 } else {
     Add-Fail "deploy.ps1 does not remove an existing Contributor grant; environments deployed before the change would keep it forever"
+}
+
+# Issue #134: the session job's hard kill (--replica-timeout) and the worker's
+# view of it (SQUAD_REPLICA_TIMEOUT_SECONDS, from which it computes the deadline
+# at which it stops the agent and publishes WIP) must come from ONE parameter on
+# BOTH the create and the update path. If they drift -- the variable says 7200
+# while ACA kills at 3600 -- the worker plans to publish after it is already
+# dead, which is exactly the lost-work failure #134 fixes.
+# worker/tests/test_session_deadline.sh holds the same checks on Linux.
+if ($deployText -match '\[int\]\$SessionReplicaTimeout = 14400') {
+    Add-Pass "deploy.ps1 has -SessionReplicaTimeout (default 14400) for the session job's replica timeout"
+} else {
+    Add-Fail "deploy.ps1 has no -SessionReplicaTimeout parameter defaulting to 14400; the session job's replica timeout is not configurable in one place"
+}
+if ($deployText -match '\$sessionTimeoutEnv = "SQUAD_REPLICA_TIMEOUT_SECONDS=\$SessionReplicaTimeout"') {
+    Add-Pass "deploy.ps1 builds SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout"
+} else {
+    Add-Fail "deploy.ps1 does not build SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout; the worker's deadline could drift from the real replica timeout"
+}
+$sessionCreate = [regex]::Match($deployText, '(?s)az containerapp job create `\s+--name \$jobName `.*?Out-Null').Value
+if ($sessionCreate -match '--replica-timeout \$SessionReplicaTimeout ' -and $sessionCreate -match '\$sessionTimeoutEnv') {
+    Add-Pass "deploy.ps1 session job CREATE sets --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from the same parameter"
+} else {
+    Add-Fail "deploy.ps1 session job CREATE does not take both --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout"
+}
+$sessionUpdate = [regex]::Match($deployText, 'az containerapp job update --name \$jobName [^\r\n]*').Value
+if ($sessionUpdate -match '--replica-timeout \$SessionReplicaTimeout ' -and $sessionUpdate -match '\$sessionTimeoutEnv') {
+    Add-Pass "deploy.ps1 session job UPDATE sets --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from the same parameter, so a redeploy cannot leave them apart"
+} else {
+    Add-Fail "deploy.ps1 session job UPDATE does not take both --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout; an existing job would keep a stale limit"
+}
+if ($deployText -match '--replica-timeout 7200') {
+    Add-Fail "deploy.ps1 still hard-codes --replica-timeout 7200 somewhere; use -SessionReplicaTimeout"
+} else {
+    Add-Pass "deploy.ps1 no longer hard-codes the session job's 7200 s replica timeout"
+}
+$commonEnvBlock = [regex]::Match($deployText, '(?s)\$commonEnv = @\(.*?\r?\n\)').Value
+if ($commonEnvBlock -and $commonEnvBlock -notmatch 'SQUAD_REPLICA_TIMEOUT_SECONDS') {
+    Add-Pass "SQUAD_REPLICA_TIMEOUT_SECONDS is kept out of `$commonEnv, which the ralph job (240 s) and the watch app share"
+} else {
+    Add-Fail "SQUAD_REPLICA_TIMEOUT_SECONDS is in `$commonEnv (or `$commonEnv was not found); the ralph job and watch app would be told the session job's limit"
 }
 
 # --- 6. Governance paths cover what the PRD names ---------------------------

@@ -45,7 +45,19 @@ param(
     # 2 GiB could not hold. Must be a valid ACA Consumption pair (memory = 2x CPU).
     [ValidateSet("0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0")]
     [string]$SessionCpu = "2.0",
-    [string]$SessionMemory = ""
+    [string]$SessionMemory = "",
+    # --- Session time limit (issue #134) -----------------------------------------
+    # The session job's ACA replicaTimeout, in seconds: the HARD kill. It is
+    # applied to the job as `--replica-timeout` AND as the environment variable
+    # SQUAD_REPLICA_TIMEOUT_SECONDS from this one value, so the two can never
+    # drift. The worker uses the variable to compute its own, earlier deadline
+    # (minus SQUAD_PUBLISH_MARGIN_SECONDS, default 900) at which it stops the
+    # agent and publishes what it has as a draft WIP pull request -- if the
+    # variable said 7200 while ACA killed at 3600, the worker would plan to
+    # publish after it was already dead. 14400 (4 h) matches the live job since
+    # 2026-10-05; it was a hard-coded 7200 before. Must exceed the margin.
+    [ValidateRange(1800, 86400)]
+    [int]$SessionReplicaTimeout = 14400
 )
 
 $ErrorActionPreference = "Stop"
@@ -724,6 +736,15 @@ $commonEnv = @(
     "ACA_SESSION_JOB_NAME=$jobName"
 )
 
+# Issue #134: the session job gets its replicaTimeout and the matching
+# SQUAD_REPLICA_TIMEOUT_SECONDS from ONE value (-SessionReplicaTimeout), on both
+# the create and the update path, so the worker's publish deadline is always
+# computed from the limit ACA actually enforces. This is deliberately NOT in
+# $commonEnv: that array is shared with the ralph job (replicaTimeout 240) and
+# the watch app (no replicaTimeout at all), and telling either of them "14400"
+# would be a lie about its own budget.
+$sessionTimeoutEnv = "SQUAD_REPLICA_TIMEOUT_SECONDS=$SessionReplicaTimeout"
+
 $existingJobImage = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query "properties.template.containers[0].image" -o tsv 2>$null
 if ($existingJobImage -and $existingJobImage -ne $image) {
     az containerapp job delete --name $jobName --resource-group $ResourceGroupName --yes | Out-Null
@@ -736,7 +757,7 @@ if (-not $existingJobImage) {
         --resource-group $ResourceGroupName `
         --environment $envName `
         --trigger-type Manual `
-        --replica-timeout 7200 `
+        --replica-timeout $SessionReplicaTimeout `
         --replica-retry-limit 0 `
         --replica-completion-count 1 `
         --parallelism 1 `
@@ -747,9 +768,9 @@ if (-not $existingJobImage) {
         --registry-server $loginServer `
         --registry-identity $identityId `
         --secrets @jobAndWatcherSecrets `
-        --env-vars @commonEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" "SQUAD_POD_ID=smoke-template" | Out-Null
+        --env-vars @commonEnv $sessionTimeoutEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" "SQUAD_POD_ID=smoke-template" | Out-Null
 } else {
-    az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --cpu $SessionCpu --memory $SessionMemory --set-env-vars @commonEnv | Out-Null
+    az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --replica-timeout $SessionReplicaTimeout --cpu $SessionCpu --memory $SessionMemory --set-env-vars @commonEnv $sessionTimeoutEnv | Out-Null
     az containerapp job secret set --name $jobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 
