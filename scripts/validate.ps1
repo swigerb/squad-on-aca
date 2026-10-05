@@ -3385,15 +3385,62 @@ if (-not $IsWindowsHost) {
             Add-Fail "Windows cmd.exe transport regression: $($cmdFailures -join '; ')"
         }
 
+        # Issue #129's second bug: on a failed `az containerapp job start`, the
+        # lease used to stay `claimed`/`dispatched` until the heartbeat TTL
+        # swept it, so an immediate retry with the SAME --name was refused.
+        # The fix releases the lease (worker/lib/dispatch-lease.js writes it
+        # back with state `released` -- a `gh api --method PUT ... contents/...`
+        # update, logged as `gh lease-write <file>.json`; it is an idempotent
+        # content update, never a `gh lease-delete`, which this suite has never
+        # emitted for ANY lease operation). A check that greps the call log for
+        # `gh lease-delete` therefore asserts a transport that was never built
+        # and fails on every run regardless of whether the lease was released --
+        # exactly the false negative this rewrite replaces. The behaviour that
+        # actually matters, and the one issue #129 asks for by name, is
+        # observable only by retrying: a same-name retry must dispatch a FRESH
+        # execution rather than being refused as "already claimed/dispatched".
         Reset-SquadCliStubLog -Stub $stub
         $failedStart = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "safe-start-fail", "failure path %GITHUB_TOKEN%") `
             -StartExitCode 5
-        $callLog = if (Test-Path $stub.CallLog) { Get-Content -LiteralPath $stub.CallLog -Raw } else { "" }
-        if ($failedStart.ExitCode -eq 1 -and $callLog -match 'gh lease-delete session-safe-start-fail\.json') {
-            Add-Pass "A failed local CLI job start exits non-zero and releases its claimed lease immediately"
+        $failedStartCalls = @($failedStart.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        $failedStartCallLog = if (Test-Path $stub.CallLog) { Get-Content -LiteralPath $stub.CallLog -Raw } else { "" }
+        # Structural guard: the release write must land IN THE SAME PROCESS,
+        # immediately after the failed compute request -- not merely leave the
+        # lease to be reclaimed later by the sweeper's heartbeat TTL. The call
+        # log is shared and ordered (az and gh both append to it), so this is
+        # provable by finding a SECOND `gh lease-write` for this lease key after
+        # the `az job-start` entry, not merely asserting one exists anywhere.
+        $failedStartCallLines = @(($failedStartCallLog -split "`r?`n") | Where-Object { $_ -ne "" })
+        $jobStartIdx = [array]::FindIndex($failedStartCallLines, [Predicate[string]] { param($l) $l -eq "az job-start" })
+        # A lease write happens BEFORE compute too (the initial claim), so the
+        # release write is identified by position: any matching write AFTER
+        # the job-start index, not merely one existing anywhere in the log.
+        $leaseWriteIdxs = for ($i = 0; $i -lt $failedStartCallLines.Count; $i++) {
+            if ($failedStartCallLines[$i] -eq "gh lease-write session-safe-start-fail.json") { $i }
+        }
+        $releasedImmediately = ($jobStartIdx -ge 0) -and (@($leaseWriteIdxs | Where-Object { $_ -gt $jobStartIdx }).Count -ge 1)
+        if ($failedStart.ExitCode -ne 1 -or $failedStartCalls.Count -ne 1 -or -not $releasedImmediately) {
+            Add-Fail ("A failed local CLI job start no longer fails the way this check expects " +
+                "(exit=$($failedStart.ExitCode), starts=$($failedStartCalls.Count), " +
+                "released-immediately=$releasedImmediately, calls=$($failedStartCallLog -replace "`r?`n", ' | '))")
         } else {
-            Add-Fail "Failed local CLI start no longer releases its lease immediately (exit=$($failedStart.ExitCode), calls=$($callLog -replace "`r?`n", ' | '))"
+            # Behavioural proof: the SAME --name, immediately after, with no
+            # sweep in between. A lease still `claimed`/`dispatched` refuses
+            # this with "Not dispatching ... is already ..." and starts
+            # nothing; a released lease dispatches a brand-new execution.
+            Reset-SquadCliStubLog -Stub $stub
+            $retry = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript `
+                -CliArguments @("run", "--repo", "octo/demo", "--name", "safe-start-fail", "retry after a failed start")
+            $retryStartCalls = @($retry.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+            $retryRefused = ($retry.StdOut + $retry.StdErr) -match "(?i)not dispatching"
+            if ($retry.ExitCode -eq 0 -and $retryStartCalls.Count -eq 1 -and -not $retryRefused) {
+                Add-Pass "A failed local CLI job start releases its claimed lease immediately, so an identical retry with the same --name is NOT refused and dispatches a fresh execution"
+            } else {
+                Add-Fail ("A failed local CLI start no longer releases its lease immediately: a same-name retry was refused or " +
+                    "did not dispatch (exit=$($retry.ExitCode), starts=$($retryStartCalls.Count), refused=$retryRefused, " +
+                    "stdout='$($retry.StdOut -replace "`r?`n", ' | ')')")
+            }
         }
     } catch {
         Add-Fail "Windows cmd.exe free-text transport checks threw: $($_.Exception.Message)"
