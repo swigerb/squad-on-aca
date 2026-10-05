@@ -1,0 +1,22 @@
+### CASE 28-run-hostile-prompt: squad-aca run Hostile prompt: "quotes"
+line2 %PATH% %GITHUB_TOKEN% & | ^ ! < > \\ $HOME 'single' café 😀 --name fixedhostile
+### EXITCODE: 0
+### AZ CALLS
+### ARM CALLS
+GET https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/caj-squad-aca-session?api-version=2026-01-01
+---
+POST https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/caj-squad-aca-session/start?api-version=2026-01-01
+{"containers":[{"name":"squad-worker","image":"ghcr.io/example/squad-worker:stub","resources":{"cpu":1.0,"memory":"2.0Gi"},"env":[{"name":"ASPIRE_OTLP_GRPC_ENDPOINT","value":"http://ca-squad-aca-aspire:18889"},{"name":"GITHUB_REPOSITORY","value":"octo/demo"},{"name":"GITHUB_REF","value":"main"},{"name":"SQUAD_MODE","value":"prompt"},{"name":"SESSION_NAME","value":"fixedhostile"},{"name":"SQUAD_DEPLOYMENT_MODE","value":"squad-per-pod"},{"name":"SQUAD_POD_ID","value":"fixedhostile"},{"name":"OTEL_SERVICE_NAME","value":"squad-fixedhostile"},{"name":"ENABLE_GITHUB_REMOTE","value":"true"},{"name":"GITHUB_TOKEN","secretRef":"github-token"},{"name":"COPILOT_GITHUB_TOKEN","secretRef":"copilot-github-token"},{"name":"OTEL_EXPORTER_OTLP_HEADERS","secretRef":"otlp-headers"},{"name":"SQUAD_PROMPT","value":"Hostile prompt: \"quotes\"\nline2 %PATH% %GITHUB_TOKEN% & | ^ ! < > \\\\ $HOME 'single' café 😀"},{"name":"PUSH_CHANGES","value":"true"},{"name":"OUTPUT_BRANCH","value":"squad/fixedhostile"},{"name":"SQUAD_DISPATCH_ROUTE","value":"aca-job"},{"name":"SQUAD_DISPATCH_SOURCE","value":"local-cli"},{"name":"SQUAD_LEASE_KEY","value":"session-fixedhostile"}]}],"manualTriggerConfig":{"parallelism":1,"replicaCompletionCount":1}}
+---
+### GH CALLS
+repo view --json nameWithOwner --jq .nameWithOwner
+auth status
+auth setup-git
+### SQUAD CALLS
+### ACA CALLS
+### STDOUT
+stub-execution
+
+### STDERR
+Everything up-to-date
+

@@ -27,3 +27,8 @@ id_rsa
 id_ed25519
 id_dsa
 id_ecdsa
+
+# Never commit vendored tool runtimes or scratch verification artifacts
+.tools/
+.verify-*/
+worker/tests/.tmp-debug-*/

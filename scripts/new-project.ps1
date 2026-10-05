@@ -12,8 +12,7 @@ param(
     [string]$Prompt = "",
     [string]$OutputBranch = "",
     [string]$GitHubUser = "",
-    [switch]$UseExisting,
-    [switch]$NoWait
+    [switch]$UseExisting
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,8 +76,7 @@ $startSession = Join-Path $scriptRoot "start-session.ps1"
     -SessionName $SessionName `
     -Prompt $Prompt `
     -PushChanges `
-    -OutputBranch $OutputBranch `
-    -NoWait:$NoWait
+    -OutputBranch $OutputBranch
 
 [pscustomobject]@{
     repository = "https://github.com/$repository"

@@ -1,4 +1,5 @@
 param(
+    [string]$SubscriptionId = "",
     [string]$ResourceGroupName = "rg-squad-aca-dev-centralus",
     [string]$JobName = "caj-squad-aca-session",
     [Parameter(Mandatory = $true)]
@@ -15,8 +16,7 @@ param(
     [string]$DispatchRoute = "",
     [ValidateSet("", "local-cli", "ralph", "watch", "api")]
     [string]$DispatchSource = "",
-    [string]$LeaseKey = "",
-    [switch]$NoWait
+    [string]$LeaseKey = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,6 +32,8 @@ if (-not $Ref) {
 if (-not $SessionName) {
     $SessionName = "session-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 }
+
+[void](Assert-SquadPromptByteCap -Prompt $Prompt)
 
 # Session-scoped variables. These are supplied fresh on every dispatch so a
 # stale value from a previous session can never leak in. Optional variables are
@@ -64,31 +66,13 @@ if ($DispatchRoute) { $sessionEnv["SQUAD_DISPATCH_ROUTE"] = $DispatchRoute }
 if ($DispatchSource) { $sessionEnv["SQUAD_DISPATCH_SOURCE"] = $DispatchSource }
 if ($LeaseKey) { $sessionEnv["SQUAD_LEASE_KEY"] = $LeaseKey }
 
-# Build the full, isolated environment for THIS execution only. The shared job
-# template is read (never written), stripped of any session-managed keys, and
-# overlaid with the fresh session values. The result is passed to
-# `az containerapp job start --env-vars`, which applies it to a single execution
-# without mutating the stored template -- eliminating both cross-session leakage
-# and concurrent-dispatch races on the shared template.
-$envVars = New-SessionStartEnvVars -JobName $JobName -ResourceGroupName $ResourceGroupName -SessionEnv $sessionEnv
+$response = Start-AcaJobExecution `
+    -SubscriptionId $SubscriptionId `
+    -JobName $JobName `
+    -ResourceGroupName $ResourceGroupName `
+    -SessionEnv $sessionEnv
 
-# ACA only applies the per-execution --env-vars override reliably when the start
-# call also supplies a complete execution container spec. Read the immutable
-# template's container name, image, and resources and echo them back on start.
-# This does NOT mutate the stored template.
-$containerOptions = Get-JobStartContainerOptions -JobName $JobName -ResourceGroupName $ResourceGroupName
-
-$startArgs = @(
-    "containerapp", "job", "start",
-    "--name", $JobName,
-    "--resource-group", $ResourceGroupName,
-    "--image", $containerOptions.Image,
-    "--cpu", $containerOptions.Cpu,
-    "--memory", $containerOptions.Memory,
-    "--container-name", $containerOptions.ContainerName,
-    "--env-vars"
-) + $envVars
-
-if ($NoWait) { $startArgs += "--no-wait" }
-
-az @startArgs
+if (-not $response -or -not ($response.PSObject.Properties.Name -contains "name") -or -not $response.name) {
+    throw "ARM job start for '$JobName' returned no execution name. Refusing to treat a malformed response as a successful dispatch."
+}
+Write-Output ([string]$response.name)

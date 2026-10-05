@@ -87,6 +87,7 @@ function New-AcaJobExecutionProvider {
         }
 
         & $start `
+            -SubscriptionId $Context.Config.subscriptionId `
             -ResourceGroupName $Context.Config.resourceGroup `
             -JobName $Context.Config.sessionJob `
             -Repository $request.repository.fullName `

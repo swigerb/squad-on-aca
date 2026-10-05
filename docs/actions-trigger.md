@@ -4,6 +4,8 @@ Squad on ACA can start a session from a GitHub issue event. A GitHub Actions wor
 
 Actions is the trigger transport. The shared dispatch core in `worker/lib/` decides whether to run, claims the lease, and starts the same ACA session job used by the local CLI, Ralph, and Watch.
 
+The workflow fetches the ACA job definition, rebuilds the full container override, and starts the run through the ARM `POST .../jobs/<job>/start?api-version=2026-01-01` API with a JSON body file. Prompts and other free-text dispatch values never appear on a command line. `SQUAD_PROMPT` is capped at **100,000 UTF-8 bytes** before the workflow claims its lease, leaving headroom below Linux's `MAX_ARG_STRLEN` limit once the worker appends its publish-contract note before `copilot -p`.
+
 ## End-to-end path
 
 ```mermaid
@@ -24,7 +26,7 @@ sequenceDiagram
     AAD-->>GA: federated access token<br/>(no stored credential)
     GA->>GH: claim the shared lease<br/>(squad-dispatch.js)
     GH-->>GA: outcome: created / repaired / active
-    GA->>ACA: az containerapp job start<br/>(complete container spec + merged env)
+    GA->>ACA: ARM jobs/start REST call<br/>(complete container spec + merged env)
     ACA-->>GA: execution name
     GA->>GH: comment the session and execution on the issue
     GA->>GH: label `squad-aca:dispatched`
@@ -240,7 +242,7 @@ Ralph and Actions can see the same issue. Two mechanisms prevent duplicate sessi
 
 The workflow uses Ralph's `ralph_build_session_env` so the template values and overrides are merged before the start call.
 
-Sessions are dispatched as `SQUAD_MODE=prompt`. Valid worker modes are `smoke`, `telemetry-smoke`, `prompt`, `new-project`, `loop`, `ralph`, `watch`/`triage`, and `shell`. Anything else exits `64`.
+Sessions are dispatched as `SQUAD_MODE=prompt`, `SQUAD_POD_ID=<session>`, and `OTEL_SERVICE_NAME=squad-<session>`. Valid worker modes are `smoke`, `telemetry-smoke`, `prompt`, `new-project`, `loop`, `ralph`, `watch`/`triage`, and `shell`. Anything else exits `64`.
 
 ## Setup
 

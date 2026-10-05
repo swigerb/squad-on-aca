@@ -329,8 +329,29 @@ mkdir -p "$FAKE_BIN"
 
 cat > "${FAKE_BIN}/az" <<'AZ'
 #!/usr/bin/env bash
-if [[ "${1:-}" == "containerapp" && "${2:-}" == "job" && "${3:-}" == "start" ]]; then
+set -euo pipefail
+if [[ "${1:-}" == "account" && "${2:-}" == "show" ]]; then
+  printf '%s\n' "${AZ_ACCOUNT_SHOW_JSON:?}"
+  exit 0
+fi
+if [[ "${1:-}" != "rest" ]]; then
+  exit 0
+fi
+shift
+method=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --method) method="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [[ "$method" == "get" ]]; then
+  printf '%s' "${AZ_JOB_SHOW_JSON:?}"
+  exit 0
+fi
+if [[ "$method" == "post" ]]; then
   echo "start" >> "${AZ_START_LOG}"
+  printf '{"name":"stub-exec-001"}'
   exit 0
 fi
 exit 0
@@ -357,6 +378,7 @@ mkdir -p "$FAKE_GH_STATE"
 
 export ACA_SESSION_JOB_NAME="caj-squad-aca-session"
 export AZURE_RESOURCE_GROUP="rg-squad-test"
+export AZURE_SUBSCRIPTION_ID="00000000-0000-0000-0000-000000000000"
 export GITHUB_REPOSITORY="octo/demo"
 export RALPH_DISPATCH_LABEL="squad-aca:dispatched"
 export RALPH_SESSION_JOB_IMAGE="example.azurecr.io/squad-worker:latest"
@@ -364,6 +386,9 @@ export RALPH_SESSION_JOB_CPU="1.0"
 export RALPH_SESSION_JOB_MEMORY="2.0Gi"
 export RALPH_SESSION_JOB_CONTAINER="squad-worker"
 export RALPH_SESSION_JOB_ENV_JSON='[{"name":"ASPIRE_OTLP_GRPC_ENDPOINT","value":"http://ca-squad-aspire:18889"}]'
+export RALPH_SESSION_JOB_DEFINITION_JSON='{"properties":{"template":{"containers":[{"name":"squad-worker","image":"example.azurecr.io/squad-worker:latest","resources":{"cpu":1,"memory":"2.0Gi"},"env":[{"name":"ASPIRE_OTLP_GRPC_ENDPOINT","value":"http://ca-squad-aspire:18889"},{"name":"SESSION_NAME","value":"smoke-template"}]}]}}}'
+export AZ_JOB_SHOW_JSON="$RALPH_SESSION_JOB_DEFINITION_JSON"
+export AZ_ACCOUNT_SHOW_JSON="{\"id\":\"${AZURE_SUBSCRIPTION_ID}\"}"
 
 # Sourced from the LAYOUT, not from worker/lib. squad_dispatch_cli() falls back
 # to "$(dirname "${BASH_SOURCE[0]}")/squad-dispatch.js", so this is the only way
