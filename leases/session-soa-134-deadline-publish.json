@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-soa-134-deadline-publish",
+  "sessionId": "soa-134-deadline-publish",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-10-05T18:49:18.637Z",
+  "lastHeartbeatAt": "2026-10-05T18:49:18.637Z",
+  "updatedAt": "2026-10-05T18:49:18.637Z",
+  "terminalReason": null,
+  "executionRef": null
+}
