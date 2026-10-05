@@ -1193,6 +1193,13 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_LEASE_BRANCH = "squad-aca-leases"
 
         $argList = @("-NoProfile", "-NonInteractive", "-File", $ScriptPath) + $CliArguments
+        if ($IsWindows) {
+            # Start-Process joins an array with spaces and does not escape
+            # embedded quotes, so the child would see a hostile prompt with its
+            # quotes stripped. Hand it one command line built with the Windows
+            # argv rules instead, so the CLI receives each argument byte-exact.
+            $argList = ($argList | ForEach-Object { ConvertTo-SquadCliWindowsArgument $_ }) -join " "
+        }
         $proc = Start-Process -FilePath $hostExe -ArgumentList $argList `
             -WorkingDirectory $Stub.WorkDir -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
@@ -1241,6 +1248,29 @@ function Invoke-SquadCliCapture {
         AcaCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool aca)
         CurlCalls  = @(Get-SquadCliStubCall -Stub $Stub -Tool curl)
     }
+}
+
+function ConvertTo-SquadCliWindowsArgument {
+    # Quotes one argument per the CommandLineToArgvW rules: backslashes are
+    # literal unless they precede a quote, where they are doubled.
+    param([AllowEmptyString()][string]$Value)
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $sb = [System.Text.StringBuilder]::new('"')
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq [char]'\') {
+            $backslashes++
+        } elseif ($ch -eq [char]'"') {
+            [void]$sb.Append('\', 2 * $backslashes + 1).Append('"')
+            $backslashes = 0
+        } else {
+            if ($backslashes -gt 0) { [void]$sb.Append('\', $backslashes) }
+            [void]$sb.Append($ch)
+            $backslashes = 0
+        }
+    }
+    if ($backslashes -gt 0) { [void]$sb.Append('\', 2 * $backslashes) }
+    return $sb.Append('"').ToString()
 }
 
 function Remove-SquadCliStubEnvironment {

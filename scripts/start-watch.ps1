@@ -32,7 +32,7 @@ if ($Stop) {
 
 $sessionName = if ($SubSquad) { "watch-$SubSquad" } else { "watch-default" }
 $resolvedSubscription = if ($SubscriptionId) { $SubscriptionId } else { Get-AcaCurrentSubscriptionId }
-$watchUri = "https://management.azure.com/subscriptions/$resolvedSubscription/resourceGroups/$ResourceGroupName/providers/Microsoft.App/containerApps/$WatchAppName?api-version=$($script:AcaArmApiVersion)"
+$watchUri = "https://management.azure.com/subscriptions/$resolvedSubscription/resourceGroups/$ResourceGroupName/providers/Microsoft.App/containerApps/${WatchAppName}?api-version=$($script:AcaArmApiVersion)"
 $watchApp = Invoke-AcaArmRequest -Method GET -Uri $watchUri -SubscriptionId $resolvedSubscription
 if (-not $watchApp -or -not $watchApp.properties -or -not $watchApp.properties.template) {
     throw "Could not read the watcher template for app '$WatchAppName' in resource group '$ResourceGroupName'."

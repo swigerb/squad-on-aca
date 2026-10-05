@@ -8,6 +8,7 @@ containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stu
 acr list --resource-group rg-squad-stub --subscription 00000000-0000-0000-0000-000000000000 --query [].name -o json --only-show-errors
 containerapp job show --name caj-squad-aca-ralph --resource-group rg-squad-stub --query id -o tsv
 extension show --name containerapp --only-show-errors -o none
+### ARM CALLS
 ### GH CALLS
 repo view --json nameWithOwner --jq .nameWithOwner
 auth status

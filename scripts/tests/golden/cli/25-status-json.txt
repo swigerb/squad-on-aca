@@ -7,6 +7,7 @@ containerapp list --resource-group rg-squad-stub --query [].{name:name,provision
 containerapp job execution list --name caj-squad-aca-session --resource-group rg-squad-stub --query [0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime} -o json
 containerapp job execution list --name caj-squad-aca-ralph --resource-group rg-squad-stub --query [0:10].{name:name,status:properties.status,start:properties.startTime,end:properties.endTime} -o json
 containerapp show --name ca-squad-aca-aspire --resource-group rg-squad-stub --query properties.configuration.ingress.fqdn -o tsv
+### ARM CALLS
 ### GH CALLS
 ### SQUAD CALLS
 ### ACA CALLS

@@ -1,6 +1,7 @@
 ### CASE 22-sync-dryrun: squad-aca sync --dry-run
 ### EXITCODE: 0
 ### AZ CALLS
+### ARM CALLS
 ### GH CALLS
 ### SQUAD CALLS
 ### ACA CALLS

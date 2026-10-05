@@ -3,9 +3,12 @@
 ### AZ CALLS
 account set --subscription 00000000-0000-0000-0000-000000000000
 containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query id -o tsv
-containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query properties.template.containers[0].env -o json
-containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --query properties.template.containers[0] -o json
-containerapp job start --name caj-squad-aca-session --resource-group rg-squad-stub --image ghcr.io/example/squad-worker:stub --cpu 1 --memory 2.0Gi --container-name squad-worker --env-vars ASPIRE_OTLP_GRPC_ENDPOINT=http://ca-squad-aca-aspire:18889 GITHUB_REPOSITORY=octo/demo GITHUB_REF=main SQUAD_MODE=prompt SESSION_NAME=fixedfour SQUAD_DEPLOYMENT_MODE=squad-per-pod SQUAD_POD_ID=fixedfour OTEL_SERVICE_NAME=squad-fixedfour ENABLE_GITHUB_REMOTE=true GITHUB_TOKEN=secretref:github-token COPILOT_GITHUB_TOKEN=secretref:copilot-github-token OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers "SQUAD_PROMPT=Implicit prompt form" PUSH_CHANGES=true OUTPUT_BRANCH=squad/fixedfour SQUAD_DISPATCH_ROUTE=aca-job SQUAD_DISPATCH_SOURCE=local-cli SQUAD_LEASE_KEY=session-fixedfour
+### ARM CALLS
+GET https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/caj-squad-aca-session?api-version=2026-01-01
+---
+POST https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/caj-squad-aca-session/start?api-version=2026-01-01
+{"containers":[{"name":"squad-worker","image":"ghcr.io/example/squad-worker:stub","resources":{"cpu":1.0,"memory":"2.0Gi"},"env":[{"name":"ASPIRE_OTLP_GRPC_ENDPOINT","value":"http://ca-squad-aca-aspire:18889"},{"name":"GITHUB_REPOSITORY","value":"octo/demo"},{"name":"GITHUB_REF","value":"main"},{"name":"SQUAD_MODE","value":"prompt"},{"name":"SESSION_NAME","value":"fixedfour"},{"name":"SQUAD_DEPLOYMENT_MODE","value":"squad-per-pod"},{"name":"SQUAD_POD_ID","value":"fixedfour"},{"name":"OTEL_SERVICE_NAME","value":"squad-fixedfour"},{"name":"ENABLE_GITHUB_REMOTE","value":"true"},{"name":"GITHUB_TOKEN","secretRef":"github-token"},{"name":"COPILOT_GITHUB_TOKEN","secretRef":"copilot-github-token"},{"name":"OTEL_EXPORTER_OTLP_HEADERS","secretRef":"otlp-headers"},{"name":"SQUAD_PROMPT","value":"Implicit prompt form"},{"name":"PUSH_CHANGES","value":"true"},{"name":"OUTPUT_BRANCH","value":"squad/fixedfour"},{"name":"SQUAD_DISPATCH_ROUTE","value":"aca-job"},{"name":"SQUAD_DISPATCH_SOURCE","value":"local-cli"},{"name":"SQUAD_LEASE_KEY","value":"session-fixedfour"}]}],"manualTriggerConfig":{"parallelism":1,"replicaCompletionCount":1}}
+---
 ### GH CALLS
 repo view --json nameWithOwner --jq .nameWithOwner
 auth status
@@ -13,7 +16,7 @@ auth setup-git
 ### SQUAD CALLS
 ### ACA CALLS
 ### STDOUT
-STUB-START-ACK
+stub-execution
 
 ### STDERR
 Everything up-to-date

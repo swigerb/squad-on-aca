@@ -18,6 +18,7 @@ identity show --name uai-squad-aca-acrpull --resource-group rg-squad-stub --subs
 containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stub --subscription 00000000-0000-0000-0000-000000000000 -o json --only-show-errors
 containerapp job show --name caj-squad-aca-ralph --resource-group rg-squad-stub --query id -o tsv
 extension show --name containerapp --only-show-errors -o none
+### ARM CALLS
 ### GH CALLS
 repo view --json nameWithOwner --jq .nameWithOwner
 auth status

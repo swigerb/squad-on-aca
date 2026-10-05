@@ -296,7 +296,7 @@ function Get-AcaJobResourceUrl {
         [Parameter(Mandatory = $true)][string]$JobName
     )
 
-    return "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.App/jobs/$JobName?api-version=$($script:AcaArmApiVersion)"
+    return "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.App/jobs/${JobName}?api-version=$($script:AcaArmApiVersion)"
 }
 
 function Get-AcaJobDefinition {
