@@ -39,6 +39,19 @@ jobs:
         with:
           node-version: '24'
 
+      # worker/tests/test_memory_audit_pin_publication.sh's real-SDK case
+      # needs the ACTUAL @bradygaster/squad-sdk rotateAuditIfNeeded() this
+      # image nests under squad-cli (worker/Dockerfile), not a mock -- that is
+      # the only way to prove the pin really disables rotation rather than
+      # merely asserting the pin landed on disk. The runner does not install
+      # squad-cli, so without this step that test SKIPs (exit 77), and
+      # "Run worker capability tests" below fails the job on any skip. Keep
+      # this version in lockstep with worker/Dockerfile's squad-cli pin.
+      - name: Install squad-sdk 0.13.1 for real-SDK tests
+        run: |
+          npm install --prefix "$RUNNER_TEMP/sdk" @bradygaster/squad-sdk@0.13.1
+          echo "SQUAD_SDK_DIR=$RUNNER_TEMP/sdk/node_modules/@bradygaster/squad-sdk" >> "$GITHUB_ENV"
+
       - name: Syntax-check worker sources
         run: |
           node --check worker/lib/parse-capabilities.js

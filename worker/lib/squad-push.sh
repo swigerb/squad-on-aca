@@ -41,6 +41,22 @@ squad_push_branch() {
     local branch="$1"
     local push_log push_rc push_kind
 
+    # Session-only memory audit pin backstop (worker/lib/squad-policy.sh). Lives
+    # HERE, on the push itself, rather than in one caller, so every push this
+    # container makes is gated. Active whenever harden recorded a seal; refuses
+    # with 78 (policy) -- nothing is pushed -- if the pin would be published, or
+    # if the check itself is unavailable.
+    if [[ -n "${SQUAD_POLICY_PIN_SEAL_MODE:-}" ]]; then
+        if ! declare -f squad_policy_assert_pin_unpublished >/dev/null 2>&1; then
+            squad_push_log "Session FAILED (policy): a memory audit pin seal is recorded but the pin publication check is not loaded. Nothing has been pushed."
+            return 78
+        fi
+        if ! squad_policy_assert_pin_unpublished; then
+            squad_push_log "Session FAILED (policy): pushing ${branch} would publish the session-only memory audit pin (.squad/memory/config.json). Nothing has been pushed."
+            return 78
+        fi
+    fi
+
     push_log="$(mktemp)"
 
     # `push_rc=$?` must NOT be captured inside `if ! git push ...`. In the
@@ -178,6 +194,13 @@ squad_push_checkpoint() {
     git checkout -B "$branch" >/dev/null 2>&1 || return 0
     git add -A >/dev/null 2>&1 || return 0
     git commit -m "${COMMIT_MESSAGE:-Remote Squad session}: ${label}" >/dev/null 2>&1 || return 0
+
+    if [[ -n "${SQUAD_POLICY_PIN_SEAL_MODE:-}" ]]; then
+        if ! declare -f squad_policy_assert_pin_unpublished >/dev/null 2>&1 || ! squad_policy_assert_pin_unpublished; then
+            squad_push_log "Checkpoint NOT pushed (${label}): it would publish the session-only memory audit pin, or that could not be checked. The final push will refuse too."
+            return 0
+        fi
+    fi
 
     git push --set-upstream origin "$branch" >/dev/null 2>&1 || rc=$?
     if (( rc == 0 )); then

@@ -74,3 +74,27 @@ failed / 0 skipped**, identical to the baseline captured before any edit.
 Markdown links: **94 checked, 0 broken** (up from 79; 15 links added, no
 existing link or heading changed). No secrets, tokens, or subscription/tenant
 GUIDs beyond identifiers already present in the repository.
+
+## 2026-10-02 — Revision owner: pin seal security REJECT (findings 1–10)
+
+Security rejected engineer's implementation of my B0 pin seal, so I revised it as the lockout owner. The tracked --skip-worktree seal stays as it was. The untracked info/exclude seal is now enforced continuously:
+
+- a sampler re-pins on every tick;
+- worker/squad-agent checks the seal between agent iterations;
+- pre-commit and pre-push hooks;
+- the backstop moved into squad_push_branch/squad_push_checkpoint.
+
+Also fixed: lowercase s is accepted (finding 4); git -C at the repo root fails closed (7); an empty base fails closed inside a git repo (8); the overclaiming comments are rewritten (10); finding 5 is accepted in writing in docs/security.md. I rejected intent-to-add + skip-worktree after a probe: it breaks stash, eset --hard and rebase, and false-positives detector (c).
+
+Evidence:
+- pin suite 84/84; 10/10 mutants killed;
+- validate.ps1 578/0/0;
+- worker suite has no new failures vs merge-base 0cf3687 or origin/main, compared per suite and per assertion on Git Bash.
+
+Merge note: #121 on main auto-merges but drops the commit-rc→78 mapping. Details are in decisions/inbox/lead-pin-seal-revision.md.
+
+**Learned:** never compare git paths as strings across Git Bash and Windows; decide from git config and ev-parse --path-format=absolute instead. Test drivers that run the sampler need private SQUAD_POLICY_STATE_DIRs.
+
+## 2026-10-02 — Pin seal fix → commit b54b3be, pushed
+
+The full session cycle: engineer implemented the B0 index-seal design; security rejected with 10 findings; I revised with continuous enforcement layers, all findings closed; security re-reviewed (🟡 with advisories); reviewer closed all advisories and has final say. Commit b54b3be authorized and pushed on `fix/governance-pin-leak`. Lockout chain: engineer → lead (first revision) → lead locked for re-review → reviewer (edit authority, closes advisories).

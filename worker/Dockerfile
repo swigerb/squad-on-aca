@@ -72,6 +72,12 @@ RUN apt-get update \
     # here alongside squad-cli/squad-hub: nothing about those two pins forces
     # a Copilot CLI version, and re-verifying compatibility is the cost of
     # changing this pin, not a side effect of changing the other two.
+    # Keep in lockstep with the squad-sdk version CI installs for
+    # test_memory_audit_pin_publication.sh's real-SDK case (worker/tests/
+    # test_memory_audit_pin_publication.sh; .github/workflows/worker-tests.yml)
+    # -- that test exercises the ACTUAL rotateAuditIfNeeded() this image nests
+    # under squad-cli, so the pinned version here and the version that test
+    # installs must always agree.
     && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.13.1 \
     # Record what was asked for, so a running container can be ASKED which
     # squad-hub it has rather than guessed at -- including "none".

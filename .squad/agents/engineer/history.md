@@ -1,5 +1,73 @@
 # engineer History
 
+## 2026-10-02: Memory-audit-pin publication leak fix (issue #113 follow-up)
+
+Branch `fix/governance-pin-leak`. Implemented lead's design
+(`pinleak-design.md`, verified against the installed SDK and git behavior)
+end to end: `squad_policy_harden` used to COMMIT the session-only
+`.squad/memory/config.json` audit-rotation pin before `SQUAD_POLICY_BASE_COMMIT`
+was captured, so the pin rode along on every published branch (live proof:
+swigerb/arcade-hall-of-fame#7, `auditMaxBytes: 1048576 -> 0`). Replaced the
+commit with a seal: the pin stays in the working tree only and is kept out of
+git's index via `reset`+`--skip-worktree` (tracked) or `rm --cached`+
+`.git/info/exclude` (untracked), never committed.
+
+- `worker/lib/squad-policy.sh`: `squad_policy_commit_memory_audit_config_pin`
+  replaced with `squad_policy_seal_memory_audit_config_pin` (sparse-checkout
+  refusal, anchored exclude line, fail-closed self-check including a
+  whole-tree `git add -A --dry-run` check that catches a `.gitignore`
+  negation); new seal-integrity check added to `squad_policy_verify`; new
+  `squad_policy_assert_pin_unpublished` pre-push backstop (exit 78, nothing
+  pushed) if the pin is ever found staged. Doc block above the function
+  rewritten to describe the seal and why it is correct for agent-driven
+  pushes (watch/loop), not just the prompt-mode entrypoint path.
+- `worker/entrypoint.sh`: wired `squad_policy_assert_pin_unpublished` into
+  `commit_and_push_if_needed`, after `git commit` and before `squad_push_branch`.
+- `worker/lib/agent-policy.js`: comment-only updates describing the seal.
+- `worker/tests/test_governance_guard.sh`: fixed a stale comment describing
+  the pin as committed.
+- New suite `worker/tests/test_memory_audit_pin_publication.sh` (34
+  assertions): prompt-mode push (real `commit_and_push_if_needed` extracted
+  from entrypoint.sh) and watch/loop-style push both publish a branch whose
+  pin is byte-identical to the branch they started from; six tampering
+  sub-scenarios are still caught (direct rewrite, clearing skip-worktree or
+  the exclude line with/without a commit, and a `.gitignore` negation that
+  makes harden itself refuse to run); and against the REAL
+  `@bradygaster/squad-sdk` 0.13.1, 1100 real `audit()` calls never rotate
+  when hardened, with an unhardened control proving the harness itself would
+  rotate.
+- `.github/workflows/worker-tests.yml`: added the squad-sdk 0.13.1 install
+  step, exporting `SQUAD_SDK_DIR`, so the new suite's real-SDK scenario runs
+  in CI instead of SKIPping.
+- `worker/Dockerfile`: comment cross-referencing the CI SDK-install step, so
+  the two pins are kept in lockstep deliberately, not by accident.
+- `docs/security-report.md`, `docs/architecture.md`, `docs/runbook.md`,
+  `docs/security.md`: updated the passages describing the pin to say "sealed,
+  never committed" instead of "committed", and documented the new
+  `squad_policy_assert_pin_unpublished` exit-78 backstop.
+
+Validation: `pwsh ./scripts/validate.ps1` — 578 passed, 0 failed, 0 skipped.
+Worker bash suite (WSL): compared the branch against a fresh `origin/main`
+worktree, running every `test_*.sh` standalone with a 60s per-suite timeout
+(same methodology `run-tests.sh` uses, but isolated per suite to get a clean
+diff). Found and normalized pre-existing CRLF corruption in this specific
+Windows checkout (both the branch working copy AND the freshly-created
+`origin/main` worktree had it — not something either I or the design change
+introduced; `git diff` is empty for every CRLF-only file) so bash could even
+parse several suites; reverted that normalization for every file outside this
+change's scope afterward (`git checkout --`) once the comparison was done, so
+the working tree carries only the intended edits. With CRLF normalized
+identically on both sides, branch and `origin/main` fail/skip exactly the
+same 6 suites (`test_credential_withholding.sh`, `test_credentials.sh`,
+`test_git_checkout.sh`, `test_push.sh`, `test_token_preflight.sh`,
+`test_uid_separation.sh` — all pre-existing environment gaps: no live network/
+GH API and no real multi-UID separation available in this sandbox) and skip
+the same 1 (`test_security_n1b_root_sealed_state.sh`, needs real root). Zero
+regressions. All assertions produced session artifacts stored in `.squad/agents/engineer/` session workspace with timestamped filenames.
+
+**Outcome:** Locked out by security REJECT protocol (finding 10). Lead took revision author. No further action engineer-side.
+new failures. The new suite passes 34/34 standalone and inside the full run.
+
 ## 2026-07-15: Initial charter
 
 Created as the primary code-writing agent for Squad on ACA. Code-writing work should use `claude-opus-4.8` and should be routed here by default.

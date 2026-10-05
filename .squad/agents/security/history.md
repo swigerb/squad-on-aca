@@ -59,6 +59,14 @@ identical ignoring PowerShell's error-record line annotation, exit 0** — the
 zero-behaviour-change guarantee is intact. Worker suite: **6 suites / 302
 assertions (123/11/62/40/23/43), 0 failed, 0 skipped**, unchanged.
 
+## 2026-10-02 — Pin seal fix: REJECT (10 findings) → RE-REVIEW (APPROVE WITH ADVISORIES, findings CLOSED)
+
+Performed adversarial review of engineer's implementation of lead's design B0. The tracked `--skip-worktree` seal was sound, but the untracked `.git/info/exclude` seal was breakable by `git add -f` and `.gitignore` negations, and the detector overclaimed what it guaranteed in documentation (finding 10). **REJECTED** with 10 findings. Lead took revision author under lockout.
+
+After lead's revision added continuous enforcement layers (sampler tick, pre-commit/pre-push hooks, agent-wrapper gate, seal-integrity checks), performed a second review. **All 10 original findings CLOSED.** Re-produced every attack empirically in throwaway repos outside the repo root: `git add -f`, `.gitignore` negation, `clean -fdx`, `ls-files -v` case-sensitivity, checkout/merge blocking. Six new advisories remain (R5 mid-range commit, R-CI suite timeout, R5-b/R6 doc, R7 symlink guard scope, R8 PR merge conflicts) — all closed by reviewer's edit authority.
+
+**Verdict:** 🟡 APPROVE WITH ADVISORIES (all six closed). All 10 original findings CLOSED. Nothing blocking. Commit b54b3be authorized.
+
 **Mutation-tested the new checks.** Re-applying the reviewer's three mutations:
 a no-op ACA `terminate` fails 4 adapter checks; `throw "MUTANT wait"` in ACA
 `wait` fails both wait checks; `| Out-Null` on the ACA `cancel` az call fails
@@ -868,3 +876,125 @@ to run the real artefact against a real process if you run it under the wrong
 interpreter, because the gate stays green and *looks like evidence*. Prove the
 interpreter in the same run that uses it, and screen every command the process
 emits - including the ones that never had a function to hide behind.
+---
+
+## 2026-10-02 — Adversarial review: memory-audit pin publication seal (`fix/governance-pin-leak`)
+
+**Verdict: REJECT.** Revision owner **lead** (engineer authored it; reviewer
+lockout applies). Full finding set:
+`.squad/decisions/inbox/security-pin-publication-seal-review.md`.
+
+**What I did.** Reviewed the uncommitted diff across `worker/lib/squad-policy.sh`,
+`worker/entrypoint.sh`, `worker/lib/agent-policy.js`, the new
+`worker/tests/test_memory_audit_pin_publication.sh`, the workflow and the
+Dockerfile pin. Every git claim was then re-derived empirically against git
+2.55.0 in throwaway repositories outside the repo root — one fixture with the
+path tracked at HEAD, one with it untracked — rather than taken from the design
+doc. The doc''s proof was deliberately not treated as evidence.
+
+**What held.** The tracked-at-HEAD half of the seal is real and index-level. It
+survived `add -A`, `add -f <path>`, `add -f .squad`, `add --sparse -f`,
+`checkout -- .`, `restore .`, `checkout HEAD -- <path>`, `reset --hard`,
+`stash -u`, `clean -fdx`, and a forced branch switch to a commit with different
+content. `git diff <base> -- <path>` is confirmed blind to a skip-worktree
+entry, so detector (c) does not false-positive on the control''s own pin — the
+regression the old design was built to avoid is avoided here too, by a
+different mechanism. Governance classification is untouched; the baseline
+manifest still hashes the pinned bytes, so an agent edit is still caught. The
+new detector (e) is not bypassable by restoring the bit or the exclude line
+before verify: the `diff --cached <base>` leg and detector (c)''s `base..HEAD`
+leg close every re-seal sequence I could construct. Scenario (d) has a genuine
+control. No secrets, no injection, no weakened existing control.
+
+**What broke it.** The untracked half is not an index property at all — it is
+an ignore rule, and overriding ignore rules is what `-f` is *for*. `git add -f
+.squad/memory/config.json` stages the pin, rc 0; so does `git add -f .squad`,
+silently. Git itself prints `hint: Use -f if you really want to add them.` when
+the plain form fails, so the bypass is the path of least resistance, not
+sabotage — and committing `.squad/` state is routine Squad behaviour. Separately,
+an agent writing `!.squad/memory/config.json` into the repo `.gitignore`
+mid-session defeats the seal with a plain `git add -A`, no flag at all; harden''s
+negation check runs once and `.gitignore` is not a governance path. Both land in
+watch/loop/ralph/triage, where `commit_and_push_if_needed` is never called, so
+the pre-push backstop never runs and the pin reaches the remote before verify
+ever looks. The invariant is audited, not enforced, in the exact modes that
+produced the live leak.
+
+Two more concrete bugs. `git clean -fdx` deletes the ignored pin file, the SDK
+recreates it at the default 1048576, rotation turns back on mid-session and the
+append-only detector then blames the agent for the rename — a requirement-2
+regression against the old committed-pin design, which `clean` could not touch.
+And the seal-integrity check compares `git ls-files -v` output against `S*`,
+but with both `--assume-unchanged` and `--skip-worktree` set git prints
+lowercase `s`; a stronger-than-required seal is therefore reported as
+`seal broken` and aborts the session at 78.
+
+**Lesson recorded.** The previous design failed because reasoning that was
+correct about detector (c) was wrong about ancestry. This one repeats the
+shape one level down: a proof that is correct about the index is asserted over
+a branch that never touches the index. Two mechanisms sharing one function do
+not share one guarantee, and a comment that says "no git porcelain can ever"
+has to be true for the weaker branch, not the stronger one. The suite inherited
+the same blind spot — it tests `add -f` only on the fixture where
+skip-worktree already defeats it. When a control has two implementations,
+every adversarial case has to be run against both, or the test is measuring
+the half that was never in doubt.
+
+
+## 2026-10-02 — Re-review: memory-audit pin publication seal (revision by `lead`) — VERDICT 🟡 approve-with-advisories
+
+Re-reviewed the full uncommitted diff on `fix/governance-pin-leak` after my 🔴
+reject of engineer's implementation. `engineer` was locked out; `lead` produced
+the revision. Review: `.squad/decisions/inbox/security-pin-seal-rereview.md`.
+
+**All ten original findings closed.** Six (1, 2, 3, 4, 7, 8) I closed by
+reproducing the original attack empirically in throwaway `mktemp` repos outside
+the repo root — not by reading lead's summary. Three (5, 6, 10) are written
+acceptances/comments I read and found accurate; notably lead's own comment
+concedes the `advice.*` git settings are cosmetic, which I verified
+independently (`advice.addIgnoredFile=false` hides the hint, `add -f` still
+works). Finding 9 I closed with my own 3-mutant run on a scratch copy of
+`worker/` — each mutant was killed by exactly its own assertions and no others,
+so the new section (e) is not vacuous and lead's mutation claim is honest.
+
+Nothing on my prior "WHAT HELD" list regressed. Detector (c) still does not
+false-positive on the control, the governance class is byte-identical, and an
+agent content edit is still a violation in both modes.
+
+**The new machinery is better than I asked for in one place.** I expected the
+"staged pin was seen" record to be a file and asked whether the agent could
+erase it. It is not a file at all — `SQUAD_POLICY_PIN_EVENTS` and
+`SQUAD_POLICY_PIN_BROKEN_MASK` live in entrypoint shell memory, carried from the
+sampler subshell through a process-substitution pipe. Strictly stronger than a
+root-owned file in the sealed state dir. The re-pin is an atomic
+write-temp-then-rename, the sampler adds no new process and leaves no orphan,
+and killing it is itself a violation.
+
+**Two real defects, neither blocking.** (R5) Every prevention layer checks only
+the *tip* — pre-push hook, `assert_pin_unpublished` (mask 16 is `HEAD:<rel>`),
+and detector (c)'s net diffs. A pin committed with `--no-verify` and then
+`git rm --cached`'d lands on the remote inside an intermediate commit,
+undetected, when the staging window is sub-tick; at 3s the sampler catches it.
+(R-CI) The suite is 112s on my host, 147s on lead's, against a hard 120s
+per-suite kill at `run-tests.sh:59` that the workflow does not override — and
+the workflow also fails on any skip, so there is no escape hatch. It will be
+killed in CI.
+
+**Why I did not reject again.** The R5 attack requires `--no-verify`, which puts
+it inside the acknowledged, explicitly out-of-scope deliberate-agent boundary,
+and its harm is strictly lower than the bug being fixed — the net diff stays
+clean and the pin survives only in an intermediate commit. The proportionality
+rule says block on NEW or UNCLOSED concrete defects, and a second reject would
+have pushed revision authority onto `reviewer` over a gap narrower than the one
+being closed. Approving with advisories was the honest call, not the lenient one.
+
+**Lesson recorded.** My own prior review had the same shape of blind spot I am
+now flagging in lead's: I checked that the pin was absent from `HEAD` and from
+the net diff, and never asked about the commits *between* base and tip. "Is it
+published?" is a question about a range, not a point, and three independent
+layers all answered the point version. When several controls agree, check
+whether they agree because the invariant holds or because they share a
+predicate — here all three shared "look at one commit." Also: a security suite
+that cannot finish inside the harness timeout is not a passing suite, it is an
+absent one, and that belongs in the findings table at the same weight as a code
+defect.

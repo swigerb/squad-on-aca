@@ -106,6 +106,15 @@
 #                                  mcp-config.sha256 TRIPWIRE copy. If either
 #                                  variable is set the session is hardened and
 #                                  the check below fails CLOSED (78).
+#   SQUAD_POLICY_PIN_SEAL_MODE,    set by squad_policy_harden
+#   SQUAD_POLICY_PIN_REPO_DIR,     (squad_policy_seal_memory_audit_config_pin):
+#   SQUAD_POLICY_PIN_BASE_BLOB,    the session-only memory audit pin seal. When
+#   SQUAD_POLICY_PIN_SHA256        the mode is set and not `none`, every
+#                                  iteration re-runs the seal predicate from
+#                                  squad-policy.sh (found beside this script or
+#                                  in lib/) and checks the pinned file's digest;
+#                                  a broken seal, an un-pinned file or missing
+#                                  state refuses to run (78).
 
 set -Eeuo pipefail
 
@@ -283,6 +292,56 @@ if [[ -n "${SQUAD_POLICY_STATE_DIR:-}" || -n "${SQUAD_POLICY_MCP_CONFIG_SHA256:-
     if [[ "$mcp_sealed" != "$mcp_baseline" ]]; then
       squad_agent_abort "The root-sealed .mcp.json baseline ('${mcp_sealed}') does not match this session's ('${mcp_baseline}'); refusing to run."
     fi
+  fi
+fi
+
+# Session-only memory audit pin (worker/lib/squad-policy.sh,
+# squad_policy_seal_memory_audit_config_pin). watch/loop/triage never run the
+# container's own commit-and-push, so this wrapper -- which runs before EVERY
+# agent iteration -- is where the seal is re-verified for those modes: a broken
+# seal (pin staged, `.gitignore` negation, skip-worktree cleared, pin committed)
+# or an un-pinned file refuses to start the next iteration. The predicate runs
+# in a SUBSHELL so sourcing the policy library cannot disturb this script's
+# state. Fail CLOSED once a seal was recorded.
+if [[ -n "${SQUAD_POLICY_PIN_SEAL_MODE:-}" && "${SQUAD_POLICY_PIN_SEAL_MODE}" != "none" ]]; then
+  pin_lib=""
+  pin_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for pin_candidate in "${pin_self_dir}/squad-policy.sh" "${pin_self_dir}/lib/squad-policy.sh"; do
+    if [[ -f "$pin_candidate" ]]; then
+      pin_lib="$pin_candidate"
+      break
+    fi
+  done
+  if [[ -z "$pin_lib" ]]; then
+    squad_agent_abort "A memory audit pin seal is recorded for this session (mode '${SQUAD_POLICY_PIN_SEAL_MODE}') but squad-policy.sh could not be found to verify it; refusing to run."
+  fi
+  if [[ -z "${SQUAD_POLICY_PIN_REPO_DIR:-}" || ! "${SQUAD_POLICY_PIN_BASE_BLOB:-}" =~ ^([0-9a-f]{40,64}|absent)$ || ! "${SQUAD_POLICY_PIN_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    squad_agent_abort "This session recorded a memory audit pin seal but its state is incomplete (repo '${SQUAD_POLICY_PIN_REPO_DIR:-}', base '${SQUAD_POLICY_PIN_BASE_BLOB:-}'). Missing integrity state is a violation; refusing to run."
+  fi
+  pin_problems="$(
+    # shellcheck source=lib/squad-policy.sh
+    source "$pin_lib" >/dev/null 2>&1 || { echo "could not load ${pin_lib}"; exit 0; }
+    if ! squad_policy_pin_seal_check "$SQUAD_POLICY_PIN_REPO_DIR" "$SQUAD_POLICY_PIN_SEAL_MODE" "$SQUAD_POLICY_PIN_BASE_BLOB"; then
+      squad_policy_pin_seal_describe "$SQUAD_POLICY_PIN_SEAL_MASK"
+    fi
+  )" || pin_problems="could not run the memory audit pin seal check"
+  if [[ -n "$pin_problems" ]]; then
+    squad_agent_abort "The session-only memory audit pin seal is broken; refusing to start another agent iteration: ${pin_problems//$'\n'/; }"
+  fi
+  # The in-session sampler re-pins a deleted/replaced file within one
+  # interval; give it a few before refusing.
+  pin_file="${SQUAD_POLICY_PIN_REPO_DIR}/.squad/memory/config.json"
+  pin_ok=0
+  for pin_try in 1 2 3 4 5 6 7 8 9 10; do
+    pin_sum="$(sha256sum "$pin_file" 2>/dev/null || true)"
+    if [[ ! -L "$pin_file" && "${pin_sum%% *}" == "$SQUAD_POLICY_PIN_SHA256" ]]; then
+      pin_ok=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "$pin_ok" -ne 1 ]]; then
+    squad_agent_abort "${pin_file} no longer holds this session's memory audit pin (policy.auditMaxBytes=0); squad-sdk audit rotation would be re-enabled. Refusing to start another agent iteration."
   fi
 fi
 
