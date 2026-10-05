@@ -248,6 +248,10 @@ EOF
 chmod +x "${STUBS_UNIT}"/*.sh
 
 # watchdog <seconds-until-deadline> <cmd...> -- prints the report variables
+# The timed-out cases use 2, not 1: EPOCHSECONDS has whole-second resolution,
+# so "+1" can be a few milliseconds away -- less than a stub needs to install
+# its traps -- and a SIGINT landing first would kill it with bash's default
+# disposition and make the case flaky. "+2" is always at least a full second.
 watchdog() {
   local until="$1"; shift
   (
@@ -269,24 +273,47 @@ assert_eq "1" "$(( elapsed <= 2 ? 1 : 0 ))" "... and the watchdog does not hold 
 out="$(watchdog 30 true)"
 assert_contains "$out" "TIMED_OUT=0 RC=0" "a successful agent: TIMED_OUT=0 RC=0"
 
+# A signal that was IGNORED when a non-interactive bash started cannot be
+# trapped or reset by it (POSIX), and the ignore is inherited by everything it
+# starts. This suite inherits SIGINT ignored when it is itself launched as a
+# background job without job control (`suite &` from a script) -- then no stub
+# can ever see the watchdog's SIGINT. Probe exactly the stubs' mechanism; where
+# SIGINT cannot arrive, prove instead that the watchdog's SIGTERM escalation
+# still stops every agent -- which is also what happens in a container whose
+# agent starts with SIGINT ignored.
+SIGINT_DELIVERABLE=0
+bash -c 'trap "exit 42" INT; kill -INT $$; exit 0' 2>/dev/null
+[[ $? -eq 42 ]] && SIGINT_DELIVERABLE=1
+if [[ "$SIGINT_DELIVERABLE" -eq 1 ]]; then
+  OFFERED="INT TERM"
+else
+  OFFERED="TERM"
+  echo "NOTE: this suite was started with SIGINT ignored (inherited, so no bash stub can trap it); the SIGINT-specific outcomes below are replaced by the SIGTERM fallback, which is still asserted."
+fi
+
 SIG="${WORK}/sig-polite"; : >"$SIG"
-out="$(watchdog 1 "${STUBS_UNIT}/polite.sh" "$SIG")"
-assert_contains "$out" "TIMED_OUT=1 RC=42" "a polite agent still running at the deadline is stopped by SIGINT (its own status 42 kept)"
-assert_eq "INT" "$(tr '\n' ' ' <"$SIG" | sed 's/ $//')" "... and received SIGINT only -- no escalation was needed"
+out="$(watchdog 2 "${STUBS_UNIT}/polite.sh" "$SIG")"
+if [[ "$SIGINT_DELIVERABLE" -eq 1 ]]; then
+  assert_contains "$out" "TIMED_OUT=1 RC=42" "a polite agent still running at the deadline is stopped by SIGINT (its own status 42 kept)"
+  assert_eq "INT" "$(tr '\n' ' ' <"$SIG" | sed 's/ $//')" "... and received SIGINT only -- no escalation was needed"
+else
+  assert_contains "$out" "TIMED_OUT=1 RC=43" "(SIGINT ignored on entry) a polite agent is stopped by the SIGTERM escalation instead"
+  assert_eq "TERM" "$(tr '\n' ' ' <"$SIG" | sed 's/ $//')" "... which it received"
+fi
 
 SIG="${WORK}/sig-term"; : >"$SIG"
-out="$(watchdog 1 "${STUBS_UNIT}/term-only.sh" "$SIG")"
+out="$(watchdog 2 "${STUBS_UNIT}/term-only.sh" "$SIG")"
 assert_contains "$out" "TIMED_OUT=1 RC=143" "an agent that ignores SIGINT is escalated to SIGTERM after the INT grace"
-assert_eq "INT TERM" "$(tr '\n' ' ' <"$SIG" | sed 's/ $//')" "... in that order: SIGINT first, then SIGTERM"
+assert_eq "$OFFERED" "$(tr '\n' ' ' <"$SIG" | sed 's/ $//')" "... in that order: SIGINT first, then SIGTERM"
 
 SIG="${WORK}/sig-stubborn"; : >"$SIG"
-out="$(watchdog 1 "${STUBS_UNIT}/stubborn.sh" "$SIG")"
+out="$(watchdog 2 "${STUBS_UNIT}/stubborn.sh" "$SIG")"
 assert_contains "$out" "TIMED_OUT=1 RC=137" "an agent that swallows SIGINT and SIGTERM is SIGKILLed after the TERM grace (137)"
-assert_eq "INT TERM" "$(tr '\n' ' ' <"$SIG" | sed 's/ $//')" "... after being offered SIGINT, then SIGTERM"
+assert_eq "$OFFERED" "$(tr '\n' ' ' <"$SIG" | sed 's/ $//')" "... after being offered SIGINT, then SIGTERM"
 
 GC="${WORK}/grandchild.pid"; : >"$GC"
-out="$(watchdog 1 "${STUBS_UNIT}/leaves-grandchild.sh" "$GC")"
-assert_contains "$out" "TIMED_OUT=1 RC=130" "an agent that exits on SIGINT but leaves a child behind reports its own status"
+out="$(watchdog 2 "${STUBS_UNIT}/leaves-grandchild.sh" "$GC")"
+assert_contains "$out" "TIMED_OUT=1 RC=$([[ "$SIGINT_DELIVERABLE" -eq 1 ]] && echo 130 || echo 143)" "an agent that stops but leaves a child behind reports its own status"
 sleep 0.2
 assert_eq "1" "$(pid_gone "$(cat "$GC")" && echo 1 || echo 0)" \
   "... and the child it left in its process group (ignoring INT and TERM) is swept with SIGKILL, so nothing is still writing to the checkout during the WIP commit"
@@ -470,8 +497,13 @@ EOF
 # Runs one session: the real case-arm body, eval'd in a driver that sources the
 # real libraries and defines the real entrypoint functions, against a fresh
 # clone of a fresh bare remote. The deadline is <deadline-offset> seconds from
-# now (computed through the real SQUAD_REPLICA_TIMEOUT_SECONDS=90 /
-# SQUAD_PUBLISH_MARGIN_SECONDS=30 arithmetic: start = now - 60 + offset).
+# the moment the checkout has been hardened (computed through the real
+# SQUAD_REPLICA_TIMEOUT_SECONDS=90 / SQUAD_PUBLISH_MARGIN_SECONDS=30
+# arithmetic: start = now - 60 + offset). Taken AFTER hardening, which can
+# take seconds on a loaded runner: a deadline that has already passed when the
+# agent starts would stop it before it wrote anything, and the scenario would
+# prove nothing. TIMED_OUT_OFFSET leaves room for the agent (and, on the hub
+# path, the node policy resolver that runs before it) to start and write.
 # Leaves: ${WORK}/<name>/{remote.git,client,stub/*} and prints the driver's
 # combined output, ending in "SESSION_EXIT=<rc>".
 run_session() {
@@ -507,17 +539,20 @@ run_session() {
     echo 'export ASPIRE_OTLP_HTTP_ENDPOINT=http://otel.invalid SQUAD_HUB_URL=http://hub.invalid'
     echo 'COPILOT_ARGV=(--allow-all-tools --deny-tool "shell(git push)")'
     echo 'export SQUAD_REPLICA_TIMEOUT_SECONDS=90 SQUAD_PUBLISH_MARGIN_SECONDS=30'
-    printf 'export SQUAD_SESSION_START_EPOCH=$((EPOCHSECONDS - 60 + %d))\n' "$offset"
     echo 'export SQUAD_DEADLINE_INT_GRACE_SECONDS=1 SQUAD_DEADLINE_TERM_GRACE_SECONDS=1'
     local line
     for line in "$@"; do printf '%s\n' "$line"; done
     echo 'cd "$REPO_DIR"'
     echo 'squad_policy_harden "$REPO_DIR" >/dev/null'
+    printf 'export SQUAD_SESSION_START_EPOCH=$((EPOCHSECONDS - 60 + %d))\n' "$offset"
     echo 'trap '"'"'echo "SESSION_EXIT=$?"'"'"' EXIT'
     printf '%s\n' "${!block_var}"
   } >"$driver"
   bash "$driver" 2>&1
 }
+
+# Seconds from "hardened" to the deadline in the scenarios that time out.
+TIMED_OUT_OFFSET=4
 
 remote_branch() { git --git-dir="${WORK}/$1/remote.git" rev-parse --verify -q "refs/heads/$2" 2>/dev/null || echo none; }
 remote_main() { git --git-dir="${WORK}/$1/remote.git" rev-parse refs/heads/main; }
@@ -526,7 +561,7 @@ gh_call_flat() { tr '\0' '|' <"${WORK}/$1/stub/gh-call-$2" 2>/dev/null; }
 
 # --- 5a. the acceptance case: an agent that never exits -------------------
 t0=$SECONDS
-out="$(run_session never PROMPT_BODY never-exits 0 1)"
+out="$(run_session never PROMPT_BODY never-exits 0 "$TIMED_OUT_OFFSET")"
 elapsed=$((SECONDS - t0))
 branch="$(remote_branch never squad/deadline-test)"
 assert_contains "$out" "SESSION_EXIT=124" \
@@ -544,7 +579,7 @@ if [[ "$branch" != none ]]; then
   assert_eq "" "$(git --git-dir="${WORK}/never/remote.git" diff "$(remote_main never)" "$branch" -- .squad/memory/config.json)" \
     "acceptance: the published branch carries NO .squad/memory/config.json diff (the session-only pin never leaves the container)"
 fi
-assert_eq "INT TERM" "$(tr '\n' ' ' <"${WORK}/never/stub/signals" 2>/dev/null | sed 's/ $//')" \
+assert_eq "$OFFERED" "$(tr '\n' ' ' <"${WORK}/never/stub/signals" 2>/dev/null | sed 's/ $//')" \
   "acceptance: the agent was offered SIGINT, then SIGTERM, before being killed"
 assert_eq "1" "$(pid_gone "$(cat "${WORK}/never/stub/agent.pid" 2>/dev/null)" && echo 1 || echo 0)" \
   "acceptance: the agent process is gone after the session"
@@ -580,7 +615,7 @@ assert_eq "none" "$(remote_branch failing squad/deadline-test)" "... and still p
 assert_eq "0" "$(ls "${WORK}/failing/stub" | grep -c '^gh-call-' || true)" "... and opens no pull request"
 
 # --- 5d. the WIP publish is still pin-guarded ------------------------------
-out="$(run_session pin PROMPT_BODY pin-adversary 0 1)"
+out="$(run_session pin PROMPT_BODY pin-adversary 0 "$TIMED_OUT_OFFSET")"
 assert_contains "$out" "SESSION_EXIT=78" \
   "an agent that force-stages .squad/memory/config.json and hangs is stopped -- and the WIP publish is REFUSED by the pin guard (78)"
 assert_eq "none" "$(remote_branch pin squad/deadline-test)" \
@@ -588,7 +623,7 @@ assert_eq "none" "$(remote_branch pin squad/deadline-test)" \
 assert_eq "0" "$(ls "${WORK}/pin/stub" | grep -c '^gh-call-' || true)" "... and no pull request is opened"
 
 # --- 5e. the squad-hub oneshot path ----------------------------------------
-out="$(run_session hub PROMPT_BODY none 1 1)"
+out="$(run_session hub PROMPT_BODY none 1 "$TIMED_OUT_OFFSET")"
 assert_contains "$out" "SESSION_EXIT=124" "hub path: a squad-hub oneshot still running at the deadline ends the session with 124"
 branch="$(remote_branch hub squad/deadline-test)"
 assert_ne "none" "$branch" "hub path: the WIP branch is pushed"
@@ -610,7 +645,7 @@ assert_eq "0" "$([[ -e "${WORK}/hub-resolver/stub/hub.pid" ]] && echo 1 || echo 
 assert_eq "none" "$(remote_branch hub-resolver squad/deadline-test)" "... and nothing is published"
 
 # --- 5f. new-project: same watchdog, its own branch and title --------------
-out="$(run_session newproj NEWPROJ_BODY never-exits 0 1 'unset PUSH_CHANGES')"
+out="$(run_session newproj NEWPROJ_BODY never-exits 0 "$TIMED_OUT_OFFSET" 'unset PUSH_CHANGES')"
 assert_contains "$out" "SESSION_EXIT=124" "new-project: a never-exiting agent also ends with 124"
 branch="$(remote_branch newproj squad/bootstrap-deadline-test)"
 assert_ne "none" "$branch" "new-project: its bootstrap branch is pushed"
@@ -622,7 +657,7 @@ assert_contains "$gh1" "--draft" "new-project: the PR is a draft"
 assert_contains "$gh1" "WIP: Bootstrap project with Squad on ACA" "new-project: its own PR title, marked WIP"
 
 # --- 5g. no draft PRs on this repository: still a PR, still WIP -----------
-out="$(run_session nodraft PROMPT_BODY never-exits 0 1 'export GH_FAIL_DRAFT=1')"
+out="$(run_session nodraft PROMPT_BODY never-exits 0 "$TIMED_OUT_OFFSET" 'export GH_FAIL_DRAFT=1')"
 assert_contains "$out" "SESSION_EXIT=124" "no-draft repo: the session still ends 124"
 assert_contains "$(gh_call nodraft 1)" "--draft" "no-draft repo: a draft was tried first"
 gh2="$(gh_call nodraft 2)"

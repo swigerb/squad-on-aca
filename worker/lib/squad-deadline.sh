@@ -323,7 +323,12 @@ _squad_deadline_wait_until() {
 #   * bash makes a background job started WITHOUT job control ignore SIGINT
 #     (and an ignored signal stays ignored across exec), so the polite first
 #     signal would never arrive at all. Verified with a stub that traps INT:
-#     it receives it under `set -m` and does not without.
+#     it receives it under `set -m` and does not without. (`set -m` cannot
+#     undo a SIGINT that was already ignored when the WORKER started -- POSIX
+#     shells may not reset a signal ignored on entry. Then the SIGINT is lost
+#     and the SIGTERM one grace period later is what stops the agent; the
+#     escalation exists for exactly that kind of case, and
+#     test_session_deadline.sh covers it.)
 #
 # The job runs the command exactly as the old `( squad_policy_exec_agent ... )`
 # subshell did -- it is still a subshell, so squad_policy_exec_agent's
