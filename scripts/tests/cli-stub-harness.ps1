@@ -358,15 +358,6 @@ null
     Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
 @echo off
 >>"%SQUAD_STUB_AZ_LOG%" echo %*
-set "CMDLINE=%*"
-if not "%SQUAD_STUB_AZ_FORBID_VALUE%"=="" echo %CMDLINE% | findstr /C:"%SQUAD_STUB_AZ_FORBID_VALUE%" >nul && (
-  1>&2 echo STUB-ARGV-LEAK: forbidden free-text value reached az.cmd
-  exit /b 97
-)
-if "%SQUAD_STUB_AZ_FORBID_PERCENT%"=="1" echo %CMDLINE% | findstr /C:"%%" >nul && (
-  1>&2 echo STUB-ARGV-LEAK: percent token reached az.cmd
-  exit /b 98
-)
 set "A1=%~1"
 set "A2=%~2"
 set "A3=%~3"
@@ -1052,7 +1043,7 @@ function Invoke-SquadCliCapture {
 
     $envNames = @("PATH", "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE",
                   "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT",
-                  "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_AZ_FORBID_VALUE", "SQUAD_STUB_AZ_FORBID_PERCENT",
+                  "SQUAD_STUB_AZ_LOG",
                   "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
                   "SQUAD_STUB_ACA_LOG", "SQUAD_STUB_ARM_LOG", "SQUAD_STUB_ARM_MALFORMED",
                   "SQUAD_STUB_CURL_LOG", "SQUAD_STUB_CURL_RC",
@@ -1105,8 +1096,6 @@ function Invoke-SquadCliCapture {
         $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $env:SQUAD_STUB_STOP_RC = "$StopExitCode"
         $env:SQUAD_STUB_START_RC = "$StartExitCode"
-        $env:SQUAD_STUB_AZ_FORBID_VALUE = $ForbiddenAzArgValue
-        $env:SQUAD_STUB_AZ_FORBID_PERCENT = if ($FailOnAzPercentToken) { "1" } else { "" }
         $env:SQUAD_STUB_ARM_LOG = $Stub.ArmLog
         $env:SQUAD_STUB_ARM_MALFORMED = "0"
         # The adapter-level checks in validate.ps1 drive these; a CLI capture
@@ -1220,11 +1209,32 @@ function Invoke-SquadCliCapture {
     if (Test-Path $errFile) { $stderr = [System.IO.File]::ReadAllText($errFile) }
     Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
+    # Argv-leak check for the Windows az.cmd shim. It runs here, in PowerShell,
+    # over the argv log that az.cmd already writes, because expanding a hostile
+    # value inside az.cmd itself makes cmd.exe parse its quotes and & | < > as
+    # syntax. Any distinctive word of the forbidden value, or any % token, on an
+    # az argv line means free text crossed the Windows command line.
+    $azCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
+    if ($ForbiddenAzArgValue) {
+        $markers = @($ForbiddenAzArgValue -split '\s+' | Where-Object { $_ -cmatch '^[A-Za-z_]{5,}$' })
+        foreach ($line in $azCalls) {
+            foreach ($marker in $markers) {
+                if ($line.Contains($marker)) {
+                    $stderr += "`nSTUB-ARGV-LEAK: forbidden free-text value reached az.cmd"
+                    break
+                }
+            }
+        }
+    }
+    if ($FailOnAzPercentToken -and @($azCalls | Where-Object { $_.Contains('%') }).Count -gt 0) {
+        $stderr += "`nSTUB-ARGV-LEAK: percent token reached az.cmd"
+    }
+
     return [pscustomobject]@{
         ExitCode   = $exitCode
         StdOut     = $stdout
         StdErr     = $stderr
-        AzCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
+        AzCalls    = $azCalls
         GhCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool gh)
         ArmCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool arm)
         SquadCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool squad)

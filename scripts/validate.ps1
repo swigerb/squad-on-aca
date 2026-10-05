@@ -3259,18 +3259,27 @@ if (-not (Test-Path $harness)) {
         # Windows cmd.exe regression test: a real az.cmd shim fails if any argv
         # contains the free-text prompt or a raw % token. The dispatch must still
         # succeed, proving those values stayed inside the ARM JSON body instead of
-        # crossing the Windows command line.
-        Reset-SquadCliStubLog -Stub $stub
-        $hostilePrompt = "quotes `" and %PATH% %GITHUB_TOKEN% & | ^ ! < > \ newline café 😀"
-        $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript `
-            -CliArguments @("run", $hostilePrompt, "--name", "fixedwinshim") `
-            -ForbiddenAzArgValue $hostilePrompt `
-            -FailOnAzPercentToken
-        $startCall = @($r.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
-        if ($r.ExitCode -eq 0 -and $startCall.Count -eq 1 -and $r.StdErr -notmatch 'STUB-ARGV-LEAK') {
-            Add-Pass "The Windows az.cmd shim never sees the free-text prompt or a percent token on its argv; the prompt stays inside the ARM request body"
-        } else {
-            Add-Fail "The Windows az.cmd shim saw free-text dispatch data on argv or dispatch failed (exit=$($r.ExitCode), stderr=$($r.StdErr))"
+        # crossing the Windows command line. `run` needs a real Squad repo, so
+        # this check gets its own initialized stub.
+        $shimStub = $null
+        try {
+            $shimStub = New-SquadCliStubEnvironment
+            Initialize-SquadCliStubRepository -Stub $shimStub | Out-Null
+            Reset-SquadCliStubLog -Stub $shimStub
+            $hostilePrompt = "quotes `" and %PATH% %GITHUB_TOKEN% & | ^ ! < > \ newline café 😀"
+            $r = Invoke-SquadCliCapture -Stub $shimStub -ScriptPath $cliScript `
+                -CliArguments @("run", "--repo", "octo/demo", "--name", "fixedwinshim", $hostilePrompt) `
+                -ForbiddenAzArgValue $hostilePrompt `
+                -FailOnAzPercentToken
+            $startCall = @($r.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
+            $armTrace = $r.ArmCalls -join "`n"
+            if ($r.ExitCode -eq 0 -and $startCall.Count -eq 1 -and $r.StdErr -notmatch 'STUB-ARGV-LEAK' -and $armTrace.Contains("newline caf")) {
+                Add-Pass "The Windows az.cmd shim never sees the free-text prompt or a percent token on its argv; the prompt stays inside the ARM request body"
+            } else {
+                Add-Fail "The Windows az.cmd shim saw free-text dispatch data on argv or dispatch failed (exit=$($r.ExitCode), stderr=$($r.StdErr))"
+            }
+        } finally {
+            if ($shimStub) { Remove-SquadCliStubEnvironment -Stub $shimStub }
         }
 
         # doctor is not routed through the provider; assert it is still intact.
@@ -3696,7 +3705,7 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
         $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("smoke", "--repo", "octo/demo")
         $calls = @(Get-Content -LiteralPath $stub.CallLog -ErrorAction SilentlyContinue)
         $leaseIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -like "gh lease-write*" })
-        $startIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -eq "az job-start" })
+        $startIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -eq "arm job-start" })
         if ($leaseIdx -ge 0 -and $startIdx -ge 0 -and $leaseIdx -lt $startIdx) {
             Add-Pass "squad-aca dispatch writes the lease at index $leaseIdx, BEFORE the compute request at index $startIdx"
         } else {

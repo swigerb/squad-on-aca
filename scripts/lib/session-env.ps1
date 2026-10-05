@@ -455,6 +455,11 @@ function Invoke-AcaArmRequest {
             "---"
         ) -Encoding utf8
         if ($Method -eq "POST") {
+            # The shared, ordered call log lets the claim-before-compute test
+            # prove the lease write precedes this compute request.
+            if ($env:SQUAD_CALL_LOG) {
+                Add-Content -LiteralPath $env:SQUAD_CALL_LOG -Value "arm job-start" -Encoding ascii
+            }
             $startRc = 0
             if ($env:SQUAD_STUB_START_RC) { $startRc = [int]$env:SQUAD_STUB_START_RC }
             if ($startRc -ne 0) {
