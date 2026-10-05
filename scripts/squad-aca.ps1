@@ -2034,7 +2034,7 @@ function Invoke-Ralph {
             # Unlike a fresh worker session, a manual Ralph run must INHERIT the
             # template's Ralph config and secret refs (SQUAD_MODE=ralph,
             # RALPH_LABELS, RALPH_MAX_ISSUES, tokens, Azure fields, Aspire
-            # endpoints). New-RalphRunEnvVars preserves them and overlays only the
+            # endpoints). New-RalphRunEnvMap preserves them and overlays only the
             # optional repository/run-identity values.
             $envMap = New-RalphRunEnvMap -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup -Repository $repo -SubscriptionId $config.subscriptionId
             $response = Start-AcaJobExecution `

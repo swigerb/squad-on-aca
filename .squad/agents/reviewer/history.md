@@ -116,3 +116,101 @@ coordinator to re-verify on an unloaded host/real CI runner.
 ## 2026-10-02 (final) — Pin seal fix session conclusion
 
 Lockout chain: engineer (original impl) → lead (revision 1) → lead locked for re-review → reviewer (edit authority, closes all 6 advisories from security re-review). Commit b54b3be authorized, pushed on `fix/governance-pin-leak`. All 10 security findings from round 1 verified CLOSED in round 2. Full session documented in `.squad/log/2026-10-02T09-33-56Z-governance-pin-leak.md` and orchestration-log entries.
+
+## 2026-10-05 17:17 UTC — Issue #129 ARM REST dispatch fix review
+
+**Commit reviewed:** `910920e` on branch `squad/129-safe-prompt-dispatch-3`
+(one commit ahead of `origin/main` @ `a642bf0`).
+
+**Scope:** `scripts/lib/session-env.ps1`, `start-session.ps1`,
+`start-watch.ps1`, `squad-aca.ps1`, `providers/squad-sandbox-provider.ps1`,
+`providers/squad-aca-job-provider.ps1`, `worker/lib/aca-job-rest.sh`,
+`worker/lib/aca-job-rest.js`, `worker/lib/ralph-dispatch.sh`,
+`.github/workflows/squad-dispatch.yml`, `worker/Dockerfile`,
+`worker/entrypoint.sh`, plus the new/updated test suites and golden file.
+
+**Verdict: APPROVED WITH ADVISORIES**
+
+No blocking issues found. The core security property holds: traced every
+dispatch path (local CLI `run`/`smoke`/`sessions`, `squad-aca.ps1` watch and
+Ralph-manual, the worker's own `ralph` loop, and the GitHub Actions
+trigger) and confirmed the prompt/session-name/branch/team values now reach
+Azure only as JSON HTTP body bytes (`Invoke-RestMethod -Body $bytes` /
+`az rest --body @file`), never as a literal `az`/`az.cmd` argv token. The
+`LiteralOnlySessionEnvKeys` (PS) and `LITERAL_ONLY_SESSION_ENV_KEYS` (JS)
+allowlists that prevent a hostile `SQUAD_PROMPT` beginning with the literal
+string `secretref:` from being upgraded into a secret reference are
+byte-for-byte identical today. The 100,000 UTF-8 byte cap is enforced
+before the lease claim on every path I traced (`start-session.ps1`,
+`squad-aca.ps1`'s `Start-LeasedExecution`, `squad-sandbox-provider.ps1`,
+`ralph-dispatch.sh`'s `ralph_dispatch_issue`, and the Actions workflow's
+"Prepare prompt" step, which runs and must succeed before "Claim the shared
+lease" runs). Lease-release-on-failure is correctly wired everywhere a
+start can fail, including the Actions workflow's `trap ... ERR` pattern
+(verified bash's ERR trap does fire for a failing sourced-function call at
+top level even without `errtrace`, and that `set -e` does propagate failure
+from `var="$(cmd)"` command substitutions, unlike the `mapfile < <(cmd)`
+process-substitution case the workflow explicitly guards against with its
+own empty-array/`GITHUB_TOKEN` presence checks). Test coverage for the
+hostile-prompt path (quotes, CRLF/LF, `%PATH%`/`%GITHUB_TOKEN%`, shell
+metacharacters, backslashes, non-ASCII/emoji) is genuinely end-to-end in
+`worker/tests/test_aca_job_rest.sh`, `test_ralph_dispatch.sh`, and
+`scripts/tests/golden/cli/28-run-hostile-prompt.txt`, and `validate.ps1`
+adds a real `az.cmd`-shim regression test gated to `$IsWindowsHost` that
+fails the build (`STUB-ARGV-LEAK`) if the prompt or a raw `%` token ever
+reaches `az.cmd`'s argv again.
+
+**Findings:**
+
+- advisory — `scripts/lib/session-env.ps1:39-92` vs
+  `worker/lib/aca-job-rest.js:6-27`: `$script:LiteralOnlySessionEnvKeys`
+  and `LITERAL_ONLY_SESSION_ENV_KEYS` are two hand-maintained copies of the
+  same security-critical allowlist (the one that stops a hostile
+  `SQUAD_PROMPT`/session value from being silently upgraded into a
+  `secretRef`). They match today, but `scripts/validate.ps1` already has a
+  drift check for the sibling list (`SessionManagedEnvKeys` vs
+  `RALPH_MANAGED_ENV_KEYS`, see `validate.ps1:444-461` and the comment in
+  `ralph-dispatch.sh` promising it), and no equivalent check exists for
+  this pair. A future edit to only one copy would reintroduce the
+  secretRef-confusion class of bug with no test to catch it. Suggested
+  fix: add a drift check to `validate.ps1` alongside the existing one.
+
+- advisory — `scripts/lib/session-env.ps1:94-360` (`ConvertTo-EnvVarTokens`,
+  `New-SessionStartEnvVars`, `New-RalphRunEnvVars`, `Get-SquadScratchFilePath`):
+  dead code left over from the pre-ARM-REST `az containerapp job start
+  --env-vars` design. Confirmed via repo-wide grep that none of these four
+  functions are called from anywhere except each other/the file's own
+  comments; every real caller now goes through `Get-AcaJobStartRequest` /
+  `New-SessionStartEnvMap` / `New-RalphRunEnvMap` / `Start-AcaJobExecution`.
+  Harmless today but actively misleading: the file's own `.SYNOPSIS`/header
+  comment (lines 1-30) still describes `az containerapp job start
+  --env-vars` as the current mechanism, which no longer matches the
+  implementation below it. Worth deleting or at minimum re-marked
+  "retained for X" if there's a reason to keep them.
+
+- advisory (low confidence, could not verify in this sandbox) —
+  `scripts/lib/session-env.ps1:456-459` (`Get-AcaJobStartRequest`): `cpu =
+  [double]$containerOptions.Cpu` relies on PowerShell's implicit
+  string-to-double conversion, which in some PowerShell/.NET contexts uses
+  the host's current culture rather than invariant culture. Elsewhere in
+  this same repo (`scripts/deploy.ps1:52`) the team already parses a CPU
+  value explicitly with `[double]::Parse($SessionCpu,
+  [Globalization.CultureInfo]::InvariantCulture)`, suggesting this exact
+  pitfall is already known. I could not install a working `pwsh` + ICU in
+  this sandbox to prove the cast actually misbehaves (and there's a
+  plausible self-consistency argument — the same current-culture is used to
+  both stringify the template's cpu value and re-parse it in the same
+  process — that would make this a non-issue in practice). Flagging as a
+  low-confidence advisory for someone with a real Windows/non-en-US-locale
+  pwsh to verify `squad-aca run` still dispatches correctly on a non-US
+  locale host; if it's actually fine, no action needed.
+
+**Explicitly checked and found correct (not re-litigating):** `worker/entrypoint.sh`'s
+intentional lack of base64-encoding for `SQUAD_PROMPT` (per the issue
+thread's ARG_MAX finding — not a bug); `squad-sandbox-provider.ps1`'s
+separate (pre-existing, untouched by this diff) `ConvertTo-SandboxShellSingleQuoted`
+POSIX-quoting path, which is sound and wasn't part of this change's attack
+surface; ARM request JSON array serialization for single-element
+`containers`/`env` arrays (verified this is not affected by PowerShell's
+pipeline-enumeration array-collapsing gotcha, since these are nested
+hashtable *properties*, not top-level piped objects).

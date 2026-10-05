@@ -998,3 +998,146 @@ predicate — here all three shared "look at one commit." Also: a security suite
 that cannot finish inside the harness timeout is not a passing suite, it is an
 absent one, and that belongs in the findings table at the same weight as a code
 defect.
+
+## 2026-10-05 — Issue #129: ACA dispatch via ARM REST instead of `az` argv — VERDICT 🟢 APPROVED
+
+Reviewed commit `910920e` on `squad/129-safe-prompt-dispatch-3` (one ahead of
+`origin/main`), the full 25-file / ~1257-line changeset converting every ACA
+Jobs/ContainerApps dispatch path — local CLI (`scripts/squad-aca.ps1`,
+`scripts/start-session.ps1`), the sandbox provider
+(`scripts/lib/providers/squad-sandbox-provider.ps1`), watch
+(`scripts/start-watch.ps1`), Ralph (`worker/lib/ralph-dispatch.sh`,
+`worker/entrypoint.sh`), and the Actions dispatcher
+(`.github/workflows/squad-dispatch.yml`) — from `az containerapp job start
+--env-vars <tokens>` to `POST .../jobs/{job}/start?api-version=2026-01-01` with
+a JSON body, specifically to close the Windows `cmd.exe` re-parsing hole (quote
+stripping, `%VAR%` expansion from the dispatcher's own environment, newline
+truncation) that issue #129 describes.
+
+**What I verified directly, not by reading comments:**
+
+1. **No path hands a free-text prompt/session-name/branch/team value to `az`
+   (or any process) as a command-line argument.** Grepped the whole diff for
+   `--env-vars` and `containerapp job start`; every live call site is gone
+   (`scripts/squad-aca.ps1:2036-2052` Ralph path, `scripts/start-session.ps1`
+   local-CLI path, `.github/workflows/squad-dispatch.yml` Actions path). The
+   only remaining hits are comments/docs and one golden-test invocation that
+   feeds the hostile prompt as the CLI's own first positional argument
+   (`scripts/validate.ps1:3266`), which is the legitimate user-facing entry
+   point, not a re-parse boundary.
+2. **`Invoke-AcaArmRequest` (`scripts/lib/session-env.ps1`) sends the body as
+   bytes, not an interpolated string.** `Start-AcaJobExecution` /
+   `start-watch.ps1` build `[byte[]]$bytes` via
+   `[System.Text.Encoding]::UTF8.GetBytes($json)` and pass them through
+   `Invoke-RestMethod @invokeArgs` where `$invokeArgs["Body"] = $BodyBytes` —
+   no shell, no `cmd.exe`, no argv.
+3. **Bash side (`worker/lib/aca-job-rest.sh`) passes the JSON body via a file
+   reference.** `squad_start_job_via_arm` runs `az rest --method post --url
+   "$url" --body "@${body_file}"` — the `@` prefix makes this a file read by
+   `az`'s own Python arg parser, never inline JSON on argv, and the prompt/env
+   tokens are written to that file with `squad_build_job_start_body ... >
+   "$body_file"`, never echoed.
+4. **Golden test `scripts/tests/golden/cli/28-run-hostile-prompt.txt` is a real
+   regression test for the exact #129 scenario** and passed: a prompt
+   containing literal `%PATH% %GITHUB_TOKEN%`, quotes, backslashes, and
+   newline-adjacent text survives into the JSON body as an exact (JSON-escaped)
+   string value, `%GITHUB_TOKEN%` is NOT expanded, and `GITHUB_TOKEN` itself
+   stays a `{"name":"GITHUB_TOKEN","secretRef":"github-token"}` entry rather
+   than a literal.
+5. **`secretref:` allowlist is consistent and correctly scoped in both
+   runtimes.** `LITERAL_ONLY_SESSION_ENV_KEYS` (`worker/lib/aca-job-rest.js`)
+   and `$script:LiteralOnlySessionEnvKeys` (`scripts/lib/session-env.ps1`) list
+   the same 21 free-text/session-identity keys (including `SQUAD_PROMPT`,
+   `SQUAD_TEAM`, `OUTPUT_BRANCH`, `PR_TITLE`/`PR_BODY`, `SQUAD_LEASE_KEY`) and
+   deliberately *exclude* the 3 real secret-backed keys
+   (`GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `OTEL_EXPORTER_OTLP_HEADERS`) that
+   `$script:SessionManagedEnvKeys` carries — the only keys legitimately allowed
+   to resolve a `secretref:` value into `{"name":...,"secretRef":...}`.
+   Verified `worker/tests/test_aca_job_rest.sh` asserts `SQUAD_PROMPT stays
+   literal even when it starts with secretref:` and `SQUAD_PROMPT is never
+   upgraded into a secretRef`, both passing. No bypass found via case tricks
+   (JS check is case-sensitive `startsWith`, PS check is
+   `OrdinalIgnoreCase` — the asymmetry doesn't matter because SQUAD_PROMPT is
+   in the literal-only list regardless of case) or via a key present in one
+   allowlist but not the other (diffed both lists field-by-field; identical).
+6. **No prompt/secret echoing in error paths.** Read every `catch`/`2>&1`/
+   `2>/dev/null` in the touched bash and PowerShell: `az rest` output is always
+   captured into a variable or redirected to a file, never printed; the ARM
+   REST error handler in `Invoke-AcaArmRequest` surfaces only
+   `$_.Exception.Message` / HTTP status, not the request body; the Actions
+   workflow's `$GITHUB_OUTPUT` multiline block for `preparedPrompt` writes to
+   the runner's output file (standard practice, not the log stream).
+7. **Bearer token only ever in a header.** `Invoke-AcaArmRequest` gets the
+   token via `az account get-access-token ... -o tsv` into a local variable,
+   builds `Bearer $token` into an `Authorization` header object, and never
+   places it in a URI or argv. `azure/login@v2` OIDC in the workflow is
+   unchanged standard usage.
+8. **100,000-byte `SQUAD_PROMPT` cap is enforced before every lease claim,**
+   confirmed by reading code order (not inferring from comments): local CLI
+   (`scripts/squad-aca.ps1:1251-1253` inside `Start-LeasedExecution`, before
+   `squad_dispatch_decide`/claim), sandbox provider
+   (`scripts/lib/providers/squad-sandbox-provider.ps1:2056-2058`, before env
+   assembly), Ralph (`worker/lib/ralph-dispatch.sh` calls
+   `squad_assert_prompt_byte_cap` immediately after building the prompt string
+   and before `squad_dispatch_decide`/`squad_lease_claim`), and the Actions
+   workflow (the "Prepare prompt and enforce the 100 KB cap" step runs before
+   the "Claim the shared lease" step in `.github/workflows/squad-dispatch.yml`).
+   `worker/tests/test_ralph_dispatch.sh` has an explicit `prompt cap: rejected
+   prompt never claims a lease` assertion, passing.
+9. **Lease hygiene: every failure path releases with reason
+   `dispatch-failed`,** verified by reading every `return 1` / `trap ERR` in
+   `ralph_dispatch_issue` (scratch-file allocation, env build, job-definition
+   fetch, body build, subscription lookup, ARM start, malformed response) and
+   the Actions workflow's `trap 'cleanup; release_lease' ERR` — all pass
+   `--reason "dispatch-failed"` (previously some paths released with no
+   reason). `test_ralph_dispatch.sh`'s "malformed response: lease records
+   dispatch-failed" assertion passes.
+10. **`worker/Dockerfile`:** the new `COPY --chown=root:root ... worker/lib/aca-job-rest.sh
+    worker/lib/aca-job-rest.js ...` line is consistent with the rest of that
+    instruction, and both files fall under the later `chmod -R a-w
+    /usr/local/lib/squad-on-aca ...` (recursive, so the omission of
+    `aca-job-rest.js` from the separate `sed -i 's/\r$//'` normalization list
+    does not affect write-protection — confirmed by running
+    `worker/tests/test_image_layout.sh`, which asserts the shipped layout is
+    read-only and exercises Ralph dispatch from it end-to-end).
+11. **`worker/lib/aca-job-rest.js` parsing surface:** `parseEnvTokens` splits
+    on NUL, never uses the parsed `name` as a property-access key into another
+    object (no `obj[name] = ...` merge), so a token named `__proto__` or
+    `constructor` cannot pollute a prototype — it only ever becomes the
+    `name` field of a plain `{name, value}`/`{name, secretRef}` object pushed
+    into an array. `buildStartBody` only reads `jobDefinition.properties...`,
+    never writes attacker-controlled keys into it.
+
+**Tests run (all green):** `worker/tests/test_aca_job_rest.sh` (13/13),
+`worker/tests/test_ralph_dispatch.sh` (76/76, including the prompt-cap and
+lease-record-contains-no-prompt/no-secret assertions),
+`worker/tests/test_image_layout.sh` (25/25),
+`worker/tests/test_credential_withholding.sh` (62/62). PowerShell golden tests
+(`scripts/tests/golden/cli/28-run-hostile-prompt.txt` and the CLI stub harness)
+were read and reasoned through but not executed — no `pwsh` available in this
+sandbox; nothing in them contradicts the bash/Node evidence above, and the
+hostile-prompt golden's captured ARM POST body is itself the artifact that
+would have failed under the pre-fix `--env-vars` approach.
+
+**Advisories (non-blocking):**
+- `worker/Dockerfile`'s `sed -i 's/\r$//'` CRLF-normalization list does not
+  include `worker/lib/aca-job-rest.js`. Not a security issue (the file is
+  invoked via `node <path>`, never executed directly off a shebang, and it's
+  authored/checked in with LF), but worth adding for consistency if the
+  Dockerfile's file list is ever revisited.
+- The `secretref:` prefix check is case-sensitive in
+  `worker/lib/aca-job-rest.js` (`value.startsWith('secretref:')`) but
+  case-insensitive in `scripts/lib/session-env.ps1`
+  (`StartsWith("secretref:", OrdinalIgnoreCase)`). Currently harmless because
+  every key that could carry attacker-influenced free text is in the
+  literal-only allowlist regardless of this check, but the asymmetry is a
+  latent footgun if the allowlist is ever extended without reconciling the two
+  implementations. Recommend aligning case-sensitivity between the two
+  runtimes.
+
+No blocking findings. This is a correct, well-tested closure of the injection
+boundary described in #129: the prompt/session-name/branch/team no longer
+cross any shell/cmd.exe re-parse boundary on any dispatch path I could find,
+secretRef entries cannot be forged or flattened by hostile free text, the byte
+cap is a real pre-lease gate everywhere, and failed starts release the lease
+with an honest, greppable reason.

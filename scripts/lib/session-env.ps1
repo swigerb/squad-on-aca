@@ -6,27 +6,24 @@
 .DESCRIPTION
     Squad on ACA dispatches every session as a single ACA Jobs execution. To avoid
     mutating the shared job template (which races under concurrent dispatch and
-    lets omitted variables persist between sessions), dispatch uses
-    `az containerapp job start --env-vars <complete-set>`. That start override
-    replaces the container's ENTIRE env array for one execution only, and the
-    stored template is never written.
-
-    Important behavior discovered in live ACA E2E: `az containerapp job start
-    --env-vars ...` on its own does NOT reliably apply the per-execution env
-    override in this Azure CLI/runtime path -- the worker still observes the
-    template's baked-in values (for example `SESSION_NAME=smoke-template`). ACA
-    only applies the per-execution env when the start call also supplies a
-    complete execution container spec. Dispatch therefore reads the image, CPU,
-    memory, and container name from the immutable job template and echoes them
-    back on `job start` alongside `--env-vars`. These values are read from the
-    stored template and re-supplied verbatim; the shared job template itself is
-    still never mutated. Get-JobStartContainerOptions performs that read.
+    lets omitted variables persist between sessions), AND to avoid ever handing a
+    free-text value (prompt, session name, branch, team) to a process command
+    line -- `az.cmd` on Windows is a cmd.exe batch wrapper that re-parses its
+    argv, silently stripping quotes, expanding `%VAR%` from the DISPATCHER'S OWN
+    environment, and truncating multi-line values (issue #129) -- dispatch starts
+    the execution directly through the ARM REST API: a GET of the job definition
+    (Get-AcaJobDefinition) followed by a POST of a complete container override to
+    `.../jobs/{job}/start?api-version=...` (Start-AcaJobExecution), with the JSON
+    body sent as bytes via Invoke-RestMethod. No shell ever re-parses any of it.
 
     Because the override fully replaces env (it does not merge), the caller must
-    supply every variable the worker needs. New-SessionStartEnvVars reads the job
-    template's env once (an immutable read), removes any session-managed keys so
-    no stale placeholder can leak, then overlays the fresh session values. The
-    result is a complete, self-contained env set for a single execution.
+    supply every variable the worker needs. New-SessionStartEnvMap reads the job
+    template's env once (an immutable read via Get-JobTemplateEnvVars), removes
+    any session-managed keys so no stale placeholder can leak, then overlays the
+    fresh session values. The result is a complete, self-contained env set for a
+    single execution. Get-JobStartContainerOptions reads the image, CPU, memory,
+    and container name from the same immutable template so the POST body carries
+    a complete execution container spec; the stored template is never mutated.
 #>
 
 # Note: intentionally no Set-StrictMode here. This file is dot-sourced into
@@ -121,109 +118,6 @@ function Get-JobTemplateEnvVars {
         }
     }
     return $result
-}
-
-function ConvertTo-EnvVarTokens {
-    <#
-    .SYNOPSIS
-        Converts an ordered dictionary of name -> value/secretref into the
-        "NAME=VALUE" / "NAME=secretref:<ref>" token array expected by
-        `az containerapp job start --env-vars`.
-
-    .DESCRIPTION
-        Centralizes the single formatting rule so every dispatch path (fresh
-        worker session and manual Ralph run) emits identical token shapes and no
-        caller has to re-implement it.
-
-    .PARAMETER EnvVars
-        Ordered hashtable/dictionary of env name -> literal value or
-        "secretref:<name>" token.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$EnvVars
-    )
-
-    $tokens = @()
-    foreach ($key in $EnvVars.Keys) {
-        $tokens += ("{0}={1}" -f $key, $EnvVars[$key])
-    }
-    return $tokens
-}
-
-function New-SessionStartEnvVars {
-    <#
-    .SYNOPSIS
-        Builds the complete `--env-vars` token list for a single job execution.
-
-    .DESCRIPTION
-        Reads the job template env (immutable), strips session-managed keys, then
-        overlays the supplied session values. The returned array is a list of
-        "NAME=VALUE" / "NAME=secretref:<ref>" strings suitable for splatting into
-        `az containerapp job start --env-vars`.
-
-    .PARAMETER SessionEnv
-        Ordered hashtable of session-scoped variables for THIS execution.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$JobName,
-        [Parameter(Mandatory = $true)][string]$ResourceGroupName,
-        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$SessionEnv
-    )
-
-    $merged = Get-JobTemplateEnvVars -JobName $JobName -ResourceGroupName $ResourceGroupName
-
-    # Drop every session-managed key from the template snapshot so stale values
-    # cannot survive into the new execution.
-    foreach ($key in $script:SessionManagedEnvKeys) {
-        if ($merged.Contains($key)) { $merged.Remove($key) }
-    }
-
-    # Overlay the fresh session values.
-    foreach ($key in $SessionEnv.Keys) {
-        $merged[$key] = [string]$SessionEnv[$key]
-    }
-
-    return ConvertTo-EnvVarTokens -EnvVars $merged
-}
-
-function New-RalphRunEnvVars {
-    <#
-    .SYNOPSIS
-        Builds the complete `--env-vars` token list for a manual `ralph run`
-        execution, preserving the Ralph job template's Ralph config and secret
-        refs.
-
-    .DESCRIPTION
-        A manual Ralph run is fundamentally different from a fresh worker session:
-        it must INHERIT the Ralph job template's baked-in configuration
-        (SQUAD_MODE=ralph, RALPH_LABELS, RALPH_MAX_ISSUES, secret refs, Azure
-        fields, Aspire endpoints) rather than stripping session-managed keys.
-        Stripping them (as New-SessionStartEnvVars does) drops SQUAD_MODE and the
-        Ralph config, so the worker falls back to `smoke` mode and loses its
-        dispatch configuration.
-
-        This helper reads the immutable template env verbatim, guarantees
-        SQUAD_MODE=ralph, and overlays only the small set of manual-run values
-        (repository override and, when a repo override is supplied, refreshed run
-        identity). The stored template is never mutated.
-
-    .PARAMETER Repository
-        Optional owner/repo to target. When set, overlays GITHUB_REPOSITORY and
-        refreshes run identity (SESSION_NAME, SQUAD_POD_ID, OTEL_SERVICE_NAME).
-
-    .PARAMETER SessionName
-        Optional run identity label. Defaults to a timestamped manual-ralph name.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$JobName,
-        [Parameter(Mandatory = $true)][string]$ResourceGroupName,
-        [string]$Repository = "",
-        [string]$SessionName = "",
-        [string]$SubscriptionId = ""
-    )
-
-    $merged = New-RalphRunEnvMap -JobName $JobName -ResourceGroupName $ResourceGroupName -Repository $Repository -SessionName $SessionName -SubscriptionId $SubscriptionId
-    return ConvertTo-EnvVarTokens -EnvVars $merged
 }
 
 function New-RalphRunEnvMap {
@@ -479,17 +373,6 @@ function Get-AcaJobStartUrl {
     )
 
     return "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.App/jobs/$JobName/start?api-version=$($script:AcaArmApiVersion)"
-}
-
-function Get-SquadScratchFilePath {
-    param(
-        [string]$Prefix = ".squad-aca-dispatch",
-        [string]$Extension = ".json"
-    )
-
-    $baseDir = Get-Location
-    $name = "{0}-{1}-{2}{3}" -f $Prefix, $PID, ([guid]::NewGuid().ToString("N")), $Extension
-    return (Join-Path $baseDir $name)
 }
 
 function Get-AcaStubArmResponse {
