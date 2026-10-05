@@ -145,12 +145,24 @@ squad_session_has_publishable_work() {
 # (PUSH_CHANGES=true). Without it a well-behaved agent tries `git push` and
 # `gh pr create`, is refused by policy, retries with workarounds, and ends its
 # session reporting a "blocker" for a step the worker then does anyway.
+#
+# Issue #134: when the worker has computed a session deadline (worker/lib/
+# squad-deadline.sh exports SQUAD_SESSION_DEADLINE_UTC before the prompt is
+# composed), the note also states it. This is the cooperative half of the
+# fix: an agent that knows when it will be stopped can commit a coherent,
+# tested slice and stop on its own, instead of being interrupted mid-edit and
+# having a half-finished tree committed for it as WIP. Without a deadline in
+# the environment the note is byte-for-byte what it was before.
 squad_publish_contract_note() {
     if [[ "${PUSH_CHANGES:-false}" != "true" ]]; then
         return 0
     fi
     printf '\n\n---\n%s\n' \
         "Publishing is handled for you: when you finish, leave your work in this checkout (committing it is fine). Do not run git push or gh pr, and do not change git or gh credentials. After you exit, the Squad on ACA worker pushes the branch and opens the pull request. If the brief asks you to open a pull request, that is how it will be opened, so it is not a blocker and you do not need to report it as one."
+    if [[ -n "${SQUAD_SESSION_DEADLINE_UTC:-}" ]]; then
+        printf '%s\n' \
+            "Session deadline: ${SQUAD_SESSION_DEADLINE_UTC} (UTC; also in the SQUAD_SESSION_DEADLINE_UTC environment variable). By the deadline, commit a coherent, tested slice of the work and stop; do not start a change you cannot finish and commit before it. If anything is left undone, end your last commit message with a \"Remaining:\" Markdown checklist of what is unfinished. If you are still running at the deadline, the worker stops you, commits whatever is in the checkout as a WIP commit, and opens the pull request as a draft marked WIP."
+    fi
 }
 
 # Push whatever exists RIGHT NOW to the session branch, best effort.

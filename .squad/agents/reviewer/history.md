@@ -116,3 +116,77 @@ coordinator to re-verify on an unloaded host/real CI runner.
 ## 2026-10-02 (final) — Pin seal fix session conclusion
 
 Lockout chain: engineer (original impl) → lead (revision 1) → lead locked for re-review → reviewer (edit authority, closes all 6 advisories from security re-review). Commit b54b3be authorized, pushed on `fix/governance-pin-leak`. All 10 security findings from round 1 verified CLOSED in round 2. Full session documented in `.squad/log/2026-10-02T09-33-56Z-governance-pin-leak.md` and orchestration-log entries.
+
+## 2026-10-05 — Issue #134: publish before the session deadline
+
+Reviewed engineer's 5-commit local diff (`a642bf0..cf538f5`, +1395/-18 across
+`worker/entrypoint.sh`, new `worker/lib/squad-deadline.sh`,
+`worker/lib/squad-push.sh`, `scripts/deploy.ps1`, `scripts/validate.ps1`,
+`docs/runbook.md`, and a new 696-line test suite
+`worker/tests/test_session_deadline.sh`) implementing a worker-side watchdog
+that stops the `prompt`/`new-project` agent (both the direct `copilot -p` path
+and the `squad-hub oneshot` path) at a computed `SQUAD_SESSION_DEADLINE_UTC`
+(replica-timeout minus a publish margin, or an earlier token-expiry-derived
+deadline) and publishes a WIP draft PR instead of losing the work to ACA's
+hard kill.
+
+Verified independently rather than trusting the engineer's self-report:
+- Reran the new suite (114 assertions, 0 failed).
+- Ran the full `worker/tests/test_*.sh` set on HEAD and, separately, in a
+  scratch worktree at the pre-change base commit `a642bf0`, suite by suite.
+  Same 14 failures + 1 skip on both sides (pre-existing environmental/sandbox
+  gaps, not caused by this diff); the only delta is the new suite's pass.
+  `test_security_n5_entrypoint_hardening` (which the engineer flagged as a
+  possible flake) passed cleanly on both trees when I ran it.
+- Confirmed all 5 commits start `Fix #134: ` and end with the correct
+  `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`
+  trailer (`git log --format=%B`).
+- Confirmed PR #137 (ARM REST dispatch, #129) is untouched: no dispatch/ARM
+  REST files in the diff; `scripts/deploy.ps1` changes are localized to the
+  new `-SessionReplicaTimeout` param and the session job's
+  create/update lines only — the ralph job (`--replica-timeout 240`) and the
+  watch app are unchanged.
+- Confirmed the WIP publish path is the SAME `commit_and_push_if_needed` as a
+  normal finish (no early branch around the governance checkpoint or the pin
+  guard): `squad_policy_checkpoint` still runs first, the pre-commit pin hook
+  and `squad_policy_assert_pin_unpublished` still gate the commit, and
+  `squad_push_branch`'s pin backstop still gates the push. Only the
+  commit/PR labelling changes on a timeout.
+- Checked specifically for the PR #9 `$?`-after-negation bug class in the new
+  watchdog/kill logic — none found; every exit-code capture uses the
+  `cmd || rc=$?` form.
+- Confirmed process-group kill scoping: the agent runs under `set -m` in its
+  own process group, job control is switched off immediately after, so the
+  watchdog's own sleep timer, the lease heartbeat, and the policy sealer are
+  never in the killed group.
+- Verdict on the brief's optional point 3 (publish on an early, non-deadline
+  SIGTERM): agreed with the engineer's decision NOT to implement it.
+  `runuser` (PID 1 after the uid-drop) SIGKILLs its child ~2s after
+  forwarding SIGTERM, and the session job sets no ACA
+  `--termination-grace-period` (only the watch app does), so there isn't
+  enough time for a safe checkpoint+commit+push, and publishing on
+  `squad-aca stop` would also be the wrong behavior for a deliberate stop.
+  Documented in the library header and `docs/runbook.md`; SIGTERM behavior
+  for this case is unchanged by this PR.
+
+**Verdict: APPROVE WITH NOTES** (non-blocking):
+- `scripts/lib/job-drift-compare.ps1` does not yet know about
+  `SQUAD_REPLICA_TIMEOUT_SECONDS` — a job whose timeout was hand-edited or
+  that predates this deploy (exactly the 2026-10-05 incident this issue is
+  about) won't be flagged by drift detection even though the worker would
+  compute a deadline after the real hard kill. Worth a follow-up issue;
+  deliberately not folded into this PR to keep it localized and avoid
+  conflicting with other in-flight deploy.ps1 work.
+- `worker/lib/squad-deadline.sh` token-expiry-deadline comment should note
+  that a refreshed token (the credential helper re-reads the token file at
+  push time) does not move the already-computed deadline.
+- The stale-`index.lock`-removal comment in the same file overclaims
+  "stale by construction" — true only if nothing the agent started escaped
+  its process group (e.g. via `setsid`); low risk, same trust boundary as
+  the existing normal-finish path, but the comment should state the
+  condition rather than imply it is impossible.
+- Windows `powershell-validation` CI job was not run in this sandbox (no
+  pwsh available here); required green before merge per the brief.
+
+Coordinated with `security`'s independent review pass (also APPROVE WITH
+NOTES, no overlapping findings — see `.squad/agents/security/history.md`).
