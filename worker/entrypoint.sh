@@ -72,7 +72,15 @@ squad_root_seal_policy_state() {
 # If the container is ever started as a non-root user directly (e.g. a
 # developer running this script locally), `id -u` is already non-zero and
 # this block is a no-op: nothing below depends on having been root.
+#
+# Issue #134: the session deadline (worker/lib/squad-deadline.sh) is measured
+# from container start, so on the root path the instant is taken inside this
+# block, before the re-exec, and carried across it by `runuser -p`. It is set
+# unconditionally there, so a SQUAD_SESSION_START_EPOCH arriving in the
+# dispatcher's environment can never move the deadline. (Kept to one line in
+# the block: test_uid_separation.sh reads the drop from a fixed window.)
 if [[ "$(id -u)" -eq 0 ]]; then
+  export SQUAD_SESSION_START_EPOCH="$EPOCHSECONDS"
   SQUAD_RUNTIME_USER="squad"
   if [[ "${SQUAD_MODE:-smoke}" == "ralph" ]]; then
     SQUAD_RUNTIME_USER="squad-identity"
@@ -84,6 +92,10 @@ if [[ "$(id -u)" -eq 0 ]]; then
   # it so the fallback below resolves HOME from the user this process becomes.
   exec env -u HOME runuser -p -u "$SQUAD_RUNTIME_USER" -- "$0" "$@"
 fi
+
+# A container never started as root (a developer running this script locally)
+# records its start here instead.
+export SQUAD_SESSION_START_EPOCH="${SQUAD_SESSION_START_EPOCH:-$EPOCHSECONDS}"
 
 # The fallback is resolved from THIS process's actual user, never hard-coded
 # to /home/squad -- after the PC-2 drop above, a ralph-mode process is
@@ -200,6 +212,19 @@ if [[ ! -f "$SQUAD_SIGNAL_FORWARDING_LIB" ]]; then
 fi
 # shellcheck source=lib/squad-signal-forwarding.sh
 source "$SQUAD_SIGNAL_FORWARDING_LIB"
+
+# Issue #134: the session deadline and the watchdog `prompt` / `new-project`
+# run their agent under, so a session still working when the replica timeout
+# approaches publishes its work as a draft WIP pull request instead of losing
+# it. See worker/lib/squad-deadline.sh.
+SQUAD_DEADLINE_LIB="${SQUAD_DEADLINE_LIB:-/usr/local/lib/squad-on-aca/squad-deadline.sh}"
+if [[ ! -f "$SQUAD_DEADLINE_LIB" ]]; then
+  log "Session deadline library not found at ${SQUAD_DEADLINE_LIB}."
+  log "Without it a prompt or new-project session would run with no deadline, and an agent still working when ACA kills the replica would lose all of its work unpublished. Refusing to start."
+  exit 78
+fi
+# shellcheck source=lib/squad-deadline.sh
+source "$SQUAD_DEADLINE_LIB"
 
 # PC-1 (issue #86): the process-isolation probe. Sourced (not executed) so its
 # functions are available to call after the identity drop, below. A missing
@@ -772,6 +797,11 @@ squad_lease_finish() {
   fi
   if [[ "$code" -eq 0 ]]; then
     squad_lease_report complete --state succeeded
+  elif [[ "${SQUAD_SESSION_TIMED_OUT:-0}" -eq 1 ]]; then
+    # Issue #134: stopped at the session deadline. Its work was published (as
+    # a draft WIP pull request) before this exit, so the lease says so rather
+    # than reading like any other failure.
+    squad_lease_report complete --state failed --reason "session-deadline-exit-${code}"
   else
     squad_lease_report complete --state failed --reason "exit-${code}"
   fi
@@ -889,11 +919,25 @@ commit_and_push_if_needed() {
   fi
 
   local branch="${OUTPUT_BRANCH:-squad/${SESSION_NAME}}"
+  # Issue #134: a session the watchdog stopped at its deadline publishes
+  # through this SAME function -- the governance checkpoint above, the
+  # pre-commit pin hook and squad_push_branch's pin backstop below all run
+  # exactly as for a finished session. Only the labels differ: the commit
+  # message, the PR title and body say WIP, and the PR is opened as a draft
+  # (squad_deadline_wip_*, worker/lib/squad-deadline.sh). For every other
+  # session timed_out is 0 and nothing below changes.
+  local timed_out="${SQUAD_SESSION_TIMED_OUT:-0}"
+  local commit_message="${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}"
+  local wip_commit="" wip_files=0
   git checkout -B "$branch"
   if [[ -n "$(git status --porcelain)" ]]; then
     git add -A
+    if [[ "$timed_out" -eq 1 ]]; then
+      wip_files="$(git diff --cached --name-only | wc -l | tr -d '[:space:]')"
+      commit_message="$(squad_deadline_wip_commit_message "$commit_message")"
+    fi
     local commit_rc=0
-    git commit -m "${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}" || commit_rc=$?
+    git commit -m "$commit_message" || commit_rc=$?
     if (( commit_rc != 0 )); then
       # The worker-generated pre-commit hook refuses a commit that would carry
       # the session-only memory audit pin; report that as the policy failure it
@@ -902,6 +946,9 @@ commit_and_push_if_needed() {
         exit 78
       fi
       exit "$commit_rc"
+    fi
+    if [[ "$timed_out" -eq 1 ]]; then
+      wip_commit="$(git rev-parse --short HEAD)"
     fi
   else
     log "Publishing the commits the agent made itself."
@@ -953,8 +1000,26 @@ commit_and_push_if_needed() {
     # the report function below is a no-op (empty string) when there were none,
     # so a session that touched no reported-mutable path gets an unchanged body.
     local pr_body="${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}"
+    local pr_title="${PR_TITLE:-Remote Squad session ${SESSION_NAME}}"
+    if [[ "$timed_out" -eq 1 ]]; then
+      pr_body="$(squad_deadline_wip_pr_body "$pr_body" "$wip_commit" "$wip_files")"
+      pr_title="$(squad_deadline_wip_pr_title "$pr_title")"
+    fi
     pr_body+="$(squad_policy_reported_changes_report)"
-    gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "${PR_TITLE:-Remote Squad session ${SESSION_NAME}}" --body "$pr_body" || true
+    if [[ "$timed_out" -eq 1 ]]; then
+      # Draft pull requests are not available on every plan (a private
+      # repository on GitHub Free cannot have them), and `gh pr create --draft`
+      # then fails outright. The branch is already pushed, so a failed draft
+      # must not also cost the pull request: retry as a regular one, whose
+      # title and body still say WIP.
+      gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" --draft \
+        || {
+          log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" || true
+        }
+    else
+      gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" || true
+    fi
   fi
 }
 
@@ -1065,6 +1130,10 @@ NODE
     ;;
   prompt)
     require SQUAD_PROMPT
+    # Issue #134: compute the session deadline BEFORE the prompt is composed --
+    # squad_publish_contract_note states it to the agent -- and refuse (64) a
+    # replica timeout / margin that cannot produce one.
+    squad_session_deadline_init || exit $?
     SQUAD_AGENT_PROMPT="${SQUAD_PROMPT}$(squad_publish_contract_note)"
     log "Running one-shot Squad prompt."
     # Issue #84 PI-3: withhold the push credential from the agent for an
@@ -1081,28 +1150,46 @@ NODE
       squad_credential_withhold
       __squad_credential_withheld=1
     fi
+    # Issue #134: both paths run under the deadline watchdog, which stops the
+    # agent at SQUAD_SESSION_DEADLINE_UTC so what it has done is published
+    # below instead of being lost to the replica's hard kill. It is a plain
+    # statement on purpose (never `|| rc=$?`): see squad_deadline_run_agent
+    # for why errexit must stay live inside the agent's subshell. The OTel
+    # variables are passed with `env` because the agent is now a background
+    # job of this shell rather than a `( ... )` subshell; what Copilot
+    # receives is unchanged.
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      ( squad_policy_exec_agent squad_hub_run "$SQUAD_AGENT_PROMPT" )
+      squad_deadline_run_agent "$SQUAD_SESSION_DEADLINE_EPOCH" \
+        squad_policy_exec_agent squad_hub_run "$SQUAD_AGENT_PROMPT"
     else
       squad_policy_announce direct
-      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
-        COPILOT_OTEL_ENABLED=true \
-        COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
+      squad_deadline_run_agent "$SQUAD_SESSION_DEADLINE_EPOCH" \
         squad_policy_exec_agent \
-          copilot -p "$SQUAD_AGENT_PROMPT" "${COPILOT_ARGV[@]}" )
+          env OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+          COPILOT_OTEL_ENABLED=true \
+          COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
+          copilot -p "$SQUAD_AGENT_PROMPT" "${COPILOT_ARGV[@]}"
     fi
+    # A failed agent that was NOT stopped by the deadline ends the session
+    # here with its own status, publishing nothing -- as before. A stopped one
+    # continues, and publishes as WIP.
+    squad_deadline_settle_agent "$REPO_DIR"
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
     fi
     commit_and_push_if_needed
+    squad_deadline_finish_session
     ;;
   new-project)
     SQUAD_PROMPT="${SQUAD_PROMPT:-Initialize this repository as a new project with Squad. Review the existing README, create a useful project structure, commit the initial .squad team state and starter files, and open a pull request with the bootstrap changes.}"
     export PUSH_CHANGES="${PUSH_CHANGES:-true}"
     export OUTPUT_BRANCH="${OUTPUT_BRANCH:-squad/bootstrap-${SESSION_NAME}}"
     export PR_TITLE="${PR_TITLE:-Bootstrap project with Squad on ACA}"
+    # Issue #134: same deadline as `prompt` -- new-project publishes through
+    # the same commit_and_push_if_needed and loses its work the same way.
+    squad_session_deadline_init || exit $?
     SQUAD_AGENT_PROMPT="${SQUAD_PROMPT}$(squad_publish_contract_note)"
     log "Running new-project bootstrap Squad prompt."
     # Issue #84 PI-3: same withholding as `prompt`. new-project is the OTHER
@@ -1118,22 +1205,27 @@ NODE
       squad_credential_withhold
       __squad_credential_withheld=1
     fi
+    # Issue #134: the same watchdog as `prompt` -- see the comment there.
     if squad_hub_should_supervise; then
       squad_hub_preflight
       squad_policy_announce hub
-      ( squad_policy_exec_agent squad_hub_run "$SQUAD_AGENT_PROMPT" )
+      squad_deadline_run_agent "$SQUAD_SESSION_DEADLINE_EPOCH" \
+        squad_policy_exec_agent squad_hub_run "$SQUAD_AGENT_PROMPT"
     else
       squad_policy_announce direct
-      ( OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
-        COPILOT_OTEL_ENABLED=true \
-        COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
+      squad_deadline_run_agent "$SQUAD_SESSION_DEADLINE_EPOCH" \
         squad_policy_exec_agent \
-          copilot -p "$SQUAD_AGENT_PROMPT" "${COPILOT_ARGV[@]}" )
+          env OTEL_EXPORTER_OTLP_ENDPOINT="$ASPIRE_OTLP_HTTP_ENDPOINT" \
+          COPILOT_OTEL_ENABLED=true \
+          COPILOT_OTEL_EXPORTER_TYPE=otlp-http \
+          copilot -p "$SQUAD_AGENT_PROMPT" "${COPILOT_ARGV[@]}"
     fi
+    squad_deadline_settle_agent "$REPO_DIR"
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore
     fi
     commit_and_push_if_needed
+    squad_deadline_finish_session
     ;;
   loop)
     if [[ -n "${LOOP_MARKDOWN:-}" ]]; then
