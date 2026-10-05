@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "issue-31",
+  "sessionId": "issue-31-20261005025706",
+  "repository": "octo/demo",
+  "issueNumber": 31,
+  "dispatchSource": "ralph",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "released",
+  "attempts": 2,
+  "startedAt": "2024-05-01T00:00:00.000Z",
+  "lastHeartbeatAt": "2024-05-01T00:00:00.000Z",
+  "updatedAt": "2024-05-01T00:00:00.000Z",
+  "terminalReason": "dispatch-failed",
+  "executionRef": null
+}

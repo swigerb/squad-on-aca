@@ -1242,23 +1242,24 @@ NODE
       exit 0
     fi
 
-    # Snapshot the session job's container template ONCE (immutable read):
-    # name, image, resources, and env. Each dispatch below builds a complete,
-    # isolated env override from this snapshot AND echoes the stored image and
-    # resources back on `job start`. In live ACA E2E, `job start --env-vars`
-    # alone does NOT apply the per-execution override (the worker still sees the
-    # template's baked-in values); ACA only applies it when a complete execution
-    # container spec (image + resources) is also supplied. Reading and echoing
-    # the stored image/resources does NOT mutate the shared session job template,
-    # so cross-session leakage and concurrent-dispatch races are still avoided.
-    session_job_container_json="$(az containerapp job show \
-      --name "$ACA_SESSION_JOB_NAME" \
-      --resource-group "$AZURE_RESOURCE_GROUP" \
-      --query "properties.template.containers[0]" -o json)"
+    # Snapshot the session job definition ONCE (immutable ARM read). Ralph then
+    # POSTs JSON to `/start`, so prompts and other free-text session values never
+    # appear on a process command line.
+    session_job_subscription_id="${AZURE_SUBSCRIPTION_ID:-$(az account show --query id -o tsv 2>/dev/null)}"
+    if [[ -z "$session_job_subscription_id" ]]; then
+      log "Could not determine the Azure subscription for Ralph dispatch."
+      exit 1
+    fi
+    RALPH_SESSION_JOB_DEFINITION_JSON="$(squad_fetch_job_definition \
+      "$session_job_subscription_id" \
+      "$AZURE_RESOURCE_GROUP" \
+      "$ACA_SESSION_JOB_NAME")"
+    export RALPH_SESSION_JOB_DEFINITION_JSON
 
-    mapfile -t session_job_spec < <(SJ_CONTAINER="$session_job_container_json" node - <<'NODE'
-let c = {};
-try { c = JSON.parse(process.env.SJ_CONTAINER || '{}') || {}; } catch { c = {}; }
+    mapfile -t session_job_spec < <(SJ_JOB_DEFINITION="$RALPH_SESSION_JOB_DEFINITION_JSON" node - <<'NODE'
+let job = {};
+try { job = JSON.parse(process.env.SJ_JOB_DEFINITION || '{}') || {}; } catch { job = {}; }
+const c = ((((job || {}).properties || {}).template || {}).containers || [])[0] || {};
 const name = String(c.name || '');
 const image = String(c.image || '');
 const cpu = c.resources && c.resources.cpu != null ? String(c.resources.cpu) : '';

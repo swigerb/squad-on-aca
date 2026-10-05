@@ -1,0 +1,1 @@
+{"properties":{"template":{"containers":[{"name":"w","image":"i","resources":{"cpu":1,"memory":"1Gi"},"env":[]}]}}}

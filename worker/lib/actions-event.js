@@ -148,9 +148,13 @@ function resolveEvent(input) {
 
   if (eventName === 'workflow_dispatch') {
     const issue = normalizeIssue(payload.inputs && payload.inputs.issue);
+    const prompt = typeof (payload.inputs && payload.inputs.prompt) === 'string'
+      ? String(payload.inputs.prompt)
+      : '';
     return verdict(true, REASON.DISPATCH_MANUAL, {
       issueNumber: issue,
-      sessionName: buildSessionName('manual', issue, payload)
+      sessionName: buildSessionName('manual', issue, payload),
+      prompt
     });
   }
 

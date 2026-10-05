@@ -175,7 +175,9 @@ Explicit script command:
   -OutputBranch squad/feature-123
 ```
 
-Each execution schedules a new ACA job replica, sets `SQUAD_POD_ID=feature-123`, enables GitHub remote control, and exports telemetry to Aspire.
+Each execution schedules a new ACA job replica, sets `SQUAD_POD_ID=feature-123` and `OTEL_SERVICE_NAME=squad-feature-123`, enables GitHub remote control, and exports telemetry to Aspire.
+
+Dispatch starts the ACA job through the ARM REST API with a JSON body built from the stored job template. Free-text values such as the prompt, session name, branch, and team stay in that body instead of appearing on any command line. `SQUAD_PROMPT` is capped at **100,000 UTF-8 bytes** on every path; the worker later appends its own publish-contract note before `copilot -p`, so the cap stays below Linux's `MAX_ARG_STRLEN` ceiling.
 
 ## Start without an existing repo
 
@@ -386,4 +388,3 @@ Both implement the same Squad agent model and team structure. To learn more abou
 ## License
 
 MIT. See [LICENSE](LICENSE).
-

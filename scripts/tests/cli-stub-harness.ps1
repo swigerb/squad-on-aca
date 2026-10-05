@@ -141,6 +141,7 @@ function New-SquadCliStubEnvironment {
     $ghLog = Join-Path $Root "gh-calls.log"
     $squadLog = Join-Path $Root "squad-calls.log"
     $acaLog = Join-Path $Root "aca-calls.log"
+    $armLog = Join-Path $Root "arm-calls.log"
     $curlLog = Join-Path $Root "curl-calls.log"
     # Shared, ordered, cross-tool call log. `az` and the lease store both append
     # to it, so a test can assert that the lease write precedes the compute
@@ -149,6 +150,7 @@ function New-SquadCliStubEnvironment {
     $callLog = Join-Path $Root "dispatch-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $ghLog -Value "" -NoNewline -Encoding ascii
+    Set-Content -LiteralPath $armLog -Value "" -NoNewline -Encoding utf8
     Set-Content -LiteralPath $curlLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $squadLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $acaLog -Value "" -NoNewline -Encoding ascii
@@ -356,6 +358,15 @@ null
     Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
 @echo off
 >>"%SQUAD_STUB_AZ_LOG%" echo %*
+set "CMDLINE=%*"
+if not "%SQUAD_STUB_AZ_FORBID_VALUE%"=="" echo %CMDLINE% | findstr /C:"%SQUAD_STUB_AZ_FORBID_VALUE%" >nul && (
+  1>&2 echo STUB-ARGV-LEAK: forbidden free-text value reached az.cmd
+  exit /b 97
+)
+if "%SQUAD_STUB_AZ_FORBID_PERCENT%"=="1" echo %CMDLINE% | findstr /C:"%%" >nul && (
+  1>&2 echo STUB-ARGV-LEAK: percent token reached az.cmd
+  exit /b 98
+)
 set "A1=%~1"
 set "A2=%~2"
 set "A3=%~3"
@@ -759,6 +770,7 @@ exit /b 0
         GhLog      = $ghLog
         SquadLog   = $squadLog
         AcaLog     = $acaLog
+        ArmLog     = $armLog
         CurlLog    = $curlLog
         LeaseDir   = $leaseDir
         CallLog    = $callLog
@@ -910,6 +922,7 @@ function Reset-SquadCliStubLog {
     param([Parameter(Mandatory = $true)][object]$Stub)
     Set-Content -LiteralPath $Stub.AzLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $Stub.GhLog -Value "" -NoNewline -Encoding ascii
+    if ($Stub.ArmLog) { Set-Content -LiteralPath $Stub.ArmLog -Value "" -NoNewline -Encoding utf8 }
     if ($Stub.SquadLog) { Set-Content -LiteralPath $Stub.SquadLog -Value "" -NoNewline -Encoding ascii }
     if ($Stub.AcaLog) { Set-Content -LiteralPath $Stub.AcaLog -Value "" -NoNewline -Encoding ascii }
     if ($Stub.CurlLog) { Set-Content -LiteralPath $Stub.CurlLog -Value "" -NoNewline -Encoding ascii }
@@ -929,12 +942,13 @@ function Get-SquadCliStubCall {
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
-        [ValidateSet("az", "gh", "squad", "aca", "curl")][string]$Tool = "az"
+        [ValidateSet("az", "gh", "squad", "aca", "arm", "curl")][string]$Tool = "az"
     )
     $path = switch ($Tool) {
         "gh"    { $Stub.GhLog }
         "squad" { $Stub.SquadLog }
         "aca"   { $Stub.AcaLog }
+        "arm"   { $Stub.ArmLog }
         "curl"  { $Stub.CurlLog }
         default { $Stub.AzLog }
     }
@@ -1027,7 +1041,9 @@ function Invoke-SquadCliCapture {
         [string]$GhAuthToken = "",
         [string]$CredentialFileCapture = "",
         [string]$DriftMode = "",
-        [int]$CurlExitCode = 0
+        [int]$CurlExitCode = 0,
+        [string]$ForbiddenAzArgValue = "",
+        [switch]$FailOnAzPercentToken
     )
 
     $hostExe = (Get-Process -Id $PID).Path
@@ -1036,8 +1052,9 @@ function Invoke-SquadCliCapture {
 
     $envNames = @("PATH", "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE",
                   "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT",
-                  "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
-                  "SQUAD_STUB_ACA_LOG",
+                  "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_AZ_FORBID_VALUE", "SQUAD_STUB_AZ_FORBID_PERCENT",
+                  "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
+                  "SQUAD_STUB_ACA_LOG", "SQUAD_STUB_ARM_LOG", "SQUAD_STUB_ARM_MALFORMED",
                   "SQUAD_STUB_CURL_LOG", "SQUAD_STUB_CURL_RC",
                   "SQUAD_STUB_FIXTURES",
                   "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC",
@@ -1088,6 +1105,10 @@ function Invoke-SquadCliCapture {
         $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $env:SQUAD_STUB_STOP_RC = "$StopExitCode"
         $env:SQUAD_STUB_START_RC = "$StartExitCode"
+        $env:SQUAD_STUB_AZ_FORBID_VALUE = $ForbiddenAzArgValue
+        $env:SQUAD_STUB_AZ_FORBID_PERCENT = if ($FailOnAzPercentToken) { "1" } else { "" }
+        $env:SQUAD_STUB_ARM_LOG = $Stub.ArmLog
+        $env:SQUAD_STUB_ARM_MALFORMED = "0"
         # The adapter-level checks in validate.ps1 drive these; a CLI capture
         # must always see the default (quiet, sequence-free) stub behaviour.
         $env:SQUAD_STUB_STOP_ERR = ""
@@ -1205,6 +1226,7 @@ function Invoke-SquadCliCapture {
         StdErr     = $stderr
         AzCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
         GhCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool gh)
+        ArmCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool arm)
         SquadCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool squad)
         AcaCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool aca)
         CurlCalls  = @(Get-SquadCliStubCall -Stub $Stub -Tool curl)

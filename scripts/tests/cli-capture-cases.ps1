@@ -82,6 +82,7 @@ $Cases = @(
     # of this committed golden directly, so regenerating the goldens cannot
     # quietly bless a downgrade.
     @{ Id = "27-doctor-drift";    Args = @("doctor"); Drift = $true }
+    @{ Id = "28-run-hostile-prompt"; Args = @("run", 'Hostile prompt: "quotes"' + "`n" + 'line2 %PATH% %GITHUB_TOKEN% & | ^ ! < > \\ $HOME ''single'' café 😀', "--name", "fixedhostile"); NeedsRepo = $true }
 )
 
 function Get-NormalizedCapture {
@@ -254,6 +255,8 @@ function Invoke-CaptureSet {
             [void]$sb.AppendLine("### EXITCODE: $($r.ExitCode)")
             [void]$sb.AppendLine("### AZ CALLS")
             foreach ($line in $r.AzCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
+            [void]$sb.AppendLine("### ARM CALLS")
+            foreach ($line in $r.ArmCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
             [void]$sb.AppendLine("### GH CALLS")
             foreach ($line in $r.GhCalls) { [void]$sb.AppendLine((Get-NormalizedCapture $line $ScriptsRoot)) }
             [void]$sb.AppendLine("### SQUAD CALLS")

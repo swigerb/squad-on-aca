@@ -33,7 +33,9 @@ SQUAD_POD_ID=<session name or ACA execution name>
 OTEL_SERVICE_NAME=squad-<session name>
 ```
 
-Dispatch uses a per-execution `az containerapp job start --env-vars` override. It reads the template, strips session-managed keys, overlays fresh session values, and passes a complete execution container spec with image, CPU, and memory.
+Dispatch uses the ARM `POST .../jobs/<job>/start?api-version=2026-01-01` API with a JSON body. The control plane reads the stored job template, strips session-managed keys, overlays fresh session values, preserves secret-backed `secretRef` entries, and posts the complete container override as bytes or from a file. Prompt text, session names, branch names, and team names stay inside the request body; they are never placed on a process command line.
+
+`SQUAD_PROMPT` is capped at **100,000 UTF-8 bytes** on every dispatch path. The measured hard ceiling is the Linux kernel's per-string `MAX_ARG_STRLEN` limit (131,072 bytes including `NAME=`), and the worker later appends its publish-contract note before it execs `copilot -p "$SQUAD_AGENT_PROMPT"`, so the control plane stops well short of that ceiling.
 
 Session size comes from the job template, so `deploy.ps1 -SessionCpu` sets it for every dispatcher. The default is 2 vCPU / 4 GiB, enough for a Squad fan-out of several Copilot CLI agents. Memory is derived as 2x CPU (the ACA Consumption ratio); re-running `deploy.ps1` applies a new size to an existing job.
 
@@ -288,9 +290,10 @@ by hand.
 | Variable | Purpose |
 |---|---|
 | `SQUAD_MODE` | `prompt`, `new-project`, `loop`, `watch`, `triage`, `shell`, `smoke`, `telemetry-smoke`, or `ralph`. |
-| `SQUAD_PROMPT` | What the session should do. Required by `prompt`. |
+| `SQUAD_PROMPT` | What the session should do. Required by `prompt`. Capped at 100,000 UTF-8 bytes before dispatch. |
 | `SESSION_NAME` | Names the run in logs and in the hub. |
-| `SQUAD_POD_ID` | Identifies the pod for SubSquad routing. |
+| `SQUAD_POD_ID` | Identifies the pod for SubSquad routing. Set to the session name on every dispatch path. |
+| `OTEL_SERVICE_NAME` | Groups traces/logs as `squad-<session>`. Set on every dispatch path. |
 | `GITHUB_REPOSITORY` | The `owner/repo` the session works in. |
 | `SQUAD_DISPATCH_SOURCE` | Who started the run: `local-cli`, `ralph`, or `actions`. Feeds the tool policy. |
 | `SQUAD_COPILOT_FLAGS` | Extra Copilot CLI flags. Cleared on every deploy. |
@@ -821,4 +824,3 @@ Full detail: [actions-trigger.md](actions-trigger.md#who-may-trigger-a-run).
 - OTLP auth modes are `BrowserToken` for UI and `ApiKey` for OTLP. OTLP ports stay internal to the ACA environment.
 - `squad-aca sync --sync-all` blocks obvious secret files and inline tokens before staging. Override only for known-private repos with `SQUAD_ACA_ALLOW_UNSAFE_SYNC=1`.
 - Run `scripts/validate.ps1` before pushing.
-
