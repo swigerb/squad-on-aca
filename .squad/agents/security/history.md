@@ -998,3 +998,89 @@ predicate — here all three shared "look at one commit." Also: a security suite
 that cannot finish inside the harness timeout is not a passing suite, it is an
 absent one, and that belongs in the findings table at the same weight as a code
 defect.
+## 2026-10-05 — Issue #134: publish before the session deadline (push-path review)
+
+Security review of engineer's 5-commit diff adding a worker-side deadline/
+watchdog mechanism to `prompt`/`new-project` mode, required because it
+changes both the publish path (`commit_and_push_if_needed`, now labelled WIP
+on a timeout) and the agent process lifecycle (new SIGINT→SIGTERM→SIGKILL
+escalation against the agent's own process group at a computed deadline).
+
+Checked against this repo's existing documented invariants (issue #84 credential
+withholding, the governance checkpoint, the `.squad/memory/config.json` pin-leak
+guard both at commit- and push-time, the Azure-identity-drop ordering, and the
+issue #92 orphaned-grandchild process-group lesson) rather than only the new
+code in isolation:
+
+- **Credential withholding / restore ordering**: on the timeout path,
+  `squad_credential_restore` runs only after the agent's entire process group
+  has received its final SIGKILL, plus a stale-lock sweep — strictly later
+  than the non-timeout path's restore point, so no process in the dying
+  group can observe the restored credential. No regression found.
+- **Governance checkpoint**: `commit_and_push_if_needed` still calls
+  `squad_policy_checkpoint` as its first statement; the new
+  `SQUAD_SESSION_TIMED_OUT` flag is read only afterward and only changes
+  labels. A timed-out session that touched a protected path still exits 78
+  and publishes nothing — confirmed in the diff, not just asserted by the
+  engineer.
+- **Pin-leak guard**: both call sites (`squad_policy_assert_pin_unpublished`
+  at commit time and again inside `squad_push_branch` as the push-time
+  backstop) are reached on the WIP path exactly as on the normal path — no
+  bypass branch exists. An end-to-end test (agent force-stages the pin, is
+  stopped by the watchdog) proves the WIP publish is refused with 78.
+- **Process-group kill blast radius**: traced `set -m`/`$!`/subshell
+  boundaries directly. The agent gets its own process group; job control is
+  switched off immediately after forking it, which keeps the watchdog's own
+  sleep timer out of that group. The lease heartbeat
+  (`SQUAD_LEASE_HEARTBEAT_PID`) and the policy sealer were started earlier in
+  their own groups and are unreachable by the new kill. Verified with a live
+  test: an agent ignoring INT/TERM with a background grandchild was escalated
+  to SIGKILL; the grandchild died with it, a stand-in heartbeat loop and the
+  calling shell both survived. No recurrence of the issue #92 orphaned-child
+  class.
+- **`$?`-after-negation (PR #9 bug class)**: none found in the new watchdog or
+  in the modified `commit_and_push_if_needed`.
+- **WIP PR title/body/"Remaining" checklist**: composed only from worker-owned
+  text, existing `PR_TITLE`/`PR_BODY`/`COMMIT_MESSAGE` overrides, a short
+  commit hash, and a file count — nothing from the agent or the original
+  attacker-influenced prompt is interpolated, and `gh` is still invoked with
+  real argv (no `eval`/`sh -c`/unquoted expansion introduced).
+- **Deadline provenance**: sourcing `squad-deadline.sh` unconditionally resets
+  `SQUAD_SESSION_DEADLINE_UTC` and related state, so a value arriving in the
+  inbound environment (e.g. from a dispatcher or an attacker-influenced
+  context) cannot manipulate when the watchdog fires; it is always
+  recomputed from the trusted `SQUAD_SESSION_START_EPOCH` set before the
+  privilege drop.
+- **`SQUAD_TOKEN_EXPIRES_AT` handling**: an earlier value only shortens the
+  session's own run (self-limiting, not attacker-advantageous). A malformed
+  value is logged and ignored in favor of the replica-timeout-derived
+  deadline — fails safe. Correction to the engineer's self-report: exit 64 on
+  a bad value applies only to the replica-timeout/margin inputs, not to a
+  malformed `SQUAD_TOKEN_EXPIRES_AT` — noted for the record, not a security
+  problem either way.
+- **Draft-PR fallback**: if `gh pr create --draft` fails, the retry drops only
+  the draft flag; title/body (and therefore the WIP marking) are the same
+  variables, so WIP-ness cannot be silently lost in the fallback.
+- **Azure-identity-drop ordering**: the new library starts no background
+  process at source time; `squad_session_deadline_init` and the watchdog only
+  run inside the `prompt`/`new-project` case, well after
+  `squad_drop_azure_identity`. Ordering invariant preserved.
+
+**Verdict: APPROVE WITH NOTES** (non-blocking, neither rises to a reject):
+1. An agent that deliberately detaches a process from its own group
+   (`setsid`/`setpgid`) survives the watchdog's sweep and could still read
+   the restored token file afterward. This exposure already exists today on
+   a normal, non-timeout finish (nothing new this diff introduces) and would
+   need a uid or cgroup boundary to close properly — tracked as a pre-existing
+   gap, not a regression.
+2. `SQUAD_EXIT_DEADLINE` is read from the inherited environment if already
+   set (`squad-deadline.sh`), rather than hard-coded to 124. Since only the
+   trusted control plane sets session environment and this value only affects
+   exit-code *reporting* (not whether/what gets published), impact is
+   confined to lease/result bookkeeping. Recommend hard-coding 124 to remove
+   the question entirely; not a blocking finding.
+
+No overlap with `reviewer`'s independent pass beyond the shared non-blocking
+notes above (see `.squad/agents/reviewer/history.md`) — reviewer separately
+flagged the `job-drift-compare.ps1` gap and two comment-accuracy nits, which
+are correctness/process notes rather than security findings.
