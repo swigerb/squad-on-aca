@@ -1313,3 +1313,84 @@ that the fall-through fixes the hub-report gap with no behavioural change
 to the `gh` invocations themselves.
 
 **VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.
+
+## Issue #135 re-dispatch (r4) — security pass on PR #142's must-fix and nit fixes
+
+Reviewed the same round of changes as `reviewer`'s entry above, on
+`squad/soa-135-dispatch-inputs-r4`, with a security focus.
+
+**Reviewer retry-ladder rewrite (`worker/entrypoint.sh`).** The `gh pr
+create` argv is still built entirely from a discrete bash array
+(`pr_create_args`), never a concatenated shell string, so there is no new
+injection surface from removing `--reviewer` from it. `SQUAD_PR_REVIEWER`
+now only ever reaches `gh` as a single, separate `--add-reviewer` argv
+element on the `gh pr edit` call (also array-based, never interpolated into
+a shell string) — same trust boundary as before, just a different
+subcommand. The value is also echoed into the PR body via `printf '...%s'`,
+which is the existing, already-reviewed body-construction pattern (no
+format-string risk: `%s` is a fixed literal, the reviewer id is data). No
+credential or token material touches `pr_url`; it is `gh`'s own stdout,
+unconditionally the PR URL.
+
+**`SQUAD_MODEL`/`SQUAD_AGENT_MODEL` → `--model` wiring (`worker/entrypoint.sh`,
+`worker/squad-agent`).** This is the first place an operator-controlled,
+workflow_dispatch-origin string is appended to the `copilot` argv as its own
+discrete array element (`COPILOT_ARGV+=(--model "$SQUAD_MODEL")` /
+`MODEL_ARGV=(--model "$SQUAD_AGENT_MODEL")`) — worth a closer look than
+usual. Confirmed: (1) it is never passed through a shell string, so no
+command injection; (2) the leading-dash check
+(`validateNoLeadingDash`/the equivalent bash check in both scripts) closes
+the flag-injection angle — without it, a value like `--allow-all-tools`
+could have been smuggled in as "a model name" and reached `copilot` as a
+genuine extra flag, since bash arrays don't distinguish a flag-shaped string
+from a positional argument; (3) the value is validated independently in
+THREE places with the same rule (dispatch-inputs.js at the Action boundary,
+entrypoint.sh before `COPILOT_ARGV`, squad-agent before `MODEL_ARGV`) —
+defense in depth, not redundant, since each one is the last gate for a
+different code path (manual dispatch validation can be bypassed by anyone
+who can set `OV_SQUAD_MODEL` directly on the ACA job, so the worker-side
+checks are the ones that actually matter at the trust boundary that counts).
+Confirmed a value starting with `-` fails closed (`squad_policy_abort` /
+`squad_agent_abort`, exit 78) before `copilot` is ever exec'd on either path
+— no window where a malformed model reaches the real binary.
+
+**`dispatch-inputs.js` nits.** `sanitizeForMessage()` strips `\r`/`\n` from
+every raw value before it is interpolated into an error string — this
+closes a genuine (if low-severity) log/summary-forging path: without it, a
+`model` or `base_branch` value containing an embedded newline could have
+made the Action's `::error::` annotation or `GITHUB_STEP_SUMMARY` output
+look like it contained a SECOND, different error line, or (worse) an
+actor-controlled line that merely resembles one. Confirmed with the new
+`model-newline-sanitized` test in `worker/tests/test_dispatch_inputs.sh`
+that the raw newline genuinely never reaches stderr unescaped. The expanded
+`base_branch` shape checks (leading `-`, `..`, `@{`, `.lock`) all reject
+values that `git` itself treats specially (`-` as flag-vs-ref ambiguity,
+`..` as a range operator, `@{` as a reflog/upstream expansion, `.lock` as a
+reserved ref-lock suffix) — this closes off a small but real set of ways a
+"valid-looking" branch name could have been misinterpreted downstream by
+`git`/`gh` rather than treated as a literal ref name. None of these are
+exploitable today (nothing downstream currently shells these values out
+unquoted), but they are cheap, correct hardening against future code that
+might.
+
+**Verification.** Ran `worker/tests/test_dispatch_inputs.sh` (55/55),
+`worker/tests/test_squad_agent_wrapper.sh` (97/97, with the ambient
+`SQUAD_POLICY_*`/`SQUAD_AGENT_*` env vars this sandbox itself exports
+cleared via `env -u ...` — see `reviewer`'s entry for the exact flag list;
+without clearing them, ~24 assertions fail purely from env leakage, verified
+pre-existing/environmental by comparing against a stashed, unmodified tree),
+`worker/tests/test_session_deadline.sh` (126/126, same env-clearing),
+`worker/tests/test_squad_hub.sh` (134/134). Full
+`worker/tests/run-tests.sh` with the same env-clearing: 43 passed, 3 failed
+(1 skipped) — the 3 failures (`test_suite_process_group_containment.sh`'s
+mutation-proof, `test_token_preflight.sh`'s one no-credential-no-push
+assertion) reproduce identically on a stashed/unmodified tree, so they are
+sandbox-capability gaps (process-group/namespace and network egress), not a
+regression introduced by this round. `bash -n`/`node --check` clean on
+every touched file.
+
+No overlap with `reviewer`'s pass beyond the shared conclusion that the
+`--model` wiring and the reviewer-ladder rewrite introduce no new injection
+surface and fail closed on malformed input.
+
+**VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.

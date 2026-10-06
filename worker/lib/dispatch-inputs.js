@@ -38,17 +38,39 @@ function normalizeOptionalString(value) {
   return String(value);
 }
 
+// Error messages below echo the raw (rejected) value back to the caller so a
+// human can see what was sent. That value is untrusted and, up to this point,
+// has not yet been checked against any charset -- an embedded newline (or
+// carriage return) would let it forge an extra `::error::`/log line, or an
+// extra GITHUB_STEP_SUMMARY line, that never went through validation. Every
+// place that interpolates a raw value into a message goes through this first.
+function sanitizeForMessage(value) {
+  return String(value).replace(/[\r\n]/g, '\\n');
+}
+
 function normalizeBooleanInput(name, rawValue, defaultValue, errors) {
   const value = normalizeOptionalString(rawValue);
   if (value === '') return defaultValue ? 'true' : 'false';
   if (value === 'true' || value === 'false') return value;
-  errors.push(`${name} must be exactly 'true' or 'false' when provided; received '${value}'.`);
+  errors.push(`${name} must be exactly 'true' or 'false' when provided; received '${sanitizeForMessage(value)}'.`);
   return defaultValue ? 'true' : 'false';
 }
 
 function validateAllowedChars(name, value, pattern, allowedText, errors) {
   if (!pattern.test(value)) {
-    errors.push(`${name} may contain only ${allowedText}; received '${value}'.`);
+    errors.push(`${name} may contain only ${allowedText}; received '${sanitizeForMessage(value)}'.`);
+    return false;
+  }
+  return true;
+}
+
+// A leading '-' would be read as a flag rather than a positional value by
+// anything downstream that builds a plain argv from this input (for example
+// `copilot --model <value>`), so it is rejected here regardless of what the
+// charset pattern alone would allow.
+function validateNoLeadingDash(name, value, errors) {
+  if (value.startsWith('-')) {
+    errors.push(`${name} must not start with '-'; received '${sanitizeForMessage(value)}'.`);
     return false;
   }
   return true;
@@ -56,11 +78,27 @@ function validateAllowedChars(name, value, pattern, allowedText, errors) {
 
 function validateBranchShape(branch, errors) {
   if (branch.startsWith('/') || branch.endsWith('/')) {
-    errors.push(`base_branch must not start or end with '/'; received '${branch}'.`);
+    errors.push(`base_branch must not start or end with '/'; received '${sanitizeForMessage(branch)}'.`);
     return false;
   }
   if (branch.includes('//')) {
-    errors.push(`base_branch must not contain an empty path segment ('//'); received '${branch}'.`);
+    errors.push(`base_branch must not contain an empty path segment ('//'); received '${sanitizeForMessage(branch)}'.`);
+    return false;
+  }
+  if (branch.startsWith('-')) {
+    errors.push(`base_branch must not start with '-' (it would be read as a flag, not a ref); received '${sanitizeForMessage(branch)}'.`);
+    return false;
+  }
+  if (branch.includes('..')) {
+    errors.push(`base_branch must not contain '..'; received '${sanitizeForMessage(branch)}'.`);
+    return false;
+  }
+  if (branch.includes('@{')) {
+    errors.push(`base_branch must not contain '@{'; received '${sanitizeForMessage(branch)}'.`);
+    return false;
+  }
+  if (branch.endsWith('.lock') || branch.includes('.lock/')) {
+    errors.push(`base_branch must not contain a '.lock' path segment; received '${sanitizeForMessage(branch)}'.`);
     return false;
   }
   return true;
@@ -138,7 +176,11 @@ async function validateDispatchInputs(rawInputs, options) {
   normalized.watchOnly = normalizeBooleanInput('watch_only', rawInputs && rawInputs.watchOnly, false, errors);
 
   const model = normalizeOptionalString(rawInputs && rawInputs.model);
-  if (model !== '' && validateAllowedChars('model', model, SIMPLE_VALUE_PATTERN, "letters, digits, '.', '_' and '-'", errors)) {
+  if (
+    model !== '' &&
+    validateAllowedChars('model', model, SIMPLE_VALUE_PATTERN, "letters, digits, '.', '_' and '-'", errors) &&
+    validateNoLeadingDash('model', model, errors)
+  ) {
     normalized.model = model;
   }
 
@@ -174,7 +216,7 @@ async function validateDispatchInputs(rawInputs, options) {
     validateBranchShape(baseBranch, errors)
   ) {
     if (!isRepositoryName(repository)) {
-      errors.push(`base_branch requires --repository in owner/name form so its existence can be verified; received '${repository || ''}'.`);
+      errors.push(`base_branch requires --repository in owner/name form so its existence can be verified; received '${sanitizeForMessage(repository || '')}'.`);
     } else {
       try {
         const exists = await branchExists(repository, baseBranch);

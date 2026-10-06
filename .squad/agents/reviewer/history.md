@@ -567,3 +567,106 @@ Coordinated with `security`'s independent review pass on the same merge —
 see `.squad/agents/security/history.md`.
 
 **VERDICT: APPROVE.**
+
+## Issue #135 re-dispatch (r4) — fixing PR #142's review findings
+
+Picked up after the content-identical merge of `squad/soa-135-dispatch-inputs-r2`
+(see the entry above) and addressed the two must-fix findings plus the nits
+from Scout's PR #142 review, all on `squad/soa-135-dispatch-inputs-r4`.
+
+**Must-fix 1 — reviewer retry ladder losing the PR URL.** Root cause:
+`gh pr create --reviewer <id>` on github.com can create the pull request,
+print its URL to stdout, and still exit 1 when `<id>` is not a real GitHub
+login (the normal case, since `SQUAD_PR_REVIEWER` is a squad casting-registry
+id). The old ladder read that exit 1 as "no PR yet", retried WITHOUT
+`--reviewer`, that retry failed with "a pull request already exists" (empty
+stdout), and the empty stdout overwrote `pr_url` — losing it and skipping
+`squad_hub_report_pr_if_any` even though a PR was open. Fixed by decoupling
+the two concerns completely: `gh pr create` no longer takes `--reviewer` at
+all, and once `pr_url` is known, a strictly separate, best-effort
+`gh pr edit "$pr_url" --repo "$GITHUB_REPOSITORY" --add-reviewer
+"$SQUAD_PR_REVIEWER"` is attempted and only logged (never fatal) on failure.
+The requested reviewer is also always recorded in the PR body now, so the
+request survives even when GitHub rejects it outright. Added an end-to-end
+behavioral test to `worker/tests/test_session_deadline.sh` (new "5h" section)
+with a `gh` stub that prints a real PR URL on `pr create` and can be told to
+fail `pr edit --add-reviewer` (`GH_FAIL_REVIEWER_EDIT=1`) — asserts the PR
+URL is still logged and reported, exactly two `gh` calls are made (no retry
+confusion), and the reviewer-add failure is logged non-fatally. Also added
+the reviewer-add-succeeds counterpart. Discovered along the way that the
+test driver's function-extraction list (`LOG_FN`/`COMMIT_PUSH_FN`/etc.) never
+included `squad_hub_report_pr_if_any` itself — harmless before because the
+old `gh` stub never printed a URL so `pr_url` was always empty and the call
+site was never reached, but it surfaces as "command not found" the moment a
+stub returns a URL. Fixed by adding `HUB_REPORT_IF_ANY_FN` to the extraction
+and embed lists.
+
+**Must-fix 2 — `model` input has no effect.** Traced the whole pipeline:
+workflow_dispatch `model` → `OV_SQUAD_MODEL` (set in the "Start the ACA
+session job" step) → `ralph_build_session_env` strips the `OV_` prefix →
+plain `SQUAD_MODEL` in the container. Nothing read it. There are two
+distinct Copilot invocation paths that both needed wiring: (1) prompt mode in
+`worker/entrypoint.sh`, which now validates `SQUAD_MODEL` has no leading `-`
+(fails closed via `squad_policy_abort` if it does) and appends
+`--model "$SQUAD_MODEL"` to `COPILOT_ARGV`, and exports
+`SQUAD_AGENT_MODEL="${SQUAD_MODEL:-}"`; (2) the `squad watch`/`squad loop`
+path via `worker/squad-agent` (the `--agent-cmd` wrapper), which now reads
+`SQUAD_AGENT_MODEL`, validates the same leading-dash rule (aborts via
+`squad_agent_abort`, exit 78, `copilot` never runs), and appends
+`--model "$SQUAD_AGENT_MODEL"` to the final `exec copilot` argv. Both
+syntax-checked with `bash -n`. `worker/tests/test_squad_agent_wrapper.sh` got
+a new "(b2)" section (3 assertions): valid model reaches argv, no model means
+no `--model` token, leading-dash model aborts before `copilot` ever runs.
+
+**Nits.** `worker/lib/dispatch-inputs.js`: added `sanitizeForMessage()`
+(strips `\r`/`\n` before any raw value is interpolated into an error message
+— closes a log/summary line-forging path) and `validateNoLeadingDash()`;
+extended `validateBranchShape()` to also reject a leading `-`, any `..`
+segment, `@{`, and a `.lock` path segment in `base_branch` (the `@{` check is
+currently unreachable in practice since `@` and `{` already fail the
+existing charset check first — kept anyway as defense in depth documented
+inline, and the test for it asserts the charset message that actually
+fires). `.github/workflows/squad-dispatch.yml`'s "Validate workflow_dispatch
+inputs" step now also writes rejections to `GITHUB_STEP_SUMMARY` (in addition
+to the existing `::error::` annotations), through the same single-line
+sanitizer. `docs/actions-trigger.md` updated to match all of the above.
+Audited every new comment/string I added across the touched files for
+British spellings and fixed the two that slipped in (`defence-in-depth` →
+`defense-in-depth` in `worker/squad-agent`, `behaviour` → `behavior` in the
+new test_session_deadline.sh comment).
+
+**Testing.** `worker/tests/test_dispatch_inputs.sh`: 55/55 (6 new
+assertions for the nits above). `worker/tests/test_squad_agent_wrapper.sh`:
+97/97 (6 model-related assertions, 3 pre-existing + 3 new). The full wrapper
+suite has ~24 false failures when run directly in THIS sandbox, because this
+session is itself a Squad worker container with ambient `SQUAD_POLICY_*`/
+`SQUAD_AGENT_*` env vars that `run_wrapper()` does not unset before invoking
+the wrapper under test — confirmed pre-existing/environmental by stashing
+all changes and re-running (same 24 failures on a clean tree), and confirmed
+it is purely environmental by explicitly clearing the ambient vars
+(`env -u SQUAD_POLICY_PIN_BASE_BLOB -u SQUAD_POLICY_MCP_CONFIG_SHA256
+-u SQUAD_POLICY_PIN_REPO_DIR -u SQUAD_POLICY_PIN_SHA256
+-u SQUAD_POLICY_SEALED_DIR -u SQUAD_POLICY_STATE_DIR
+-u SQUAD_POLICY_PIN_SEAL_MODE -u SQUAD_AGENT_REPO_DIR
+-u SQUAD_AGENT_POLICY_ARGV_JSON`), which gives a clean 97/97 (and the same
+trick is needed for a trustworthy read of `test_session_deadline.sh` and any
+other suite that execs the wrapper or entrypoint.sh under this sandbox —
+worth remembering for anyone else working inside this environment).
+`worker/tests/test_session_deadline.sh`: 126/126 with the env-clearing
+invocation (the new 5h reviewer-edit scenarios plus the
+HUB_REPORT_IF_ANY_FN extraction fix needed to make them pass at all — see
+must-fix 1 above). `worker/tests/test_squad_hub.sh`:
+134/134, unaffected by the entrypoint.sh changes (the PR-reporting call site
+itself didn't move, only what calls into it). Ran the full
+`worker/tests/run-tests.sh` with the same ambient vars cleared: 43 passed, 3
+failed, 1 skipped — confirmed by stashing all changes and re-running on the
+unmodified tree that the same 3 suites fail identically
+(`test_suite_process_group_containment.sh`'s mutation-proof assertion and
+`test_token_preflight.sh`'s one assertion, both needing sandbox capabilities
+— namespaces / network — this container does not have), so none of this
+round's changes caused a regression. `bash -n` / `node --check` pass on
+every touched file. The `powershell-validation` job's scripts need
+`pwsh`/`dotnet`, neither available in this sandbox, so they could not be
+exercised locally; no code under their scope was touched this round.
+
+**VERDICT: APPROVE.**

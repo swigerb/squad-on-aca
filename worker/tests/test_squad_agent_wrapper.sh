@@ -82,14 +82,18 @@ printf '{"mcpServers":{}}\n' > "${REPO_WITH_MCP}/.mcp.json"
 # Runs the REAL worker/squad-agent. Sets WRAPPER_OUT, WRAPPER_RC, and
 # DUMPED_ARGV (a bash array: one element per line the stub copilot dumped;
 # empty if copilot was never reached because the wrapper aborted first).
+# Honours RUN_WRAPPER_MODEL (SQUAD_AGENT_MODEL to export for this one call;
+# unset/empty means "do not export it at all") so callers can exercise the
+# issue #135 model-override path without threading a new parameter through
+# every existing call site.
 run_wrapper() {
   local policy_json="$1" repo_dir="$2"
   shift 2
   : > "$DUMP_FILE"
   if [[ "$policy_json" == "__UNSET__" ]]; then
-    WRAPPER_OUT="$(env -u SQUAD_AGENT_POLICY_ARGV_JSON SQUAD_AGENT_REPO_DIR="$repo_dir" bash "$WRAPPER" "$@" 2>&1)"
+    WRAPPER_OUT="$(env -u SQUAD_AGENT_POLICY_ARGV_JSON -u SQUAD_AGENT_MODEL SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
   else
-    WRAPPER_OUT="$(SQUAD_AGENT_POLICY_ARGV_JSON="$policy_json" SQUAD_AGENT_REPO_DIR="$repo_dir" bash "$WRAPPER" "$@" 2>&1)"
+    WRAPPER_OUT="$(env -u SQUAD_AGENT_MODEL SQUAD_AGENT_POLICY_ARGV_JSON="$policy_json" SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
   fi
   WRAPPER_RC=$?
   DUMPED_ARGV=()
@@ -252,6 +256,26 @@ assert_no_exact_token "mcp present: still no --yolo alongside the mcp config" "-
 run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
 assert_eq "0" "$WRAPPER_RC" "mcp absent: execs successfully"
 assert_no_exact_token "mcp absent: no --additional-mcp-config when the repo has no .mcp.json" "--additional-mcp-config" "${DUMPED_ARGV[@]}"
+
+# ---------------------------------------------------------------------------
+# (b2) Issue #135: SQUAD_AGENT_MODEL becomes a `--model <value>` argv element,
+#      and a value starting with '-' aborts rather than being passed through.
+# ---------------------------------------------------------------------------
+echo "-- (b2) issue #135: SQUAD_AGENT_MODEL reaches copilot as --model <value> --"
+
+RUN_WRAPPER_MODEL="gpt-5.6-sol" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+unset RUN_WRAPPER_MODEL
+assert_eq "0" "$WRAPPER_RC" "a model override execs successfully"
+assert_has_exact_token "the model override reaches copilot as --model" "--model" "${DUMPED_ARGV[@]}"
+assert_has_exact_token "the model value itself is a separate argv element" "gpt-5.6-sol" "${DUMPED_ARGV[@]}"
+
+run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_no_exact_token "no model override: --model never appears when SQUAD_AGENT_MODEL is unset" "--model" "${DUMPED_ARGV[@]}"
+
+RUN_WRAPPER_MODEL="--allow-all-tools" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+unset RUN_WRAPPER_MODEL
+assert_eq "78" "$WRAPPER_RC" "a model value starting with '-' is refused (exit 78), not passed through as a flag"
+assert_eq "1" "$(copilot_never_ran)" "... and copilot is never exec'd for that rejected model value"
 
 # ---------------------------------------------------------------------------
 # (c) Squad's trailing -p <prompt> is preserved intact, including a prompt

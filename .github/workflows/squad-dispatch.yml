@@ -163,7 +163,20 @@ jobs:
                 .split(/\r?\n/)
                 .map((line) => line.trim())
                 .filter(Boolean);
-            for (const error of errors) process.stdout.write(`::error::${error}\n`);
+            // Defense in depth: dispatch-inputs.js already strips newlines out
+            // of any rejected value it echoes back, but an error message could
+            // still carry one from an unexpected source (for example a raw
+            // `gh` failure message). Stripping here too means a single
+            // `::error::` / summary line can never be split into a forged
+            // extra one.
+            const singleLine = (text) => String(text).replace(/\r?\n/g, ' ').trim();
+            for (const error of errors) process.stdout.write(`::error::${singleLine(error)}\n`);
+            if (process.env.GITHUB_STEP_SUMMARY) {
+              const summary = ['### Manual dispatch input validation failed', '']
+                .concat(errors.map((error) => `- ${singleLine(error)}`))
+                .join('\n') + '\n';
+              fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+            }
             process.exit(result.status || 1);
           }
 

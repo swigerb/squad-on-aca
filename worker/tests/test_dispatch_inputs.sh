@@ -135,9 +135,33 @@ assert_eq "65" "$RUN_RC" "an invalid model is rejected with EX_REFUSED"
 assert_eq "false" "$(json_field "$RUN_STDOUT" ok)" "an invalid model returns ok=false"
 assert_contains "$RUN_STDERR" "squad-dispatch: model may contain only" "the model rejection is explained on stderr"
 
+run_capture model-leading-dash --model '-rf'
+assert_eq "65" "$RUN_RC" "a model value starting with '-' is rejected -- it would be read as a flag, not a model name"
+assert_contains "$RUN_STDERR" "squad-dispatch: model must not start with '-'" "the leading-dash model rejection is explained"
+
 run_capture invalid-branch-chars --base-branch 'release;rm'
 assert_eq "65" "$RUN_RC" "a base_branch with unsafe characters is rejected"
 assert_contains "$RUN_STDERR" "squad-dispatch: base_branch may contain only" "the base_branch charset rejection is explained"
+
+run_capture branch-leading-dash --base-branch '-force'
+assert_eq "65" "$RUN_RC" "a base_branch starting with '-' is rejected -- it would be read as a flag, not a ref"
+assert_contains "$RUN_STDERR" "squad-dispatch: base_branch must not start with '-'" "the leading-dash base_branch rejection is explained"
+
+run_capture branch-dotdot --base-branch 'feature/../escape'
+assert_eq "65" "$RUN_RC" "a base_branch containing '..' is rejected"
+assert_contains "$RUN_STDERR" "squad-dispatch: base_branch must not contain '..'" "the '..' base_branch rejection is explained"
+
+run_capture branch-at-brace --base-branch 'release@{1}'
+assert_eq "65" "$RUN_RC" "a base_branch containing '@{' is rejected"
+# '@' and '{' are both outside BRANCH_VALUE_PATTERN already, so the charset
+# check (which runs first) catches this case before the '@{' shape check
+# ever sees it. The shape check stays as defense in depth for the day the
+# charset is ever loosened -- see validateBranchShape's own '@{' branch.
+assert_contains "$RUN_STDERR" "squad-dispatch: base_branch may contain only" "the '@{' value is already rejected by the charset check"
+
+run_capture branch-dot-lock --base-branch 'main.lock'
+assert_eq "65" "$RUN_RC" "a base_branch ending in '.lock' is rejected"
+assert_contains "$RUN_STDERR" "squad-dispatch: base_branch must not contain a '.lock' path segment" "the '.lock' base_branch rejection is explained"
 
 run_capture invalid-reviewer-chars --reviewer 'fact checker'
 assert_eq "65" "$RUN_RC" "a reviewer with unsafe characters is rejected"
@@ -162,6 +186,14 @@ assert_contains "$RUN_STDERR" "squad-dispatch: base_branch 'missing-branch' does
 FAKE_INPUTS_GH_MODE=verify-fail run_capture unverifiable-branch --base-branch main
 assert_eq "65" "$RUN_RC" "a branch probe failure is rejected"
 assert_contains "$RUN_STDERR" "squad-dispatch: base_branch 'main' could not be verified in octo/demo:" "branch probe failures are distinct from missing branches"
+
+# A newline embedded in a rejected value must never reach stderr/output as a
+# raw, un-sanitized line -- that would let a crafted manual-dispatch input
+# forge an extra `::error::`/log line out of what should be a single rejection.
+run_capture model-newline-sanitized --model $'bad\nname'
+assert_eq "65" "$RUN_RC" "a model value containing a newline is rejected (it also fails the charset check)"
+assert_not_contains "$RUN_STDERR" $'bad\nname' "the raw newline-bearing value never reaches stderr unescaped"
+assert_contains "$RUN_STDERR" 'bad\nname' "the newline is escaped to a literal backslash-n in the diagnostic instead"
 
 run_capture help --help
 assert_eq "0" "$RUN_RC" "validate-manual-inputs --help succeeds"
