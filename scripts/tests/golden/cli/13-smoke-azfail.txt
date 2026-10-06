@@ -17,6 +17,6 @@ repo view octo/demo --json defaultBranchRef --jq .defaultBranchRef.name
 ### STDOUT
 
 ### STDERR
-Exception: <SCRIPTS>\lib\session-env.ps1:466
+Exception: <SCRIPTS>\lib\session-env.ps1:464
      | STUB-START-FAILED (5)
 
