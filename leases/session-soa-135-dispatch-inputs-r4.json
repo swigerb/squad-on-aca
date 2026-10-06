@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-soa-135-dispatch-inputs-r4",
+  "sessionId": "soa-135-dispatch-inputs-r4",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-10-06T07:05:36.680Z",
+  "lastHeartbeatAt": "2026-10-06T07:05:36.680Z",
+  "updatedAt": "2026-10-06T07:05:36.680Z",
+  "terminalReason": null,
+  "executionRef": null
+}
