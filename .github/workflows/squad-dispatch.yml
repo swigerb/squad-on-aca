@@ -25,6 +25,25 @@ on:
       prompt:
         description: Prompt override
         required: false
+      model:
+        description: Session model override
+        required: false
+      base_branch:
+        description: Checkout and PR base branch override
+        required: false
+      publish_pr:
+        description: Publish changes and open a pull request
+        type: boolean
+        required: false
+        default: true
+      reviewer:
+        description: Squad registry id to request on the pull request
+        required: false
+      watch_only:
+        description: Attach Squad Hub in watch-only mode for this run
+        type: boolean
+        required: false
+        default: false
 
 permissions: {}          # nothing by default; each job asks for exactly what it needs
 
@@ -51,6 +70,11 @@ jobs:
       issue: ${{ steps.decide.outputs.issue }}
       prompt: ${{ steps.decide.outputs.prompt }}
       requester: ${{ steps.decide.outputs.requester }}
+      model: ${{ steps.manual_inputs.outputs.model }}
+      baseBranch: ${{ steps.manual_inputs.outputs.baseBranch }}
+      publishPr: ${{ steps.manual_inputs.outputs.publishPr }}
+      reviewer: ${{ steps.manual_inputs.outputs.reviewer }}
+      watchOnly: ${{ steps.manual_inputs.outputs.watchOnly }}
     steps:
       - uses: actions/checkout@v4
 
@@ -88,6 +112,71 @@ jobs:
             echo "${delim}"
             echo "requester=$(printf '%s' "$verdict" | jq -r '.requester // ""')"
           } >>"$GITHUB_OUTPUT"
+
+      - name: Validate workflow_dispatch inputs
+        id: manual_inputs
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_MODEL: ${{ github.event.inputs.model || '' }}
+          INPUT_BASE_BRANCH: ${{ github.event.inputs.base_branch || '' }}
+          INPUT_PUBLISH_PR: ${{ github.event.inputs.publish_pr || '' }}
+          INPUT_REVIEWER: ${{ github.event.inputs.reviewer || '' }}
+          INPUT_WATCH_ONLY: ${{ github.event.inputs.watch_only || '' }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const { spawnSync } = require('child_process');
+          const fs = require('fs');
+
+          const args = [
+            'worker/lib/squad-dispatch.js',
+            'validate-manual-inputs',
+            '--repository', process.env.GITHUB_REPOSITORY,
+            '--repo-dir', process.env.GITHUB_WORKSPACE,
+            '--model', process.env.INPUT_MODEL || '',
+            '--base-branch', process.env.INPUT_BASE_BRANCH || '',
+            '--publish-pr', process.env.INPUT_PUBLISH_PR || '',
+            '--reviewer', process.env.INPUT_REVIEWER || '',
+            '--watch-only', process.env.INPUT_WATCH_ONLY || ''
+          ];
+
+          const result = spawnSync(process.execPath, args, {
+            encoding: 'utf8',
+            env: process.env
+          });
+
+          if (result.stdout) process.stdout.write(result.stdout);
+          if (result.stderr) process.stderr.write(result.stderr);
+
+          let payload = null;
+          try {
+            payload = JSON.parse(result.stdout || '{}');
+          } catch (err) {
+            payload = null;
+          }
+
+          if (result.status !== 0) {
+            const errors = Array.isArray(payload && payload.errors) && payload.errors.length
+              ? payload.errors
+              : String(result.stderr || 'Manual dispatch input validation failed.')
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean);
+            for (const error of errors) process.stdout.write(`::error::${error}\n`);
+            process.exit(result.status || 1);
+          }
+
+          const normalized = payload && payload.normalized ? payload.normalized : {};
+          const outputs = [
+            `model=${normalized.model || ''}`,
+            `baseBranch=${normalized.baseBranch || ''}`,
+            `publishPr=${normalized.publishPr || ''}`,
+            `reviewer=${normalized.reviewer || ''}`,
+            `watchOnly=${normalized.watchOnly || ''}`
+          ].join('\n') + '\n';
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, outputs);
+          NODE
 
       - name: Explain a refusal
         if: steps.decide.outputs.dispatch != 'true'
@@ -201,7 +290,12 @@ jobs:
           ISSUE: ${{ needs.resolve.outputs.issue }}
           PROMPT: ${{ steps.prompt.outputs.preparedPrompt }}
           LEASE_KEY: ${{ steps.lease.outputs.leaseKey }}
-          BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
+          DEFAULT_BASE_REF: ${{ github.event.repository.default_branch || 'main' }}
+          INPUT_MODEL: ${{ needs.resolve.outputs.model }}
+          INPUT_BASE_BRANCH: ${{ needs.resolve.outputs.baseBranch }}
+          INPUT_PUBLISH_PR: ${{ needs.resolve.outputs.publishPr }}
+          INPUT_REVIEWER: ${{ needs.resolve.outputs.reviewer }}
+          INPUT_WATCH_ONLY: ${{ needs.resolve.outputs.watchOnly }}
           RG: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-squad-aca-dev-eastus2' }}
           JOB: ${{ vars.ACA_SESSION_JOB_NAME || 'caj-squad-aca-session' }}
           SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
@@ -212,6 +306,15 @@ jobs:
           source worker/lib/ralph-dispatch.sh
 
           prompt="${PROMPT}"
+          model="${INPUT_MODEL}"
+          base_branch="${INPUT_BASE_BRANCH}"
+          publish_pr="${INPUT_PUBLISH_PR}"
+          reviewer="${INPUT_REVIEWER}"
+          watch_only="${INPUT_WATCH_ONLY}"
+          base_ref="${DEFAULT_BASE_REF}"
+          if [ -n "$base_branch" ]; then
+            base_ref="$base_branch"
+          fi
           commit_message="Remote Squad session ${SESSION}"
           if [ -n "${REQUESTER}" ]; then
             commit_message="$(printf '%s\n\n%s\n\n%s' \
@@ -237,27 +340,47 @@ jobs:
             false
           fi
           mapfile -d '' -t start_env < <(
-            SJ_ENV="$(jq -c '.properties.template.containers[0].env // []' "$job_file")" \
-            OV_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
-            OV_GITHUB_REF="${BASE_REF}" \
-            OV_SQUAD_MODE="prompt" \
-            OV_SESSION_NAME="$SESSION" \
-            OV_SQUAD_POD_ID="$SESSION" \
-            OV_SQUAD_DEPLOYMENT_MODE="squad-per-pod" \
-            OV_OTEL_SERVICE_NAME="squad-${SESSION}" \
-            OV_ENABLE_GITHUB_REMOTE="true" \
-            OV_GITHUB_TOKEN="secretref:github-token" \
-            OV_COPILOT_GITHUB_TOKEN="secretref:copilot-github-token" \
-            OV_OTEL_EXPORTER_OTLP_HEADERS="secretref:otlp-headers" \
-            OV_SQUAD_PROMPT="$prompt" \
-            OV_PUSH_CHANGES="true" \
-            OV_RUN_COPILOT_SMOKE="false" \
-            OV_OUTPUT_BRANCH="squad/issue-${ISSUE:-$SESSION}" \
-            OV_PR_TITLE="Squad: issue #${ISSUE}" \
-            OV_COMMIT_MESSAGE="$commit_message" \
-            OV_SQUAD_DISPATCH_SOURCE="actions" \
-            OV_SQUAD_LEASE_KEY="$LEASE_KEY" \
-            ralph_build_session_env
+            (
+              export SJ_ENV="$(jq -c '.properties.template.containers[0].env // []' "$job_file")"
+              export OV_GITHUB_REPOSITORY="$GITHUB_REPOSITORY"
+              export OV_GITHUB_REF="$base_ref"
+              export OV_SQUAD_MODE="prompt"
+              export OV_SESSION_NAME="$SESSION"
+              export OV_SQUAD_POD_ID="$SESSION"
+              export OV_SQUAD_DEPLOYMENT_MODE="squad-per-pod"
+              export OV_OTEL_SERVICE_NAME="squad-${SESSION}"
+              export OV_ENABLE_GITHUB_REMOTE="true"
+              export OV_GITHUB_TOKEN="secretref:github-token"
+              export OV_COPILOT_GITHUB_TOKEN="secretref:copilot-github-token"
+              export OV_OTEL_EXPORTER_OTLP_HEADERS="secretref:otlp-headers"
+              export OV_SQUAD_PROMPT="$prompt"
+              export OV_PUSH_CHANGES="true"
+              export OV_RUN_COPILOT_SMOKE="false"
+              export OV_OUTPUT_BRANCH="squad/issue-${ISSUE:-$SESSION}"
+              export OV_PR_TITLE="Squad: issue #${ISSUE}"
+              export OV_COMMIT_MESSAGE="$commit_message"
+              export OV_SQUAD_DISPATCH_SOURCE="actions"
+              export OV_SQUAD_LEASE_KEY="$LEASE_KEY"
+              if [ -n "$base_branch" ]; then
+                # An explicit manual base_branch changes BOTH checkout and PR base
+                # for this run only. Leaving it empty preserves the template's own
+                # GITHUB_BASE_BRANCH, which is today's behaviour.
+                export OV_GITHUB_BASE_BRANCH="$base_branch"
+              fi
+              if [ -n "$model" ]; then
+                export OV_SQUAD_MODEL="$model"
+              fi
+              if [ "$publish_pr" = "false" ]; then
+                export OV_PUSH_CHANGES="false"
+              fi
+              if [ -n "$reviewer" ]; then
+                export OV_SQUAD_PR_REVIEWER="$reviewer"
+              fi
+              if [ "$watch_only" = "true" ]; then
+                export OV_SQUAD_HUB_APPROVAL="auto"
+              fi
+              ralph_build_session_env
+            )
           )
 
           if ! printf '%s\n' "${start_env[@]}" | grep -q '^GITHUB_TOKEN=secretref:'; then

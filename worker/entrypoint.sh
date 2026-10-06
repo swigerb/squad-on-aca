@@ -1012,20 +1012,69 @@ commit_and_push_if_needed() {
       pr_body="$(squad_deadline_wip_pr_body "$pr_body" "$wip_commit" "$wip_files")"
       pr_title="$(squad_deadline_wip_pr_title "$pr_title")"
     fi
+    # `--reviewer` only resolves to a real request if SQUAD_PR_REVIEWER happens
+    # to match an actual GitHub login or org/team slug. The dispatch-side
+    # validation (worker/lib/dispatch-inputs.js) only guarantees it is an
+    # ACTIVE SQUAD CASTING REGISTRY id (issue #135) -- a distinct namespace
+    # that `gh` knows nothing about -- so `--reviewer` commonly fails even for
+    # a validated value. The requested reviewer is therefore ALWAYS recorded in
+    # the PR body too, so the information survives even when GitHub never
+    # receives (or rejects) the formal reviewer request.
+    if [[ -n "${SQUAD_PR_REVIEWER:-}" ]]; then
+      pr_body+="$(printf '\n\nRequested reviewer (squad): %s' "$SQUAD_PR_REVIEWER")"
+    fi
     pr_body+="$(squad_policy_reported_changes_report)"
+    local -a pr_create_args=(
+      gh pr create
+      --repo "$GITHUB_REPOSITORY"
+      --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}"
+      --head "$branch"
+      --title "$pr_title"
+      --body "$pr_body"
+    )
+    local -a pr_reviewer_args=()
+    if [[ -n "${SQUAD_PR_REVIEWER:-}" ]]; then
+      pr_reviewer_args=(--reviewer "$SQUAD_PR_REVIEWER")
+    fi
     if [[ "$timed_out" -eq 1 ]]; then
       # Draft pull requests are not available on every plan (a private
       # repository on GitHub Free cannot have them), and `gh pr create --draft`
       # then fails outright. The branch is already pushed, so a failed draft
       # must not also cost the pull request: retry as a regular one, whose
-      # title and body still say WIP.
-      pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" --draft)" \
-        || {
-          log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
-          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body")" || true
-        }
+      # title and body still say WIP. The reviewer is dropped ONLY as the last
+      # resort, one axis (draft, then reviewer) at a time, so a bad reviewer
+      # never costs the draft attempt and a bad draft never costs the reviewer.
+      #
+      # Every attempt below assigns straight into pr_url (never `return 0`),
+      # so whichever attempt succeeds falls through to the single report call
+      # after this if/else -- the PR URL is captured and reported to the hub
+      # on every path of the ladder, not only the first attempt (issue #135
+      # re-dispatch finding).
+      if pr_url="$("${pr_create_args[@]}" "${pr_reviewer_args[@]}" --draft)"; then
+        :
+      elif [[ "${#pr_reviewer_args[@]}" -gt 0 ]]; then
+        log "Could not open the WIP pull request as a draft with reviewer ${SQUAD_PR_REVIEWER}; retrying as a regular pull request, keeping the reviewer."
+        if pr_url="$("${pr_create_args[@]}" "${pr_reviewer_args[@]}")"; then
+          :
+        else
+          log "Could not open the WIP pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer (the requested reviewer is still recorded in the pull request body)."
+          if pr_url="$("${pr_create_args[@]}" --draft)"; then
+            :
+          else
+            pr_url="$("${pr_create_args[@]}")" || true
+          fi
+        fi
+      else
+        log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
+        pr_url="$("${pr_create_args[@]}")" || true
+      fi
     else
-      pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body")" || true
+      if pr_url="$("${pr_create_args[@]}" "${pr_reviewer_args[@]}")"; then
+        :
+      elif [[ "${#pr_reviewer_args[@]}" -gt 0 ]]; then
+        log "Could not open the pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer (the requested reviewer is still recorded in the pull request body)."
+        pr_url="$("${pr_create_args[@]}")" || true
+      fi
     fi
     if [[ -n "$pr_url" ]]; then
       log "Opened pull request: ${pr_url}"
