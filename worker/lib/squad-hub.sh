@@ -370,13 +370,26 @@ squad_hub_run() {
 # Report the pull request this session opened, if this image knows how.
 #
 # The worker image pins squad-hub@0.6.0 until the hub's v0.7.0 rollout, so this
-# must detect the new verb rather than assume it. Reporting is best-effort once
-# the hub is configured: a failed report must not fail the already-open pull
-# request, but a half-configured hub is still the same exit-78 misconfiguration
-# squad_hub_enabled already treats as fatal everywhere else in this file.
+# must detect the new verb rather than assume it.
+#
+# Deliberately NOT squad_hub_enabled: that function `squad_hub_abort`s (exit 78)
+# on a half-configuration, which is correct for the SUPERVISION gate -- a
+# session that was asked to run supervised must never quietly run unsupervised
+# instead. This call site is different. `shell` mode calls
+# commit_and_push_if_needed with no earlier hub check at all (it never calls
+# squad_hub_should_supervise/squad_hub_preflight), so a half-configured hub
+# would otherwise be discovered for the FIRST time here -- after the branch is
+# already pushed and the pull request already open -- and would abort a
+# successful session over a reporting step the brief says must "never fail the
+# session". So the check here is read-only: both halves present, or skip.
 squad_hub_report_pr() {
   local url="$1" number="$2" title="${3:-}" session="${4:-${SESSION_NAME:-}}"
-  squad_hub_enabled || return 0
+  if [[ -z "${SQUAD_HUB_URL:-}" || -z "${SQUAD_HUB_TOKEN:-}" ]]; then
+    if [[ -n "${SQUAD_HUB_URL:-}" || -n "${SQUAD_HUB_TOKEN:-}" ]]; then
+      squad_hub_log "Hub half-configured (one of SQUAD_HUB_URL/SQUAD_HUB_TOKEN is unset); skipping PR reporting rather than failing an already-published session over it."
+    fi
+    return 0
+  fi
   if [[ -z "$url" || -z "$number" ]]; then
     squad_hub_log "No pull request to report to the hub."
     return 0

@@ -786,6 +786,23 @@ report_pr_status() {
 assert_eq "0" "$(report_pr_status https://github.com/octo/demo/pull/304 304 'Title' 'session-304')" \
   "PR reporting is a no-op when no hub is configured"
 
+# `shell` mode (worker/entrypoint.sh) calls commit_and_push_if_needed directly,
+# with NO earlier squad_hub_should_supervise/squad_hub_preflight check at all --
+# so a half-configured hub (operator set one of SQUAD_HUB_URL/SQUAD_HUB_TOKEN,
+# not both) is discovered for the first time at THIS call site, after the
+# branch is already pushed and the pull request already open. This function
+# must never escalate that into a session failure the way squad_hub_enabled's
+# abort does for the supervision gate -- it must behave exactly like "hub not
+# configured": skip quietly (one log line) and return success.
+half_configured_report_pr_status() {
+  env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN "$@" \
+    bash -c 'source "'"$HUB_LIB"'"; squad_hub_report_pr "https://github.com/octo/demo/pull/304" 304 Title session-304 >/dev/null 2>&1; printf "%s" "$?"'
+}
+assert_eq "0" "$(half_configured_report_pr_status SQUAD_HUB_URL=https://hub.example)" \
+  "PR reporting does not abort the session when only SQUAD_HUB_URL is set (#136 review fix)"
+assert_eq "0" "$(half_configured_report_pr_status SQUAD_HUB_TOKEN=sqhd1.x)" \
+  "PR reporting does not abort the session when only SQUAD_HUB_TOKEN is set (#136 review fix)"
+
 REPORT_STUB_ROOT="$(mktemp -d)"
 REPORT_STUB_DIR="${REPORT_STUB_ROOT}/bin"
 mkdir -p "$REPORT_STUB_DIR"

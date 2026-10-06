@@ -287,3 +287,179 @@ Verified independently rather than trusting the engineer's self-report:
 
 Coordinated with `security`'s independent review pass (also APPROVE WITH
 NOTES, no overlapping findings — see `.squad/agents/security/history.md`).
+
+## 2026-10-06 — Issue #136: hub device metadata and PR reporting
+
+Reviewed commit `6aa9287` (the only commit on `HEAD` over `main`/`ee61724`),
+`worker/lib/squad-hub.sh`, `worker/entrypoint.sh`,
+`worker/tests/test_squad_hub.sh`, `docs/squad-hub.md`.
+
+Verified directly:
+- `squad_hub_issue_number`: matches `OUTPUT_BRANCH=squad/issue-<n>` (anchored
+  `^...$`, so it can't partially match), falls back to a trailing `#<n>` in
+  `PR_TITLE`, and correctly does NOT match `new-project`'s
+  `squad/bootstrap-<session>` — confirmed with a standalone repro
+  (`OUTPUT_BRANCH=squad/bootstrap-sess123` → no match, device name falls back
+  to `SESSION_NAME`). Matching a manually-dispatched session whose
+  operator-supplied `OUTPUT_BRANCH`/`PR_TITLE` happens to look like an issue
+  branch is an accepted best-effort heuristic, not a bug — there's no
+  dedicated issue-number env var to parse instead, and a false-positive here
+  only mislabels a device name, it doesn't change behavior.
+- `squad_hub_device_name`: repro'd `#304 · AzureAIDriveThru` for an issue
+  session and plain `SESSION_NAME` fallback otherwise. Checked the actual
+  bytes with `cat -A`: the middle dot is `M-BM-7`, i.e. `0xC2 0xB7`, real
+  UTF-8 U+00B7 — not a mangled substitute.
+- `squad_hub_device_meta_json`: repro'd valid JSON with all 4 keys
+  (`repo`, `issue`, `executionName`, `jobName`), `issue` as a JSON string
+  (`"304"`, not `304`), empty-string defaults. Truncation happens on the bash
+  values BEFORE they're handed to `node -e` for JSON-encoding, so a long
+  value gets truncated-then-quoted, not quoted-then-truncated — can't produce
+  invalid JSON from the cap itself.
+- `squad_hub_truncate`'s `${value:0:limit}` is a byte-oblivious bash
+  substring; a 200-char cut through a multi-byte UTF-8 character (e.g. a
+  non-ASCII repo/issue title) could emit invalid UTF-8 mid-sequence. Flagging
+  per the brief's ask, but not blocking: these are short, mostly-ASCII
+  operational fields (repo slugs, issue numbers, ACA execution/job names) at
+  a 200-char budget, so the exposure is narrow, and the hub validates on
+  receipt per the issue body.
+- `squad_hub_run` wiring: `SQUAD_HUB_DEVICE_NAME`/`SQUAD_HUB_DEVICE_META_JSON`
+  are set in the same `env`-prefix block as `SQUAD_HUB_DEVICE_ID`, before
+  `squad-hub oneshot`. `${SQUAD_HUB_DEVICE_NAME:-$(squad_hub_device_name)}`
+  correctly respects an operator-supplied override — nothing upstream
+  exports/defaults `SQUAD_HUB_DEVICE_NAME` before this point.
+- Ran `bash worker/tests/test_squad_hub.sh`: **131 assertions, 0 failed.**
+  Spot-checked the new report-pr assertions against a stub `squad-hub` whose
+  `--help` omits/includes `report-pr` and whose `report-pr` subcommand writes
+  a detectable sentinel file — the "verb absent" test asserts the sentinel
+  file was NOT created, i.e. it genuinely confirms non-invocation rather than
+  just "didn't crash". Not tautological.
+- Token hygiene in `squad_hub_report_pr`: confirmed no CLI arg ever carries
+  `$SQUAD_HUB_TOKEN`, and both the `--help` probe and the `report-pr`
+  invocation are `>/dev/null 2>&1`, so nothing the subprocess emits reaches
+  the session log.
+- `commit_and_push_if_needed`: `pr_url` is now captured via command
+  substitution at all three `gh pr create` call sites (plain, `--draft`, and
+  the draft-fallback-to-regular retry), and `squad_hub_report_pr_if_any` is
+  called exactly once, gated on `-n "$pr_url"`, after whichever path set it —
+  confirmed no double-report and no missed report by reading the diff
+  directly (only `gh pr create ... \` → `pr_url="$(gh pr create ...)"` and
+  the new trailing `if` block were touched; the WIP/draft decision logic
+  itself, issue #134 territory, is byte-for-byte unchanged).
+- `squad_hub_report_pr_if_any`'s `declare -f squad_hub_report_pr` guard
+  correctly no-ops for any session that never sourced
+  `worker/lib/squad-hub.sh` — confirmed that's the only "hub not configured
+  at all" path exercised by `prompt`/`new-project`/`shell`, all three of which
+  define `SQUAD_HUB_LIB`-sourced helpers unconditionally at the top of
+  `entrypoint.sh`, so this guard is really gating on "hub functions compiled
+  in", not on configuration.
+- Scope: confirmed only the four intended files changed
+  (`git show --stat`); no edits to deny-list survival, `--allow-all-tools`
+  dropping, device-token-only enforcement, or any other existing hub
+  security property — purely additive.
+- Commit hygiene: `Fix #136: report hub device metadata and PR URLs`,
+  correct `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`
+  trailer.
+
+**Blocking defect found** (point 6 of the brief, confirmed reachable):
+
+`squad_hub_report_pr` calls `squad_hub_enabled`, which (unchanged, pre-existing
+behavior) `exit 78`s the ENTIRE session on a half-configuration — exactly one
+of `SQUAD_HUB_URL`/`SQUAD_HUB_TOKEN` set. Before this change, that abort was
+only ever reachable through `squad_hub_should_supervise` → `squad_hub_preflight`,
+which every call site that runs an agent invokes BEFORE `commit_and_push_if_needed`
+(`prompt` at entrypoint.sh:1172, `new-project` at :1220). But `SQUAD_MODE=shell`
+(entrypoint.sh:1461-1465) calls `commit_and_push_if_needed` directly — it never
+calls `squad_hub_should_supervise`/`squad_hub_preflight` at all, because `shell`
+doesn't run a supervised agent. That path was never gated on hub configuration
+before this commit.
+
+Now `commit_and_push_if_needed` unconditionally calls
+`squad_hub_report_pr_if_any` once a PR is open. For a `shell`-mode session with
+a half-configured hub (operator typo'd/partially set `SQUAD_HUB_URL`/
+`SQUAD_HUB_TOKEN`, e.g. via a container-level env default meant for other
+modes), the sequence is: `REMOTE_SQUAD_COMMAND` runs → branch pushes
+successfully → `gh pr create` succeeds → `squad_hub_report_pr_if_any` →
+`squad_hub_enabled` → `squad_hub_abort` → `exit 78`. The PR is already open and
+the branch already pushed at that point, but the session as a whole now exits
+78 — the same code the rest of the codebase uses for "governance VIOLATION —
+session failed" (see `squad_watch_governance_report_if_any` callers) — making a
+session that actually succeeded look like a hard configuration failure to
+anything watching exit codes. Before this commit, the identical
+half-configured-hub `shell` session would have run to completion with no hub
+check at all, since nothing in that mode touched `squad_hub_enabled`.
+
+This is not a hypothetical: `worker/tests/test_squad_hub.sh` only exercises
+`squad_hub_report_pr` fully-configured (both set) or fully-unconfigured
+(neither set) — no test covers the half-configured case for this function or
+for the `shell` entrypoint path, so the gap wasn't caught by the new suite
+either.
+
+Suggested fix (not implemented — read-only review): either (a) have
+`squad_hub_report_pr` check configuration without routing through
+`squad_hub_enabled`'s abort-on-half-config behavior (e.g. treat half-config as
+a quiet skip-with-log for this best-effort, post-success call site only,
+since the session has nothing left to protect by aborting), or (b) gate
+`SQUAD_MODE=shell` through the same `squad_hub_should_supervise`/
+`squad_hub_preflight` check as the other publishing modes earlier in the
+session (before the agent runs), so a half-configured hub is caught up front
+instead of after a successful push+PR. (b) changes `shell` mode's behavior
+more broadly (it would start supervising/preflighting a mode that today
+doesn't); (a) is the smaller, more targeted fix.
+
+**Verdict: CHANGES REQUESTED** — blocking on the `shell`-mode half-configured-hub
+defect above. Everything else in the diff (regex correctness, device name
+formatting including the UTF-8 middle dot, meta JSON shape and truncate
+ordering, env wiring and override precedence, token non-leakage, scope
+discipline, commit hygiene, and the 131/131 green test run) checks out clean.
+
+## 2026-10-06 — Issue #136 follow-up: half-configured-hub fix for `squad_hub_report_pr`
+
+Re-reviewed the uncommitted fix applied directly to `worker/lib/squad-hub.sh`
+and `worker/tests/test_squad_hub.sh` in response to the blocking defect from
+the entry above (fix option (a)).
+
+Verified directly:
+- `git diff -- worker/lib/squad-hub.sh worker/tests/test_squad_hub.sh` against
+  `HEAD` (`6aa9287`) shows `squad_hub_report_pr` no longer calls
+  `squad_hub_enabled` at all. It now checks `SQUAD_HUB_URL`/`SQUAD_HUB_TOKEN`
+  directly: if either is unset it returns 0 immediately, emitting the new
+  one-line `squad_hub_log` skip message only when the OTHER one of the pair
+  is set (i.e. only in the genuinely half-configured case), and only falls
+  through to the existing feature-detect-and-report logic when both are set.
+  This is exactly fix (a) as suggested — no abort path, no exit 78, reachable
+  only after a successful push + PR open.
+- Confirmed `squad_hub_enabled` itself (lines 217–228) is byte-for-byte
+  unchanged, and its only other call site, `worker/entrypoint.sh:594`
+  (`declare -f squad_hub_enabled >/dev/null 2>&1 && squad_hub_enabled`, the
+  ambient/`prompt`/`new-project` supervision gate), is untouched — grepped
+  every reference to `squad_hub_enabled` in `worker/` to confirm this is the
+  complete set of callers. The abort-on-half-config semantics for the
+  supervision gate are fully intact.
+- Ran `bash worker/tests/test_squad_hub.sh` myself: **133 assertions, 0
+  failed** (was 131 at the prior review; the two new assertions — "PR
+  reporting does not abort the session when only SQUAD_HUB_URL is set" and
+  the matching TOKEN-only case — are net additions, confirmed by reading the
+  diff rather than just trusting the count: nothing in the existing 131 was
+  edited or removed).
+- Scope check: `git status --short` shows only `worker/lib/squad-hub.sh` and
+  `worker/tests/test_squad_hub.sh` modified in the working tree (plus this
+  history file). No unrelated files touched.
+- Re-verified the acceptance criterion the fix must not regress — the
+  fully-unconfigured case (neither var set) must stay a silent no-op, not
+  pick up the new log line. Reproduced directly:
+  `env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN bash -c 'source worker/lib/squad-hub.sh; squad_hub_report_pr ...'`
+  → `RC=0`, empty stdout+stderr. Only the half-configured case (exactly one
+  of the two set) hits the new log line; the new outer `[[ -z url || -z
+  token ]]` / inner `[[ -n url || -n token ]]` pair correctly distinguishes
+  "neither set" (outer true, inner false → silent return 0) from "exactly one
+  set" (outer true, inner true → logged return 0) from "both set" (outer
+  false → proceeds to report).
+- This closes the exact defect flagged: a `shell`-mode session with a
+  half-configured hub now completes with a one-line log instead of an exit-78
+  abort discovered after a successful push + PR open. No new edge case
+  introduced.
+
+**Verdict: APPROVE** — the targeted fix (option a) is correctly scoped,
+doesn't touch `squad_hub_enabled` or its supervision-gate call site, the test
+suite is green with only additive coverage, and the fully-unconfigured no-op
+behavior is preserved alongside the new half-configured skip-with-log path.
