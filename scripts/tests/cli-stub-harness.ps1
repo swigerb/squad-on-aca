@@ -141,6 +141,7 @@ function New-SquadCliStubEnvironment {
     $ghLog = Join-Path $Root "gh-calls.log"
     $squadLog = Join-Path $Root "squad-calls.log"
     $acaLog = Join-Path $Root "aca-calls.log"
+    $armLog = Join-Path $Root "arm-calls.log"
     $curlLog = Join-Path $Root "curl-calls.log"
     # Shared, ordered, cross-tool call log. `az` and the lease store both append
     # to it, so a test can assert that the lease write precedes the compute
@@ -149,6 +150,7 @@ function New-SquadCliStubEnvironment {
     $callLog = Join-Path $Root "dispatch-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $ghLog -Value "" -NoNewline -Encoding ascii
+    Set-Content -LiteralPath $armLog -Value "" -NoNewline -Encoding utf8
     Set-Content -LiteralPath $curlLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $squadLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $acaLog -Value "" -NoNewline -Encoding ascii
@@ -759,6 +761,7 @@ exit /b 0
         GhLog      = $ghLog
         SquadLog   = $squadLog
         AcaLog     = $acaLog
+        ArmLog     = $armLog
         CurlLog    = $curlLog
         LeaseDir   = $leaseDir
         CallLog    = $callLog
@@ -910,6 +913,7 @@ function Reset-SquadCliStubLog {
     param([Parameter(Mandatory = $true)][object]$Stub)
     Set-Content -LiteralPath $Stub.AzLog -Value "" -NoNewline -Encoding ascii
     Set-Content -LiteralPath $Stub.GhLog -Value "" -NoNewline -Encoding ascii
+    if ($Stub.ArmLog) { Set-Content -LiteralPath $Stub.ArmLog -Value "" -NoNewline -Encoding utf8 }
     if ($Stub.SquadLog) { Set-Content -LiteralPath $Stub.SquadLog -Value "" -NoNewline -Encoding ascii }
     if ($Stub.AcaLog) { Set-Content -LiteralPath $Stub.AcaLog -Value "" -NoNewline -Encoding ascii }
     if ($Stub.CurlLog) { Set-Content -LiteralPath $Stub.CurlLog -Value "" -NoNewline -Encoding ascii }
@@ -929,12 +933,13 @@ function Get-SquadCliStubCall {
     #>
     param(
         [Parameter(Mandatory = $true)][object]$Stub,
-        [ValidateSet("az", "gh", "squad", "aca", "curl")][string]$Tool = "az"
+        [ValidateSet("az", "gh", "squad", "aca", "arm", "curl")][string]$Tool = "az"
     )
     $path = switch ($Tool) {
         "gh"    { $Stub.GhLog }
         "squad" { $Stub.SquadLog }
         "aca"   { $Stub.AcaLog }
+        "arm"   { $Stub.ArmLog }
         "curl"  { $Stub.CurlLog }
         default { $Stub.AzLog }
     }
@@ -1027,7 +1032,9 @@ function Invoke-SquadCliCapture {
         [string]$GhAuthToken = "",
         [string]$CredentialFileCapture = "",
         [string]$DriftMode = "",
-        [int]$CurlExitCode = 0
+        [int]$CurlExitCode = 0,
+        [string]$ForbiddenAzArgValue = "",
+        [switch]$FailOnAzPercentToken
     )
 
     $hostExe = (Get-Process -Id $PID).Path
@@ -1036,8 +1043,9 @@ function Invoke-SquadCliCapture {
 
     $envNames = @("PATH", "HOME", "HOMEDRIVE", "HOMEPATH", "USERPROFILE",
                   "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT",
-                  "SQUAD_STUB_AZ_LOG", "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
-                  "SQUAD_STUB_ACA_LOG",
+                  "SQUAD_STUB_AZ_LOG",
+                  "SQUAD_STUB_GH_LOG", "SQUAD_STUB_SQUAD_LOG",
+                  "SQUAD_STUB_ACA_LOG", "SQUAD_STUB_ARM_LOG", "SQUAD_STUB_ARM_MALFORMED",
                   "SQUAD_STUB_CURL_LOG", "SQUAD_STUB_CURL_RC",
                   "SQUAD_STUB_FIXTURES",
                   "SQUAD_STUB_STOP_RC", "SQUAD_STUB_START_RC",
@@ -1088,6 +1096,8 @@ function Invoke-SquadCliCapture {
         $env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = "1"
         $env:SQUAD_STUB_STOP_RC = "$StopExitCode"
         $env:SQUAD_STUB_START_RC = "$StartExitCode"
+        $env:SQUAD_STUB_ARM_LOG = $Stub.ArmLog
+        $env:SQUAD_STUB_ARM_MALFORMED = "0"
         # The adapter-level checks in validate.ps1 drive these; a CLI capture
         # must always see the default (quiet, sequence-free) stub behaviour.
         $env:SQUAD_STUB_STOP_ERR = ""
@@ -1183,6 +1193,13 @@ function Invoke-SquadCliCapture {
         $env:SQUAD_LEASE_BRANCH = "squad-aca-leases"
 
         $argList = @("-NoProfile", "-NonInteractive", "-File", $ScriptPath) + $CliArguments
+        if ($IsWindows) {
+            # Start-Process joins an array with spaces and does not escape
+            # embedded quotes, so the child would see a hostile prompt with its
+            # quotes stripped. Hand it one command line built with the Windows
+            # argv rules instead, so the CLI receives each argument byte-exact.
+            $argList = ($argList | ForEach-Object { ConvertTo-SquadCliWindowsArgument $_ }) -join " "
+        }
         $proc = Start-Process -FilePath $hostExe -ArgumentList $argList `
             -WorkingDirectory $Stub.WorkDir -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
@@ -1199,16 +1216,61 @@ function Invoke-SquadCliCapture {
     if (Test-Path $errFile) { $stderr = [System.IO.File]::ReadAllText($errFile) }
     Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
+    # Argv-leak check for the Windows az.cmd shim. It runs here, in PowerShell,
+    # over the argv log that az.cmd already writes, because expanding a hostile
+    # value inside az.cmd itself makes cmd.exe parse its quotes and & | < > as
+    # syntax. Any distinctive word of the forbidden value, or any % token, on an
+    # az argv line means free text crossed the Windows command line.
+    $azCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
+    if ($ForbiddenAzArgValue) {
+        $markers = @($ForbiddenAzArgValue -split '\s+' | Where-Object { $_ -cmatch '^[A-Za-z_]{5,}$' })
+        foreach ($line in $azCalls) {
+            foreach ($marker in $markers) {
+                if ($line.Contains($marker)) {
+                    $stderr += "`nSTUB-ARGV-LEAK: forbidden free-text value reached az.cmd"
+                    break
+                }
+            }
+        }
+    }
+    if ($FailOnAzPercentToken -and @($azCalls | Where-Object { $_.Contains('%') }).Count -gt 0) {
+        $stderr += "`nSTUB-ARGV-LEAK: percent token reached az.cmd"
+    }
+
     return [pscustomobject]@{
         ExitCode   = $exitCode
         StdOut     = $stdout
         StdErr     = $stderr
-        AzCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool az)
+        AzCalls    = $azCalls
         GhCalls    = @(Get-SquadCliStubCall -Stub $Stub -Tool gh)
+        ArmCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool arm)
         SquadCalls = @(Get-SquadCliStubCall -Stub $Stub -Tool squad)
         AcaCalls   = @(Get-SquadCliStubCall -Stub $Stub -Tool aca)
         CurlCalls  = @(Get-SquadCliStubCall -Stub $Stub -Tool curl)
     }
+}
+
+function ConvertTo-SquadCliWindowsArgument {
+    # Quotes one argument per the CommandLineToArgvW rules: backslashes are
+    # literal unless they precede a quote, where they are doubled.
+    param([AllowEmptyString()][string]$Value)
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $sb = [System.Text.StringBuilder]::new('"')
+    $backslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq [char]'\') {
+            $backslashes++
+        } elseif ($ch -eq [char]'"') {
+            [void]$sb.Append('\', 2 * $backslashes + 1).Append('"')
+            $backslashes = 0
+        } else {
+            if ($backslashes -gt 0) { [void]$sb.Append('\', $backslashes) }
+            [void]$sb.Append($ch)
+            $backslashes = 0
+        }
+    }
+    if ($backslashes -gt 0) { [void]$sb.Append('\', 2 * $backslashes) }
+    return $sb.Append('"').ToString()
 }
 
 function Remove-SquadCliStubEnvironment {

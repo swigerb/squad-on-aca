@@ -82,6 +82,8 @@
 
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here.
 
+. (Join-Path (Split-Path -Parent $PSScriptRoot) "session-env.ps1")
+
 $script:SandboxProviderId = "sandbox"
 
 # ARM api-version for Microsoft.App/sandboxGroups. The GROUP is the only part of
@@ -2051,10 +2053,16 @@ function New-SandboxWorkerEnvironment {
     )
 
     $prefs = $Request.executionPreferences
+    if ($Request.task.prompt) {
+        [void](Assert-SquadPromptByteCap -Prompt ([string]$Request.task.prompt))
+    }
     $vars = [ordered]@{
         SESSION_NAME      = [string]$Request.sessionId
         GITHUB_REPOSITORY = [string]$Request.repository.fullName
         SQUAD_MODE        = [string]$prefs.mode
+        SQUAD_DEPLOYMENT_MODE = "squad-per-pod"
+        SQUAD_POD_ID      = [string]$Request.sessionId
+        OTEL_SERVICE_NAME = "squad-$([string]$Request.sessionId)"
         PUSH_CHANGES      = $(if ($prefs.pushChanges) { "true" } else { "false" })
         OUTPUT_BRANCH     = [string]$Request.git.outputBranch
         GIT_CLONE_DEPTH   = [string]$Request.repository.cloneDepth

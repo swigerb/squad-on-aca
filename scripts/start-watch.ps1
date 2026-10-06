@@ -1,4 +1,5 @@
 param(
+    [string]$SubscriptionId = "",
     [string]$ResourceGroupName = "rg-squad-aca-dev-centralus",
     [string]$WatchAppName = "ca-squad-aca-watch",
     [Parameter(Mandatory = $true)]
@@ -14,6 +15,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptRoot "lib\session-env.ps1")
 if (-not $Ref) {
     $Ref = gh repo view $Repository --json defaultBranchRef --jq .defaultBranchRef.name 2>$null
     if (-not $Ref) {
@@ -28,32 +31,73 @@ if ($Stop) {
 }
 
 $sessionName = if ($SubSquad) { "watch-$SubSquad" } else { "watch-default" }
-$envVars = @(
-    "GITHUB_REPOSITORY=$Repository",
-    "GITHUB_REF=$Ref",
-    "SQUAD_MODE=watch",
-    "SESSION_NAME=$sessionName",
-    "SQUAD_DEPLOYMENT_MODE=squad-per-pod",
-    "SQUAD_POD_ID=$sessionName",
-    "OTEL_SERVICE_NAME=squad-$sessionName",
-    "WATCH_INTERVAL_MINUTES=$IntervalMinutes",
-    "WATCH_TIMEOUT_MINUTES=$TimeoutMinutes",
-    "WATCH_MAX_CONCURRENT=$MaxConcurrent",
-    "GITHUB_TOKEN=secretref:github-token",
-    "COPILOT_GITHUB_TOKEN=secretref:copilot-github-token",
-    "OTEL_EXPORTER_OTLP_HEADERS=secretref:otlp-headers",
-    "ENABLE_GITHUB_REMOTE=true"
-)
-if ($SubSquad) { $envVars += "SQUAD_TEAM=$SubSquad" }
-# Sprint 6 (PRD #6): the route and lease the caller resolved and claimed BEFORE
-# this update, so the watcher is observable and can heartbeat its own lease.
-$envVars += "SQUAD_DISPATCH_SOURCE=watch"
-if ($DispatchRoute) { $envVars += "SQUAD_DISPATCH_ROUTE=$DispatchRoute" }
-if ($LeaseKey) { $envVars += "SQUAD_LEASE_KEY=$LeaseKey" }
+$resolvedSubscription = if ($SubscriptionId) { $SubscriptionId } else { Get-AcaCurrentSubscriptionId }
+$watchUri = "https://management.azure.com/subscriptions/$resolvedSubscription/resourceGroups/$ResourceGroupName/providers/Microsoft.App/containerApps/${WatchAppName}?api-version=$($script:AcaArmApiVersion)"
+$watchApp = Invoke-AcaArmRequest -Method GET -Uri $watchUri -SubscriptionId $resolvedSubscription
+if (-not $watchApp -or -not $watchApp.properties -or -not $watchApp.properties.template) {
+    throw "Could not read the watcher template for app '$WatchAppName' in resource group '$ResourceGroupName'."
+}
 
-az containerapp update `
-    --name $WatchAppName `
-    --resource-group $ResourceGroupName `
-    --min-replicas 1 `
-    --max-replicas 1 `
-    --set-env-vars @envVars
+$template = $watchApp.properties.template
+if (-not $template -or -not $template.containers -or @($template.containers).Count -eq 0) {
+    throw "Watcher app '$WatchAppName' has no readable container template. Refusing to update it blindly."
+}
+
+$envMap = [ordered]@{}
+foreach ($entry in @($template.containers[0].env)) {
+    if (-not $entry.name) { continue }
+    if ($entry.PSObject.Properties.Name -contains "secretRef" -and $entry.secretRef) {
+        $envMap[$entry.name] = "secretref:$($entry.secretRef)"
+    } else {
+        $envMap[$entry.name] = [string]$entry.value
+    }
+}
+
+$envMap["GITHUB_REPOSITORY"] = $Repository
+$envMap["GITHUB_REF"] = $Ref
+$envMap["SQUAD_MODE"] = "watch"
+$envMap["SESSION_NAME"] = $sessionName
+$envMap["SQUAD_DEPLOYMENT_MODE"] = "squad-per-pod"
+$envMap["SQUAD_POD_ID"] = $sessionName
+$envMap["OTEL_SERVICE_NAME"] = "squad-$sessionName"
+$envMap["WATCH_INTERVAL_MINUTES"] = [string]$IntervalMinutes
+$envMap["WATCH_TIMEOUT_MINUTES"] = [string]$TimeoutMinutes
+$envMap["WATCH_MAX_CONCURRENT"] = [string]$MaxConcurrent
+$envMap["GITHUB_TOKEN"] = "secretref:github-token"
+$envMap["COPILOT_GITHUB_TOKEN"] = "secretref:copilot-github-token"
+$envMap["OTEL_EXPORTER_OTLP_HEADERS"] = "secretref:otlp-headers"
+$envMap["ENABLE_GITHUB_REMOTE"] = "true"
+if ($SubSquad) {
+    $envMap["SQUAD_TEAM"] = $SubSquad
+} elseif ($envMap.Contains("SQUAD_TEAM")) {
+    $envMap.Remove("SQUAD_TEAM")
+}
+$envMap["SQUAD_DISPATCH_SOURCE"] = "watch"
+if ($DispatchRoute) {
+    $envMap["SQUAD_DISPATCH_ROUTE"] = $DispatchRoute
+} elseif ($envMap.Contains("SQUAD_DISPATCH_ROUTE")) {
+    $envMap.Remove("SQUAD_DISPATCH_ROUTE")
+}
+if ($LeaseKey) {
+    $envMap["SQUAD_LEASE_KEY"] = $LeaseKey
+} elseif ($envMap.Contains("SQUAD_LEASE_KEY")) {
+    $envMap.Remove("SQUAD_LEASE_KEY")
+}
+
+$template.containers[0].env = @(ConvertTo-AcaEnvEntries -EnvVars $envMap)
+if (-not $template.scale) { $template | Add-Member -MemberType NoteProperty -Name scale -Value ([pscustomobject]@{}) }
+$template.scale.minReplicas = 1
+$template.scale.maxReplicas = 1
+
+$body = [ordered]@{
+    properties = [ordered]@{
+        template = $template
+    }
+}
+$json = $body | ConvertTo-Json -Depth 30 -Compress
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+$response = Invoke-AcaArmRequest -Method PATCH -Uri $watchUri -BodyBytes $bytes -SubscriptionId $resolvedSubscription
+if (-not $response -or ((-not ($response.PSObject.Properties.Name -contains "name")) -and (-not ($response.PSObject.Properties.Name -contains "properties")))) {
+    throw "ARM watcher update for '$WatchAppName' returned no resource payload. Refusing to treat a malformed response as a successful dispatch."
+}
+Write-Output "Started watcher scale for $WatchAppName."

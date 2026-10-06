@@ -6,6 +6,7 @@ containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stu
 containerapp job execution list --name caj-squad-aca-session --resource-group rg-squad-stub --query [0:3].name -o json
 containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub01 -o json
 containerapp job execution show --name caj-squad-aca-session --resource-group rg-squad-stub --job-execution-name caj-squad-aca-session-stub02 -o json
+### ARM CALLS
 ### GH CALLS
 ### SQUAD CALLS
 ### ACA CALLS

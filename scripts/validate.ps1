@@ -713,13 +713,16 @@ if (-not (Test-Path $acaLogsFile)) {
         Add-Fail "squad-aca doctor has no 'Logs path' check (issue #13 asked for it)"
     }
 
-    . $acaLogsFile
+    if (-not $IsWindowsHost) {
+        Add-Pass "Offline logs stub execution is skipped on non-Windows hosts; the .cmd az stub requires cmd.exe"
+    } else {
+        . $acaLogsFile
 
-    $stubRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("aca-logs-" + [guid]::NewGuid().ToString("N"))
-    $stubBin = Join-Path $stubRoot "bin"
-    New-Item -ItemType Directory -Force -Path $stubBin | Out-Null
+        $stubRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("aca-logs-" + [guid]::NewGuid().ToString("N"))
+        $stubBin = Join-Path $stubRoot "bin"
+        New-Item -ItemType Directory -Force -Path $stubBin | Out-Null
 
-    # Fake `az`. Records one marker line per call. If dynamic extension install
+        # Fake `az`. Records one marker line per call. If dynamic extension install
     # was NOT suppressed it records PROMPT-RISK, which stands in for the real
     # CLI's interactive "install it now? (Y/n)" prompt that blocks on stdin.
     # Every branch exits from a label, never from inside a parenthesized block:
@@ -965,6 +968,7 @@ exit /b 1
             Remove-Item Env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL -ErrorAction SilentlyContinue
         }
         Remove-Item -Recurse -Force $stubRoot -ErrorAction SilentlyContinue
+    }
     }
 }
 
@@ -3246,11 +3250,38 @@ if (-not (Test-Path $harness)) {
         # smoke: dispatch still goes through az containerapp job start.
         Reset-SquadCliStubLog -Stub $stub
         $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("smoke", "--repo", "octo/demo")
-        $startCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" })
-        if ($r.ExitCode -eq 0 -and $startCall.Count -eq 1 -and $startCall[0] -like "*SQUAD_MODE=smoke*" -and $startCall[0] -like "*RUN_COPILOT_SMOKE=true*") {
-            Add-Pass "squad-aca smoke dispatches one 'az containerapp job start' with the smoke env-vars"
+        $startCall = @($r.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
+        $armTrace = $r.ArmCalls -join "`n"
+        if ($r.ExitCode -eq 0 -and $startCall.Count -eq 1 -and $armTrace -match '"name":"SQUAD_MODE","value":"smoke"' -and $armTrace -match '"name":"RUN_COPILOT_SMOKE","value":"true"') {
+            Add-Pass "squad-aca smoke dispatches one ARM start request with the smoke env body"
         } else {
-            Add-Fail "squad-aca smoke dispatch changed: $($startCall -join ' | ')"
+            Add-Fail "squad-aca smoke dispatch changed: $($r.ArmCalls -join ' | ')"
+        }
+
+        # Windows cmd.exe regression test: a real az.cmd shim fails if any argv
+        # contains the free-text prompt or a raw % token. The dispatch must still
+        # succeed, proving those values stayed inside the ARM JSON body instead of
+        # crossing the Windows command line. `run` needs a real Squad repo, so
+        # this check gets its own initialized stub.
+        $shimStub = $null
+        try {
+            $shimStub = New-SquadCliStubEnvironment
+            Initialize-SquadCliStubRepository -Stub $shimStub | Out-Null
+            Reset-SquadCliStubLog -Stub $shimStub
+            $hostilePrompt = "quotes `" and %PATH% %GITHUB_TOKEN% & | ^ ! < > \ newline café 😀"
+            $r = Invoke-SquadCliCapture -Stub $shimStub -ScriptPath $cliScript `
+                -CliArguments @("run", "--repo", "octo/demo", "--name", "fixedwinshim", $hostilePrompt) `
+                -ForbiddenAzArgValue $hostilePrompt `
+                -FailOnAzPercentToken
+            $startCall = @($r.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
+            $armTrace = $r.ArmCalls -join "`n"
+            if ($r.ExitCode -eq 0 -and $startCall.Count -eq 1 -and $r.StdErr -notmatch 'STUB-ARGV-LEAK' -and $armTrace.Contains("newline caf")) {
+                Add-Pass "The Windows az.cmd shim never sees the free-text prompt or a percent token on its argv; the prompt stays inside the ARM request body"
+            } else {
+                Add-Fail "The Windows az.cmd shim saw free-text dispatch data on argv or dispatch failed (exit=$($r.ExitCode), stderr=$($r.StdErr))"
+            }
+        } finally {
+            if ($shimStub) { Remove-SquadCliStubEnvironment -Stub $shimStub }
         }
 
         # doctor is not routed through the provider; assert it is still intact.
@@ -3310,7 +3341,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $issue117NodeAvailable))
 
         Reset-SquadCliStubLog -Stub $stub
         $runExternal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-external", "do the thing")
-        $externalStartCalls = @($runExternal.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        $externalStartCalls = @($runExternal.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
         if ($runExternal.ExitCode -ne 0 -and
             "$($runExternal.StdErr)`n$($runExternal.StdOut)" -match "external" -and
             $externalStartCalls.Count -eq 0) {
@@ -3335,7 +3366,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $issue117NodeAvailable))
 
         Reset-SquadCliStubLog -Stub $stub
         $runRemote = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-remote", "do the thing")
-        $remoteStartCalls = @($runRemote.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        $remoteStartCalls = @($runRemote.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
         if ($runRemote.ExitCode -ne 0 -and
             "$($runRemote.StdErr)`n$($runRemote.StdOut)" -match "\.\./other-repo/\.squad" -and
             $remoteStartCalls.Count -eq 0) {
@@ -3360,7 +3391,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $issue117NodeAvailable))
 
         Reset-SquadCliStubLog -Stub $stub
         $runAbsent = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-absent", "do the thing")
-        $absentStartCalls = @($runAbsent.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        $absentStartCalls = @($runAbsent.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
         if ($runAbsent.ExitCode -eq 0 -and $absentStartCalls.Count -eq 1) {
             Add-Pass "squad-aca run dispatches normally when .squad/config.json is absent"
         } else {
@@ -3381,7 +3412,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $issue117NodeAvailable))
 
         Reset-SquadCliStubLog -Stub $stub
         $runLocal = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "issue-117-local-dot", "do the thing")
-        $localStartCalls = @($runLocal.AzCalls | Where-Object { $_ -like "containerapp job start*" })
+        $localStartCalls = @($runLocal.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
         if ($runLocal.ExitCode -eq 0 -and $localStartCalls.Count -eq 1) {
             Add-Pass "squad-aca run dispatches normally for teamRoot: '.' (the local sentinel)"
         } else {
@@ -3676,7 +3707,7 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
         $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("smoke", "--repo", "octo/demo")
         $calls = @(Get-Content -LiteralPath $stub.CallLog -ErrorAction SilentlyContinue)
         $leaseIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -like "gh lease-write*" })
-        $startIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -eq "az job-start" })
+        $startIdx = [array]::FindIndex($calls, [Predicate[string]] { param($l) $l -eq "arm job-start" })
         if ($leaseIdx -ge 0 -and $startIdx -ge 0 -and $leaseIdx -lt $startIdx) {
             Add-Pass "squad-aca dispatch writes the lease at index $leaseIdx, BEFORE the compute request at index $startIdx"
         } else {
@@ -3685,11 +3716,12 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
 
         # Route and dispatcher source must reach the execution env, or `sessions`
         # has nothing to show.
-        $startCall = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" })
-        if ($startCall.Count -eq 1 -and $startCall[0] -like "*SQUAD_DISPATCH_ROUTE=aca-job*" -and $startCall[0] -like "*SQUAD_DISPATCH_SOURCE=local-cli*" -and $startCall[0] -like "*SQUAD_LEASE_KEY=*") {
+        $startCall = @($r.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" })
+        $armTrace = $r.ArmCalls -join "`n"
+        if ($startCall.Count -eq 1 -and $armTrace -match '"name":"SQUAD_DISPATCH_ROUTE","value":"aca-job"' -and $armTrace -match '"name":"SQUAD_DISPATCH_SOURCE","value":"local-cli"' -and $armTrace -match '"name":"SQUAD_LEASE_KEY","value":"[^"]+"') {
             Add-Pass "Dispatch stamps SQUAD_DISPATCH_ROUTE, SQUAD_DISPATCH_SOURCE and SQUAD_LEASE_KEY into the execution"
         } else {
-            Add-Fail "Dispatch no longer stamps the route/source/lease env: $($startCall -join ' | ')"
+            Add-Fail "Dispatch no longer stamps the route/source/lease env: $($r.ArmCalls -join ' | ')"
         }
 
         # sessions surfaces both, in full (no width-dependent truncation).
@@ -3704,10 +3736,10 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
         # A repeat dispatch of the SAME work must not start a second execution.
         Reset-SquadCliStubLog -Stub $stub
         $first = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "dupe-session", "do the thing")
-        $firstStarts = @($first.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $firstStarts = @($first.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         Reset-SquadCliStubLog -Stub $stub
         $second = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -CliArguments @("run", "--repo", "octo/demo", "--name", "dupe-session", "do the thing")
-        $secondStarts = @($second.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $secondStarts = @($second.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($firstStarts -eq 1 -and $secondStarts -eq 0) {
             Add-Pass "A repeated dispatch of the same session does not start a second execution (idempotent)"
         } else {
@@ -3800,7 +3832,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         Reset-SquadCliStubLog -Stub $stub
         $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-nomanifest", "do the thing")
-        $jobStarts = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $jobStarts = @($r.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($r.ExitCode -eq 0 -and $jobStarts -eq 1 -and $r.AcaCalls.Count -eq 0) {
             Add-Pass "No manifest + sandbox flag ON still dispatches to ACA Jobs and never invokes the sandbox binary"
         } else {
@@ -3814,7 +3846,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         Reset-SquadCliStubLog -Stub $stub
         $r = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-default", "do the thing")
-        $jobStarts = @($r.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $jobStarts = @($r.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($r.ExitCode -eq 0 -and $jobStarts -eq 1 -and $r.AcaCalls.Count -eq 0) {
             Add-Pass "A manifest the default worker image satisfies still dispatches to ACA Jobs with the sandbox plane enabled"
         } else {
@@ -3830,7 +3862,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         $sb = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
             -CredentialFileCapture $cliCredFile `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-sandbox", "do the thing")
-        $jobStarts = @($sb.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $jobStarts = @($sb.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         $sbCreate = @($sb.AcaCalls | Where-Object { $_ -like "sandbox create*" }).Count
         if ($sb.ExitCode -eq 0 -and $sbCreate -ge 1 -and $jobStarts -eq 0) {
             Add-Pass "A repository requiring an approved non-default capability is routed to a matching SANDBOX, and no ACA Job execution is started"
@@ -3929,7 +3961,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         $noCred = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
             -GitToken "" -CopilotToken "" -GhAuthToken "" `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-nocred", "do the thing")
-        $noCredJobStarts = @($noCred.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $noCredJobStarts = @($noCred.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($noCred.ExitCode -ne 0 -and $noCred.AcaCalls.Count -eq 0 -and $noCredJobStarts -eq 0 `
                 -and ($noCred.StdErr -match "gh auth login") -and ($noCred.StdErr -match "GH_TOKEN")) {
             Add-Pass "A sandbox-routed run with NO usable credential is refused before any aca call, naming 'gh auth login' and the environment variables that would satisfy it (nothing is provisioned, nothing is billed)"
@@ -3977,7 +4009,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         Reset-SquadCliStubLog -Stub $stub
         $off = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "" `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-flagoff", "do the thing")
-        $jobStarts = @($off.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $jobStarts = @($off.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($off.ExitCode -ne 0 -and $jobStarts -eq 0 -and $off.AcaCalls.Count -eq 0 `
                 -and ($off.StdErr -match "sandbox-feature-disabled-and-default-insufficient")) {
             Add-Pass "The same manifest with the sandbox flag OFF FAILS CLOSED naming the reason, and starts nothing on either plane (no silent downgrade to ACA Jobs)"
@@ -3990,7 +4022,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         Reset-SquadCliStubLog -Stub $stub
         $un = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-unapproved", "do the thing")
-        $jobStarts = @($un.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $jobStarts = @($un.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($un.ExitCode -ne 0 -and $jobStarts -eq 0 -and @($un.AcaCalls | Where-Object { $_ -like "sandbox create*" }).Count -eq 0) {
             Add-Pass "A manifest no approved class satisfies fails closed with the flag ON, starting nothing on either plane"
         } else {
@@ -4005,7 +4037,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         Reset-SquadCliStubLog -Stub $stub
         $bad = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
             -CliArguments @("run", "--repo", "octo/demo", "--name", "s25-badmanifest", "do the thing")
-        $jobStarts = @($bad.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $jobStarts = @($bad.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($bad.ExitCode -ne 0 -and $jobStarts -eq 0 -and $bad.AcaCalls.Count -eq 0) {
             Add-Pass "An unreadable squad-capabilities.yml refuses the dispatch outright rather than guessing a route, and starts nothing"
         } else {
@@ -4021,7 +4053,7 @@ if (-not ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable)) {
         Reset-SquadCliStubLog -Stub $stub
         $other = Invoke-SquadCliCapture -Stub $stub -ScriptPath $cliScript -SandboxFlag "1" `
             -CliArguments @("run", "--repo", "other/repo", "--name", "s25-otherrepo", "do the thing")
-        $jobStarts = @($other.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $jobStarts = @($other.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($jobStarts -eq 1 -and $other.AcaCalls.Count -eq 0 -and ($other.StdOut -match "read no manifest")) {
             Add-Pass "A repository with no readable working tree falls back to ACA Jobs and SAYS SO, instead of silently pretending a manifest was consulted"
         } else {
@@ -4142,7 +4174,7 @@ if ((Test-Path $harness) -and $IsWindowsHost -and $nodeAvailable) {
         }
         # The compute request must never happen: a diagnostic may not turn a
         # failed claim into a dispatch.
-        if (@($denied.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count -eq 0) {
+        if (@($denied.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count -eq 0) {
             Add-Pass "A failed lease claim still starts no execution, so the improved diagnostic did not weaken claim-before-compute"
         } else {
             Add-Fail "A failed lease claim started an execution; the 404 diagnosis changed the classification"
@@ -5176,7 +5208,7 @@ if (-not (Test-Path $dispatchWorkflow)) {
     if ($wf -match 'ralph_build_session_env') {
         Add-Pass "The dispatch workflow merges the template environment through Ralph's tested builder, so secret-backed variables survive the per-execution override instead of being silently replaced"
     } else {
-        Add-Fail "The dispatch workflow passes --env-vars without merging the job template's environment. ACA REPLACES rather than merges, so GITHUB_TOKEN and COPILOT_GITHUB_TOKEN would be dropped and the session would fail authentication after cloning"
+        Add-Fail "The dispatch workflow does not merge the job template's environment through Ralph's tested builder. ACA REPLACES rather than merges, so GITHUB_TOKEN and COPILOT_GITHUB_TOKEN would be dropped and the session would fail authentication after cloning"
     }
 
     # ralph_build_session_env SKIPS every managed key when copying the template
@@ -5217,6 +5249,22 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "The requester reaches only the worker's commit message. A live run showed the agent committing its own work and opening its own PR, so that lever never fires and the request is attributed to nobody"
     }
 
+    if ($wf -match 'squad_assert_prompt_byte_cap' -and $wf -match 'SQUAD_PROMPT_UTF8_BYTE_CAP:\s*100000') {
+        Add-Pass "The dispatch workflow enforces the measured 100000-byte UTF-8 prompt cap before it ever claims a lease"
+    } else {
+        Add-Fail "The dispatch workflow does not enforce the measured 100000-byte UTF-8 prompt cap before lease claim"
+    }
+
+    # A multi-line prompt written to $GITHUB_OUTPUT as `prompt=...` fails the
+    # step or, worse, lets a prompt line such as `issue=42` forge another
+    # output. Both prompt outputs must use a random heredoc delimiter.
+    $randomDelims = [regex]::Matches($wf, 'delim="SQUAD_EOF_\$\(openssl rand -hex 16\)"').Count
+    if ($randomDelims -ge 2 -and $wf -match 'echo "prompt<<\$\{delim\}"' -and $wf -match 'echo "preparedPrompt<<\$\{delim\}"' -and $wf -notmatch 'echo "prompt=\$\(' -and $wf -notmatch '__SQUAD_PROMPT__') {
+        Add-Pass "The dispatch workflow writes both prompt outputs as heredocs with a random delimiter, so a multi-line prompt cannot break the step or forge another output"
+    } else {
+        Add-Fail "The dispatch workflow writes a prompt to GITHUB_OUTPUT without a random heredoc delimiter; a multi-line prompt breaks the step or forges outputs"
+    }
+
     # A requester who sees a label change and then silence cannot tell a running
     # session from a trigger that quietly refused.
     if ($wf -match 'gh issue comment' -and $wf -match 'ACA execution') {
@@ -5240,19 +5288,22 @@ if (-not (Test-Path $dispatchWorkflow)) {
         Add-Fail "The dispatch workflow does not pass --bot-login, so a comment made by the App itself could retrigger the workflow and loop"
     }
 
-    # ACA applies a per-execution --env-vars override ONLY when a COMPLETE
-    # container spec is supplied. Supply a partial one and the override is
-    # SILENTLY ignored: the execution starts, reports success, and runs the
-    # template's baked-in SQUAD_MODE=smoke instead of the work that was asked
-    # for. Ralph hit this in live E2E and guards against it; this path must too.
-    if ($wf -match '--cpu\b' -and $wf -match '--memory\b' -and $wf -match '--image\b' -and $wf -match '--container-name\b') {
-        Add-Pass "The dispatch workflow supplies a COMPLETE container spec (image, container name, cpu, memory) on job start, without which ACA silently ignores the env override and runs the template's defaults"
+    # The workflow must start the ACA job through ARM REST with a JSON body FILE,
+    # never by reintroducing free-text values onto a command line.
+    if ($wf -match 'squad_build_job_start_body' -and $wf -match 'squad_start_job_via_arm') {
+        Add-Pass "The dispatch workflow starts the ACA job through ARM REST with a generated JSON body file, so prompt/session text never appears on a command line"
     } else {
-        Add-Fail "The dispatch workflow starts the ACA job without a complete container spec (needs --image, --container-name, --cpu and --memory). ACA would ignore the env override and the session would run the template's baked-in mode while reporting success"
+        Add-Fail "The dispatch workflow does not start the ACA job through ARM REST with a generated JSON body file; free-text dispatch values would reappear on a command line"
+    }
+
+    if ($wf -match 'jq -e ''\.properties\.template\.containers\[0\]\.image and \(\.properties\.template\.containers\[0\]\.resources\.cpu != null\) and \.properties\.template\.containers\[0\]\.resources\.memory''') {
+        Add-Pass "The dispatch workflow refuses to start when the fetched ACA job template lacks image/cpu/memory, so it never starts blind with an ignored env override"
+    } else {
+        Add-Fail "The dispatch workflow does not verify the fetched ACA job template still carries image/cpu/memory before building the ARM start body"
     }
 
     # There is no `issue` mode in the worker; an unknown SQUAD_MODE exits 64.
-    if ($wf -match 'SQUAD_MODE=prompt') {
+    if ($wf -match 'OV_SQUAD_MODE="prompt"' -or $wf -match 'SQUAD_MODE=prompt') {
         Add-Pass "The dispatch workflow starts sessions in 'prompt' mode, the same mode Ralph dispatches with -- the worker exits 64 on an unknown mode"
     } else {
         Add-Fail "The dispatch workflow does not use SQUAD_MODE=prompt; the worker has no 'issue' mode and exits 64 on anything it does not recognise"
@@ -6090,7 +6141,7 @@ if (-not ((Test-Path $egressHarness) -and $IsWindowsHost -and $nodeAvailable)) {
         #    the rollback path; a repository that adds two advisory lines to its
         #    manifest must still dispatch. Failing closed here was considered and
         #    rejected in ADR 0003 -- this is the guard on that decision.
-        $egressJobStarts = @($egressRun.AzCalls | Where-Object { $_ -like "containerapp job start*" }).Count
+        $egressJobStarts = @($egressRun.ArmCalls | Where-Object { $_ -like "POST https://management.azure.com*/start?api-version=2026-01-01" }).Count
         if ($egressRun.ExitCode -eq 0 -and $egressJobStarts -eq 1) {
             Add-Pass "routing: a manifest declaring only advisory egress still dispatches to aca-job (the unconditional default and the rollback path are unchanged)"
         } else {
@@ -6235,6 +6286,7 @@ if (-not (Test-Path $workflowDir)) {
 
     $yamlParser = $null
     foreach ($candidate in @('python', 'python3', 'py')) {
+        if (-not (Get-Command $candidate -ErrorAction SilentlyContinue)) { continue }
         $probe = & $candidate -c "import yaml; print('ok')" 2>$null
         if ($LASTEXITCODE -eq 0 -and $probe -match 'ok') { $yamlParser = $candidate; break }
     }

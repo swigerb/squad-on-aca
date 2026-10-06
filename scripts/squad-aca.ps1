@@ -1248,6 +1248,9 @@ function Start-LeasedExecution {
     $sessionId = [string]$Request.sessionId
     $ref = [string]$Request.repository.ref
     $outputBranch = [string]$Request.git.outputBranch
+    if ($Request.task -and ($Request.task.PSObject.Properties.Name -contains "prompt")) {
+        [void](Assert-SquadPromptByteCap -Prompt ([string]$Request.task.prompt))
+    }
     $repoDir = ""
     if ($ManifestSource -and $ManifestSource.Path) { $repoDir = [string]$ManifestSource.Path }
 
@@ -1985,9 +1988,9 @@ function Invoke-Watch {
                 return
             }
             try {
-                & (Join-Path $ScriptDir "start-watch.ps1") -ResourceGroupName $config.resourceGroup -WatchAppName $config.watchApp -Repository $repo -Ref $ref -SubSquad $subSquad -DispatchRoute ([string]$decision.routing.route) -LeaseKey ([string]$decision.leaseKey)
+                & (Join-Path $ScriptDir "start-watch.ps1") -SubscriptionId $config.subscriptionId -ResourceGroupName $config.resourceGroup -WatchAppName $config.watchApp -Repository $repo -Ref $ref -SubSquad $subSquad -DispatchRoute ([string]$decision.routing.route) -LeaseKey ([string]$decision.leaseKey)
             } catch {
-                Set-SquadDispatchLeaseState -Operation "release" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -Reason "watch-start-failed" | Out-Null
+                Set-SquadDispatchLeaseState -Operation "release" -Repository $repo -LeaseKey ([string]$decision.leaseKey) -Reason "dispatch-failed" | Out-Null
                 throw
             }
             # The watcher is live: recording `dispatched` must not throw to the
@@ -2031,25 +2034,18 @@ function Invoke-Ralph {
             # Unlike a fresh worker session, a manual Ralph run must INHERIT the
             # template's Ralph config and secret refs (SQUAD_MODE=ralph,
             # RALPH_LABELS, RALPH_MAX_ISSUES, tokens, Azure fields, Aspire
-            # endpoints). New-RalphRunEnvVars preserves them and overlays only the
+            # endpoints). New-RalphRunEnvMap preserves them and overlays only the
             # optional repository/run-identity values.
-            $envVars = New-RalphRunEnvVars -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup -Repository $repo
-            # ACA only applies the per-execution --env-vars override reliably when
-            # the start call also supplies the stored image and resources. Read
-            # them from the immutable template and echo them back; this does not
-            # mutate the shared template.
-            $containerOptions = Get-JobStartContainerOptions -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup
-            $startArgs = @(
-                "containerapp", "job", "start",
-                "--name", $config.ralphJob,
-                "--resource-group", $config.resourceGroup,
-                "--image", $containerOptions.Image,
-                "--cpu", $containerOptions.Cpu,
-                "--memory", $containerOptions.Memory,
-                "--container-name", $containerOptions.ContainerName,
-                "--env-vars"
-            ) + $envVars
-            az @startArgs
+            $envMap = New-RalphRunEnvMap -JobName $config.ralphJob -ResourceGroupName $config.resourceGroup -Repository $repo -SubscriptionId $config.subscriptionId
+            $response = Start-AcaJobExecution `
+                -SubscriptionId $config.subscriptionId `
+                -JobName $config.ralphJob `
+                -ResourceGroupName $config.resourceGroup `
+                -SessionEnv $envMap
+            if (-not $response -or -not ($response.PSObject.Properties.Name -contains "name") -or -not $response.name) {
+                throw "ARM job start for '$($config.ralphJob)' returned no execution name. Refusing to treat a malformed response as a successful dispatch."
+            }
+            Write-Output ([string]$response.name)
         }
         "pause" {
             az containerapp job update --name $config.ralphJob --resource-group $config.resourceGroup --cron-expression "0 0 1 1 *" | Out-Null

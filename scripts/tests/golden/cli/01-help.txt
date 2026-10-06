@@ -1,6 +1,7 @@
 ### CASE 01-help: squad-aca help
 ### EXITCODE: 0
 ### AZ CALLS
+### ARM CALLS
 ### GH CALLS
 ### SQUAD CALLS
 ### ACA CALLS
