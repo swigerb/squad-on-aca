@@ -23,6 +23,7 @@
  *   release     Hand work back after a failed compute request, so it retries.
  *   sweep       Reclaim stale leases. Idempotent.
  *   list        List lease records.
+ *   validate-manual-inputs  Validate workflow_dispatch-only manual inputs.
  *
  * Exit codes
  *   0   the operation succeeded (including every idempotent no-op: already
@@ -30,11 +31,13 @@
  *   1   a real failure -- auth, permissions, throttling, network, missing `gh`,
  *       malformed state. Never reported as success.
  *   64  usage error
- *   65  the routing decision REFUSES to dispatch (fail-closed manifest)
+ *   65  the routing decision REFUSES to dispatch, or manual dispatch inputs
+ *       were rejected (fail-closed)
  *   70  the administrator catalog is missing/unreadable/invalid
  */
 
 const fs = require('fs');
+const path = require('path');
 
 const {
   ACTION_REFUSE,
@@ -44,6 +47,7 @@ const {
 } = require('./dispatch-decision.js');
 
 const lease = require('./dispatch-lease.js');
+const { DEFAULT_REPO_DIR, validateDispatchInputs } = require('./dispatch-inputs.js');
 
 const EX_USAGE = 64;
 const EX_REFUSED = 65;
@@ -130,6 +134,58 @@ function requireKey(flags) {
   return String(key);
 }
 
+function optionalFlagValue(flags, name) {
+  if (!Object.prototype.hasOwnProperty.call(flags, name)) return '';
+  if (flags[name] === true) fail(`--${name} requires a value.`, EX_USAGE);
+  return String(flags[name]);
+}
+
+function defaultRepoDir() {
+  return path.resolve(DEFAULT_REPO_DIR);
+}
+
+function printValidateManualInputsHelp() {
+  process.stderr.write(
+    'usage: squad-dispatch.js validate-manual-inputs --repository <owner/name> [--repo-dir <path>]\n' +
+      '       [--model <value>] [--base-branch <value>] [--publish-pr <true|false>]\n' +
+      '       [--reviewer <registry-id>] [--watch-only <true|false>] [--pretty]\n'
+  );
+}
+
+async function commandValidateManualInputs(flags, pretty) {
+  if (flags.help === true) {
+    printValidateManualInputsHelp();
+    return;
+  }
+
+  const repository = requireRepository(flags, null);
+  const result = await validateDispatchInputs(
+    {
+      model: optionalFlagValue(flags, 'model'),
+      baseBranch: optionalFlagValue(flags, 'base-branch'),
+      publishPr: optionalFlagValue(flags, 'publish-pr'),
+      reviewer: optionalFlagValue(flags, 'reviewer'),
+      watchOnly: optionalFlagValue(flags, 'watch-only')
+    },
+    {
+      repoDir: Object.prototype.hasOwnProperty.call(flags, 'repo-dir')
+        ? optionalFlagValue(flags, 'repo-dir') || defaultRepoDir()
+        : defaultRepoDir(),
+      repository
+    }
+  );
+
+  if (result.ok) {
+    emit({ ok: true, normalized: result.normalized }, pretty);
+    return;
+  }
+
+  emit({ ok: false, errors: result.errors, normalized: result.normalized }, pretty);
+  for (const message of result.errors) {
+    process.stderr.write(`squad-dispatch: ${message}\n`);
+  }
+  process.exit(EX_REFUSED);
+}
 function commandDecide(flags, pretty) {
   let catalog = null;
   try {
@@ -170,14 +226,14 @@ function commandDecide(flags, pretty) {
   if (decision.routing.action === ACTION_REFUSE) process.exit(EX_REFUSED);
 }
 
-function run() {
+async function run() {
   const argv = process.argv.slice(2);
   const { _, flags } = parseArgs(argv);
   const command = _[0] || '';
   const pretty = flags.pretty === true;
 
   if (!command) {
-    fail('usage: squad-dispatch.js <decide|claim|dispatched|heartbeat|complete|release|sweep|list> [options]', EX_USAGE);
+    fail('usage: squad-dispatch.js <decide|claim|dispatched|heartbeat|complete|release|sweep|list|validate-manual-inputs> [options]', EX_USAGE);
   }
 
   if (command === 'decide') {
@@ -253,6 +309,9 @@ function run() {
         emit(result, pretty);
         return;
       }
+      case 'validate-manual-inputs':
+        await commandValidateManualInputs(flags, pretty);
+        return;
       default:
         fail(`unknown subcommand '${command}'.`, EX_USAGE);
     }
@@ -264,7 +323,7 @@ function run() {
 }
 
 if (require.main === module) {
-  run();
+  run().catch((err) => fail(err && err.message ? err.message : String(err), 1));
 }
 
 module.exports = { parseArgs };
