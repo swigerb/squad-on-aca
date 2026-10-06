@@ -1028,8 +1028,9 @@ commit_and_push_if_needed() {
       pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body")" || true
     fi
     if [[ -n "$pr_url" ]]; then
+      log "Opened pull request: ${pr_url}"
       pr_number="${pr_url##*/}"
-      squad_hub_report_pr_if_any "$pr_url" "$pr_number" "$pr_title" "$SESSION_NAME"
+      squad_hub_report_pr_if_any "$pr_url" "$pr_number" "$pr_title"
     fi
   fi
 }

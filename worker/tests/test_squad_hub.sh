@@ -816,6 +816,7 @@ case "${1:-}" in
     ;;
   report-pr)
     printf '%s\n' "$@" > "${STUB_ARGV_FILE}"
+    printf '%s' "${SQUAD_HUB_DEVICE_ID:-}" > "${STUB_ARGV_FILE}.device"
     if [[ -n "${STUB_SENTINEL_FILE:-}" ]]; then
       : > "${STUB_SENTINEL_FILE}"
     fi
@@ -836,14 +837,18 @@ SUCCESS_LOG="$(env \
   STUB_ARGV_FILE="$REPORT_ARGS_FILE" \
   SQUAD_HUB_URL='https://hub.example' \
   SQUAD_HUB_TOKEN='sqhd1.device-token' \
-  bash -c 'source "'"$HUB_LIB"'"; squad_hub_report_pr "https://github.com/octo/demo/pull/304" "304" "Hub title" "session-304"')"
+  CONTAINER_APP_JOB_EXECUTION_NAME='caj-squad-aca-session-ABC123' \
+  bash -c 'source "'"$HUB_LIB"'"; squad_hub_report_pr "https://github.com/octo/demo/pull/304" "304" "Hub title"')"
 SUCCESS_ARGS="$(paste -sd ' ' "$REPORT_ARGS_FILE")"
+SUCCESS_DEVICE="$(cat "${REPORT_ARGS_FILE}.device")"
 assert_contains "$SUCCESS_LOG" "Reported pull request #304 to the hub." \
   "PR reporting logs success when squad-hub report-pr succeeds"
-assert_eq "report-pr --url https://github.com/octo/demo/pull/304 --number 304 --title Hub title --session session-304" "$SUCCESS_ARGS" \
-  "PR reporting passes url, number, title, and session to squad-hub report-pr"
+assert_eq "report-pr --url https://github.com/octo/demo/pull/304 --number 304 --title Hub title" "$SUCCESS_ARGS" \
+  "PR reporting passes url, number, and title (no --session: the hub targets this device's latest session)"
+assert_eq "aca-caj-squad-aca-session-abc123" "$SUCCESS_DEVICE" \
+  "PR reporting runs report-pr under the same aca- device id as the oneshot session"
 
-rm -f "$REPORT_ARGS_FILE" "$REPORT_SENTINEL_FILE"
+rm -f "$REPORT_ARGS_FILE" "${REPORT_ARGS_FILE}.device" "$REPORT_SENTINEL_FILE"
 SKIP_LOG="$(env \
   PATH="${REPORT_STUB_DIR}:$PATH" \
   STUB_HELP_OUTPUT='usage: squad-hub oneshot' \
