@@ -94,6 +94,79 @@ squad_hub_device_id() {
   printf '%s%s' "$SQUAD_HUB_DEVICE_ID_PREFIX" "$unique" | tr '[:upper:]' '[:lower:]'
 }
 
+# Cap a string before it ever leaves this container.
+#
+# The hub validates these fields too, but the worker owns NOT emitting an
+# oversized value in the first place. Centralising the cap keeps the helpers
+# below simple and makes the tests ask one question.
+squad_hub_truncate() {
+  local value="${1:-}" limit="${2:-200}"
+  printf '%s' "${value:0:limit}"
+}
+
+# Derive the issue number attached to this session, if any.
+#
+# There is no dedicated SQUAD_ISSUE_NUMBER-style env var in the worker today.
+# The two untrusted dispatchers that DO attach an issue both set the same
+# visible OUTPUT_BRANCH / PR_TITLE shapes instead:
+#   * .github/workflows/squad-dispatch.yml -> squad/issue-<n>, "Squad: issue #<n>"
+#   * worker/lib/ralph-dispatch.sh        -> squad/issue-<n>, "Squad: issue #<n>"
+# Parse the branch first (the stronger signal), then fall back to the title.
+# new-project uses squad/bootstrap-<session>, which must not match.
+squad_hub_issue_number() {
+  if [[ "${OUTPUT_BRANCH:-}" =~ ^squad/issue-([0-9]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "${PR_TITLE:-}" =~ \#([0-9]+)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# The hub shows a human-friendly device name beside the stable device id.
+#
+# When this session is attached to an issue, the name leads with that issue so a
+# phone-sized screen still tells an approver WHICH work they are looking at.
+# Without an issue, the session name is the next most specific label we have.
+squad_hub_device_name() {
+  local issue repo_short
+  issue="$(squad_hub_issue_number || true)"
+  if [[ -n "$issue" ]]; then
+    repo_short="${GITHUB_REPOSITORY##*/}"
+    squad_hub_truncate "#${issue} · ${repo_short}" 200
+    return 0
+  fi
+  squad_hub_truncate "${SESSION_NAME:-squad-session}" 200
+}
+
+# Session metadata the hub can index without parsing a display name.
+#
+# String-only by contract: even the issue number is carried as a string, and an
+# absent field is the empty string rather than null. Values are capped before the
+# JSON leaves bash, so the worker's own size budget is enforced locally.
+squad_hub_device_meta_json() {
+  local issue repo execution_name job_name
+  issue="$(squad_hub_issue_number || true)"
+  repo="$(squad_hub_truncate "${GITHUB_REPOSITORY:-}" 200)"
+  issue="$(squad_hub_truncate "$issue" 200)"
+  execution_name="$(squad_hub_truncate "${CONTAINER_APP_JOB_EXECUTION_NAME:-}" 200)"
+  job_name="$(squad_hub_truncate "${CONTAINER_APP_JOB_NAME:-}" 200)"
+  SQUAD_HUB_META_REPO="$repo" \
+  SQUAD_HUB_META_ISSUE="$issue" \
+  SQUAD_HUB_META_EXECUTION_NAME="$execution_name" \
+  SQUAD_HUB_META_JOB_NAME="$job_name" \
+  node -e '
+    process.stdout.write(JSON.stringify({
+      repo: process.env.SQUAD_HUB_META_REPO || "",
+      issue: process.env.SQUAD_HUB_META_ISSUE || "",
+      executionName: process.env.SQUAD_HUB_META_EXECUTION_NAME || "",
+      jobName: process.env.SQUAD_HUB_META_JOB_NAME || "",
+    }));
+  '
+}
+
 # Pin the id the squad-hub DAEMON registers under (issue #126).
 #
 # `squad_hub_run` hands the id to `squad-hub oneshot` through
@@ -236,11 +309,15 @@ squad_hub_policy_json() {
 # set, and the exit codes are the contract.
 squad_hub_run() {
   local prompt="$1"
-  local policy_json
+  local policy_json device_name device_meta_json
   policy_json="$(squad_hub_policy_json)"
+  device_name="${SQUAD_HUB_DEVICE_NAME:-$(squad_hub_device_name)}"
+  device_name="$(squad_hub_truncate "$device_name" 200)"
+  device_meta_json="$(squad_hub_device_meta_json)"
 
   squad_hub_log "Supervising this session with the hub at ${SQUAD_HUB_URL}."
   squad_hub_log "Registering as device $(squad_hub_device_id)."
+  squad_hub_log "Reporting this session as \"${device_name}\"."
   if squad_hub_auto_approve; then
     squad_hub_log "Approval mode: auto (watch-only, SQUAD_HUB_APPROVAL=auto)."
     squad_hub_log "  The session is visible in the hub and can be stopped there; nothing waits for a person."
@@ -263,6 +340,8 @@ squad_hub_run() {
   SQUAD_HUB_PROMPT="$prompt" \
   SQUAD_HUB_CWD="$REPO_DIR" \
   SQUAD_HUB_DEVICE_ID="$(squad_hub_device_id)" \
+  SQUAD_HUB_DEVICE_NAME="$device_name" \
+  SQUAD_HUB_DEVICE_META_JSON="$device_meta_json" \
   SQUAD_HUB_AGENT_EXTRA_ARGS_JSON="$policy_json" \
     squad-hub oneshot || rc=$?
 
@@ -286,6 +365,37 @@ squad_hub_run() {
       ;;
   esac
   return "$rc"
+}
+
+# Report the pull request this session opened, if this image knows how.
+#
+# The worker image pins squad-hub@0.6.0 until the hub's v0.7.0 rollout, so this
+# must detect the new verb rather than assume it. Reporting is best-effort once
+# the hub is configured: a failed report must not fail the already-open pull
+# request, but a half-configured hub is still the same exit-78 misconfiguration
+# squad_hub_enabled already treats as fatal everywhere else in this file.
+squad_hub_report_pr() {
+  local url="$1" number="$2" title="${3:-}" session="${4:-${SESSION_NAME:-}}"
+  squad_hub_enabled || return 0
+  if [[ -z "$url" || -z "$number" ]]; then
+    squad_hub_log "No pull request to report to the hub."
+    return 0
+  fi
+  if ! command -v squad-hub >/dev/null 2>&1 || ! squad-hub --help 2>&1 | grep -q 'report-pr'; then
+    squad_hub_log "This image's squad-hub has no 'report-pr' verb yet (needs squad-hub >= 0.7.0); skipping PR reporting to the hub."
+    return 0
+  fi
+
+  local args=(report-pr --url "$url" --number "$number")
+  [[ -n "$title" ]] && args+=(--title "$title")
+  [[ -n "$session" ]] && args+=(--session "$session")
+
+  if squad-hub "${args[@]}" >/dev/null 2>&1; then
+    squad_hub_log "Reported pull request #${number} to the hub."
+  else
+    squad_hub_log "Could not report pull request #${number} to the hub (non-fatal; the PR is already open)."
+  fi
+  return 0
 }
 
 # --- ambient supervision, for the modes that own their own loop ---------------

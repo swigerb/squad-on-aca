@@ -594,6 +594,12 @@ squad_hub_should_supervise() {
   declare -f squad_hub_enabled >/dev/null 2>&1 && squad_hub_enabled
 }
 
+# One call site, however gh pr create happened to succeed.
+squad_hub_report_pr_if_any() {
+  declare -f squad_hub_report_pr >/dev/null 2>&1 || return 0
+  squad_hub_report_pr "$@"
+}
+
 # --- Credential withholding for untrusted-input agent calls (issue #84 PI-3) -
 # Asked immediately before the SAME two modes invoke Copilot (directly, or via
 # Squad Hub's oneshot verb), so the answer is always current:
@@ -1001,6 +1007,7 @@ commit_and_push_if_needed() {
     # so a session that touched no reported-mutable path gets an unchanged body.
     local pr_body="${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}"
     local pr_title="${PR_TITLE:-Remote Squad session ${SESSION_NAME}}"
+    local pr_url="" pr_number=""
     if [[ "$timed_out" -eq 1 ]]; then
       pr_body="$(squad_deadline_wip_pr_body "$pr_body" "$wip_commit" "$wip_files")"
       pr_title="$(squad_deadline_wip_pr_title "$pr_title")"
@@ -1012,13 +1019,17 @@ commit_and_push_if_needed() {
       # then fails outright. The branch is already pushed, so a failed draft
       # must not also cost the pull request: retry as a regular one, whose
       # title and body still say WIP.
-      gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" --draft \
+      pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" --draft)" \
         || {
           log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
-          gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" || true
+          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body")" || true
         }
     else
-      gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" || true
+      pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body")" || true
+    fi
+    if [[ -n "$pr_url" ]]; then
+      pr_number="${pr_url##*/}"
+      squad_hub_report_pr_if_any "$pr_url" "$pr_number" "$pr_title" "$SESSION_NAME"
     fi
   fi
 }

@@ -119,7 +119,7 @@ assert_contains "$HUB_JSON" '"shell(gh repo delete)"'  "a three-word deny patter
 # operator reading the log saw a MORE permissive session than the one that ran.
 # Wrong in the safe direction is still wrong: there is no way to tell from the
 # log which of the two contradicting lines to believe.
-ANNOUNCE="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+ANNOUNCE="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE -u SQUAD_HUB_APPROVAL \
   SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=ralph \
   bash -c 'source "'"${WORKER_DIR}/lib/squad-policy.sh"'"; squad_policy_resolve >/dev/null 2>&1; squad_policy_announce hub' 2>&1)"
 FLAGS_LINE="$(printf '%s\n' "$ANNOUNCE" | grep 'Copilot flags (via Squad Hub')"
@@ -303,7 +303,7 @@ assert_eq "78" "$bogus_policy_status" \
 
 # The log must state the policy that actually applies.
 announce_for() {
-  env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+  env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE -u SQUAD_HUB_APPROVAL \
     SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=ralph SQUAD_HUB_APPROVAL="$1" \
     bash -c 'source "'"${WORKER_DIR}/lib/squad-policy.sh"'"; squad_policy_resolve >/dev/null 2>&1; squad_policy_announce hub' 2>&1
 }
@@ -548,7 +548,7 @@ done
 # The hub's own announcement must reflect the same narrowing an operator would
 # see off the hub — a hub session must not look MORE permissive in the log
 # than the direct path for the same untrusted source.
-ANNOUNCE_UNTRUSTED="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+ANNOUNCE_UNTRUSTED="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE -u SQUAD_HUB_APPROVAL \
   SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=ralph \
   bash -c 'source "'"${WORKER_DIR}/lib/squad-policy.sh"'"; squad_policy_resolve >/dev/null 2>&1; squad_policy_announce hub' 2>&1)"
 UNTRUSTED_FLAGS_LINE="$(printf '%s\n' "$ANNOUNCE_UNTRUSTED" | grep 'Copilot flags (via Squad Hub')"
@@ -716,6 +716,152 @@ assert_eq "after" "$observe_order" \
 observe_guard="$(printf '%s\n' "$AMBIENT_FN" | awk '/squad_hub_hooks_observe_only/{f=1} f{print} f&&/^    fi/{exit}')"
 assert_contains "$observe_guard" "squad_hub_abort" \
   "a failed watch-only rewrite aborts instead of running sessions that still block"
+
+# ---------------------------------------------------------------------------
+# 8. Device display metadata and PR reporting (#136)
+# ---------------------------------------------------------------------------
+echo "-- device metadata and PR reporting (#136) --"
+
+issue_probe() {
+  env -u OUTPUT_BRANCH -u PR_TITLE "$@" \
+    bash -c 'source "'"$HUB_LIB"'"; out=""; if out="$(squad_hub_issue_number)"; then printf "rc=0|%s" "$out"; else rc=$?; printf "rc=%s|%s" "$rc" "$out"; fi'
+}
+
+assert_eq "rc=0|304" "$(issue_probe OUTPUT_BRANCH='squad/issue-304')" \
+  "the issue number is parsed from OUTPUT_BRANCH first"
+assert_eq "rc=0|304" "$(issue_probe OUTPUT_BRANCH='squad/bootstrap-foo' PR_TITLE='Squad: issue #304')" \
+  "the issue number falls back to PR_TITLE when the branch is not an issue branch"
+assert_eq "rc=1|" "$(issue_probe OUTPUT_BRANCH='squad/bootstrap-foo')" \
+  "new-project style branches do not fabricate an issue number"
+
+device_name_probe() {
+  env -u OUTPUT_BRANCH -u PR_TITLE -u GITHUB_REPOSITORY -u SESSION_NAME "$@" \
+    bash -c 'source "'"$HUB_LIB"'"; squad_hub_device_name'
+}
+
+assert_eq "#304 · AzureAIDriveThru" \
+  "$(device_name_probe OUTPUT_BRANCH='squad/issue-304' GITHUB_REPOSITORY='swigerb/AzureAIDriveThru')" \
+  "the device name is issue-first with the repository short name"
+assert_eq "alpha-session" "$(device_name_probe SESSION_NAME='alpha-session')" \
+  "without an issue, the device name falls back to SESSION_NAME"
+
+LONG_REPO_SUFFIX="$(printf 'a%.0s' $(seq 1 260))"
+LONG_DEVICE_NAME="$(device_name_probe OUTPUT_BRANCH='squad/issue-304' GITHUB_REPOSITORY="swigerb/${LONG_REPO_SUFFIX}")"
+assert_eq "200" "${#LONG_DEVICE_NAME}" \
+  "the computed device name is capped at 200 characters before it reaches the hub"
+
+META_JSON="$(env -u CONTAINER_APP_JOB_NAME \
+  OUTPUT_BRANCH='squad/issue-304' \
+  PR_TITLE='Squad: issue #999' \
+  GITHUB_REPOSITORY="octo/$(printf 'r%.0s' $(seq 1 260))" \
+  CONTAINER_APP_JOB_EXECUTION_NAME="$(printf 'e%.0s' $(seq 1 260))" \
+  bash -c 'source "'"$HUB_LIB"'"; squad_hub_device_meta_json')"
+META_SUMMARY="$(META_JSON="$META_JSON" node -e '
+  const meta = JSON.parse(process.env.META_JSON);
+  const keys = Object.keys(meta).join(",");
+  const summary = [
+    keys,
+    typeof meta.issue,
+    meta.issue,
+    String(meta.repo.length),
+    String(meta.executionName.length),
+    String(meta.jobName.length),
+    meta.jobName === "" ? "empty" : "set",
+  ];
+  process.stdout.write(summary.join("|"));
+')"
+assert_eq "repo,issue,executionName,jobName|string|304|200|200|0|empty" "$META_SUMMARY" \
+  "device metadata is valid JSON with exactly four string-valued keys and empty-string defaults"
+
+assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_NAME="$device_name"' \
+  "the oneshot env block exports the computed device name"
+assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_META_JSON="$device_meta_json"' \
+  "the oneshot env block exports the computed device metadata JSON"
+
+report_pr_status() {
+  env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN \
+    bash -c 'source "'"$HUB_LIB"'"; squad_hub_report_pr "$1" "$2" "$3" "$4" >/dev/null 2>&1; printf "%s" "$?"' \
+    _ "${1:-}" "${2:-}" "${3:-}" "${4:-}"
+}
+assert_eq "0" "$(report_pr_status https://github.com/octo/demo/pull/304 304 'Title' 'session-304')" \
+  "PR reporting is a no-op when no hub is configured"
+
+REPORT_STUB_ROOT="$(mktemp -d)"
+REPORT_STUB_DIR="${REPORT_STUB_ROOT}/bin"
+mkdir -p "$REPORT_STUB_DIR"
+
+cat > "${REPORT_STUB_DIR}/squad-hub" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  --help)
+    printf '%s\n' "${STUB_HELP_OUTPUT:-}"
+    ;;
+  report-pr)
+    printf '%s\n' "$@" > "${STUB_ARGV_FILE}"
+    if [[ -n "${STUB_SENTINEL_FILE:-}" ]]; then
+      : > "${STUB_SENTINEL_FILE}"
+    fi
+    exit "${STUB_REPORT_PR_EXIT_CODE:-0}"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "${REPORT_STUB_DIR}/squad-hub"
+
+REPORT_ARGS_FILE="${REPORT_STUB_ROOT}/report-pr.argv"
+REPORT_SENTINEL_FILE="${REPORT_STUB_ROOT}/report-pr.hit"
+SUCCESS_LOG="$(env \
+  PATH="${REPORT_STUB_DIR}:$PATH" \
+  STUB_HELP_OUTPUT='usage: squad-hub report-pr' \
+  STUB_ARGV_FILE="$REPORT_ARGS_FILE" \
+  SQUAD_HUB_URL='https://hub.example' \
+  SQUAD_HUB_TOKEN='sqhd1.device-token' \
+  bash -c 'source "'"$HUB_LIB"'"; squad_hub_report_pr "https://github.com/octo/demo/pull/304" "304" "Hub title" "session-304"')"
+SUCCESS_ARGS="$(paste -sd ' ' "$REPORT_ARGS_FILE")"
+assert_contains "$SUCCESS_LOG" "Reported pull request #304 to the hub." \
+  "PR reporting logs success when squad-hub report-pr succeeds"
+assert_eq "report-pr --url https://github.com/octo/demo/pull/304 --number 304 --title Hub title --session session-304" "$SUCCESS_ARGS" \
+  "PR reporting passes url, number, title, and session to squad-hub report-pr"
+
+rm -f "$REPORT_ARGS_FILE" "$REPORT_SENTINEL_FILE"
+SKIP_LOG="$(env \
+  PATH="${REPORT_STUB_DIR}:$PATH" \
+  STUB_HELP_OUTPUT='usage: squad-hub oneshot' \
+  STUB_ARGV_FILE="$REPORT_ARGS_FILE" \
+  STUB_SENTINEL_FILE="$REPORT_SENTINEL_FILE" \
+  SQUAD_HUB_URL='https://hub.example' \
+  SQUAD_HUB_TOKEN='sqhd1.device-token' \
+  bash -c 'source "'"$HUB_LIB"'"; squad_hub_report_pr "https://github.com/octo/demo/pull/305" "305" "Skipped title" "session-305"; printf "|rc=%s" "$?"')"
+assert_contains "$SKIP_LOG" "has no 'report-pr' verb yet" \
+  "PR reporting logs a one-line skip when this image's squad-hub lacks report-pr"
+assert_contains "$SKIP_LOG" "|rc=0" \
+  "PR reporting still returns success when report-pr is unavailable"
+assert_eq "0" "$([[ -f "$REPORT_SENTINEL_FILE" ]] && echo 1 || echo 0)" \
+  "without the verb, PR reporting does not try to invoke report-pr"
+
+rm -f "$REPORT_ARGS_FILE"
+FAIL_LOG="$(env \
+  PATH="${REPORT_STUB_DIR}:$PATH" \
+  STUB_HELP_OUTPUT='usage: squad-hub report-pr' \
+  STUB_ARGV_FILE="$REPORT_ARGS_FILE" \
+  STUB_REPORT_PR_EXIT_CODE='9' \
+  SQUAD_HUB_URL='https://hub.example' \
+  SQUAD_HUB_TOKEN='sqhd1.device-token' \
+  bash -c 'source "'"$HUB_LIB"'"; squad_hub_report_pr "https://github.com/octo/demo/pull/306" "306" "Failing title" "session-306"; printf "|rc=%s" "$?"')"
+assert_contains "$FAIL_LOG" "Could not report pull request #306 to the hub" \
+  "PR reporting logs a non-fatal failure when report-pr itself fails"
+assert_contains "$FAIL_LOG" "|rc=0" \
+  "a failed report-pr invocation never fails the session"
+rm -rf "$REPORT_STUB_ROOT"
+
+COMMIT_PUSH_FN="$(awk '/^commit_and_push_if_needed\(\) \{/,/^\}/' "$ENTRY")"
+assert_contains "$ENTRYPOINT_SRC" "squad_hub_report_pr_if_any()" \
+  "entrypoint.sh defines the PR-reporting wrapper next to the supervision helper"
+assert_contains "$COMMIT_PUSH_FN" "squad_hub_report_pr_if_any" \
+  "commit_and_push_if_needed reports the opened pull request through the wrapper"
 
 echo ""
 echo "squad-hub supervision: ${TESTS_RUN} assertions, ${TESTS_FAILED} failed"
