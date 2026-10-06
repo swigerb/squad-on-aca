@@ -55,9 +55,6 @@ function parseEnvTokens(path) {
 function buildStartBody(jobDefinition, envTokens) {
   const properties = jobDefinition && typeof jobDefinition === 'object' ? (jobDefinition.properties || {}) : {};
   const template = properties.template || {};
-  const manualTriggerConfig = properties.configuration && properties.configuration.manualTriggerConfig
-    ? properties.configuration.manualTriggerConfig
-    : undefined;
   const containers = Array.isArray(template.containers) ? template.containers.slice() : [];
   if (containers.length === 0) {
     throw new Error('Job definition has no template container to start.');
@@ -69,9 +66,8 @@ function buildStartBody(jobDefinition, envTokens) {
   if (Array.isArray(template.initContainers) && template.initContainers.length > 0) {
     body.initContainers = template.initContainers;
   }
-  if (manualTriggerConfig) {
-    body.manualTriggerConfig = manualTriggerConfig;
-  }
+  // The start API's StartJobExecutionTemplate accepts only containers and
+  // initContainers; sending manualTriggerConfig fails the start with HTTP 400.
   return body;
 }
 

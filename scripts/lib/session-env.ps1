@@ -331,7 +331,6 @@ function Get-AcaJobStartRequest {
 
     $job = Get-AcaJobDefinition -ResourceGroupName $ResourceGroupName -JobName $JobName -SubscriptionId $SubscriptionId
     $containerOptions = Get-JobStartContainerOptions -JobName $JobName -ResourceGroupName $ResourceGroupName -SubscriptionId $SubscriptionId
-    $manualTriggerConfig = Get-JobManualTriggerConfig -JobName $JobName -ResourceGroupName $ResourceGroupName -SubscriptionId $SubscriptionId
     $envMap = New-SessionStartEnvMap -JobName $JobName -ResourceGroupName $ResourceGroupName -SessionEnv $SessionEnv -SubscriptionId $SubscriptionId
 
     $container = [ordered]@{}
@@ -359,9 +358,8 @@ function Get-AcaJobStartRequest {
     if ($job -and $job.properties -and $job.properties.template -and $job.properties.template.initContainers) {
         $body["initContainers"] = @($job.properties.template.initContainers)
     }
-    if ($manualTriggerConfig) {
-        $body["manualTriggerConfig"] = $manualTriggerConfig
-    }
+    # The start API's StartJobExecutionTemplate accepts only containers and
+    # initContainers; sending manualTriggerConfig fails the start with HTTP 400.
     return $body
 }
 
