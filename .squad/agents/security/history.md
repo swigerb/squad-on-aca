@@ -1227,3 +1227,56 @@ No overlap with `reviewer`'s independent pass beyond the shared non-blocking
 notes above (see `.squad/agents/reviewer/history.md`) — reviewer separately
 flagged the `job-drift-compare.ps1` gap and two comment-accuracy nits, which
 are correctness/process notes rather than security findings.
+
+## Issue #135 — Squad Hub v0.7.0 workflow_dispatch inputs (model, base_branch, publish_pr, reviewer, watch_only)
+
+Reviewed commit 616c5445 (`Fix #135: validate manual dispatch inputs`), which
+adds `model`/`base_branch`/`publish_pr`/`reviewer`/`watch_only` as optional
+`workflow_dispatch` inputs, `worker/lib/dispatch-inputs.js`, and the
+`validate-manual-inputs` subcommand.
+
+Verified all five values stay out of shell strings (ARM JSON body, or
+discrete argv/flag-value pairs only — never a concatenated `run:` token).
+Confirmed the allow-list charsets plus the live branch-existence and
+registry-membership checks neutralize git-ref-syntax and flag-injection
+concerns, including local reproductions of a leading-`-` value passed as a
+positional git/gh argument (each consuming flag unconditionally swallows the
+next token as a literal value; a misinterpreted flag just errors and the
+caller's existing `|| true` / retry handling absorbs it, never a silent
+bypass). Confirmed the branch-exists probe (`defaultCheckBranchExists`) is
+fail-closed: a real `gh` failure (auth/network/rate-limit) throws and is
+rejected, distinct from a clean 404 which is the only path that resolves to
+"does not exist" — matches the fail-closed pattern already established in
+`dispatch-lease.js`. Confirmed `watch_only`'s `SQUAD_HUB_APPROVAL=auto`
+mapping only reaches the session when `github.event_name == 'workflow_dispatch'`,
+so the documented Write-access trigger boundary in `docs/actions-trigger.md`
+is unchanged; nothing in this diff lets these inputs reach the lower-trust
+`issues`/`issue_comment` paths. No credential or token material is logged
+anywhere in the new validation code path, including `::error::` annotations
+and `$GITHUB_OUTPUT` writes (both visible in a public repo's Actions log).
+
+Noted non-blocking: the hand-rolled CLI `parseArgs` in `squad-dispatch.js`
+mis-tokenizes a free-text value that happens to start with `--`, but every
+such case was traced to fail closed (the subcommand aborts with exit 64/65)
+rather than enabling a bypass or value swap — a minor robustness quirk, not
+an exploitable issue. Also noted the new `reviewer` value, once it leaves
+dispatch-side validation, is a Squad casting-registry id rather than a
+GitHub identity, so `gh pr create --reviewer` frequently cannot honour it —
+this is a correctness/design gap (now addressed by `reviewer`'s fix: the
+requested reviewer is always also recorded in the pull request body) rather
+than a security exposure, since the worst case is simply "no formal reviewer
+request was attached," not any unintended access or disclosure.
+
+Re-verified after `reviewer`'s fixes: no new shell-command-line exposure was
+introduced by the added "Requested reviewer (squad): <id>" body text (built
+with `printf` into a variable, never interpolated into a command), and the
+restructured retry matrix in `entrypoint.sh` does not change what reaches
+`gh` as arguments, only the order attempts are tried in.
+
+No overlap with `reviewer`'s independent pass beyond the shared `reviewer`-
+namespace finding — reviewer treated it as a blocking correctness bug (fixed
+before this review) and security confirms it carries no exploitable
+consequence beyond the feature not doing what its description promised (see
+`.squad/agents/reviewer/history.md`).
+
+**VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.

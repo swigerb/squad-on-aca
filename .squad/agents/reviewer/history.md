@@ -287,3 +287,61 @@ Verified independently rather than trusting the engineer's self-report:
 
 Coordinated with `security`'s independent review pass (also APPROVE WITH
 NOTES, no overlapping findings — see `.squad/agents/security/history.md`).
+
+## Issue #135 — Squad Hub v0.7.0 workflow_dispatch inputs (model, base_branch, publish_pr, reviewer, watch_only)
+
+Reviewed commit 616c5445 (`Fix #135: validate manual dispatch inputs`), which
+adds 5 optional `workflow_dispatch` inputs to `.github/workflows/squad-dispatch.yml`,
+a new `worker/lib/dispatch-inputs.js` validation module wired into
+`worker/lib/squad-dispatch.js` as a `validate-manual-inputs` subcommand, the
+per-execution `OV_*` env overrides passed through ARM REST start, a new test
+file (`worker/tests/test_dispatch_inputs.sh`, 42 assertions), and doc updates.
+
+**Checked and confirmed correct:**
+- Charset/boolean/model/branch-existence validation logic.
+- The `workflow_dispatch` → `resolve` job → `dispatch` job YAML wiring,
+  including that omitting an input truly preserves today's default, and that
+  the `issues`/`issue_comment` event paths never touch the new validation step
+  at all (outputs are simply empty strings for those paths).
+- `ralph_build_session_env`'s OV_* merge: confirmed an OV_ override always
+  wins regardless of whether its target key is in `RALPH_MANAGED_ENV_KEYS` —
+  this was an assumption in the design that needed tracing, not just taking
+  on faith, and it holds.
+- The `worker/Dockerfile` COPY-list fix: `worker/lib/dispatch-inputs.js` is
+  now staged and hardened (`chmod -R a-w`) identically to its sibling
+  `worker/lib/dispatch-decision.js`. (This was initially MISSING in the first
+  pass — `test_image_layout.sh` caught it immediately via a `MODULE_NOT_FOUND`
+  failure; fixed before this review and confirmed green.)
+- `SQUAD_GH_BIN` stub usage in the new test file is consistent with existing
+  test conventions.
+
+**Found (BLOCKING, now fixed):** the `reviewer` input was validated against
+`.squad/casting/registry.json` (Squad persona ids like `engineer`/`docs`/
+`lead` — not GitHub identities) but the validated value was passed straight
+to `gh pr create --reviewer`, which only accepts a real GitHub login or
+`org/team` slug. A validated value would therefore almost always be silently
+dropped by `entrypoint.sh`'s existing fallback, defeating the feature while
+reporting success. **Fix applied:** `entrypoint.sh` now always records the
+requested reviewer id in the pull request body (`Requested reviewer (squad):
+<id>`) in addition to attempting `--reviewer`, so the information survives
+regardless of whether GitHub accepts the formal request, and docs/actions-
+trigger.md now explains the namespace mismatch explicitly.
+
+**Found (ADVISORY, now fixed):** the WIP/draft retry path in `entrypoint.sh`
+dropped a valid `--reviewer` permanently on the final fallback even when the
+failure was caused by `--draft` being unavailable, not by the reviewer.
+Restructured the retry matrix to drop one axis (draft, then reviewer) at a
+time instead of both at once.
+
+Re-verified after fixes: `bash worker/tests/test_dispatch_inputs.sh` (42/42),
+full `worker/tests/run-tests.sh` compared against a baseline worktree at the
+pre-#135 commit (ee61724) — identical 13 pre-existing/environmental failures
+plus 1 known-flaky suite (`test_identity_drop_order.sh`, confirmed by
+rerunning in isolation 3x with 0 failures each time) and 1 pre-existing
+unrelated failure (`test_squad_hub.sh`, reproduced identically on the
+baseline worktree). No regression attributable to this change.
+
+Coordinated with `security`'s independent review pass (APPROVE, no blocking
+findings — see `.squad/agents/security/history.md`).
+
+**VERDICT: APPROVE** (after the two reviewer-namespace fixes above).

@@ -1005,6 +1005,17 @@ commit_and_push_if_needed() {
       pr_body="$(squad_deadline_wip_pr_body "$pr_body" "$wip_commit" "$wip_files")"
       pr_title="$(squad_deadline_wip_pr_title "$pr_title")"
     fi
+    # `--reviewer` only resolves to a real request if SQUAD_PR_REVIEWER happens
+    # to match an actual GitHub login or org/team slug. The dispatch-side
+    # validation (worker/lib/dispatch-inputs.js) only guarantees it is an
+    # ACTIVE SQUAD CASTING REGISTRY id (issue #135) -- a distinct namespace
+    # that `gh` knows nothing about -- so `--reviewer` commonly fails even for
+    # a validated value. The requested reviewer is therefore ALWAYS recorded in
+    # the PR body too, so the information survives even when GitHub never
+    # receives (or rejects) the formal reviewer request.
+    if [[ -n "${SQUAD_PR_REVIEWER:-}" ]]; then
+      pr_body+="$(printf '\n\nRequested reviewer (squad): %s' "$SQUAD_PR_REVIEWER")"
+    fi
     pr_body+="$(squad_policy_reported_changes_report)"
     local -a pr_create_args=(
       gh pr create
@@ -1023,22 +1034,28 @@ commit_and_push_if_needed() {
       # repository on GitHub Free cannot have them), and `gh pr create --draft`
       # then fails outright. The branch is already pushed, so a failed draft
       # must not also cost the pull request: retry as a regular one, whose
-      # title and body still say WIP. When a reviewer override was requested it
-      # is tried first and then dropped, so a bad reviewer never costs the PR.
+      # title and body still say WIP. The reviewer is dropped ONLY as the last
+      # resort, one axis (draft, then reviewer) at a time, so a bad reviewer
+      # never costs the draft attempt and a bad draft never costs the reviewer.
       if ! "${pr_create_args[@]}" "${pr_reviewer_args[@]}" --draft; then
         if [[ "${#pr_reviewer_args[@]}" -gt 0 ]]; then
-          log "Could not open the WIP pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer."
+          log "Could not open the WIP pull request as a draft with reviewer ${SQUAD_PR_REVIEWER}; retrying as a regular pull request, keeping the reviewer."
+          if "${pr_create_args[@]}" "${pr_reviewer_args[@]}"; then
+            return 0
+          fi
+          log "Could not open the WIP pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer (the requested reviewer is still recorded in the pull request body)."
           if "${pr_create_args[@]}" --draft; then
             return 0
           fi
+        else
+          log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
         fi
-        log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
         "${pr_create_args[@]}" || true
       fi
     else
       if ! "${pr_create_args[@]}" "${pr_reviewer_args[@]}"; then
         if [[ "${#pr_reviewer_args[@]}" -gt 0 ]]; then
-          log "Could not open the pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer."
+          log "Could not open the pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer (the requested reviewer is still recorded in the pull request body)."
           "${pr_create_args[@]}" || true
         else
           true

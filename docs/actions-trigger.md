@@ -119,10 +119,12 @@ The label and command prefix are configurable through repository variables `SQUA
 | `model` | string | empty | Sets `OV_SQUAD_MODEL` for that execution only | Letters, digits, `.`, `_`, `-` only |
 | `base_branch` | string | empty | Overrides `OV_GITHUB_REF` and, when set, `OV_GITHUB_BASE_BRANCH` for that execution only | Letters, digits, `.`, `_`, `-`, `/` only, and the branch must exist in the target repository |
 | `publish_pr` | boolean | `true` | `false` sets `OV_PUSH_CHANGES=false`, so the worker does not publish changes or open a PR | Only GitHub's `true` / `false` literals are accepted |
-| `reviewer` | string | empty | Sets `OV_SQUAD_PR_REVIEWER` so the worker asks GitHub for that reviewer on PR creation | Letters, digits, `.`, `_`, `-` only, and the value must be an active registry id from `.squad/casting/registry.json` |
+| `reviewer` | string | empty | Sets `OV_SQUAD_PR_REVIEWER`. The worker tries `gh pr create --reviewer <value>` and always records the request in the pull request body | Letters, digits, `.`, `_`, `-` only, and the value must be an active registry id from `.squad/casting/registry.json` |
 | `watch_only` | boolean | `false` | `true` sets `SQUAD_HUB_APPROVAL=auto` for that execution only | Only GitHub's `true` / `false` literals are accepted |
 
 Validation runs in the shared dispatch core before Azure is asked to start anything. A bad manual input fails the `resolve` job directly, prints a run-summary error, and does not fall through the workflow's ordinary trigger-refusal path.
+
+`reviewer` is validated against the squad **casting registry** (`.squad/casting/registry.json`), not against GitHub identities -- that registry has no GitHub logins to check against. `gh pr create --reviewer` only accepts a real GitHub username or an `org/team` slug, so the formal reviewer request succeeds only when a repository collaborator or team happens to share the registry id's name (for example a team literally named `security`). The worker tries it anyway, and whether or not GitHub accepts it, the requested id is always written into the pull request body as `Requested reviewer (squad): <id>` so the information is never silently lost.
 
 Use `squad-aca` as the default label. Keep Ralph's `RALPH_LABELS` aligned with `SQUAD_TRIGGER_LABEL` so all dispatchers use the same lease key and marker label.
 
