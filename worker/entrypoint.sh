@@ -1006,19 +1006,44 @@ commit_and_push_if_needed() {
       pr_title="$(squad_deadline_wip_pr_title "$pr_title")"
     fi
     pr_body+="$(squad_policy_reported_changes_report)"
+    local -a pr_create_args=(
+      gh pr create
+      --repo "$GITHUB_REPOSITORY"
+      --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}"
+      --head "$branch"
+      --title "$pr_title"
+      --body "$pr_body"
+    )
+    local -a pr_reviewer_args=()
+    if [[ -n "${SQUAD_PR_REVIEWER:-}" ]]; then
+      pr_reviewer_args=(--reviewer "$SQUAD_PR_REVIEWER")
+    fi
     if [[ "$timed_out" -eq 1 ]]; then
       # Draft pull requests are not available on every plan (a private
       # repository on GitHub Free cannot have them), and `gh pr create --draft`
       # then fails outright. The branch is already pushed, so a failed draft
       # must not also cost the pull request: retry as a regular one, whose
-      # title and body still say WIP.
-      gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" --draft \
-        || {
-          log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
-          gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" || true
-        }
+      # title and body still say WIP. When a reviewer override was requested it
+      # is tried first and then dropped, so a bad reviewer never costs the PR.
+      if ! "${pr_create_args[@]}" "${pr_reviewer_args[@]}" --draft; then
+        if [[ "${#pr_reviewer_args[@]}" -gt 0 ]]; then
+          log "Could not open the WIP pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer."
+          if "${pr_create_args[@]}" --draft; then
+            return 0
+          fi
+        fi
+        log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
+        "${pr_create_args[@]}" || true
+      fi
     else
-      gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" || true
+      if ! "${pr_create_args[@]}" "${pr_reviewer_args[@]}"; then
+        if [[ "${#pr_reviewer_args[@]}" -gt 0 ]]; then
+          log "Could not open the pull request with reviewer ${SQUAD_PR_REVIEWER}; retrying without --reviewer."
+          "${pr_create_args[@]}" || true
+        else
+          true
+        fi
+      fi
     fi
   fi
 }

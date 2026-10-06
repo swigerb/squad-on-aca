@@ -59,6 +59,7 @@ jobs:
           node --check worker/lib/verify-image-evidence.js
           node --check worker/lib/dispatch-decision.js
           node --check worker/lib/dispatch-lease.js
+          node --check worker/lib/dispatch-inputs.js
           node --check worker/lib/squad-dispatch.js
           node --check worker/tests/lib/fake-gh.js
           node -e "JSON.parse(require('fs').readFileSync('config/sandbox-classes.json','utf8'))"

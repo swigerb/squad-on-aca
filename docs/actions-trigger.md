@@ -106,9 +106,23 @@ See upstream issue [bradygaster/squad#2140](https://github.com/bradygaster/squad
 | Comment **`/squad-aca <instruction>`** on an open issue | A session is dispatched with your instruction as the prompt |
 | Comment **`@squad-on-aca-control-plane <instruction>`** | A session is dispatched with your instruction as the prompt |
 | Comment **`/squad-aca`** with no text | A session is dispatched with a default prompt |
-| Run the workflow manually | `workflow_dispatch`, with optional issue and prompt inputs |
+| Run the workflow manually | `workflow_dispatch`, with optional issue, prompt, model, base_branch, publish_pr, reviewer, and watch_only inputs |
 
 The label and command prefix are configurable through repository variables `SQUAD_TRIGGER_LABEL` and `SQUAD_COMMAND_PREFIX`.
+
+### `workflow_dispatch` inputs
+
+| Input | Type | Default | Effect | Validation |
+|---|---|---|---|---|
+| `issue` | string | empty | Selects the issue number the session works | Existing `actions-event.js` manual-trigger parsing |
+| `prompt` | string | empty | Overrides the default prompt | Existing prompt handling; free text is still carried only through workflow state / ARM JSON |
+| `model` | string | empty | Sets `OV_SQUAD_MODEL` for that execution only | Letters, digits, `.`, `_`, `-` only |
+| `base_branch` | string | empty | Overrides `OV_GITHUB_REF` and, when set, `OV_GITHUB_BASE_BRANCH` for that execution only | Letters, digits, `.`, `_`, `-`, `/` only, and the branch must exist in the target repository |
+| `publish_pr` | boolean | `true` | `false` sets `OV_PUSH_CHANGES=false`, so the worker does not publish changes or open a PR | Only GitHub's `true` / `false` literals are accepted |
+| `reviewer` | string | empty | Sets `OV_SQUAD_PR_REVIEWER` so the worker asks GitHub for that reviewer on PR creation | Letters, digits, `.`, `_`, `-` only, and the value must be an active registry id from `.squad/casting/registry.json` |
+| `watch_only` | boolean | `false` | `true` sets `SQUAD_HUB_APPROVAL=auto` for that execution only | Only GitHub's `true` / `false` literals are accepted |
+
+Validation runs in the shared dispatch core before Azure is asked to start anything. A bad manual input fails the `resolve` job directly, prints a run-summary error, and does not fall through the workflow's ordinary trigger-refusal path.
 
 Use `squad-aca` as the default label. Keep Ralph's `RALPH_LABELS` aligned with `SQUAD_TRIGGER_LABEL` so all dispatchers use the same lease key and marker label.
 
