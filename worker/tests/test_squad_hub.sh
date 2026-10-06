@@ -777,6 +777,13 @@ assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_NAME="$device_name"' \
   "the oneshot env block exports the computed device name"
 assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_META_JSON="$device_meta_json"' \
   "the oneshot env block exports the computed device metadata JSON"
+# #135: the workflow's `model` input must reach the supervised path too.
+# `copilot --acp` ignores a --model argv flag, so it travels as SQUAD_HUB_MODEL
+# (squad-hub oneshot selects it over ACP), never in the extra-args JSON.
+assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_MODEL="${SQUAD_MODEL:-}"' \
+  "the oneshot env block passes the session model override as SQUAD_HUB_MODEL"
+assert_not_contains "$(sed -n '/^squad_hub_policy_json()/,/^}/p' "$HUB_LIB")" '--model' \
+  "the model is not smuggled into the hub argv JSON, which copilot --acp would silently ignore"
 
 report_pr_status() {
   env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN \
