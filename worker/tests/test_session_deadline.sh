@@ -397,12 +397,20 @@ LOG_FN="$(awk '/^log\(\) \{/,/^\}/' "$ENTRYPOINT")"
 CHECKPOINT_FN="$(awk '/^squad_policy_checkpoint\(\) \{/,/^\}/' "$ENTRYPOINT")"
 ON_ABORT_FN="$(awk '/^squad_policy_on_abort\(\) \{/,/^\}/' "$ENTRYPOINT")"
 REPORT_FN="$(awk '/^squad_watch_governance_report_if_any\(\) \{/,/^\}/' "$ENTRYPOINT")"
+# commit_and_push_if_needed calls this directly (issue #135 re-dispatch
+# must-fix 1's PR-reporting call site); it was never extracted before because
+# the old gh stub never printed a PR URL, so pr_url was always empty and the
+# call site was never reached. Missing it here is silent until a test's gh
+# stub actually returns a URL, at which point the driver script fails with
+# "squad_hub_report_pr_if_any: command not found" -- not a policy or push
+# failure, just an incomplete extraction list.
+HUB_REPORT_IF_ANY_FN="$(awk '/^squad_hub_report_pr_if_any\(\) \{/,/^\}/' "$ENTRYPOINT")"
 COMMIT_PUSH_FN="$(awk '/^commit_and_push_if_needed\(\) \{/,/^\}/' "$ENTRYPOINT")"
 # The case-arm body, without its `prompt)` label and closing `;;`.
 PROMPT_BODY="$(sed -n '/^  prompt)/,/^    ;;/p' "$ENTRYPOINT" | sed '1d;$d')"
 NEWPROJ_BODY="$(sed -n '/^  new-project)/,/^    ;;/p' "$ENTRYPOINT" | sed '1d;$d')"
 
-for fn_var in LOG_FN CHECKPOINT_FN ON_ABORT_FN REPORT_FN COMMIT_PUSH_FN PROMPT_BODY NEWPROJ_BODY; do
+for fn_var in LOG_FN CHECKPOINT_FN ON_ABORT_FN REPORT_FN HUB_REPORT_IF_ANY_FN COMMIT_PUSH_FN PROMPT_BODY NEWPROJ_BODY; do
   assert_ne "" "${!fn_var}" "extracted ${fn_var} from worker/entrypoint.sh"
 done
 assert_contains "$COMMIT_PUSH_FN" "squad_policy_checkpoint" \
@@ -477,15 +485,31 @@ echo "hub work" >>"${SQUAD_HUB_CWD}/src/app.js"
 trap '' INT TERM
 while :; do sleep 0.1; done
 EOF
-  # `gh pr create ...`: records each call's argv, NUL-separated, one file per
-  # call. GH_FAIL_DRAFT=1 makes a --draft create fail, as it does on a plan
-  # without draft pull requests.
+  # `gh pr create ...` / `gh pr edit ... --add-reviewer ...`: records each
+  # call's argv, NUL-separated, one file per call. GH_FAIL_DRAFT=1 makes a
+  # --draft create fail, as it does on a plan without draft pull requests.
+  # GH_FAIL_REVIEWER_EDIT=1 makes `pr edit ... --add-reviewer ...` fail the
+  # way github.com actually does when SQUAD_PR_REVIEWER is a squad
+  # casting-registry id rather than a real GitHub login or org/team slug --
+  # issue #135 re-dispatch must-fix 1. `pr create` always prints a PR URL to
+  # stdout on success, exactly like the real `gh`, so pr_url is something
+  # these tests can assert on directly rather than just counting calls.
   cat >"${dir}/gh" <<'EOF'
 #!/usr/bin/env bash
 n=$(ls "${STUB_DIR}" | grep -c '^gh-call-' || true)
 printf '%s\0' "$@" >"${STUB_DIR}/gh-call-$((n + 1))"
 if [[ "${GH_FAIL_DRAFT:-0}" == 1 ]]; then
   for a in "$@"; do [[ "$a" == "--draft" ]] && { echo "draft pull requests are not supported" >&2; exit 1; }; done
+fi
+if [[ "$1" == "pr" && "$2" == "edit" ]]; then
+  if [[ "${GH_FAIL_REVIEWER_EDIT:-0}" == 1 ]]; then
+    echo "could not request a review from the given reviewer (not a user or team)" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "create" ]]; then
+  echo "${GH_PR_URL:-https://github.com/octo/repo/pull/42}"
 fi
 exit 0
 EOF
@@ -521,7 +545,7 @@ run_session() {
     printf 'export SQUAD_POLICY_RESOLVER=%q\n' "${WORKER_DIR}/lib/agent-policy.js"
     printf 'export SQUAD_POLICY_STATE_DIR=%q\n' "${base}/policy-state"
     printf 'source %q\n' "$SQUAD_POLICY_SH" "$CRED_LIB_SRC" "$PUSH_LIB_SRC" "$HUB_LIB_SRC" "$DEADLINE_LIB"
-    printf '%s\n' "$LOG_FN" "$CHECKPOINT_FN" "$ON_ABORT_FN" "$REPORT_FN" "$COMMIT_PUSH_FN"
+    printf '%s\n' "$LOG_FN" "$CHECKPOINT_FN" "$ON_ABORT_FN" "$REPORT_FN" "$HUB_REPORT_IF_ANY_FN" "$COMMIT_PUSH_FN"
     # The pieces of the real session the blocks call that are not under test
     # here: credential withholding has its own suite, and hub preflight /
     # policy announcement only log.
@@ -665,9 +689,45 @@ assert_not_contains "$gh2" "--draft" "no-draft repo: then a regular PR is opened
 assert_contains "$gh2" "WIP: Remote Squad session deadline-test" "no-draft repo: ... still titled WIP"
 assert_contains "$gh2" "WIP: this session stopped at its deadline" "no-draft repo: ... and still described as WIP"
 
-# ===========================================================================
-# 6. Deployment wiring and image layout
-# ===========================================================================
+# --- 5h. issue #135 re-dispatch must-fix 1: a reviewer `gh` rejects must
+#          never cost the pull request's URL ------------------------------
+# Reproduces the actual github.com behavior the re-dispatch finding
+# described: `gh pr create` (now always called WITHOUT --reviewer) succeeds
+# and prints the PR's URL; the separate, best-effort `gh pr edit --add-
+# reviewer` then fails because SQUAD_PR_REVIEWER is a squad casting-registry
+# id, not a real GitHub login. Before the fix, --reviewer was attached to the
+# FIRST gh pr create call, that call failed (common case), and the retry
+# WITHOUT --reviewer then failed too with "a pull request already exists",
+# whose empty stdout silently discarded the already-created PR's URL.
+out="$(run_session reviewer-edit-fails PROMPT_BODY finish 0 7200 \
+  'export SQUAD_PR_REVIEWER=security' \
+  'export GH_FAIL_REVIEWER_EDIT=1')"
+assert_contains "$out" "SESSION_EXIT=0" "reviewer-add-fails: the session itself still succeeds"
+assert_contains "$out" "Opened pull request: https://github.com/octo/repo/pull/42" \
+  "reviewer-add-fails: the PR URL is captured and logged even though the reviewer could not be added"
+gh1="$(gh_call_flat reviewer-edit-fails 1)"
+assert_not_contains "$gh1" "--reviewer" "reviewer-add-fails: gh pr create itself never carries --reviewer any more (issue #135 re-dispatch fix)"
+assert_contains "$gh1" "Requested reviewer (squad): security" "reviewer-add-fails: the requested reviewer is still recorded in the pull request body"
+gh2="$(gh_call_flat reviewer-edit-fails 2)"
+assert_eq "pr|edit|https://github.com/octo/repo/pull/42|--repo|octo/repo|--add-reviewer|security|" "$gh2" \
+  "reviewer-add-fails: the reviewer is requested as a SEPARATE, best-effort gh pr edit call, after the URL is already known"
+assert_contains "$out" "Could not add reviewer security to https://github.com/octo/repo/pull/42" \
+  "reviewer-add-fails: the failure is logged, non-fatally"
+assert_eq "0" "$(ls "${WORK}/reviewer-edit-fails/stub" | grep -c '^gh-call-3' || true)" \
+  "reviewer-add-fails: exactly two gh calls -- create, then the best-effort reviewer edit; no retry-ladder confusion"
+
+# The reviewer-add SUCCEEDING is the easier path; proves the happy path still
+# works once the ladder was simplified.
+out="$(run_session reviewer-edit-ok PROMPT_BODY finish 0 7200 \
+  'export SQUAD_PR_REVIEWER=security')"
+assert_contains "$out" "SESSION_EXIT=0" "reviewer-add-ok: the session succeeds"
+assert_contains "$out" "Opened pull request: https://github.com/octo/repo/pull/42" "reviewer-add-ok: the PR URL is logged"
+assert_not_contains "$out" "Could not add reviewer" "reviewer-add-ok: no failure is logged when the reviewer add succeeds"
+gh2ok="$(gh_call_flat reviewer-edit-ok 2)"
+assert_eq "pr|edit|https://github.com/octo/repo/pull/42|--repo|octo/repo|--add-reviewer|security|" "$gh2ok" \
+  "reviewer-add-ok: the same best-effort gh pr edit call is made"
+
+
 echo "-- 6. deploy.ps1 and the Dockerfile --"
 deploy="$(cat "$DEPLOY_PS1")"
 assert_contains "$deploy" '[int]$SessionReplicaTimeout = 14400' "deploy.ps1 has -SessionReplicaTimeout, default 14400"

@@ -1227,3 +1227,170 @@ No overlap with `reviewer`'s independent pass beyond the shared non-blocking
 notes above (see `.squad/agents/reviewer/history.md`) — reviewer separately
 flagged the `job-drift-compare.ps1` gap and two comment-accuracy nits, which
 are correctness/process notes rather than security findings.
+
+## Issue #135 — Squad Hub v0.7.0 workflow_dispatch inputs (model, base_branch, publish_pr, reviewer, watch_only)
+
+Reviewed commit 616c5445 (`Fix #135: validate manual dispatch inputs`), which
+adds `model`/`base_branch`/`publish_pr`/`reviewer`/`watch_only` as optional
+`workflow_dispatch` inputs, `worker/lib/dispatch-inputs.js`, and the
+`validate-manual-inputs` subcommand.
+
+Verified all five values stay out of shell strings (ARM JSON body, or
+discrete argv/flag-value pairs only — never a concatenated `run:` token).
+Confirmed the allow-list charsets plus the live branch-existence and
+registry-membership checks neutralize git-ref-syntax and flag-injection
+concerns, including local reproductions of a leading-`-` value passed as a
+positional git/gh argument (each consuming flag unconditionally swallows the
+next token as a literal value; a misinterpreted flag just errors and the
+caller's existing `|| true` / retry handling absorbs it, never a silent
+bypass). Confirmed the branch-exists probe (`defaultCheckBranchExists`) is
+fail-closed: a real `gh` failure (auth/network/rate-limit) throws and is
+rejected, distinct from a clean 404 which is the only path that resolves to
+"does not exist" — matches the fail-closed pattern already established in
+`dispatch-lease.js`. Confirmed `watch_only`'s `SQUAD_HUB_APPROVAL=auto`
+mapping only reaches the session when `github.event_name == 'workflow_dispatch'`,
+so the documented Write-access trigger boundary in `docs/actions-trigger.md`
+is unchanged; nothing in this diff lets these inputs reach the lower-trust
+`issues`/`issue_comment` paths. No credential or token material is logged
+anywhere in the new validation code path, including `::error::` annotations
+and `$GITHUB_OUTPUT` writes (both visible in a public repo's Actions log).
+
+Noted non-blocking: the hand-rolled CLI `parseArgs` in `squad-dispatch.js`
+mis-tokenizes a free-text value that happens to start with `--`, but every
+such case was traced to fail closed (the subcommand aborts with exit 64/65)
+rather than enabling a bypass or value swap — a minor robustness quirk, not
+an exploitable issue. Also noted the new `reviewer` value, once it leaves
+dispatch-side validation, is a Squad casting-registry id rather than a
+GitHub identity, so `gh pr create --reviewer` frequently cannot honour it —
+this is a correctness/design gap (now addressed by `reviewer`'s fix: the
+requested reviewer is always also recorded in the pull request body) rather
+than a security exposure, since the worst case is simply "no formal reviewer
+request was attached," not any unintended access or disclosure.
+
+Re-verified after `reviewer`'s fixes: no new shell-command-line exposure was
+introduced by the added "Requested reviewer (squad): <id>" body text (built
+with `printf` into a variable, never interpolated into a command), and the
+restructured retry matrix in `entrypoint.sh` does not change what reaches
+`gh` as arguments, only the order attempts are tried in.
+
+No overlap with `reviewer`'s independent pass beyond the shared `reviewer`-
+namespace finding — reviewer treated it as a blocking correctness bug (fixed
+before this review) and security confirms it carries no exploitable
+consequence beyond the feature not doing what its description promised (see
+`.squad/agents/reviewer/history.md`).
+
+**VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.
+
+## Issue #135 re-dispatch — merge PR #140 (#136) into squad/soa-135-dispatch-inputs
+
+Security pass on the merge conflict resolution in
+`worker/entrypoint.sh`'s `commit_and_push_if_needed` (reviewer's draft retry
+ladder from this branch combined with `main`'s `pr_url` capture and
+`squad_hub_report_pr_if_any` call from issue #136). No new command
+construction was introduced: every `gh pr create` invocation still goes
+through the existing `pr_create_args`/`pr_reviewer_args` arrays (discrete
+argv elements, never a concatenated shell string), and the only change is
+that each attempt's stdout is now captured into `pr_url` via command
+substitution instead of being discarded, with the exit status still
+checked via the same `if`/`elif` structure the previous `if ! ...; then`
+form used. No credential or token material flows through `pr_url`; it is
+the `gh pr create` stdout, which is the pull request URL.
+
+Confirmed the replacement of `return 0` with fall-through assignment does
+not change WHAT `gh` is invoked with on any path, only that the already-
+reviewed hub-reporting call (`squad_hub_report_pr_if_any`, reviewed under
+issue #136) now also runs after a PR opened via the reviewer/draft retry
+ladder, exactly as it already did for the plain (non-reviewer) path. Ran
+`worker/tests/test_squad_hub.sh` (134/134) and `worker/tests/test_dispatch_inputs.sh`
+(42/42) after the merge; both green. Compared the full
+`worker/tests/run-tests.sh` run against a baseline worktree of
+`origin/main` (d5abbee) — the same 13 suites fail identically on both,
+confirming they are pre-existing/environmental and not introduced by this
+merge (see `.squad/agents/reviewer/history.md` for the full list).
+
+No overlap with `reviewer`'s independent pass beyond the shared conclusion
+that the fall-through fixes the hub-report gap with no behavioural change
+to the `gh` invocations themselves.
+
+**VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.
+
+## Issue #135 re-dispatch (r4) — security pass on PR #142's must-fix and nit fixes
+
+Reviewed the same round of changes as `reviewer`'s entry above, on
+`squad/soa-135-dispatch-inputs-r4`, with a security focus.
+
+**Reviewer retry-ladder rewrite (`worker/entrypoint.sh`).** The `gh pr
+create` argv is still built entirely from a discrete bash array
+(`pr_create_args`), never a concatenated shell string, so there is no new
+injection surface from removing `--reviewer` from it. `SQUAD_PR_REVIEWER`
+now only ever reaches `gh` as a single, separate `--add-reviewer` argv
+element on the `gh pr edit` call (also array-based, never interpolated into
+a shell string) — same trust boundary as before, just a different
+subcommand. The value is also echoed into the PR body via `printf '...%s'`,
+which is the existing, already-reviewed body-construction pattern (no
+format-string risk: `%s` is a fixed literal, the reviewer id is data). No
+credential or token material touches `pr_url`; it is `gh`'s own stdout,
+unconditionally the PR URL.
+
+**`SQUAD_MODEL`/`SQUAD_AGENT_MODEL` → `--model` wiring (`worker/entrypoint.sh`,
+`worker/squad-agent`).** This is the first place an operator-controlled,
+workflow_dispatch-origin string is appended to the `copilot` argv as its own
+discrete array element (`COPILOT_ARGV+=(--model "$SQUAD_MODEL")` /
+`MODEL_ARGV=(--model "$SQUAD_AGENT_MODEL")`) — worth a closer look than
+usual. Confirmed: (1) it is never passed through a shell string, so no
+command injection; (2) the leading-dash check
+(`validateNoLeadingDash`/the equivalent bash check in both scripts) closes
+the flag-injection angle — without it, a value like `--allow-all-tools`
+could have been smuggled in as "a model name" and reached `copilot` as a
+genuine extra flag, since bash arrays don't distinguish a flag-shaped string
+from a positional argument; (3) the value is validated independently in
+THREE places with the same rule (dispatch-inputs.js at the Action boundary,
+entrypoint.sh before `COPILOT_ARGV`, squad-agent before `MODEL_ARGV`) —
+defense in depth, not redundant, since each one is the last gate for a
+different code path (manual dispatch validation can be bypassed by anyone
+who can set `OV_SQUAD_MODEL` directly on the ACA job, so the worker-side
+checks are the ones that actually matter at the trust boundary that counts).
+Confirmed a value starting with `-` fails closed (`squad_policy_abort` /
+`squad_agent_abort`, exit 78) before `copilot` is ever exec'd on either path
+— no window where a malformed model reaches the real binary.
+
+**`dispatch-inputs.js` nits.** `sanitizeForMessage()` strips `\r`/`\n` from
+every raw value before it is interpolated into an error string — this
+closes a genuine (if low-severity) log/summary-forging path: without it, a
+`model` or `base_branch` value containing an embedded newline could have
+made the Action's `::error::` annotation or `GITHUB_STEP_SUMMARY` output
+look like it contained a SECOND, different error line, or (worse) an
+actor-controlled line that merely resembles one. Confirmed with the new
+`model-newline-sanitized` test in `worker/tests/test_dispatch_inputs.sh`
+that the raw newline genuinely never reaches stderr unescaped. The expanded
+`base_branch` shape checks (leading `-`, `..`, `@{`, `.lock`) all reject
+values that `git` itself treats specially (`-` as flag-vs-ref ambiguity,
+`..` as a range operator, `@{` as a reflog/upstream expansion, `.lock` as a
+reserved ref-lock suffix) — this closes off a small but real set of ways a
+"valid-looking" branch name could have been misinterpreted downstream by
+`git`/`gh` rather than treated as a literal ref name. None of these are
+exploitable today (nothing downstream currently shells these values out
+unquoted), but they are cheap, correct hardening against future code that
+might.
+
+**Verification.** Ran `worker/tests/test_dispatch_inputs.sh` (55/55),
+`worker/tests/test_squad_agent_wrapper.sh` (97/97, with the ambient
+`SQUAD_POLICY_*`/`SQUAD_AGENT_*` env vars this sandbox itself exports
+cleared via `env -u ...` — see `reviewer`'s entry for the exact flag list;
+without clearing them, ~24 assertions fail purely from env leakage, verified
+pre-existing/environmental by comparing against a stashed, unmodified tree),
+`worker/tests/test_session_deadline.sh` (126/126, same env-clearing),
+`worker/tests/test_squad_hub.sh` (134/134). Full
+`worker/tests/run-tests.sh` with the same env-clearing: 43 passed, 3 failed
+(1 skipped) — the 3 failures (`test_suite_process_group_containment.sh`'s
+mutation-proof, `test_token_preflight.sh`'s one no-credential-no-push
+assertion) reproduce identically on a stashed/unmodified tree, so they are
+sandbox-capability gaps (process-group/namespace and network egress), not a
+regression introduced by this round. `bash -n`/`node --check` clean on
+every touched file.
+
+No overlap with `reviewer`'s pass beyond the shared conclusion that the
+`--model` wiring and the reviewer-ladder rewrite introduce no new injection
+surface and fail closed on malformed input.
+
+**VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.

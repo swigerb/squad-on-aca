@@ -99,6 +99,12 @@
 #                                  added -- that is a feature gap (squad_state_*
 #                                  tools unavailable), not a security failure,
 #                                  so it does not abort the session.
+#   SQUAD_AGENT_MODEL              optional. Issue #135's manual dispatch
+#                                  `model` override, already re-validated by
+#                                  worker/entrypoint.sh. Appended to the exec'd
+#                                  argv as `--model <value>` when set. A value
+#                                  starting with '-' aborts (78) rather than
+#                                  being passed through as a flag.
 #   SQUAD_POLICY_MCP_CONFIG_SHA256 set by squad_policy_harden: the harden-time
 #                                  SHA-256 of .mcp.json, or `absent`. The
 #                                  AUTHORITATIVE baseline (see the F8 block).
@@ -233,6 +239,20 @@ if [[ -n "$REPO_DIR" ]]; then
     mcp_present=1
     mcp_hash="${hash_out%% *}"
   fi
+fi
+
+# Issue #135: the manual dispatch `model` override. worker/entrypoint.sh
+# exports SQUAD_AGENT_MODEL (already re-validated there -- no leading '-')
+# rather than this script trusting SQUAD_MODEL directly, so there is exactly
+# one place that decides the value reaching this script is safe to use as an
+# argv element. Re-checked here anyway as the same defense-in-depth pattern
+# the policy-argv and MCP integrity checks above already use.
+MODEL_ARGV=()
+if [[ -n "${SQUAD_AGENT_MODEL:-}" ]]; then
+  if [[ "$SQUAD_AGENT_MODEL" == -* ]]; then
+    squad_agent_abort "SQUAD_AGENT_MODEL ('${SQUAD_AGENT_MODEL}') starts with '-' and would be read as a flag, not a model name; refusing to exec copilot."
+  fi
+  MODEL_ARGV=(--model "$SQUAD_AGENT_MODEL")
 fi
 
 # Security review of #112/#113 (F8 -- integrity half). `.mcp.json` is
@@ -394,10 +414,10 @@ done
 
 # Order: Squad's own trailing arguments ("$@" -- today exactly `-p <prompt>`)
 # FIRST, then the resolved policy argv, then the MCP config this script adds
-# itself. `copilot`'s flag parser does not require a particular order, but
-# putting the policy argv and this script's own additions AFTER whatever
-# Squad appended means a future Squad that starts appending its own
-# `--deny-tool`/`--additional-mcp-config` could never silently override what
-# this script resolved -- the LAST occurrence of a given flag is this script's,
-# not Squad's.
-exec copilot "$@" "${POLICY_ARGV[@]}" "${MCP_ARGV[@]}"
+# itself, then the model override. `copilot`'s flag parser does not require a
+# particular order, but putting the policy argv and this script's own
+# additions AFTER whatever Squad appended means a future Squad that starts
+# appending its own `--deny-tool`/`--additional-mcp-config` could never
+# silently override what this script resolved -- the LAST occurrence of a
+# given flag is this script's, not Squad's.
+exec copilot "$@" "${POLICY_ARGV[@]}" "${MCP_ARGV[@]}" "${MODEL_ARGV[@]}"

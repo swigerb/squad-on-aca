@@ -502,6 +502,26 @@ squad_policy_harden "$REPO_DIR"
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
 
+# --- manual dispatch model override (issue #135) -----------------------------
+# OV_SQUAD_MODEL (workflow_dispatch's `model` input) becomes SQUAD_MODEL in
+# this container's environment (see worker/lib/ralph-dispatch.sh's OV_* ->
+# bare-name merge). worker/lib/dispatch-inputs.js already rejects a leading
+# '-' and anything outside [A-Za-z0-9._-] before the session is ever started,
+# but this is the one place the value actually reaches an argv, so it is
+# re-checked here too rather than trusted blindly from the environment --
+# fail closed rather than hand a widened flag to `copilot`.
+if [[ -n "${SQUAD_MODEL:-}" ]]; then
+  if [[ "$SQUAD_MODEL" == -* ]]; then
+    squad_policy_abort "SQUAD_MODEL ('${SQUAD_MODEL}') starts with '-' and would be read as a flag, not a model name; refusing to start."
+  fi
+  COPILOT_ARGV+=(--model "$SQUAD_MODEL")
+fi
+# squad-agent (the watch/loop --agent-cmd wrapper) builds its own argv rather
+# than reusing COPILOT_ARGV -- see the policy-argv export below -- so the
+# model override is handed to it the same way: a dedicated env var it reads
+# itself, not by assuming it inherits SQUAD_MODEL unchanged.
+export SQUAD_AGENT_MODEL="${SQUAD_MODEL:-}"
+
 # --- watch/loop agent-cmd wrapper policy (issue #112) ------------------------
 # `squad watch` and `squad loop` own their own loop and spawn Copilot
 # themselves through Squad's `buildAdditionalMcpConfigArgs()`, which prepends
@@ -1012,20 +1032,68 @@ commit_and_push_if_needed() {
       pr_body="$(squad_deadline_wip_pr_body "$pr_body" "$wip_commit" "$wip_files")"
       pr_title="$(squad_deadline_wip_pr_title "$pr_title")"
     fi
+    # `--reviewer` only resolves to a real request if SQUAD_PR_REVIEWER happens
+    # to match an actual GitHub login or org/team slug. The dispatch-side
+    # validation (worker/lib/dispatch-inputs.js) only guarantees it is an
+    # ACTIVE SQUAD CASTING REGISTRY id (issue #135) -- a distinct namespace
+    # that `gh` knows nothing about -- so `--reviewer` commonly fails even for
+    # a validated value. The requested reviewer is therefore ALWAYS recorded in
+    # the PR body too, so the information survives even when GitHub never
+    # receives (or rejects) the formal reviewer request.
+    if [[ -n "${SQUAD_PR_REVIEWER:-}" ]]; then
+      pr_body+="$(printf '\n\nRequested reviewer (squad): %s' "$SQUAD_PR_REVIEWER")"
+    fi
     pr_body+="$(squad_policy_reported_changes_report)"
+    local -a pr_create_args=(
+      gh pr create
+      --repo "$GITHUB_REPOSITORY"
+      --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}"
+      --head "$branch"
+      --title "$pr_title"
+      --body "$pr_body"
+    )
+    # Issue #135 re-dispatch finding: `gh pr create --reviewer <id>` on
+    # github.com, when <id> is not a real GitHub login (the common case here --
+    # SQUAD_PR_REVIEWER is a squad casting-registry id, not a GitHub identity),
+    # has ALREADY created the pull request by the time it rejects the reviewer
+    # request: it prints the new PR's URL to stdout and still exits 1. The old
+    # retry ladder treated that exit code as "no PR was created", retried
+    # WITHOUT --reviewer, and that retry failed with "a pull request already
+    # exists for branch ...", whose EMPTY stdout then overwrote pr_url --
+    # losing the URL entirely and skipping squad_hub_report_pr_if_any even
+    # though a PR was open. Creating the PR without --reviewer at all and
+    # requesting the reviewer as a separate, strictly best-effort step after
+    # the URL is already known makes that failure mode structurally
+    # impossible: nothing about the reviewer request can ever affect whether
+    # pr_url gets set.
+    #
+    # Draft pull requests are not available on every plan (a private
+    # repository on GitHub Free cannot have them), and `gh pr create --draft`
+    # then fails outright. The branch is already pushed, so a failed draft
+    # must not also cost the pull request: retry as a regular one, whose
+    # title and body still say WIP.
+    #
+    # Every attempt below assigns straight into pr_url (never `return 0`), so
+    # whichever attempt succeeds falls through to the single report call after
+    # this if/else -- the PR URL is captured and reported to the hub on every
+    # path of the ladder, not only the first attempt.
     if [[ "$timed_out" -eq 1 ]]; then
-      # Draft pull requests are not available on every plan (a private
-      # repository on GitHub Free cannot have them), and `gh pr create --draft`
-      # then fails outright. The branch is already pushed, so a failed draft
-      # must not also cost the pull request: retry as a regular one, whose
-      # title and body still say WIP.
-      pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body" --draft)" \
-        || {
-          log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
-          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body")" || true
-        }
+      if pr_url="$("${pr_create_args[@]}" --draft)"; then
+        :
+      else
+        log "Could not open the WIP pull request as a draft; opening it as a regular pull request, still titled and described as WIP."
+        pr_url="$("${pr_create_args[@]}")" || true
+      fi
     else
-      pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}" --head "$branch" --title "$pr_title" --body "$pr_body")" || true
+      pr_url="$("${pr_create_args[@]}")" || true
+    fi
+    if [[ -n "$pr_url" && -n "${SQUAD_PR_REVIEWER:-}" ]]; then
+      # Best-effort only: the requested reviewer is already recorded in the PR
+      # body above, so a failure here (the common case, since SQUAD_PR_REVIEWER
+      # is a squad id, not a GitHub login) never costs the pull request itself.
+      if ! gh pr edit "$pr_url" --repo "$GITHUB_REPOSITORY" --add-reviewer "$SQUAD_PR_REVIEWER" >/dev/null 2>&1; then
+        log "Could not add reviewer ${SQUAD_PR_REVIEWER} to ${pr_url} (the requested reviewer is still recorded in the pull request body)."
+      fi
     fi
     if [[ -n "$pr_url" ]]; then
       log "Opened pull request: ${pr_url}"
