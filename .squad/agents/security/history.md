@@ -1280,3 +1280,36 @@ consequence beyond the feature not doing what its description promised (see
 `.squad/agents/reviewer/history.md`).
 
 **VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.
+
+## Issue #135 re-dispatch — merge PR #140 (#136) into squad/soa-135-dispatch-inputs
+
+Security pass on the merge conflict resolution in
+`worker/entrypoint.sh`'s `commit_and_push_if_needed` (reviewer's draft retry
+ladder from this branch combined with `main`'s `pr_url` capture and
+`squad_hub_report_pr_if_any` call from issue #136). No new command
+construction was introduced: every `gh pr create` invocation still goes
+through the existing `pr_create_args`/`pr_reviewer_args` arrays (discrete
+argv elements, never a concatenated shell string), and the only change is
+that each attempt's stdout is now captured into `pr_url` via command
+substitution instead of being discarded, with the exit status still
+checked via the same `if`/`elif` structure the previous `if ! ...; then`
+form used. No credential or token material flows through `pr_url`; it is
+the `gh pr create` stdout, which is the pull request URL.
+
+Confirmed the replacement of `return 0` with fall-through assignment does
+not change WHAT `gh` is invoked with on any path, only that the already-
+reviewed hub-reporting call (`squad_hub_report_pr_if_any`, reviewed under
+issue #136) now also runs after a PR opened via the reviewer/draft retry
+ladder, exactly as it already did for the plain (non-reviewer) path. Ran
+`worker/tests/test_squad_hub.sh` (134/134) and `worker/tests/test_dispatch_inputs.sh`
+(42/42) after the merge; both green. Compared the full
+`worker/tests/run-tests.sh` run against a baseline worktree of
+`origin/main` (d5abbee) — the same 13 suites fail identically on both,
+confirming they are pre-existing/environmental and not introduced by this
+merge (see `.squad/agents/reviewer/history.md` for the full list).
+
+No overlap with `reviewer`'s independent pass beyond the shared conclusion
+that the fall-through fixes the hub-report gap with no behavioural change
+to the `gh` invocations themselves.
+
+**VERDICT: APPROVE.** No blocking or high-confidence exploitable findings.

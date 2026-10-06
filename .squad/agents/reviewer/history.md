@@ -520,3 +520,50 @@ Coordinated with `security`'s independent review pass (APPROVE, no blocking
 findings — see `.squad/agents/security/history.md`).
 
 **VERDICT: APPROVE** (after the two reviewer-namespace fixes above).
+
+## Issue #135 re-dispatch — merge PR #140 (#136) into squad/soa-135-dispatch-inputs
+
+PR #141 was closed because the branch conflicted with `main` after #136 (PR
+#140) landed: both sides rewrote the `CREATE_PR` block in
+`worker/entrypoint.sh`'s `commit_and_push_if_needed`. `main` added `pr_url`
+capture plus a `squad_hub_report_pr_if_any` call (issue #136) inside the
+`timed_out` draft-retry path only; this branch independently rewrote the
+same region to add the reviewer + draft retry ladder (issue #135), using
+`return 0` on each successful attempt and never assigning `pr_url`.
+
+Reviewed the merge resolution: every `return 0` in the reviewer/draft retry
+ladder (both the `timed_out` and non-`timed_out` branches) was replaced with
+an assignment into `pr_url` via command substitution (`pr_url="$(...)"`),
+preserving the exact same attempt order (draft+reviewer -> regular+reviewer
+-> draft without reviewer -> plain fallback for the WIP path; reviewer ->
+no-reviewer fallback for the normal path) and the exact same log messages.
+Control now always falls through to the single `if [[ -n "$pr_url" ]]`
+block after the if/else, which logs the opened PR and calls
+`squad_hub_report_pr_if_any "$pr_url" "$pr_number" "$pr_title"` — so the hub
+is notified on every successful path of the retry ladder, not only the
+first attempt, closing the exact defect the re-dispatch comment flagged.
+
+Confirmed `bash -n worker/entrypoint.sh` passes and no conflict markers
+remain. Re-ran `worker/tests/test_dispatch_inputs.sh` (42/42) and
+`worker/tests/test_squad_hub.sh` (134/134, including the #136 PR-reporting
+assertions) after the merge — both green. Ran the full
+`worker/tests/run-tests.sh` suite and compared against a baseline worktree
+of `origin/main` (d5abbee): identical 13 pre-existing/environmental failing
+suites on both (`test_credentials.sh`, `test_governance_guard.sh`,
+`test_memory_audit_pin_hooks.sh`, `test_memory_audit_pin_publication.sh`,
+`test_memory_audit_pin_rotation.sh`, `test_memory_audit_pin_seal_defeats.sh`,
+`test_push.sh`, `test_security_n1_state_tamper.sh`,
+`test_security_n2_sampler_invariant.sh`, `test_security_n3_s1_symlink.sh`,
+`test_squad_agent_wrapper.sh`, `test_suite_process_group_containment.sh`,
+`test_token_preflight.sh`) — no regression attributable to this merge. Also
+ran the `worker-tests.yml` syntax-check step's `node --check` / `bash -n`
+commands locally (all pass). The `powershell-validation` job
+(`scripts/validate.ps1`, `verify-cli-golden.ps1`) and the
+`verify-launch-detachment.ps1` probe need `pwsh`/`dotnet`, neither of which
+is available in this sandbox, so they could not be exercised locally; no
+code under their scope was touched by this merge.
+
+Coordinated with `security`'s independent review pass on the same merge —
+see `.squad/agents/security/history.md`.
+
+**VERDICT: APPROVE.**
