@@ -7,7 +7,7 @@ containerapp job show --name caj-squad-aca-session --resource-group rg-squad-stu
 GET https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/caj-squad-aca-session?api-version=2026-01-01
 ---
 POST https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-squad-stub/providers/Microsoft.App/jobs/caj-squad-aca-session/start?api-version=2026-01-01
-{"containers":[{"name":"squad-worker","image":"ghcr.io/example/squad-worker:stub","resources":{"cpu":1.0,"memory":"2.0Gi"},"env":[{"name":"ASPIRE_OTLP_GRPC_ENDPOINT","value":"http://ca-squad-aca-aspire:18889"},{"name":"GITHUB_REPOSITORY","value":"octo/demo"},{"name":"GITHUB_REF","value":"octo/demo"},{"name":"SQUAD_MODE","value":"smoke"},{"name":"SESSION_NAME","value":"smoke-<TS>"},{"name":"SQUAD_DEPLOYMENT_MODE","value":"squad-per-pod"},{"name":"SQUAD_POD_ID","value":"smoke-<TS>"},{"name":"OTEL_SERVICE_NAME","value":"squad-smoke-<TS>"},{"name":"ENABLE_GITHUB_REMOTE","value":"true"},{"name":"GITHUB_TOKEN","secretRef":"github-token"},{"name":"COPILOT_GITHUB_TOKEN","secretRef":"copilot-github-token"},{"name":"OTEL_EXPORTER_OTLP_HEADERS","secretRef":"otlp-headers"},{"name":"RUN_COPILOT_SMOKE","value":"true"},{"name":"SQUAD_DISPATCH_ROUTE","value":"aca-job"},{"name":"SQUAD_DISPATCH_SOURCE","value":"local-cli"},{"name":"SQUAD_LEASE_KEY","value":"session-smoke-<TS>"}]}],"manualTriggerConfig":{"parallelism":1,"replicaCompletionCount":1}}
+{"containers":[{"name":"squad-worker","image":"ghcr.io/example/squad-worker:stub","resources":{"cpu":1.0,"memory":"2.0Gi"},"env":[{"name":"ASPIRE_OTLP_GRPC_ENDPOINT","value":"http://ca-squad-aca-aspire:18889"},{"name":"GITHUB_REPOSITORY","value":"octo/demo"},{"name":"GITHUB_REF","value":"octo/demo"},{"name":"SQUAD_MODE","value":"smoke"},{"name":"SESSION_NAME","value":"smoke-<TS>"},{"name":"SQUAD_DEPLOYMENT_MODE","value":"squad-per-pod"},{"name":"SQUAD_POD_ID","value":"smoke-<TS>"},{"name":"OTEL_SERVICE_NAME","value":"squad-smoke-<TS>"},{"name":"ENABLE_GITHUB_REMOTE","value":"true"},{"name":"GITHUB_TOKEN","secretRef":"github-token"},{"name":"COPILOT_GITHUB_TOKEN","secretRef":"copilot-github-token"},{"name":"OTEL_EXPORTER_OTLP_HEADERS","secretRef":"otlp-headers"},{"name":"RUN_COPILOT_SMOKE","value":"true"},{"name":"SQUAD_DISPATCH_ROUTE","value":"aca-job"},{"name":"SQUAD_DISPATCH_SOURCE","value":"local-cli"},{"name":"SQUAD_LEASE_KEY","value":"session-smoke-<TS>"}]}]}
 ---
 ### GH CALLS
 repo view --json nameWithOwner --jq .nameWithOwner
@@ -17,6 +17,6 @@ repo view octo/demo --json defaultBranchRef --jq .defaultBranchRef.name
 ### STDOUT
 
 ### STDERR
-Exception: <SCRIPTS>\lib\session-env.ps1:466
+Exception: <SCRIPTS>\lib\session-env.ps1:464
      | STUB-START-FAILED (5)
 

@@ -71,7 +71,7 @@ const actualPrompt = String(find('SQUAD_PROMPT').value || '');
 const actualBytes = Buffer.from(actualPrompt, 'utf8').toString('base64');
 const expectedBytes = Buffer.from(prompt, 'utf8').toString('base64');
 process.stdout.write(JSON.stringify({
-  api: body.manualTriggerConfig?.parallelism,
+  api: Object.keys(body).sort().join('+'),
   session: find('SESSION_NAME').value || '',
   podId: find('SQUAD_POD_ID').value || '',
   otel: find('OTEL_SERVICE_NAME').value || '',
@@ -82,7 +82,7 @@ process.stdout.write(JSON.stringify({
 }));
 NODE
 )"
-assert_contains "$summary" '"api":1' "body build: manualTriggerConfig is preserved"
+assert_contains "$summary" '"api":"containers"' "body build: only StartJobExecutionTemplate properties are sent (no manualTriggerConfig)"
 assert_contains "$summary" '"session":"session-123"' "body build: session name carried"
 assert_contains "$summary" '"podId":"session-123"' "body build: SQUAD_POD_ID carried"
 assert_contains "$summary" '"otel":"squad-session-123"' "body build: OTEL_SERVICE_NAME carried"
