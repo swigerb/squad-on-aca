@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-smoke-20261008-174100",
+  "sessionId": "smoke-20261008-174100",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-10-08T21:41:01.379Z",
+  "lastHeartbeatAt": "2026-10-08T21:41:01.379Z",
+  "updatedAt": "2026-10-08T21:41:01.379Z",
+  "terminalReason": null,
+  "executionRef": null
+}
