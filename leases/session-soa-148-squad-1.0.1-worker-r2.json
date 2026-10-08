@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "leaseKey": "session-soa-148-squad-1.0.1-worker-r2",
+  "sessionId": "soa-148-squad-1.0.1-worker-r2",
+  "repository": "swigerb/squad-on-aca",
+  "issueNumber": null,
+  "dispatchSource": "local-cli",
+  "route": "aca-job",
+  "executionMode": "aca-job",
+  "state": "claimed",
+  "attempts": 1,
+  "startedAt": "2026-10-08T20:03:49.741Z",
+  "lastHeartbeatAt": "2026-10-08T20:03:49.741Z",
+  "updatedAt": "2026-10-08T20:03:49.741Z",
+  "terminalReason": null,
+  "executionRef": null
+}
