@@ -290,7 +290,7 @@ Check `worker/Dockerfile` pins:
 
 - base image `node:24-bookworm-slim`;
 - Copilot CLI `@github/copilot@1.0.69-2`;
-- Squad CLI `@bradygaster/squad-cli@0.13.1`;
+- Squad `1.0.1` from the release bundle `squad-linux-x64.tar.gz` (SHA-256 `283a1893be9ddad11056dcc8bd0673eff6b48a789bbf523b3f7ec31994d27ac7`, verified with `sha256sum -c` at build time; `squad --version` and `/opt/squad/BUNDLE-INFO.json` report it);
 - squad-hub `squad-hub@0.6.0` (default; see `SQUAD_HUB_SPEC` in Dockerfile).
 
 Pin the Aspire Dashboard image to a specific tag or digest for production.

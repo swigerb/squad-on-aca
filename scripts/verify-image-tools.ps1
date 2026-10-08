@@ -361,6 +361,21 @@ try {
         }
         if ($versions.Count -gt 0) { $doc.toolVersions = $versions }
 
+        # Issue #148: Squad is a checksum-verified release bundle, not an npm
+        # package, so record the version the bundle itself declares
+        # (BUNDLE-INFO.json) next to whatever `squad --version` reported above.
+        # Best effort, like the version probe: no bundle contributes nothing.
+        $bcmd = "if [ -f /opt/squad/BUNDLE-INFO.json ]; then node -e 'const b=require(`"/opt/squad/BUNDLE-INFO.json`");console.log(`"BUNDLE `"+b.squadVersion+`" `"+b.target)'; fi; true"
+        $br = Invoke-Aca -Argv ((Get-CommonAcaArgs) + @("sandbox", "exec", "-l", "name=$probeLabel", "-c", $bcmd))
+        if ($br.ExitCode -eq 0) {
+            foreach ($line in ($br.Output -split "`r?`n")) {
+                if ($line.Trim() -match '^BUNDLE ([0-9][0-9A-Za-z.+-]{0,40}) ([a-z0-9-]{1,40})$') {
+                    if (-not $doc.Contains('toolVersions')) { $doc.toolVersions = [ordered]@{} }
+                    $doc.toolVersions['squad-bundle'] = "$($Matches[1]) ($($Matches[2]), /opt/squad/BUNDLE-INFO.json)"
+                }
+            }
+        }
+
         $fileName = ($digest -replace ':', '-') + ".json"
         $target = Join-Path $EvidenceDir $fileName
         $json = ($doc | ConvertTo-Json -Depth 6)

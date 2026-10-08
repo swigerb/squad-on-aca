@@ -239,6 +239,51 @@ printf 'x\n' >"${REPO1}/excluderepo/.squad-pr/title"
 untracked="$(cd "${REPO1}/excluderepo" && git status --porcelain --ignored -- .squad-pr)"
 assert_contains "$untracked" "!!" ".squad-pr/ shows as IGNORED (not merely untracked) once the exclude entry is in place"
 
+echo "-- 6b. Squad 1.0 transient casting files are never published (issue #148) --"
+
+CAST="${REPO1}/castingrepo"
+mkdir -p "${CAST}/.squad/casting"
+(cd "$CAST" && git_quiet init && git config user.email t@example.invalid && git config user.name t)
+printf '{"agents":{}}\n' >"${CAST}/.squad/casting/registry.json"
+printf '{"assignments":[]}\n' >"${CAST}/.squad/casting/history.json"
+printf '{"registry_sha256":"x"}\n' >"${CAST}/.squad/casting/registry-history.commit.json"
+(cd "$CAST" && git add -A && git_quiet commit -m base)
+squad_casting_transient_install_exclude "$CAST"
+squad_casting_transient_install_exclude "$CAST"
+cast_exclude="$(cd "$CAST" && git rev-parse --path-format=absolute --git-path info/exclude)"
+assert_eq "1" "$(grep -cxF '/.squad/casting/registry.lock' "$cast_exclude")" \
+  "the casting lock exclude is installed exactly once, even when called twice"
+# Every transient shape Squad 1.0.1's durable-registry.js creates.
+mkdir -p "${CAST}/.squad/casting/registry.lock" \
+         "${CAST}/.squad/casting/registry.lock.recovery" \
+         "${CAST}/.squad/casting/registry.lock.stale-tok-uuid" \
+         "${CAST}/.squad/casting/registry-history.transaction.1234.payload"
+printf 'o\n' >"${CAST}/.squad/casting/registry.lock/owner.json"
+printf 'p\n' >"${CAST}/.squad/casting/registry-history.transaction.1234.payload/registry.json"
+printf 'j\n' >"${CAST}/.squad/casting/registry-history.transaction.json"
+printf 't\n' >"${CAST}/.squad/casting/registry.json.tmp-tx-uuid"
+printf 't\n' >"${CAST}/.squad/casting/registry-history.commit.json.tmp-tx-uuid"
+cast_status="$(cd "$CAST" && git status --porcelain)"
+assert_eq "" "$cast_status" \
+  "with only Squad 1.0 transient casting files present, git sees NOTHING to publish (lock, recovery guard, quarantine, journal, payload, temp files)"
+# The durable pair and its manifest are real team state: still tracked, still published.
+printf '{"agents":{"lead":{}}}\n' >"${CAST}/.squad/casting/registry.json"
+printf '{"registry_sha256":"y"}\n' >"${CAST}/.squad/casting/registry-history.commit.json"
+cast_status="$(cd "$CAST" && git status --porcelain)"
+assert_contains "$cast_status" ".squad/casting/registry.json" \
+  "a real change to registry.json is still publishable (only transient files are excluded)"
+assert_contains "$cast_status" ".squad/casting/registry-history.commit.json" \
+  "a real change to the Squad 1.0 commit manifest is still publishable"
+(cd "$CAST" && git add -A)
+staged="$(cd "$CAST" && git diff --cached --name-only)"
+assert_not_contains "$staged" "registry.lock" "git add -A never stages the casting lock"
+assert_not_contains "$staged" "transaction" "git add -A never stages the casting transaction journal or payload"
+assert_not_contains "$staged" ".tmp-" "git add -A never stages a durableReplace() temp file"
+# Not a git checkout: best-effort, never fails the session.
+mkdir -p "${REPO1}/not-a-repo"
+squad_casting_transient_install_exclude "${REPO1}/not-a-repo"
+assert_eq "0" "$?" "squad_casting_transient_install_exclude never fails the session, even outside a git checkout"
+
 # ===========================================================================
 # 7. End to end: the real commit_and_push_if_needed, a real local remote
 # ===========================================================================

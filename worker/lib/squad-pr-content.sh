@@ -302,3 +302,53 @@ squad_pr_content_install_exclude() {
   printf '%s\n' '.squad-pr/' >>"$exclude_file" 2>/dev/null || true
   return 0
 }
+
+# Issue #148: Squad 1.0 casting transient runtime state, as gitignore patterns
+# relative to the repository root. Read from the 1.0.1 SDK
+# (dist/casting/durable-registry.js), not guessed:
+#   registry.lock                       lock directory (acquire/release)
+#   registry.lock.recovery              lock recovery guard
+#   registry.lock[.recovery].{released,stale}-<token>-<uuid>
+#                                       quarantined locks
+#   registry-history.transaction.json   in-flight transaction journal
+#   registry-history.transaction.<uuid>.payload/
+#                                       staged payload for that journal
+#   <file>.tmp-<txid>-<uuid>            durableReplace() temp files
+# The durable pair itself (registry.json, history.json and
+# registry-history.commit.json) is NOT here: it is real, committed team state
+# (reported-mutable governance, worker/lib/agent-policy.js).
+SQUAD_CASTING_TRANSIENT_EXCLUDES=(
+  '/.squad/casting/registry.lock'
+  '/.squad/casting/registry.lock.*'
+  '/.squad/casting/registry-history.transaction.json'
+  '/.squad/casting/registry-history.transaction.*.payload/'
+  '/.squad/casting/*.tmp-*'
+)
+
+# squad_casting_transient_install_exclude <repo_dir>
+# Adds SQUAD_CASTING_TRANSIENT_EXCLUDES to this checkout's LOCAL-ONLY ignore
+# list (<git common dir>/info/exclude), so `git add -A` -- and therefore every
+# commit and push this worker makes -- never carries Squad 1.0's casting lock,
+# journal or temp files, and `git status` never counts them as publishable
+# work. Independent of core.hooksPath and linked worktrees (unlike the hook
+# guard above). Best-effort and idempotent; never fails the session, because
+# a transient file the agent leaves behind must never be what fails it.
+squad_casting_transient_install_exclude() {
+  local top="$1" exclude_file pattern added=0
+  exclude_file="$(git -C "$top" rev-parse --path-format=absolute --git-path info/exclude 2>/dev/null)" || exclude_file=""
+  if [[ -z "$exclude_file" ]]; then
+    log "squad-casting: transient casting files not excluded: could not resolve the git directory."
+    return 0
+  fi
+  mkdir -p "$(dirname -- "$exclude_file")" 2>/dev/null || return 0
+  for pattern in "${SQUAD_CASTING_TRANSIENT_EXCLUDES[@]}"; do
+    if [[ -f "$exclude_file" ]] && grep -qxF -- "$pattern" "$exclude_file" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$pattern" >>"$exclude_file" 2>/dev/null && added=$((added + 1))
+  done
+  if (( added > 0 )); then
+    log "squad-casting: Squad 1.0 transient casting files (lock, transaction journal, temp files) excluded from commits."
+  fi
+  return 0
+}

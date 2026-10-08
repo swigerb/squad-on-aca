@@ -475,6 +475,11 @@ const GOVERNANCE_PATHS = [
   // runtime state upstream, so the write must be allowed, just visible.
   '.squad/casting/registry.json',
   '.squad/casting/history.json',
+  // Issue #148: Squad 1.0 made registry.json + history.json a transactional
+  // pair whose SHA-256s are recorded in this manifest, rewritten in the same
+  // transaction. Same class as the pair (reported-mutable, below): a session
+  // that legitimately recasts rewrites all three, and all three are reported.
+  '.squad/casting/registry-history.commit.json',
   '.squad/memory/config.json',
   '.squad/memory/audit.jsonl',
   '.squad/fact-checker/policy.md',
@@ -551,6 +556,15 @@ const MUTABLE_GOVERNANCE_PATTERNS = [
  *   .squad/casting/registry.json  persists casting state here across a
  *   .squad/casting/history.json   session; a coordinator may rewrite the
  *                                 whole file, not append a line to it.
+ *   .squad/casting/registry-history.commit.json
+ *                                 Squad 1.0 (issue #148): the SHA-256
+ *                                 manifest of the registry/history pair,
+ *                                 rewritten in the same transaction as the
+ *                                 pair it describes. Its transient lock,
+ *                                 journal, payload and temp files are NOT
+ *                                 governance and are never published -- see
+ *                                 squad_casting_transient_install_exclude in
+ *                                 worker/lib/squad-pr-content.sh.
  *   .squad/identity/now.md        Squad's "what the team is focused on"
  *                                 pointer, rewritten each session by design --
  *                                 see the identity/ split below.
@@ -584,6 +598,7 @@ const REPORTED_MUTABLE_GOVERNANCE_PATTERNS = [
   '^\\.squad/casting/policy\\.json$',
   '^\\.squad/casting/registry\\.json$',
   '^\\.squad/casting/history\\.json$',
+  '^\\.squad/casting/registry-history\\.commit\\.json$',
 ];
 
 function normalizeGovernanceRelPath(relativePath) {

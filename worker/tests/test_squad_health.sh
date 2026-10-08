@@ -101,6 +101,15 @@ JSON
 JSON
       exit 1
       ;;
+    fail-casting-pair)
+      # Issue #148: what the REAL Squad 1.0.1 reports for a repository still
+      # carrying the 0.13 casting layout (message text copied from 1.0.1's
+      # dist/casting/durable-registry.js; 1.0.1's health exits 0 even then).
+      cat <<'JSON'
+{"schema":"squad-health/v1","status":"fail","checks":[{"id":"team","status":"pass","message":"ok"},{"id":"registry-charters","status":"fail","message":"Cannot read a consistent casting registry/history pair: both files are required"},{"id":"routing","status":"fail","message":"routing references cannot be validated because the casting registry is invalid"},{"id":"state-backend","status":"skip","message":"No state backend is configured"},{"id":"env-vars","status":"skip","message":"No required environment variables are declared"}]}
+JSON
+      exit 0
+      ;;
     missing-command)
       echo "squad: error: unknown command 'health'" >&2
       exit 1
@@ -173,6 +182,30 @@ assert_contains "$out_fail" "DRIVER_EXIT_CODE:78" \
 # the id list is the ACTUAL failing set, not every check.
 assert_not_contains "$(printf '%s' "$out_fail" | grep 'Squad health: FAIL')" "team," \
   "fail report: a check that actually PASSED (team) is not listed among the failing ids"
+
+# A generic registry failure gets no casting-upgrade advice: the hint is
+# reserved for the Squad 1.0 casting-pair failure it actually fixes.
+assert_not_contains "$out_fail" "squad upgrade" \
+  "fail report: a non-casting registry failure does not get the Squad 1.0 casting-upgrade hint"
+
+# ===========================================================================
+# 2b. Issue #148: a 0.13-format casting registry under Squad 1.0.1. Still
+#     fail-closed (exit 78), and the refusal now names the fix instead of
+#     leaving the operator with a bare check id.
+# ===========================================================================
+out_cast="$(run_gate fail-casting-pair)"
+assert_contains "$out_cast" "Squad health: FAIL" \
+  "0.13 casting layout on Squad 1.0: the gate still logs a FAIL line"
+assert_contains "$out_cast" "DRIVER_EXIT_CODE:78" \
+  "0.13 casting layout on Squad 1.0: the gate still exits 78 (the gate is kept, not loosened)"
+assert_contains "$out_cast" "squad upgrade" \
+  "0.13 casting layout on Squad 1.0: the refusal tells the operator to run 'squad upgrade'"
+assert_contains "$out_cast" "registry-history.commit.json" \
+  "0.13 casting layout on Squad 1.0: the refusal names the commit manifest that must be committed"
+assert_contains "$out_cast" "eol=lf" \
+  "0.13 casting layout on Squad 1.0: the refusal names the LF .gitattributes pin the manifest needs"
+assert_not_contains "$out_cast" "GATE_RETURNED_ZERO" \
+  "0.13 casting layout on Squad 1.0: the session never proceeds past the gate"
 
 # ===========================================================================
 # 3. Degrades honestly on an older/broken CLI: UNAVAILABLE, never a pass, and

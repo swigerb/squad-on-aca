@@ -54,6 +54,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # can only ever supervise, never hand a single session to.
 ARG SQUAD_HUB_SPEC=squad-hub@0.6.0
 
+# Squad itself (issue #148). Installed from the official upstream GitHub
+# release, NOT from npm: 1.0.1 is not available through the Microsoft npm
+# proxy, and the standalone bundle is what upstream's own 1.0.1 activation
+# installs. The bundle carries the real @bradygaster/squad-cli and
+# @bradygaster/squad-sdk 1.0.1 packages (built from source by upstream CI)
+# plus its own Node runtime, under app/node_modules and runtime/.
+#
+# SUPPLY CHAIN. SQUAD_SHA256 is the value published in the release's
+# SHA256SUMS.txt for squad-linux-x64.tar.gz, pinned here so the build never
+# trusts whatever the URL serves on the day: `sha256sum -c` fails the RUN, and
+# so the whole build, on any mismatch. The archive is downloaded to a file and
+# checked BEFORE it is extracted -- never piped into a shell or into tar. The
+# extracted tree is root-owned with every write bit stripped, so the runtime
+# users (`squad`, `squad-identity`) can execute it but never change it, and
+# nothing is fetched at runtime. Changing SQUAD_VERSION without the matching
+# SQUAD_SHA256 fails the build; that is the point. scripts/validate.ps1 and
+# worker/tests/test_squad_release_install.sh assert all of this.
+#
+# Keep in lockstep with .github/workflows/worker-tests.yml, which installs the
+# SAME checksum-verified bundle so the real-SDK tests
+# (test_memory_audit_pin_publication.sh, test_memory_audit_pin_rotation.sh)
+# exercise exactly the squad-sdk this image ships.
+ARG SQUAD_VERSION=1.0.1
+ARG SQUAD_SHA256=283a1893be9ddad11056dcc8bd0673eff6b48a789bbf523b3f7ec31994d27ac7
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg openssh-client \
     && mkdir -p /etc/apt/keyrings \
@@ -65,20 +90,15 @@ RUN apt-get update \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
     && npm config set fetch-retries 5 \
     && npm config set fetch-retry-maxtimeout 120000 \
-    # Copilot CLI is pinned independently of the Squad bump above. Brian
-    # verified @github/copilot@1.0.69-2 directly against Squad 0.13.1's
-    # DEFAULT models (gpt-5.6-terra, gpt-5.6-luna, claude-sonnet-5 all
-    # answered) before this bump landed -- see issue #114. It is NOT bumped
-    # here alongside squad-cli/squad-hub: nothing about those two pins forces
-    # a Copilot CLI version, and re-verifying compatibility is the cost of
-    # changing this pin, not a side effect of changing the other two.
-    # Keep in lockstep with the squad-sdk version CI installs for
-    # test_memory_audit_pin_publication.sh's real-SDK case (worker/tests/
-    # test_memory_audit_pin_publication.sh; .github/workflows/worker-tests.yml)
-    # -- that test exercises the ACTUAL rotateAuditIfNeeded() this image nests
-    # under squad-cli, so the pinned version here and the version that test
-    # installs must always agree.
-    && npm install -g @github/copilot@1.0.69-2 @bradygaster/squad-cli@0.13.1 \
+    # Copilot CLI is pinned independently of the Squad bump. Brian verified
+    # @github/copilot@1.0.69-2 directly against Squad 0.13.1's DEFAULT models
+    # (gpt-5.6-terra, gpt-5.6-luna, claude-sonnet-5 all answered) -- see issue
+    # #114 -- and Squad 1.0.1 documents no newer minimum (issue #148). It is
+    # NOT bumped alongside Squad/squad-hub: nothing about those pins forces a
+    # Copilot CLI version, and re-verifying compatibility is the cost of
+    # changing this pin, not a side effect of changing the others. Squad
+    # itself is no longer an npm install; see the release-bundle RUN below.
+    && npm install -g @github/copilot@1.0.69-2 \
     # Record what was asked for, so a running container can be ASKED which
     # squad-hub it has rather than guessed at -- including "none".
     && printf '%s\n' "$SQUAD_HUB_SPEC" > /etc/squad-hub-spec \
@@ -140,6 +160,29 @@ RUN apt-get update \
     && chown -R squad-identity:squad-identity /home/squad-identity \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Squad from the checksum-verified release bundle (issue #148; see the
+# SQUAD_VERSION/SQUAD_SHA256 comment above). Download to a file, verify, THEN
+# extract -- `set -e` plus `&&` means a failed download, a checksum mismatch or
+# a failed extraction each stops the build here. /opt/squad is a symlink to
+# the versioned directory so the path tests and docs name stays stable across
+# bumps.
+RUN set -eu \
+    && squad_tar="/tmp/squad-linux-x64.tar.gz" \
+    && curl -fsSL --retry 5 --retry-delay 5 -o "$squad_tar" \
+         "https://github.com/bradygaster/squad/releases/download/v${SQUAD_VERSION}/squad-linux-x64.tar.gz" \
+    && echo "${SQUAD_SHA256}  ${squad_tar}" | sha256sum -c - \
+    && mkdir -p "/opt/squad-${SQUAD_VERSION}" \
+    && tar -xzf "$squad_tar" -C "/opt/squad-${SQUAD_VERSION}" --strip-components=1 --no-same-owner \
+    && rm -f "$squad_tar" \
+    && test -x "/opt/squad-${SQUAD_VERSION}/squad" \
+    && test -f "/opt/squad-${SQUAD_VERSION}/BUNDLE-INFO.json" \
+    && grep -q "\"squadVersion\": \"${SQUAD_VERSION}\"" "/opt/squad-${SQUAD_VERSION}/BUNDLE-INFO.json" \
+    && chown -R root:root "/opt/squad-${SQUAD_VERSION}" \
+    && chmod -R a-w "/opt/squad-${SQUAD_VERSION}" \
+    && ln -sfn "/opt/squad-${SQUAD_VERSION}" /opt/squad \
+    && ln -sfn /opt/squad/squad /usr/local/bin/squad \
+    && test "$(squad --version 2>/dev/null | tr -d '[:space:]' | sed 's/^v//')" = "${SQUAD_VERSION}"
 
 # BUILD CONTEXT IS THE REPOSITORY ROOT, not worker/. It has to be: the image
 # must carry config/sandbox-classes.json, which lives outside worker/, and a

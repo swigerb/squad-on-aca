@@ -306,7 +306,9 @@ SQUAD_SESSION_BASE_COMMIT="$(git rev-parse --verify --quiet HEAD 2>/dev/null || 
 # unsupported layout.
 #
 # Mirrors Squad's OWN config.json validation (verified against the published
-# @bradygaster/squad-sdk@0.13.1 package's dist/resolution.js: loadDirConfig()
+# @bradygaster/squad-sdk@0.13.1 package's dist/resolution.js, and re-verified
+# unchanged against the 1.0.1 release bundle this image ships -- issue #148:
+# loadDirConfig()
 # only recognizes a config.json that has BOTH a numeric `version` and a
 # string `teamRoot` -- anything else, including no .squad/config.json at all,
 # resolves to ordinary local state exactly like Squad itself would resolve
@@ -416,10 +418,12 @@ fi
 # Squad 0.13 ships `squad health --json` (schema `squad-health/v1`): checks
 # team, registry-charters, routing, state-backend, and env-vars, and is built
 # for "gate dispatch on readiness" (verified against the published
-# @bradygaster/squad-cli@0.13.1 package's dist/cli/commands/health.js --
+# @bradygaster/squad-cli@0.13.1 package's dist/cli/commands/health.js, and
+# re-verified unchanged against the 1.0.1 release bundle -- issue #148 --
 # overall `status` is `pass`/`fail` only, no `warn`; each check's own
 # `status` is `pass`/`fail`/`skip`; failing check ids live at
-# `.checks[].id`). Gating here -- AFTER `squad init`/SubSquad activation
+# `.checks[].id`; `squad health` itself exits 0 either way, so only the parsed
+# `status` is trusted). Gating here -- AFTER `squad init`/SubSquad activation
 # finishes writing the governance state those checks read, and BEFORE
 # squad_policy_harden -- means a session whose Squad state is already broken
 # fails before it ever hardens policy or runs an agent against repository
@@ -460,11 +464,15 @@ squad_health_gate() {
     if (!report || report.schema !== "squad-health/v1" || typeof report.status !== "string" || !Array.isArray(report.checks)) {
       process.exit(2);
     }
-    const failingIds = report.checks
-      .filter((check) => check && check.status === "fail")
-      .map((check) => check.id)
-      .join(",");
-    process.stdout.write(report.status + "\t" + failingIds);
+    const failing = report.checks.filter((check) => check && check.status === "fail");
+    const failingIds = failing.map((check) => check.id).join(",");
+    // Issue #148: Squad 1.0 made the casting registry/history a transactional
+    // pair guarded by .squad/casting/registry-history.commit.json. A
+    // repository still carrying the 0.13 layout fails registry-charters with
+    // one of these messages; flag it so the refusal can name the fix.
+    const castingPair = failing.some((check) => check.id === "registry-charters"
+      && /casting registry\/history pair|commit manifest|registry\/history bytes/i.test(String(check.message || "")));
+    process.stdout.write(report.status + "\t" + failingIds + "\t" + (castingPair ? "casting-pair" : ""));
     process.exit(report.status === "fail" ? 1 : 0);
   ' 2>/dev/null)" && parse_rc=0 || parse_rc=$?
   if [[ "$parse_rc" -eq 2 ]]; then
@@ -472,9 +480,15 @@ squad_health_gate() {
     return 0
   fi
   local status="${parsed%%$'\t'*}"
-  local failing="${parsed#*$'\t'}"
+  local rest="${parsed#*$'\t'}"
+  local failing="${rest%%$'\t'*}"
+  local hint=""
+  [[ "$rest" == *$'\t'* ]] && hint="${rest#*$'\t'}"
   if [[ "$status" == "fail" ]]; then
     log "Squad health: FAIL -- failing checks: ${failing:-<none reported>}"
+    if [[ "$hint" == "casting-pair" ]]; then
+      log "The casting registry is not in Squad 1.0 format (this worker runs Squad $(squad version 2>/dev/null || echo unknown)). Fix it in the repository: run 'squad upgrade' with Squad 1.0.1 or later, then commit .squad/casting/registry.json, .squad/casting/history.json and .squad/casting/registry-history.commit.json (and add '.squad/casting/*.json text eol=lf' to .gitattributes, because the commit manifest hashes exact bytes). See swigerb/squad-hub#228 and swigerb/squad-on-aca#147 for worked examples."
+    fi
     log "A session whose Squad state is not ready must not dispatch an agent against it; refusing to start."
     exit 78
   fi
@@ -520,6 +534,11 @@ squad_policy_harden "$REPO_DIR"
 # check) instead of being skipped as "an unrecognized existing hook" by
 # squad_policy_pin_install_hooks's own idempotency check.
 squad_pr_content_install_hooks "$REPO_DIR"
+
+# Issue #148: Squad 1.0's casting lock, transaction journal, payload directory
+# and temp files are transient runtime state. Keep them out of every commit
+# this worker makes (local-only exclude, independent of the hooks above).
+squad_casting_transient_install_exclude "$REPO_DIR"
 
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"

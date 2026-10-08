@@ -271,6 +271,7 @@ assert_contains "$gov" ".squad/fact-checker/audit-trail.md" "approval/audit trai
 assert_contains "$gov" ".squad/casting/policy.json"       "casting/policy.json is protected"
 assert_contains "$gov" ".squad/casting/registry.json"     "casting/registry.json is protected (new, Issue #113)"
 assert_contains "$gov" ".squad/casting/history.json"      "casting/history.json is protected (new, Issue #113)"
+assert_contains "$gov" ".squad/casting/registry-history.commit.json" "casting/registry-history.commit.json (Squad 1.0 commit manifest) is protected (Issue #148)"
 
 # Identical in both tiers: an attended run is not licensed to rewrite the
 # policies that govern it either. If that ever diverges it must be a deliberate,
@@ -308,9 +309,9 @@ assert_eq "$(policy prompt local-cli '' aca-job mutable-governance-patterns)" "$
 echo "-- reported-mutable class (Issue #113) --"
 
 rpat="$(policy ralph ralph '' aca-job reported-mutable-governance-patterns)"
-expected_rpat="$(printf '^\\.squad/identity/now\\.md$\n^\\.squad/casting/policy\\.json$\n^\\.squad/casting/registry\\.json$\n^\\.squad/casting/history\\.json$')"
+expected_rpat="$(printf '^\\.squad/identity/now\\.md$\n^\\.squad/casting/policy\\.json$\n^\\.squad/casting/registry\\.json$\n^\\.squad/casting/history\\.json$\n^\\.squad/casting/registry-history\\.commit\\.json$')"
 assert_eq "$expected_rpat" "$rpat" \
-  "the resolver publishes exactly the four reported-mutable patterns"
+  "the resolver publishes exactly the five reported-mutable patterns (Issue #148 adds the Squad 1.0 commit manifest)"
 assert_eq "$(policy prompt local-cli '' aca-job reported-mutable-governance-patterns)" "$rpat" \
   "the reported-mutable set is identical for attended and autonomous runs"
 
@@ -346,6 +347,20 @@ assert_eq "reported-mutable" "$(classify_path '.squad/casting/registry.json')" \
   "casting/registry.json classifies as reported-mutable (Issue #113)"
 assert_eq "reported-mutable" "$(classify_path '.squad/casting/history.json')" \
   "casting/history.json classifies as reported-mutable (Issue #113)"
+assert_eq "reported-mutable" "$(classify_path '.squad/casting/registry-history.commit.json')" \
+  "casting/registry-history.commit.json (Squad 1.0 commit manifest) classifies as reported-mutable, like the pair it hashes (Issue #148)"
+# Issue #148: Squad 1.0's transient casting files are NOT governance at all --
+# a lock or journal appearing mid-session must never be a violation.
+for transient in \
+  '.squad/casting/registry.lock' \
+  '.squad/casting/registry.lock.recovery' \
+  '.squad/casting/registry.lock.stale-abc-123' \
+  '.squad/casting/registry-history.transaction.json' \
+  '.squad/casting/registry-history.transaction.0f0e.payload/registry.json' \
+  '.squad/casting/registry.json.tmp-tx-uuid'; do
+  assert_eq "not-governance" "$(classify_path "$transient")" \
+    "${transient} (Squad 1.0 transient casting state) is not a governance path (Issue #148)"
+done
 assert_eq "reported-mutable" "$(classify_path '.squad/identity/now.md')" \
   "identity/now.md classifies as reported-mutable (Issue #113)"
 assert_eq "locked"           "$(classify_path '.squad/identity/mission.md')" \

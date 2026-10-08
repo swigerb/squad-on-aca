@@ -39,18 +39,29 @@ jobs:
         with:
           node-version: '24'
 
-      # worker/tests/test_memory_audit_pin_publication.sh's real-SDK case
-      # needs the ACTUAL @bradygaster/squad-sdk rotateAuditIfNeeded() this
-      # image nests under squad-cli (worker/Dockerfile), not a mock -- that is
-      # the only way to prove the pin really disables rotation rather than
-      # merely asserting the pin landed on disk. The runner does not install
-      # squad-cli, so without this step that test SKIPs (exit 77), and
-      # "Run worker capability tests" below fails the job on any skip. Keep
-      # this version in lockstep with worker/Dockerfile's squad-cli pin.
-      - name: Install squad-sdk 0.13.1 for real-SDK tests
+      # worker/tests/test_memory_audit_pin_publication.sh's and
+      # test_memory_audit_pin_rotation.sh's real-SDK cases need the ACTUAL
+      # @bradygaster/squad-sdk rotateAuditIfNeeded() this image ships, not a
+      # mock -- that is the only way to prove the pin really disables rotation
+      # rather than merely asserting the pin landed on disk. Issue #148: the
+      # image installs Squad from the checksum-verified GitHub release bundle,
+      # so this step installs THE SAME bundle the same way, reading the version
+      # and SHA-256 from worker/Dockerfile's ARGs so the two can never drift.
+      # Without it those suites SKIP (exit 77), and "Run worker capability
+      # tests" below fails the job on any skip.
+      - name: Install the Squad release bundle (same version and checksum as worker/Dockerfile)
         run: |
-          npm install --prefix "$RUNNER_TEMP/sdk" @bradygaster/squad-sdk@0.13.1
-          echo "SQUAD_SDK_DIR=$RUNNER_TEMP/sdk/node_modules/@bradygaster/squad-sdk" >> "$GITHUB_ENV"
+          set -euo pipefail
+          ver="$(sed -n 's/^ARG SQUAD_VERSION=//p' worker/Dockerfile | head -n 1)"
+          sum="$(sed -n 's/^ARG SQUAD_SHA256=//p' worker/Dockerfile | head -n 1)"
+          [[ -n "$ver" && "$sum" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::worker/Dockerfile has no SQUAD_VERSION/SQUAD_SHA256 ARG"; exit 1; }
+          tarball="$RUNNER_TEMP/squad-linux-x64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" "https://github.com/bradygaster/squad/releases/download/v${ver}/squad-linux-x64.tar.gz"
+          echo "${sum}  ${tarball}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/squad"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/squad" --strip-components=1
+          echo "SQUAD_SDK_DIR=$RUNNER_TEMP/squad/app/node_modules/@bradygaster/squad-sdk" >> "$GITHUB_ENV"
+          echo "SQUAD_BUNDLE_TARBALL=$tarball" >> "$GITHUB_ENV"
 
       - name: Syntax-check worker sources
         run: |

@@ -202,7 +202,7 @@ The helper starts `SQUAD_MODE=new-project`, initializes Squad state in the ACA s
 
 ## Ralph and watcher
 
-The worker image contains Node.js, Azure CLI, GitHub CLI, Copilot CLI `@github/copilot@1.0.69-2`, Squad CLI `@bradygaster/squad-cli@0.13.1`, and squad-hub `squad-hub@0.6.0` by default. Ralph is a scheduled job mode in that image. `caj-squad-aca-ralph` runs `SQUAD_MODE=ralph` every 5 minutes, polls GitHub issues, marks actionable issues as dispatched, and starts new `caj-squad-aca-session` executions.
+The worker image contains Node.js, Azure CLI, GitHub CLI, Copilot CLI `@github/copilot@1.0.69-2`, Squad `1.0.1` (installed from the official GitHub release bundle, `squad-linux-x64.tar.gz`, SHA-256 pinned and verified at build time; see `/opt/squad/BUNDLE-INFO.json` or `squad --version` in the image), and squad-hub `squad-hub@0.6.0` by default. Ralph is a scheduled job mode in that image. `caj-squad-aca-ralph` runs `SQUAD_MODE=ralph` every 5 minutes, polls GitHub issues, marks actionable issues as dispatched, and starts new `caj-squad-aca-session` executions.
 
 Run a watcher:
 

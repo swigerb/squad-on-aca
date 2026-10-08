@@ -2211,7 +2211,7 @@ squad_policy_harden() {
     fi
   fi
   if [[ "${#SQUAD_POLICY_REPORTED_MUTABLE_FILES[@]}" -gt 0 ]]; then
-    squad_policy_log "Reported-mutable exception (Squad 0.13 runtime state; writable this session, changes listed in the governance report and the PR body): ${SQUAD_POLICY_REPORTED_MUTABLE_FILES[*]}"
+    squad_policy_log "Reported-mutable exception (Squad runtime state; writable this session, changes listed in the governance report and the PR body): ${SQUAD_POLICY_REPORTED_MUTABLE_FILES[*]}"
     local -a rm_dir_locked=() rm_dir_open=()
     for rel in "${SQUAD_POLICY_REPORTED_MUTABLE_FILES[@]}"; do
       if squad_policy_parent_dir_is_locked "$rel"; then
@@ -2692,7 +2692,7 @@ squad_policy_reported_changes_report() {
     return 0
   fi
   printf '\n\n## Reported-mutable governance changes\n\n'
-  printf 'Squad 0.13 runtime state this session legitimately rewrote (casting state and `identity/now.md`). These are ALLOWED, not governance violations -- listed here for visibility:\n\n'
+  printf 'Squad runtime state this session legitimately rewrote (casting state, including the Squad 1.0 commit manifest, and `identity/now.md`). These are ALLOWED, not governance violations -- listed here for visibility:\n\n'
   local c
   for c in "${SQUAD_POLICY_REPORTED_CHANGES[@]}"; do
     printf -- '- %s\n' "$c"
