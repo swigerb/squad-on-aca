@@ -10,7 +10,7 @@ Squad on ACA
 
 Usage:
   squad-aca init [--owner <github-owner>] [--name <repo-name>] [--public|--private]
-  squad-aca run "prompt" [--repo <owner/repo>] [--name <session>] [--branch <branch>] [--no-push]
+  squad-aca run "prompt" [--repo <owner/repo>] [--name <session>] [--branch <branch>] [--no-push] [--pr-title <title>] [--pr-body-file <path>]
   squad-aca "prompt"
   squad-aca new --owner <github-owner> --name <repo-name> [--description "..."]
   squad-aca smoke [--repo <owner/repo>]
