@@ -255,6 +255,14 @@ node --check worker/lib/parse-capabilities.js
 
 The same suite runs in CI via [`.github/workflows/worker-tests.yml`](.github/workflows/worker-tests.yml). See [docs/validation.md](docs/validation.md).
 
+If the `worker-tests` job fails, it automatically generates a concise `failure-summary.md` with
+[`worker/lib/failure-summary.js`](worker/lib/failure-summary.js) (issue #144): the failing
+command/step, exact failing suite/test names, the assertion context around each failure, final
+status and exit code, and a pointer to the full `run-tests.out` log. The summary is appended to the
+run's job summary and uploaded as the `worker-tests-failure-summary` artifact. If extraction itself
+cannot find anything usable (for example, a step failed before `run-tests.out` existed), it reports
+that explicitly rather than a silent or misleading result, and still points at the run URL.
+
 ## Capability-aware execution
 
 Repositories can commit a `squad-capabilities.yml` manifest declaring the tools, credentials, services, and egress a session needs. A preflight step runs after clone and before Squad/Copilot starts. Required tools and credentials fail fast when absent. See [docs/capability-manifest.md](docs/capability-manifest.md).
