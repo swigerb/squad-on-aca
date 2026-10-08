@@ -1,6 +1,28 @@
 {
+  "universe_usage_history": [
+    {
+      "universe": "preset:default",
+      "used_at": "2026-07-15T15:09:41.086Z"
+    },
+    {
+      "universe": "preset:default",
+      "used_at": "2026-10-04T16:39:43.790Z"
+    },
+    {
+      "universe": "preset:default",
+      "used_at": "2026-10-04T16:39:43.791Z"
+    },
+    {
+      "universe": "builtin",
+      "used_at": "2026-10-04T16:39:43.791Z"
+    },
+    {
+      "universe": "builtin",
+      "used_at": "2026-10-04T16:39:44.200Z"
+    }
+  ],
   "assignment_cast_snapshots": {
-    "preset-preset:default-2026-07-15T15:09:41.086Z": {
+    "preset-default-r1": {
       "created_at": "2026-07-15T15:09:41.086Z",
       "agents": [
         "lead",
@@ -10,12 +32,38 @@
         "docs"
       ],
       "universe": "preset:default"
+    },
+    "preset-default-r2": {
+      "created_at": "2026-10-04T16:39:43.790Z",
+      "agents": [
+        "advisor"
+      ],
+      "universe": "preset:default"
+    },
+    "preset-default-r3": {
+      "created_at": "2026-10-04T16:39:43.791Z",
+      "agents": [
+        "engineer"
+      ],
+      "universe": "preset:default"
+    },
+    "builtin-r4": {
+      "created_at": "2026-10-04T16:39:43.791Z",
+      "agents": [
+        "fact-checker"
+      ],
+      "universe": "builtin"
+    },
+    "builtin-r5": {
+      "created_at": "2026-10-04T16:39:44.200Z",
+      "agents": [
+        "rai",
+        "ralph",
+        "scribe"
+      ],
+      "universe": "builtin"
     }
   },
-  "universe_usage_history": [
-    {
-      "universe": "preset:default",
-      "used_at": "2026-07-15T15:09:41.086Z"
-    }
-  ]
+  "transaction_id": "59cc97d7-1486-4294-9e93-9f2ab1a17838",
+  "registry_revision": 5
 }
