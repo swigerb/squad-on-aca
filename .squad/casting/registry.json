@@ -1,76 +1,114 @@
 {
+  "schema": "squad-agent-provenance/v1",
+  "schema_version": 1,
+  "revision": 5,
+  "generated_at": "2026-10-04T16:39:44.200Z",
   "agents": {
     "lead": {
-      "created_at": "2026-07-15T15:09:41.086Z",
+      "display_name": "lead",
       "persistent_name": "lead",
+      "role": "lead",
       "universe": "preset:default",
-      "status": "active"
+      "status": "active",
+      "created_at": "2026-07-15T15:09:41.086Z",
+      "updated_at": "2026-07-15T15:09:41.086Z"
     },
     "reviewer": {
-      "created_at": "2026-07-15T15:09:41.086Z",
+      "display_name": "reviewer",
       "persistent_name": "reviewer",
+      "role": "reviewer",
       "universe": "preset:default",
-      "status": "active"
+      "status": "active",
+      "created_at": "2026-07-15T15:09:41.086Z",
+      "updated_at": "2026-07-15T15:09:41.086Z"
     },
     "devrel": {
-      "created_at": "2026-07-15T15:09:41.086Z",
+      "display_name": "devrel",
       "persistent_name": "devrel",
+      "role": "devrel",
       "universe": "preset:default",
-      "status": "active"
+      "status": "active",
+      "created_at": "2026-07-15T15:09:41.086Z",
+      "updated_at": "2026-07-15T15:09:41.086Z"
     },
     "security": {
-      "created_at": "2026-07-15T15:09:41.086Z",
+      "display_name": "security",
       "persistent_name": "security",
+      "role": "security",
       "universe": "preset:default",
-      "status": "active"
+      "status": "active",
+      "created_at": "2026-07-15T15:09:41.086Z",
+      "updated_at": "2026-07-15T15:09:41.086Z"
     },
     "docs": {
-      "created_at": "2026-07-15T15:09:41.086Z",
+      "display_name": "docs",
       "persistent_name": "docs",
+      "role": "docs",
       "universe": "preset:default",
-      "status": "active"
+      "status": "active",
+      "created_at": "2026-07-15T15:09:41.086Z",
+      "updated_at": "2026-07-15T15:09:41.086Z"
     },
     "advisor": {
+      "display_name": "advisor",
       "persistent_name": "advisor",
+      "role": "advisor",
       "universe": "preset:default",
+      "status": "active",
       "created_at": "2026-10-04T16:39:43.790Z",
-      "legacy_named": false,
-      "status": "active"
+      "updated_at": "2026-10-04T16:39:43.790Z",
+      "legacy_named": false
     },
     "engineer": {
+      "display_name": "engineer",
       "persistent_name": "engineer",
+      "role": "engineer",
       "universe": "preset:default",
+      "status": "active",
       "created_at": "2026-10-04T16:39:43.791Z",
-      "legacy_named": false,
-      "status": "active"
+      "updated_at": "2026-10-04T16:39:43.791Z",
+      "legacy_named": false
     },
     "fact-checker": {
+      "display_name": "Fact Checker",
       "persistent_name": "Fact Checker",
+      "role": "Fact Checker",
       "universe": "builtin",
+      "status": "active",
       "created_at": "2026-10-04T16:39:43.791Z",
-      "legacy_named": false,
-      "status": "active"
+      "updated_at": "2026-10-04T16:39:43.791Z",
+      "legacy_named": false
     },
     "rai": {
+      "display_name": "Rai",
       "persistent_name": "Rai",
+      "role": "Responsible AI Reviewer",
       "universe": "builtin",
+      "status": "active",
       "created_at": "2026-10-04T16:39:44.200Z",
-      "legacy_named": false,
-      "status": "active"
+      "updated_at": "2026-10-04T16:39:44.200Z",
+      "legacy_named": false
     },
     "ralph": {
+      "display_name": "Ralph",
       "persistent_name": "Ralph",
+      "role": "Work Monitor",
       "universe": "builtin",
+      "status": "active",
       "created_at": "2026-10-04T16:39:44.200Z",
-      "legacy_named": false,
-      "status": "active"
+      "updated_at": "2026-10-04T16:39:44.200Z",
+      "legacy_named": false
     },
     "scribe": {
+      "display_name": "Scribe",
       "persistent_name": "Scribe",
+      "role": "Session Logger",
       "universe": "builtin",
+      "status": "active",
       "created_at": "2026-10-04T16:39:44.200Z",
-      "legacy_named": false,
-      "status": "active"
+      "updated_at": "2026-10-04T16:39:44.200Z",
+      "legacy_named": false
     }
-  }
+  },
+  "transaction_id": "59cc97d7-1486-4294-9e93-9f2ab1a17838"
 }
