@@ -61,10 +61,12 @@ jobs:
           node --check worker/lib/dispatch-lease.js
           node --check worker/lib/dispatch-inputs.js
           node --check worker/lib/squad-dispatch.js
+          node --check worker/lib/failure-summary.js
           node --check worker/tests/lib/fake-gh.js
           node -e "JSON.parse(require('fs').readFileSync('config/sandbox-classes.json','utf8'))"
           bash -n worker/lib/squad-capability-preflight.sh
           bash -n worker/tests/test_image_evidence.sh
+          bash -n worker/tests/test_failure_summary.sh
           bash -n worker/lib/ralph-dispatch.sh
           bash -n worker/entrypoint.sh
 
@@ -92,10 +94,12 @@ jobs:
           bash worker/tests/run-tests.sh 2>&1 | tee run-tests.out || rc=$?
           if [[ "$rc" -ne 0 ]]; then
             echo "::error::Worker capability tests failed (exit ${rc})."
+            echo "WORKER_TESTS_EXIT_CODE=${rc}" >>"$GITHUB_ENV"
             exit "$rc"
           fi
           if ! grep -qE 'Suites: [0-9]+ passed, 0 failed, 0 skipped\.' run-tests.out; then
             echo "::error::A worker test suite was SKIPPED on CI. Every declared dependency must be present on the runner; a skip is not a pass."
+            echo "WORKER_TESTS_EXIT_CODE=1" >>"$GITHUB_ENV"
             exit 1
           fi
           rm -f run-tests.out
@@ -123,6 +127,49 @@ jobs:
             exit 1
           fi
           exit "$rc"
+
+      # Issue #144: any failure in a step above used to leave only a wall of
+      # tee'd/interleaved step output to read by hand -- the exact "re-read
+      # the job logs, pull test.out, search for FAIL lines" archaeology the
+      # issue describes. This step runs ONLY when this job has FAILED
+      # (`if: failure()`, which fires once any earlier step failed, not just
+      # the one immediately before it) and turns whatever was captured into a
+      # concise, actionable failure-summary.md: it prefers the known
+      # run-tests.out artifact (this repo's "test.out"-equivalent -- already
+      # free of Actions' own step chrome) when the failure happened there,
+      # falls back to an explicit extraction-failure notice naming the run
+      # URL when no such file exists (e.g. a syntax-check step failed before
+      # tests ever ran), and never itself fails the job: a clean extraction is
+      # orthogonal to whether the thing it is summarizing passed.
+      - name: Generate failure summary (issue #144)
+        if: failure()
+        shell: bash
+        run: |
+          node worker/lib/failure-summary.js \
+            --test-out run-tests.out \
+            --command "worker-tests job" \
+            --exit-code "${WORKER_TESTS_EXIT_CODE:-unknown}" \
+            --status "${{ job.status }}" \
+            --artifact-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --out failure-summary.md || true
+          if [[ -s failure-summary.md ]]; then
+            {
+              echo "## Worker-tests job failure summary";
+              echo "";
+              cat failure-summary.md;
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload failure summary artifact (issue #144)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-tests-failure-summary
+          path: |
+            failure-summary.md
+            run-tests.out
+          if-no-files-found: ignore
+          retention-days: 14
 
   powershell-validation:
     # scripts/validate.ps1 is the repo's static gate: PowerShell parse, worker
