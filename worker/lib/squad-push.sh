@@ -159,6 +159,8 @@ squad_publish_contract_note() {
     fi
     printf '\n\n---\n%s\n' \
         "Publishing is handled for you: when you finish, leave your work in this checkout (committing it is fine). Do not run git push or gh pr, and do not change git or gh credentials. After you exit, the Squad on ACA worker pushes the branch and opens the pull request. If the brief asks you to open a pull request, that is how it will be opened, so it is not a blocker and you do not need to report it as one."
+    printf '%s\n' \
+        "Pull request title/body: write .squad-pr/title (one line, used verbatim as the PR title) and/or .squad-pr/body.md (Markdown, used verbatim as the PR body, before the worker appends its own governance report) if you want something more meaningful than the default placeholder title/body. For issue-driven work, lead the title or body with \"Fix #N\" (closes the issue on merge) or \"Refs #N\" (related but does not close it) using the real issue number. Do not git add or commit .squad-pr/ yourself -- it is read and then discarded by the worker, and committing it is refused."
     if [[ -n "${SQUAD_SESSION_DEADLINE_UTC:-}" ]]; then
         printf '%s\n' \
             "Session deadline: ${SQUAD_SESSION_DEADLINE_UTC} (UTC; also in the SQUAD_SESSION_DEADLINE_UTC environment variable). By the deadline, commit a coherent, tested slice of the work and stop; do not start a change you cannot finish and commit before it. If anything is left undone, end your last commit message with a \"Remaining:\" Markdown checklist of what is unfinished. If you are still running at the deadline, the worker stops you, commits whatever is in the checkout as a WIP commit, and opens the pull request as a draft marked WIP."

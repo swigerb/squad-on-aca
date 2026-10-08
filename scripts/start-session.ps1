@@ -13,6 +13,8 @@ param(
     [switch]$RunCopilotSmoke,
     [switch]$PushChanges,
     [string]$OutputBranch = "",
+    [string]$PrTitle = "",
+    [string]$PrBody = "",
     [string]$DispatchRoute = "",
     [ValidateSet("", "local-cli", "ralph", "watch", "api")]
     [string]$DispatchSource = "",
@@ -35,6 +37,19 @@ if (-not $SessionName) {
 
 [void](Assert-SquadPromptByteCap -Prompt $Prompt)
 
+# Issue #130: the same caps the worker enforces on an agent-supplied
+# .squad-pr/title and .squad-pr/body.md apply here too, so a CLI-provided
+# override can never be used to smuggle something the agent path would have
+# refused.
+$script:SquadPrTitleCap = 256
+$script:SquadPrBodyCap = 60000
+if ($PrTitle.Length -gt $script:SquadPrTitleCap) {
+    throw "-PrTitle is $($PrTitle.Length) characters, exceeding the $($script:SquadPrTitleCap)-character cap."
+}
+if ($PrBody.Length -gt $script:SquadPrBodyCap) {
+    throw "-PrBody is $($PrBody.Length) characters, exceeding the $($script:SquadPrBodyCap)-character cap."
+}
+
 # Session-scoped variables. These are supplied fresh on every dispatch so a
 # stale value from a previous session can never leak in. Optional variables are
 # only added when set; because we build a COMPLETE env set per execution (see
@@ -42,6 +57,17 @@ if (-not $SessionName) {
 $sessionEnv = [ordered]@{
     "GITHUB_REPOSITORY"          = $Repository
     "GITHUB_REF"                 = $Ref
+    # Issue #130: the pull request base MUST be set explicitly on every
+    # execution. $Ref is already "explicit -Ref when given, otherwise the
+    # repository's real default branch" (resolved above via `gh repo view`),
+    # so mirroring it here into GITHUB_BASE_BRANCH is what makes the worker
+    # open its pull request against the dispatched/default branch instead of
+    # whatever value happens to be baked into the session job template from
+    # deploy time (scripts/deploy.ps1's GITHUB_BASE_BRANCH=$DefaultRef is only
+    # a CREATE-time default for an un-dispatched job; it must never win over a
+    # live dispatch). See scripts/lib/session-env.ps1's SessionManagedEnvKeys
+    # for the stripping half of this fix.
+    "GITHUB_BASE_BRANCH"         = $Ref
     "SQUAD_MODE"                 = $Mode
     "SESSION_NAME"               = $SessionName
     "SQUAD_DEPLOYMENT_MODE"      = "squad-per-pod"
@@ -58,6 +84,12 @@ if ($SubSquad) { $sessionEnv["SQUAD_TEAM"] = $SubSquad }
 if ($RunCopilotSmoke) { $sessionEnv["RUN_COPILOT_SMOKE"] = "true" }
 if ($PushChanges) { $sessionEnv["PUSH_CHANGES"] = "true" }
 if ($OutputBranch) { $sessionEnv["OUTPUT_BRANCH"] = $OutputBranch }
+# Issue #130: an explicit CLI override always wins over whatever the agent
+# writes to .squad-pr/title / .squad-pr/body.md -- see
+# worker/lib/squad-pr-content.sh for the agent-file and precedence half of
+# this feature.
+if ($PrTitle) { $sessionEnv["PR_TITLE"] = $PrTitle }
+if ($PrBody) { $sessionEnv["PR_BODY"] = $PrBody }
 # Sprint 6 (PRD #6): the resolved route, the dispatcher that made the decision,
 # and the lease that was claimed BEFORE this call. Stamping them into the
 # execution is what makes route and source observable in `squad-aca sessions`

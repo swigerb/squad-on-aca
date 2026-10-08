@@ -62,6 +62,7 @@ SQUAD_POLICY_SH="${WORKER_DIR}/lib/squad-policy.sh"
 CRED_LIB_SRC="${WORKER_DIR}/lib/squad-credentials.sh"
 PUSH_LIB_SRC="${WORKER_DIR}/lib/squad-push.sh"
 HUB_LIB_SRC="${WORKER_DIR}/lib/squad-hub.sh"
+PR_CONTENT_LIB_SRC="${WORKER_DIR}/lib/squad-pr-content.sh"
 DEPLOY_PS1="${REPO_ROOT}/scripts/deploy.ps1"
 DOCKERFILE="${WORKER_DIR}/Dockerfile"
 
@@ -497,7 +498,24 @@ EOF
   cat >"${dir}/gh" <<'EOF'
 #!/usr/bin/env bash
 n=$(ls "${STUB_DIR}" | grep -c '^gh-call-' || true)
-printf '%s\0' "$@" >"${STUB_DIR}/gh-call-$((n + 1))"
+# Issue #130: the real worker now passes the PR body via `--body-file <path>`
+# (argv/file, never a shell string) rather than `--body <string>`. For this
+# stub's recorded-argv assertions to still see the BODY TEXT (not a throwaway
+# tmp path that the real worker deletes immediately after this call returns),
+# substitute the next argv element with the file's content when the flag is
+# `--body-file`.
+args=()
+capture_next_as_body=0
+for a in "$@"; do
+  if [[ "$capture_next_as_body" == 1 ]]; then
+    args+=("$(cat -- "$a" 2>/dev/null)")
+    capture_next_as_body=0
+    continue
+  fi
+  args+=("$a")
+  [[ "$a" == "--body-file" ]] && capture_next_as_body=1
+done
+printf '%s\0' "${args[@]}" >"${STUB_DIR}/gh-call-$((n + 1))"
 if [[ "${GH_FAIL_DRAFT:-0}" == 1 ]]; then
   for a in "$@"; do [[ "$a" == "--draft" ]] && { echo "draft pull requests are not supported" >&2; exit 1; }; done
 fi
@@ -544,7 +562,7 @@ run_session() {
     printf 'export STUB_DIR=%q STUB_MODE=%q\n' "${base}/stub" "$stub_mode"
     printf 'export SQUAD_POLICY_RESOLVER=%q\n' "${WORKER_DIR}/lib/agent-policy.js"
     printf 'export SQUAD_POLICY_STATE_DIR=%q\n' "${base}/policy-state"
-    printf 'source %q\n' "$SQUAD_POLICY_SH" "$CRED_LIB_SRC" "$PUSH_LIB_SRC" "$HUB_LIB_SRC" "$DEADLINE_LIB"
+    printf 'source %q\n' "$SQUAD_POLICY_SH" "$CRED_LIB_SRC" "$PUSH_LIB_SRC" "$HUB_LIB_SRC" "$DEADLINE_LIB" "$PR_CONTENT_LIB_SRC"
     printf '%s\n' "$LOG_FN" "$CHECKPOINT_FN" "$ON_ABORT_FN" "$REPORT_FN" "$HUB_REPORT_IF_ANY_FN" "$COMMIT_PUSH_FN"
     # The pieces of the real session the blocks call that are not under test
     # here: credential withholding has its own suite, and hub preflight /
@@ -626,9 +644,9 @@ branch="$(remote_branch golden squad/deadline-test)"
 assert_ne "none" "$branch" "golden: the branch is pushed"
 assert_eq "Remote Squad session deadline-test" "$(git --git-dir="${WORK}/golden/remote.git" log -1 --format=%B "$branch" | sed '/^$/d')" \
   "golden: the commit message is exactly the pre-#134 default"
-assert_eq "pr|create|--repo|octo/repo|--base|main|--head|squad/deadline-test|--title|Remote Squad session deadline-test|--body|Created by Azure-hosted Squad session deadline-test.|" \
+assert_eq "pr|create|--repo|octo/repo|--base|main|--head|squad/deadline-test|--title|Remote Squad session deadline-test|--body-file|Created by Azure-hosted Squad session deadline-test.|" \
   "$(gh_call_flat golden 1)" \
-  "golden: gh pr create receives exactly the pre-#134 argv -- no --draft, no WIP"
+  "golden: gh pr create receives exactly the pre-#134 argv -- no --draft, no WIP (issue #130: body is now via --body-file, not --body <string>)"
 assert_eq "" "$(git --git-dir="${WORK}/golden/remote.git" diff "$(remote_main golden)" "$branch" -- .squad/memory/config.json)" \
   "golden: no .squad/memory/config.json diff either"
 

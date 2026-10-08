@@ -374,12 +374,15 @@ jobs:
               export OV_COMMIT_MESSAGE="$commit_message"
               export OV_SQUAD_DISPATCH_SOURCE="actions"
               export OV_SQUAD_LEASE_KEY="$LEASE_KEY"
-              if [ -n "$base_branch" ]; then
-                # An explicit manual base_branch changes BOTH checkout and PR base
-                # for this run only. Leaving it empty preserves the template's own
-                # GITHUB_BASE_BRANCH, which is today's behaviour.
-                export OV_GITHUB_BASE_BRANCH="$base_branch"
-              fi
+              # Issue #130: GITHUB_BASE_BRANCH is ALWAYS set explicitly for this
+              # execution -- to the explicit manual base_branch when one was
+              # given, otherwise to the repository's real default branch
+              # (base_ref, resolved above from DEFAULT_BASE_REF). It must never
+              # be left unset: an unset override would let the session job
+              # template's own (deploy-time, possibly stale) GITHUB_BASE_BRANCH
+              # win, which is the exact "PRs open against template main" defect
+              # this fixes.
+              export OV_GITHUB_BASE_BRANCH="$base_ref"
               if [ -n "$model" ]; then
                 export OV_SQUAD_MODEL="$model"
               fi

@@ -99,6 +99,8 @@ function New-AcaJobExecutionProvider {
             -RunCopilotSmoke:$prefs.runCopilotSmoke `
             -PushChanges:$prefs.pushChanges `
             -OutputBranch $request.git.outputBranch `
+            -PrTitle $request.git.prTitle `
+            -PrBody $request.git.prBody `
             -DispatchRoute $dispatchRoute `
             -DispatchSource ([string]$request.dispatchSource) `
             -LeaseKey $leaseKey
