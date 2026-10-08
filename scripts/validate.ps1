@@ -4869,13 +4869,31 @@ if ($nodeCmd -and (Test-Path $policyResolver)) {
         '.squad/casting/policy.json',
         '.squad/casting/registry.json',
         '.squad/casting/history.json',
+        '.squad/casting/registry-history.commit.json',
         '.squad/identity/now.md'
     )
     $notReported = @($mustBeReportedMutable | Where-Object { (Get-GovernanceClass $_) -ne 'reported-mutable' })
     if ($notReported.Count -eq 0) {
-        Add-Pass "Casting state (policy/registry/history.json) and identity/now.md all classify reported-mutable: writable all session, changes surfaced rather than blocked"
+        Add-Pass "Casting state (policy/registry/history.json and the Squad 1.0 registry-history.commit.json) and identity/now.md all classify reported-mutable: writable all session, changes surfaced rather than blocked"
     } else {
-        Add-Fail "These Squad 0.13 runtime-state paths should classify reported-mutable but do not: $($notReported -join ', ')"
+        Add-Fail "These Squad runtime-state paths should classify reported-mutable but do not: $($notReported -join ', ')"
+    }
+
+    # Issue #148: Squad 1.0's casting lock/journal/temp files are transient
+    # runtime state, not governance. They must not classify as governance at
+    # all (a lock directory appearing mid-session must never fail a session).
+    $castingTransient = @(
+        '.squad/casting/registry.lock',
+        '.squad/casting/registry.lock.recovery',
+        '.squad/casting/registry-history.transaction.json',
+        '.squad/casting/registry-history.transaction.0f0e.payload/registry.json',
+        '.squad/casting/registry.json.tmp-abc-def'
+    )
+    $transientGoverned = @($castingTransient | Where-Object { (Get-GovernanceClass $_) -ne 'not-governance' })
+    if ($transientGoverned.Count -eq 0) {
+        Add-Pass "Squad 1.0 casting lock, journal, payload and temp files are not governance paths, so creating them mid-session never fails a session"
+    } else {
+        Add-Fail "These Squad 1.0 transient casting paths classify as governance and would fail a session: $($transientGoverned -join ', ')"
     }
 
     # The thing it must NOT allow. A charter states what an agent is permitted to
@@ -5875,10 +5893,47 @@ if (-not (Test-Path $workerDockerfileLayout)) {
         Add-Fail "worker/Dockerfile's default SQUAD_HUB_SPEC is not pinned to squad-hub@0.6.0 (issue #114); it has drifted from the version this image was last verified against"
     }
 
-    if ($dockerfileText -match '@bradygaster/squad-cli@0\.13\.1') {
-        Add-Pass "worker/Dockerfile installs @bradygaster/squad-cli@0.13.1"
+    if ($dockerfileText -match '@bradygaster/squad-cli@') {
+        Add-Fail "worker/Dockerfile still installs @bradygaster/squad-cli from npm; issue #148 replaced it with the checksum-verified Squad release bundle"
     } else {
-        Add-Fail "worker/Dockerfile does not install @bradygaster/squad-cli@0.13.1 (issue #114); it has drifted from the version this image was last verified against"
+        Add-Pass "worker/Dockerfile no longer installs @bradygaster/squad-cli from npm (issue #148)"
+    }
+
+    # Issue #148: Squad comes from the official GitHub release bundle, pinned to
+    # a version AND the SHA-256 published in that release's SHA256SUMS.txt.
+    # Read from the Dockerfile itself, then asserted structurally: the archive
+    # is checked with `sha256sum -c` BEFORE `tar` touches it, nothing is piped
+    # into a shell, and the extracted tree is root-owned with write bits
+    # stripped.
+    $expectedSquadVersion = '1.0.1'
+    $expectedSquadSha256 = '283a1893be9ddad11056dcc8bd0673eff6b48a789bbf523b3f7ec31994d27ac7'
+    if ($dockerfileText -match "(?m)^ARG SQUAD_VERSION=$([regex]::Escape($expectedSquadVersion))\s*$") {
+        Add-Pass "worker/Dockerfile pins SQUAD_VERSION=$expectedSquadVersion"
+    } else {
+        Add-Fail "worker/Dockerfile does not pin ARG SQUAD_VERSION=$expectedSquadVersion (issue #148)"
+    }
+    if ($dockerfileText -match "(?m)^ARG SQUAD_SHA256=$expectedSquadSha256\s*$") {
+        Add-Pass "worker/Dockerfile pins SQUAD_SHA256 to the squad-linux-x64.tar.gz checksum published for v$expectedSquadVersion"
+    } else {
+        Add-Fail "worker/Dockerfile does not pin ARG SQUAD_SHA256=$expectedSquadSha256 (the published SHA-256 of squad-linux-x64.tar.gz v$expectedSquadVersion)"
+    }
+    $sumIdx = $dockerfileText.IndexOf('sha256sum -c')
+    $tarIdx = $dockerfileText.IndexOf('tar -xzf')
+    if ($sumIdx -ge 0 -and $tarIdx -gt $sumIdx -and $dockerfileText -match 'releases/download/v\$\{SQUAD_VERSION\}/squad-linux-x64\.tar\.gz') {
+        Add-Pass "worker/Dockerfile downloads the Squad release asset and verifies it with 'sha256sum -c' before extracting it"
+    } else {
+        Add-Fail "worker/Dockerfile must download squad-linux-x64.tar.gz from the v`${SQUAD_VERSION} release and run 'sha256sum -c' BEFORE 'tar -xzf' (issue #148)"
+    }
+    $shellPipes = @([regex]::Matches($dockerfileText, '(?m)^.*\|\s*(ba|da)?sh\b.*$') | ForEach-Object { $_.Value } | Where-Object { $_ -notmatch 'InstallAzureCLIDeb \| bash' })
+    if ($shellPipes.Count -eq 0) {
+        Add-Pass "worker/Dockerfile pipes nothing new into a shell (the Squad release bundle is downloaded to a file and verified, never curl | sh)"
+    } else {
+        Add-Fail "worker/Dockerfile pipes a download into a shell (issue #148 forbids curl | sh): $($shellPipes -join ' / ')"
+    }
+    if ($dockerfileText -match 'chown -R root:root "/opt/squad-\$\{SQUAD_VERSION\}"' -and $dockerfileText -match 'chmod -R a-w "/opt/squad-\$\{SQUAD_VERSION\}"') {
+        Add-Pass "worker/Dockerfile installs the Squad bundle root-owned with every write bit stripped"
+    } else {
+        Add-Fail "worker/Dockerfile must chown the Squad bundle root:root and strip every write bit (chmod -R a-w) so the runtime users cannot modify it (issue #148)"
     }
 
     # The Copilot CLI pin is DELIBERATELY independent of the squad-cli/squad-hub
@@ -5891,6 +5946,15 @@ if (-not (Test-Path $workerDockerfileLayout)) {
     } else {
         Add-Fail "worker/Dockerfile does not install @github/copilot@1.0.69-2; this pin is independent of issue #114's squad-cli/squad-hub bump and should not have moved alongside it"
     }
+}
+
+# Issue #148: the Squad 1.0 casting commit manifest hashes exact bytes, so the
+# casting pair must check out LF on every platform or `squad health` fails.
+$gitattributesPath = Join-Path $repoRoot '.gitattributes'
+if ((Test-Path $gitattributesPath) -and ((Get-Content -LiteralPath $gitattributesPath -Raw) -match '(?m)^\.squad/casting/\*\.json\s+text\s+eol=lf\s*$')) {
+    Add-Pass ".gitattributes pins .squad/casting/*.json to LF, so a Windows checkout keeps the bytes the Squad 1.0 commit manifest hashes"
+} else {
+    Add-Fail ".gitattributes must contain '.squad/casting/*.json text eol=lf' (issue #148): a CRLF checkout fails squad health against the casting commit manifest"
 }
 
 # ---------------------------------------------------------------------------

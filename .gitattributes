@@ -18,3 +18,8 @@ config/image-evidence/*.json text eol=lf
 # squad-aca CLI golden captures are compared byte-for-byte by
 # scripts/tests/verify-cli-golden.ps1; keep them LF on every checkout.
 scripts/tests/golden/cli/*.txt text eol=lf
+
+# Squad 1.0 (issue #148): the casting registry/history pair is verified byte-for-byte
+# against the SHA-256s in .squad/casting/registry-history.commit.json, so a CRLF
+# checkout (core.autocrlf=true) fails 'squad health'. Pin these to LF everywhere.
+.squad/casting/*.json text eol=lf

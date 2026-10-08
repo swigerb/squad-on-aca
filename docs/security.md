@@ -44,7 +44,7 @@ All sessions run Copilot without `--yolo`, `--allow-all`, `--allow-all-paths`, o
 
 ### watch/loop wrapper
 
-Squad CLI 0.13.1 still injects `--yolo` with `--additional-mcp-config` when it builds its own Copilot command for `watch` and `loop`. The worker therefore passes:
+Squad CLI 0.13.1 and 1.0.1 still inject `--yolo` with `--additional-mcp-config` when they build its own Copilot command for `watch` and `loop`. The worker therefore passes:
 
 ```text
 --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
@@ -113,3 +113,9 @@ Please report privately:
 <https://github.com/swigerb/squad-on-aca/security/advisories/new>.
 
 Do not open a public issue for a suspected vulnerability.
+
+## Squad install supply chain (issue #148)
+
+The worker image installs Squad 1.0.1 from the official upstream GitHub release, not from npm. `worker/Dockerfile` pins `SQUAD_VERSION` and `SQUAD_SHA256` (the value published in that release's `SHA256SUMS.txt` for `squad-linux-x64.tar.gz`), downloads the archive to a file, and verifies it with `sha256sum -c` before `tar` touches it, so a mismatch fails the build. Nothing is piped into a shell. The bundle is extracted to `/opt/squad-<version>` (linked as `/opt/squad` and `/usr/local/bin/squad`), chowned `root:root`, and has every write bit stripped, so neither runtime user can change it. Nothing is fetched at runtime. `.github/workflows/worker-tests.yml` installs the same bundle the same way, reading the version and checksum from the Dockerfile.
+
+Squad 1.0's casting commit manifest, `.squad/casting/registry-history.commit.json`, is governance in the same reported-mutable class as `registry.json` and `history.json`: writable, and every change is reported. Its transient lock, transaction journal, payload directory and temp files are not governance and are added to the checkout's local-only `info/exclude`, so they never fail a session and are never published.

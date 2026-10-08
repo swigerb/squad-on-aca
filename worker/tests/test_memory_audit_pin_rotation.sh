@@ -67,6 +67,13 @@ locate_sdk() {
     printf '%s' "$SQUAD_SDK_DIR"
     return 0
   fi
+  # Issue #148: the worker image installs Squad from the release bundle at
+  # /opt/squad (worker/Dockerfile), so that is the first local fallback.
+  candidate="/opt/squad/app/node_modules/@bradygaster/squad-sdk"
+  if [[ -f "${candidate}/dist/memory/index.js" && -f "${candidate}/dist/storage/fs-storage-provider.js" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
   base="$(npm root -g 2>/dev/null)" || base=""
   if [[ -n "$base" ]]; then
     # A Windows-style path (e.g. under Git Bash or WSL's interop npm) needs
@@ -90,12 +97,15 @@ locate_sdk() {
 SDK_DIR=""
 if SDK_DIR="$(locate_sdk)"; then
   SDK_VERSION="$(node -e 'console.log(require(require("path").join(process.argv[1], "package.json")).version)' "$SDK_DIR" 2>/dev/null || true)"
-  if [[ "$SDK_VERSION" != 0.13.* ]]; then
-    echo "SKIP: test_memory_audit_pin_rotation.sh — @bradygaster/squad-sdk at ${SDK_DIR} is '${SDK_VERSION:-unknown}', not 0.13.x (the version worker/Dockerfile ships); this suite needs the real rotation logic this pin relies on"
+  # Issue #148: lockstep with what worker/Dockerfile actually ships (its
+  # SQUAD_VERSION ARG), not a hard-coded version that could silently drift.
+  EXPECTED_SQUAD_VERSION="$(sed -n 's/^ARG SQUAD_VERSION=//p' "${WORKER_DIR}/Dockerfile" | head -n 1)"
+  if [[ -z "$EXPECTED_SQUAD_VERSION" || "$SDK_VERSION" != "$EXPECTED_SQUAD_VERSION" ]]; then
+    echo "SKIP: test_memory_audit_pin_rotation.sh — @bradygaster/squad-sdk at ${SDK_DIR} is '${SDK_VERSION:-unknown}', not ${EXPECTED_SQUAD_VERSION:-<unknown>} (the version worker/Dockerfile ships); this suite needs the real rotation logic this pin relies on"
     exit 77
   fi
 else
-  echo "SKIP: test_memory_audit_pin_rotation.sh — @bradygaster/squad-sdk 0.13.1 not found (set SQUAD_SDK_DIR, or see .github/workflows/worker-tests.yml for how CI installs it)"
+  echo "SKIP: test_memory_audit_pin_rotation.sh — the @bradygaster/squad-sdk that worker/Dockerfile ships was not found (set SQUAD_SDK_DIR to <bundle>/app/node_modules/@bradygaster/squad-sdk, or see .github/workflows/worker-tests.yml for how CI installs it)"
   exit 77
 fi
 

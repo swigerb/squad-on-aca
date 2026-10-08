@@ -227,7 +227,10 @@ assert_eq "root:root" "$lib_chown" \
 # Extract the real `chmod -R a-w ...` command this Dockerfile ships (rather
 # than hand-writing an equivalent one here, which could pass while the real
 # RUN line regressed) and apply it to the materialised layout.
-chmod_line="$(grep -o 'chmod -R a-w [^&]*' "$DOCKERFILE" | head -1)"
+# Issue #148: the Squad release bundle has its OWN `chmod -R a-w` pass (over
+# /opt/squad-<version>, asserted by test_squad_release_install.sh), so select the
+# one over the shipped squad-on-aca paths rather than whichever comes first.
+chmod_line="$(grep -o 'chmod -R a-w [^&]*' "$DOCKERFILE" | grep 'squad-on-aca' | head -1)"
 chmod_line="${chmod_line%$'\r'}"
 assert_ne "" "$chmod_line" \
   "image layout (F1): the Dockerfile's RUN block contains a 'chmod -R a-w' pass over the shipped squad-on-aca paths"

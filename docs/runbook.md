@@ -148,7 +148,9 @@ The parsed report must use this schema:
 { "schema": "squad-health/v1", "status": "pass", "checks": [{ "id": "team", "status": "pass", "message": "..." }] }
 ```
 
-The overall status is `pass` or `fail`; check status is `pass`, `fail`, or `skip`. The check ids emitted by Squad 0.13.1 are `team`, `registry-charters`, `routing`, `state-backend`, and `env-vars`. There is no `warn` status.
+The overall status is `pass` or `fail`; check status is `pass`, `fail`, or `skip`. The check ids emitted by Squad 0.13.1 and 1.0.1 are `team`, `registry-charters`, `routing`, `state-backend`, and `env-vars`. There is no `warn` status.
+
+On Squad 1.0.1 a repository that still carries the 0.13 casting layout fails `registry-charters` ("Cannot read a consistent casting registry/history pair: ..."). The worker still refuses the session with exit 78, and its log names the fix: run `squad upgrade` with Squad 1.0.1 or later, then commit `.squad/casting/registry.json`, `.squad/casting/history.json` and `.squad/casting/registry-history.commit.json`, and pin `.squad/casting/*.json text eol=lf` in `.gitattributes` (the commit manifest hashes exact bytes).
 
 A parsed `status: "fail"` fails closed in the worker with exit `78` and logs the failing check ids:
 

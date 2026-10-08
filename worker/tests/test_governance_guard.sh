@@ -121,6 +121,7 @@ REPORTED_MUTABLE_FILES=(
   ".squad/casting/policy.json"
   ".squad/casting/registry.json"
   ".squad/casting/history.json"
+  ".squad/casting/registry-history.commit.json"
   ".squad/identity/now.md"
 )
 
@@ -713,10 +714,10 @@ assert_contains "$out" "was DELETED"  "the refusal names it as the work log bein
 # the markdown fed to the PR body.
 echo "-- Issue #113: casting/*.json and identity/now.md are reported-mutable --"
 
-# All four reported-mutable paths rewritten in the SAME session, verified in
+# All the reported-mutable paths rewritten in the SAME session, verified in
 # ONE call: this is exactly what the class permits (simultaneous unrelated
 # rewrites, no coordination required between them), and one hardened repo
-# proves it for all four at once instead of isolating each into its own
+# proves it for all of them at once instead of isolating each into its own
 # make_repo+harden+verify cycle (see the timing note in section 2c above).
 REPO="${TEST_TMP_ROOT}/repo-reported"; STATE="${TEST_TMP_ROOT}/state-reported"; rm -rf "$STATE"
 make_repo "$REPO" >/dev/null
