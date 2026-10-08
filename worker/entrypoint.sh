@@ -201,6 +201,21 @@ fi
 # shellcheck source=lib/squad-push.sh
 source "$SQUAD_PUSH_LIB"
 
+# Issue #130: agent-supplied pull request title/body (.squad-pr/title,
+# .squad-pr/body.md), with the safety rules and the commit-scrub that keeps
+# them out of every commit this worker makes. Loaded unconditionally: the
+# functions are cheap and CREATE_PR/PUSH_CHANGES are read at call time, not
+# here.
+SQUAD_PR_CONTENT_LIB="${SQUAD_PR_CONTENT_LIB:-/usr/local/lib/squad-on-aca/squad-pr-content.sh}"
+if [[ ! -f "$SQUAD_PR_CONTENT_LIB" ]]; then
+  log "PR content library not found at ${SQUAD_PR_CONTENT_LIB}."
+  log "Without it an agent-written .squad-pr/ could end up committed verbatim instead of being read and scrubbed. Refusing to start."
+  exit 78
+fi
+# shellcheck source=lib/squad-pr-content.sh
+source "$SQUAD_PR_CONTENT_LIB"
+
+
 # Issue #115: forwards SIGTERM/SIGINT from this script to the backgrounded
 # `squad watch`/`squad loop` child so Squad can drain instead of being killed
 # abruptly when ACA stops this replica. See worker/lib/squad-signal-forwarding.sh.
@@ -498,6 +513,13 @@ source "$SQUAD_POLICY_LIB"
 
 squad_policy_resolve
 squad_policy_harden "$REPO_DIR"
+
+# Issue #130: install the .squad-pr/ commit/push guard AFTER governance
+# hardening above, so if squad_policy_harden already installed a pin-seal
+# hook, this one PREPENDS to it (runs first, falls through to the pin-seal
+# check) instead of being skipped as "an unrecognized existing hook" by
+# squad_policy_pin_install_hooks's own idempotency check.
+squad_pr_content_install_hooks "$REPO_DIR"
 
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
@@ -945,6 +967,21 @@ commit_and_push_if_needed() {
   fi
 
   local branch="${OUTPUT_BRANCH:-squad/${SESSION_NAME}}"
+  # Issue #130: resolve the pull request title/body BEFORE the commit below,
+  # with precedence CLI/dispatch override (PR_TITLE / PR_BODY session env) >
+  # agent-supplied .squad-pr/title / .squad-pr/body.md > the worker's own
+  # default text (applied later, in the CREATE_PR block, when both of these
+  # are empty). Stored in SQUAD_RESOLVED_PR_TITLE / SQUAD_RESOLVED_PR_BODY so
+  # the CREATE_PR block below does not need to re-read a directory this
+  # function is about to scrub.
+  SQUAD_RESOLVED_PR_TITLE="$(squad_pr_content_resolve_title "$REPO_DIR" "${PR_TITLE:-}")"
+  SQUAD_RESOLVED_PR_BODY="$(squad_pr_content_resolve_body "$REPO_DIR" "${PR_BODY:-}")"
+  # .squad-pr/ is agent OUTPUT, read above -- never repository content. Scrub
+  # it from both the worktree and the index unconditionally, BEFORE `git add
+  # -A`, so it can never end up in a commit this worker makes even if the
+  # agent (or a hostile prompt injection) tried to have it committed
+  # deliberately.
+  squad_pr_content_scrub "$REPO_DIR"
   # Issue #134: a session the watchdog stopped at its deadline publishes
   # through this SAME function -- the governance checkpoint above, the
   # pre-commit pin hook and squad_push_branch's pin backstop below all run
@@ -958,6 +995,16 @@ commit_and_push_if_needed() {
   git checkout -B "$branch"
   if [[ -n "$(git status --porcelain)" ]]; then
     git add -A
+    # Defense in depth: even after the scrub above, refuse to commit if
+    # `.squad-pr` somehow re-entered the index (for example the agent created
+    # it again after the scrub ran). Re-scrub and continue rather than fail
+    # the whole session over agent output that was never meant to be
+    # committed.
+    if git diff --cached --name-only | grep -q '^\.squad-pr/'; then
+      log "'.squad-pr/' re-appeared in the index after scrubbing; removing it again before committing."
+      squad_pr_content_scrub "$REPO_DIR"
+      git add -A
+    fi
     if [[ "$timed_out" -eq 1 ]]; then
       wip_files="$(git diff --cached --name-only | wc -l | tr -d '[:space:]')"
       commit_message="$(squad_deadline_wip_commit_message "$commit_message")"
@@ -1025,8 +1072,15 @@ commit_and_push_if_needed() {
     # (run by squad_policy_checkpoint) populates SQUAD_POLICY_REPORTED_CHANGES;
     # the report function below is a no-op (empty string) when there were none,
     # so a session that touched no reported-mutable path gets an unchanged body.
-    local pr_body="${PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}"
-    local pr_title="${PR_TITLE:-Remote Squad session ${SESSION_NAME}}"
+    #
+    # Issue #130: title/body precedence is CLI/dispatch override (PR_TITLE /
+    # PR_BODY session env) > agent-supplied .squad-pr/title / .squad-pr/body.md
+    # > this worker's own default text. SQUAD_RESOLVED_PR_TITLE/BODY were
+    # already resolved against BOTH of the higher-precedence sources earlier in
+    # this function (before the .squad-pr/ scrub), so only the worker default
+    # is applied here.
+    local pr_body="${SQUAD_RESOLVED_PR_BODY:-Created by Azure-hosted Squad session ${SESSION_NAME}.}"
+    local pr_title="${SQUAD_RESOLVED_PR_TITLE:-Remote Squad session ${SESSION_NAME}}"
     local pr_url="" pr_number=""
     if [[ "$timed_out" -eq 1 ]]; then
       pr_body="$(squad_deadline_wip_pr_body "$pr_body" "$wip_commit" "$wip_files")"
@@ -1043,14 +1097,36 @@ commit_and_push_if_needed() {
     if [[ -n "${SQUAD_PR_REVIEWER:-}" ]]; then
       pr_body+="$(printf '\n\nRequested reviewer (squad): %s' "$SQUAD_PR_REVIEWER")"
     fi
+    # The governance report is ALWAYS appended last, after title/body have
+    # been resolved from whichever source above -- an agent-supplied
+    # .squad-pr/body.md can change the narrative, never the audit trail.
     pr_body+="$(squad_policy_reported_changes_report)"
+    # Issue #130: the ARM REST dispatch paths now always set GITHUB_BASE_BRANCH
+    # to either an explicit override or the repository's real default branch
+    # (never the stale value baked into the job template at deploy time -- see
+    # worker/lib/ralph-dispatch.sh, scripts/lib/session-env.ps1 and
+    # .github/workflows/squad-dispatch.yml). GITHUB_REF is kept ONLY as a
+    # fallback for direct/manual invocations that predate that fix (and for
+    # worker/tests that call this function without setting GITHUB_BASE_BRANCH).
+    # Whatever the chosen base branch is, fail clearly if it does not exist on
+    # the remote -- `gh pr create` would otherwise fail anyway, but with a
+    # generic "field head/base" message, and worse, a looser fallback here
+    # would risk silently retargeting a legitimate PR at "main".
+    local base_branch="${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}"
+    if ! git ls-remote --exit-code --heads origin "$base_branch" >/dev/null 2>&1; then
+      log "Refusing to open a pull request: base branch '${base_branch}' does not exist on origin. This is either a misconfigured dispatch (GITHUB_BASE_BRANCH) or a deleted/renamed branch -- it must be fixed at the dispatch source, not silently redirected to 'main'."
+      exit 78
+    fi
+    local pr_body_file
+    pr_body_file="$(mktemp)" || { log "Could not create a temporary file for the pull request body."; exit 1; }
+    printf '%s' "$pr_body" >"$pr_body_file"
     local -a pr_create_args=(
       gh pr create
       --repo "$GITHUB_REPOSITORY"
-      --base "${GITHUB_BASE_BRANCH:-${GITHUB_REF:-main}}"
+      --base "$base_branch"
       --head "$branch"
       --title "$pr_title"
-      --body "$pr_body"
+      --body-file "$pr_body_file"
     )
     # Issue #135 re-dispatch finding: `gh pr create --reviewer <id>` on
     # github.com, when <id> is not a real GitHub login (the common case here --
@@ -1087,6 +1163,7 @@ commit_and_push_if_needed() {
     else
       pr_url="$("${pr_create_args[@]}")" || true
     fi
+    rm -f -- "$pr_body_file" 2>/dev/null || true
     if [[ -n "$pr_url" && -n "${SQUAD_PR_REVIEWER:-}" ]]; then
       # Best-effort only: the requested reviewer is already recorded in the PR
       # body above, so a failure here (the common case, since SQUAD_PR_REVIEWER
@@ -1382,6 +1459,19 @@ NODE
     # token file into the environment first.
     squad_credential_refresh_env || true
     gh label create "$RALPH_DISPATCH_LABEL" --repo "$GITHUB_REPOSITORY" --color 5319E7 --description "Dispatched by Squad on ACA Ralph" --force >/dev/null 2>&1 || true
+
+    # Issue #130: resolve the repository's REAL default branch ONCE, fresh,
+    # for this Ralph run. Every issue this run dispatches uses it as both the
+    # checkout ref and the pull request base (worker/lib/ralph-dispatch.sh),
+    # so a repository whose default branch is not "main" -- or whose default
+    # branch changed since this job's template was deployed -- is handled
+    # correctly rather than silently targeting a stale deploy-time value.
+    RALPH_DEFAULT_BASE_REF="$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)"
+    if [[ -z "$RALPH_DEFAULT_BASE_REF" ]]; then
+      log "Could not determine the default branch for ${GITHUB_REPOSITORY}; refusing to dispatch (a stale template value must never be used as the pull request base)."
+      exit 1
+    fi
+    export RALPH_DEFAULT_BASE_REF
 
     issues_json="$(mktemp)"
     squad_credential_refresh_env || true

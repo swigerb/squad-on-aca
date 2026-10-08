@@ -14,6 +14,10 @@ node_modules/
 # Squad: SubSquad activation file (local to this machine)
 .squad-workstream
 
+# Squad on ACA: agent-supplied PR title/body (session output, never repo content —
+# the worker also refuses it via pre-commit/pre-push hooks and a local-only exclude)
+.squad-pr/
+
 # .NET / Aspire optional integration path build output
 bin/
 obj/

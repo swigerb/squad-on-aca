@@ -36,6 +36,7 @@ $script:AcaJobDefinitionCache = @{}
 $script:LiteralOnlySessionEnvKeys = @(
     "GITHUB_REPOSITORY",
     "GITHUB_REF",
+    "GITHUB_BASE_BRANCH",
     "SQUAD_MODE",
     "SESSION_NAME",
     "SQUAD_DEPLOYMENT_MODE",
@@ -64,6 +65,7 @@ $script:LiteralOnlySessionEnvKeys = @(
 $script:SessionManagedEnvKeys = @(
     "GITHUB_REPOSITORY",
     "GITHUB_REF",
+    "GITHUB_BASE_BRANCH",
     "SQUAD_MODE",
     "SESSION_NAME",
     "SQUAD_DEPLOYMENT_MODE",

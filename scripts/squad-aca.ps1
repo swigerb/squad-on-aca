@@ -22,7 +22,7 @@ Squad on ACA
 
 Usage:
   squad-aca init [--owner <github-owner>] [--name <repo-name>] [--public|--private]
-  squad-aca run "prompt" [--repo <owner/repo>] [--name <session>] [--branch <branch>] [--no-push]
+  squad-aca run "prompt" [--repo <owner/repo>] [--name <session>] [--branch <branch>] [--no-push] [--pr-title <title>] [--pr-body-file <path>]
   squad-aca "prompt"
   squad-aca new --owner <github-owner> --name <repo-name> [--description "..."]
   squad-aca smoke [--repo <owner/repo>]
@@ -88,7 +88,7 @@ function Get-PromptText {
             continue
         }
         $item = $Rest[$i]
-        if ($item -in @("--repo", "-Repository", "--name", "-SessionName", "--branch", "-OutputBranch", "--sub-squad", "-SubSquad", "--owner", "--description", "--subscription", "--resource-group", "--session-job", "--ralph-job", "--watch-app", "--dashboard-url", "--log-analytics-workspace")) {
+        if ($item -in @("--repo", "-Repository", "--name", "-SessionName", "--branch", "-OutputBranch", "--sub-squad", "-SubSquad", "--owner", "--description", "--subscription", "--resource-group", "--session-job", "--ralph-job", "--watch-app", "--dashboard-url", "--log-analytics-workspace", "--pr-title", "--pr-body-file")) {
             $skipNext = $true
             continue
         }
@@ -1164,6 +1164,20 @@ function Invoke-Run {
     $session = Get-OptionValue $Items @("--name", "-SessionName") "session-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     $branch = Get-OptionValue $Items @("--branch", "-OutputBranch") "squad/$session"
     $subSquad = Get-OptionValue $Items @("--sub-squad", "-SubSquad")
+    $prTitle = Get-OptionValue $Items @("--pr-title")
+    $prBodyFile = Get-OptionValue $Items @("--pr-body-file")
+    $prBody = ""
+    if ($prBodyFile) {
+        if (-not (Test-Path -LiteralPath $prBodyFile -PathType Leaf)) {
+            throw "--pr-body-file '$prBodyFile' does not exist or is not a file."
+        }
+        $prBodyItem = Get-Item -LiteralPath $prBodyFile
+        if ($prBodyItem.LinkType) {
+            throw "--pr-body-file '$prBodyFile' is a symlink/reparse point; refusing to read it."
+        }
+        $prBody = Get-Content -LiteralPath $prBodyFile -Raw
+        if (-not $prBody) { $prBody = "" }
+    }
     $prompt = Get-PromptText $FirstPrompt $Items
     if (-not $prompt) { throw "Provide a prompt, e.g. squad-aca `"Build the API and open a PR`"." }
 
@@ -1178,7 +1192,9 @@ function Invoke-Run {
         -Mode "prompt" `
         -SubSquad $subSquad `
         -PushChanges (-not (Has-Option $Items @("--no-push"))) `
-        -OutputBranch $branch
+        -OutputBranch $branch `
+        -PrTitle $prTitle `
+        -PrBody $prBody
     Start-LeasedExecution -Config $config -Request $request -ManifestSource $manifestSource `
         -Json:(Has-Option $Items @("--json"))
 }

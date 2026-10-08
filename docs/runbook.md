@@ -99,6 +99,27 @@ Use `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` for Copilot CLI headless auth. Fine-gra
 
 In `prompt` and `new-project` mode with `PUSH_CHANGES=true`, the worker publishes, not the agent. The agent's prompt ends with a note telling it to leave its work in the checkout (committing is fine) and not to run `git push` or `gh pr`. After the agent exits, the worker publishes uncommitted changes, new files, and commits the agent made itself to `OUTPUT_BRANCH` and opens the pull request. Commits that are already on the remote (an attended agent you allowed to push) are not published a second time.
 
+### Pull request base branch
+
+The worker opens the pull request against `GITHUB_BASE_BRANCH` for that execution, resolved on every dispatch path (PowerShell CLI, Ralph/bash, and the GitHub Actions workflow) as: the explicit `--branch`/dispatch base when one was provided, otherwise the repository's **real** default branch fetched at dispatch time. `GITHUB_BASE_BRANCH` is a session-managed key on every dispatch path, so each execution's ARM REST `jobs/<job>/start` request body always carries a fresh value — a stale job-template value from an earlier deploy never wins.
+
+Before opening the pull request, the worker verifies the resolved base branch exists on `origin` (`git ls-remote --exit-code --heads origin <branch>`). If it does not, the worker exits `78` with a clear error instead of silently falling back to `main`.
+
+### Pull request title and body
+
+The agent may leave `.squad-pr/title` and `.squad-pr/body.md` in the checkout to supply a meaningful PR title and body. The worker:
+
+- refuses symlinks at either path (falls back to its own default text, logs why);
+- caps the title at 256 characters and the body at 60000 characters;
+- strips unsafe control characters, preserving body newlines;
+- reads these files **before** the commit, then scrubs `.squad-pr/` from both the worktree and the index unconditionally — it is agent *output*, never repository content, and is never committed;
+- passes the resolved title/body to `gh pr create` via `--title`/`--body-file` (a temp file), never by interpolating untrusted text into a shell string;
+- always appends the existing governance report to the body after the resolved text — the report can never be replaced by agent-supplied content.
+
+`squad-aca run` also accepts `--pr-title <title>` and `--pr-body-file <path>` (read locally and carried as `PR_TITLE`/`PR_BODY` through the session environment, including the ARM REST JSON body). Precedence, highest to lowest: `--pr-title`/`--pr-body-file` flags, then `.squad-pr/title`/`.squad-pr/body.md` from the agent, then the worker's own default title/body text.
+
+`.squad-pr/` is excluded locally (`.git/info/exclude`) and refused by the worker's additive pre-commit/pre-push hooks even if an agent or earlier process forces it into the index.
+
 ### Session deadline
 
 In `prompt` and `new-project` mode (direct and Squad Hub `oneshot`), the agent runs under a watchdog (`worker/lib/squad-deadline.sh`, issue #134). Without it, a session still working when ACA reached `replicaTimeout` was killed with all of its work unpublished.

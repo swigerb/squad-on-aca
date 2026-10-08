@@ -36,6 +36,7 @@
 RALPH_MANAGED_ENV_KEYS=(
   GITHUB_REPOSITORY
   GITHUB_REF
+  GITHUB_BASE_BRANCH
   SQUAD_MODE
   SESSION_NAME
   SQUAD_DEPLOYMENT_MODE
@@ -219,7 +220,17 @@ ralph_dispatch_issue() {
   #   RALPH_SESSION_JOB_DEFINITION_JSON
   local issue_number="$1" issue_title="$2" issue_url="$3"
   local session_name prompt env_file body_file job_file decision claim_result claim_outcome claim_state route lease_key
-  local prompt_cap_err subscription_id start_response exec_name
+  local prompt_cap_err subscription_id start_response exec_name base_ref
+
+  # Issue #130: the PR base (and the checkout ref) must be the repository's
+  # REAL default branch, resolved fresh for this dispatch -- never a value
+  # baked into the session job template at deploy time (which is stale the
+  # moment the repository's default branch changes) and never a bare "main"
+  # literal. RALPH_DEFAULT_BASE_REF is resolved once per Ralph run (worker/
+  # entrypoint.sh, `ralph` mode) via `gh repo view --json defaultBranchRef`.
+  # The legacy fallback chain is kept ONLY for callers (tests) that invoke
+  # this function directly without going through entrypoint.sh.
+  base_ref="${RALPH_DEFAULT_BASE_REF:-${GITHUB_REF:-${GITHUB_BASE_BRANCH:-main}}}"
 
   session_name="issue-${issue_number}-$(date +%Y%m%d%H%M%S)"
   prompt="Ralph dispatched GitHub issue #${issue_number}: ${issue_title}
@@ -307,7 +318,8 @@ Use Squad to inspect the repository, work the issue if it is actionable, create 
   # fails we skip the issue WITHOUT starting a job or adding a label.
   if ! SJ_ENV="$RALPH_SESSION_JOB_ENV_JSON" \
        OV_GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
-       OV_GITHUB_REF="${GITHUB_REF:-${GITHUB_BASE_BRANCH:-main}}" \
+       OV_GITHUB_REF="$base_ref" \
+       OV_GITHUB_BASE_BRANCH="$base_ref" \
        OV_SQUAD_MODE="prompt" \
        OV_SESSION_NAME="$session_name" \
        OV_SQUAD_POD_ID="$session_name" \

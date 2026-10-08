@@ -179,6 +179,8 @@ Each execution schedules a new ACA job replica, sets `SQUAD_POD_ID=feature-123` 
 
 Dispatch starts the ACA job through the ARM REST API with a JSON body built from the stored job template. Free-text values such as the prompt, session name, branch, and team stay in that body instead of appearing on any command line. `SQUAD_PROMPT` is capped at **100,000 UTF-8 bytes** on every path; the worker later appends its own publish-contract note before `copilot -p`, so the cap stays below Linux's `MAX_ARG_STRLEN` ceiling.
 
+The worker opens its pull request against the dispatched/default branch, never a stale template value: `GITHUB_BASE_BRANCH` is a session-managed key refreshed on every execution (explicit `--branch` when given, otherwise the repository's real default branch). The agent can supply a meaningful title and body by writing `.squad-pr/title` and `.squad-pr/body.md` in the checkout before it exits — sanitized, capped, never committed, and always followed by the governance report. `squad-aca run --pr-title <title> --pr-body-file <path>` overrides those agent-supplied files from the CLI. See [docs/runbook.md](docs/runbook.md#pull-request-base-branch) for the full precedence and safety rules.
+
 ## Start without an existing repo
 
 Use the new-project helper. It creates a GitHub repo with an initial default branch, then starts a remote Squad bootstrap session:

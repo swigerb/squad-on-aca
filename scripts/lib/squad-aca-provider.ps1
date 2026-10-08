@@ -96,7 +96,9 @@ function New-SquadDispatchRequest {
         [bool]$RunCopilotSmoke = $false,
         [bool]$AllowFallback = $true,
         [bool]$LiveStatusRequested = $true,
-        [string]$OutputBranch = ""
+        [string]$OutputBranch = "",
+        [string]$PrTitle = "",
+        [string]$PrBody = ""
     )
 
     $owner = ""
@@ -138,6 +140,13 @@ function New-SquadDispatchRequest {
         })
         git = [pscustomobject]([ordered]@{
             outputBranch = $OutputBranch
+            # Issue #130: an explicit `squad-aca run --pr-title` / `--pr-body-file`
+            # carried through to the worker as PR_TITLE / PR_BODY session env.
+            # Empty strings here mean "no CLI override" -- the worker falls back
+            # to an agent-supplied .squad-pr/title / .squad-pr/body.md, and
+            # failing that, its own built-in defaults.
+            prTitle      = $PrTitle
+            prBody       = $PrBody
         })
     })
 }
