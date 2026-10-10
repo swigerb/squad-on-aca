@@ -122,6 +122,7 @@ The pre-existing M1–M11 mutation-proof targets and their assertions in `test_c
 
 | `worker/tests/test_dispatch_registry_exhaustiveness.sh` | Scans every production dispatcher (excluding test directories) for literal `SQUAD_DISPATCH_SOURCE=`/`SQUAD_MODE=` assignments and fails if any names a source or mode absent from `agent-policy.js`'s registry — a new dispatcher cannot silently bypass the matrix. |
 | `worker/tests/test_squad_hub.sh` | Trust-conditioned hub policy: untrusted sources' `hub-argv-json` carries the narrowed untrusted deny patterns; `local-cli`'s does not. |
+| `worker/tests/test_squad_model_policy.sh` | Issue #150 role-model alignment: `.squad/config.json`, every charter `## Model`, routing, `ralph-instructions.md`, the operative `squad.agent.md` and the after-agent Scribe spawn (reference plus overlay) agree on `gpt-6.1-sol` (lead/advisor/security/rai/fact-checker), `claude-sonnet-5.5` (engineer/reviewer/devrel/ralph) and `claude-haiku-5.5` (scribe/docs); config keys equal the lowercase agent folders; the Scribe overlay keeps the full reference prompt duties; no silent downgrade; superseded decisions stay labelled. Checks live in `worker/tests/lib/squad-model-policy.js`, which also applies 51 in-memory mutants that must each be rejected. Instruction-level only — it does not prove a runtime honoured a model. |
 
 ## CLI contract validation
 
@@ -176,6 +177,7 @@ require_deps node git
 | `test_agent_policy.sh` | `node` |
 | `test_dispatch_registry_exhaustiveness.sh` | `node`, `grep` |
 | `test_credential_withholding.sh` | `node`, `git`, `openssl` |
+| `test_squad_model_policy.sh` | `node` |
 
 A missing dependency exits `77` and is counted as a skip:
 

@@ -9,6 +9,12 @@ on:
       - 'aspire/**'
       - 'docs/capability-manifest.md'
       - 'docs/examples/squad-capabilities.example.yml'
+      - '.squad/config.json'
+      - '.squad/routing.md'
+      - '.squad/ralph-instructions.md'
+      - '.squad/agents/*/charter.md'
+      - '.squad/templates/after-agent-reference.md'
+      - '.github/agents/squad.agent.md'
       - '.github/workflows/worker-tests.yml'
   push:
     branches: [main]
@@ -19,6 +25,12 @@ on:
       - 'aspire/**'
       - 'docs/capability-manifest.md'
       - 'docs/examples/squad-capabilities.example.yml'
+      - '.squad/config.json'
+      - '.squad/routing.md'
+      - '.squad/ralph-instructions.md'
+      - '.squad/agents/*/charter.md'
+      - '.squad/templates/after-agent-reference.md'
+      - '.github/agents/squad.agent.md'
       - '.github/workflows/worker-tests.yml'
 
 jobs:

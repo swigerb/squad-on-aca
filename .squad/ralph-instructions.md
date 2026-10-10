@@ -47,6 +47,14 @@
 Read this file for your full instructions.  Follow ALL sections.
 MAXIMIZE PARALLELISM — spawn agents for ALL actionable issues simultaneously.
 
+### Models
+
+Every agent you spawn must run the model that `.squad/config.json` pins for it:
+look up `agentModelOverrides` under the lowercase member name and pass that value
+as `model`, exactly as written. You are `ralph` and run `claude-sonnet-5.5`. If a
+configured model is unavailable or out of quota, stop and report which member and
+model — do not retry on another model and do not omit the `model` parameter.
+
 ### Issue Selection
 
 Work on every open, unblocked, unassigned issue labeled `squad` or `squad:{member}`.

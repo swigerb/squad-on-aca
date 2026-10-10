@@ -2,11 +2,11 @@
   "version": 1,
   "defaultModel": "claude-sonnet-5.5",
   "agentModelOverrides": {
-    "advisor": "claude-opus-5.5",
-    "lead": "claude-opus-5.5",
-    "security": "claude-opus-5.5",
-    "rai": "claude-opus-5.5",
-    "fact-checker": "claude-opus-5.5",
+    "advisor": "gpt-6.1-sol",
+    "lead": "gpt-6.1-sol",
+    "security": "gpt-6.1-sol",
+    "rai": "gpt-6.1-sol",
+    "fact-checker": "gpt-6.1-sol",
     "engineer": "claude-sonnet-5.5",
     "reviewer": "claude-sonnet-5.5",
     "devrel": "claude-sonnet-5.5",
@@ -19,16 +19,20 @@
     "reference": "https://claude.com/blog/the-advisor-strategy",
     "developmentWork": "Route development work through Squad.",
     "executorModel": "claude-sonnet-5.5",
-    "advisorModel": "claude-opus-5.5",
+    "advisorModel": "gpt-6.1-sol",
     "scribeModel": "claude-haiku-5.5",
     "notes": [
       "Executors drive end to end and escalate to the advisor only when they hit a decision they cannot reasonably settle. Frontier reasoning is applied where it changes the outcome, not to every token of every task.",
-      "Opus is reserved for roles that judge rather than execute: the advisor itself, the lead, and the three review roles whose findings can block a release.",
-      "Haiku runs the scribe and docs. Both are high volume and low ambiguity, which is the shape Haiku is good at.",
-      "defaultModel is claude-sonnet-5.5 so a NEW agent added later lands on the executor tier by default rather than silently inheriting Opus.",
+      "gpt-6.1-sol is reserved for roles that judge rather than execute: the advisor itself, the lead, and the three review roles whose findings can block a release (security, rai, fact-checker).",
+      "claude-haiku-5.5 runs the scribe and docs. Both are high volume and low ambiguity, which is the shape a small model is good at.",
+      "defaultModel is claude-sonnet-5.5 so a NEW agent added later lands on the executor tier by default rather than silently inheriting the judgement tier.",
       "Every agent is listed explicitly even where it matches defaultModel, because Layer 0a beats Layer 0b and an unlisted agent is easy to misread as deliberate.",
+      "Keys are exact, case-sensitive member names: the lowercase .squad/agents/<name>/ folder, which is also the casting registry key and the spawn name. A display-cased key such as Rai or Scribe never matches and silently falls through to defaultModel. developer is not a member; that work is engineer.",
+      "The after-agent Scribe spawn passes scribeModel explicitly, resolved from agentModelOverrides.scribe, never from a template default or a task-based choice. .squad/templates/after-agent-reference.md takes it as {scribe_model} and .github/agents/squad.agent.md is the authoritative overlay; the reference's full Scribe prompt (manifest, archival gates, logs, permitted history updates, health report) is preserved, not replaced.",
+      "If a configured model is unavailable or out of quota, stop and report which member and model. Do not downgrade silently and do not omit the model parameter.",
+      "These notes describe the instructions the coordinator reads. They are not a runtime guarantee that a spawn used the configured model; record the model actually resolved for each invocation.",
       "LIMITATION, measured: Anthropic advisor tool performs the handoff inside a single API request. Squad cannot. An agent needing another agent must end its turn and let the coordinator bring one in, so each escalation costs a round trip. See .squad/agents/advisor/charter.md.",
-      "Model ids verified against the Copilot models API (squad models refresh) on 2026-10-08: claude-opus-5.5, claude-sonnet-5.5 and claude-haiku-5.5 are all available."
+      "Superseded 2026-10-09 (issue #150): the judgement tier was claude-opus-5.5, which Brian replaced with gpt-6.1-sol. The earlier mapping is kept as a superseded entry in .squad/decisions.md. claude-sonnet-5.5 and claude-haiku-5.5 were verified against the Copilot models API (squad models refresh) on 2026-10-08; gpt-6.1-sol is the owner-authorised judgement-tier model and its availability is reported at spawn time, not asserted here."
     ]
   }
 }
