@@ -47,7 +47,15 @@ WORK="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/squad-pr-content-test.XXXXXXXXXXXX
 }
 trap 'rm -rf "$WORK"' EXIT
 
-git_quiet() { git -c init.defaultBranch=main -c user.email=test@example.com -c user.name=test "$@" >/dev/null 2>&1; }
+git_quiet() { git -c init.defaultBranch=main "$@" >/dev/null 2>&1; }
+
+# Every fixture repository that commits carries its OWN identity, set locally
+# before its first commit. Nothing here reads or writes the machine's global
+# git config, so an unconfigured box (empty user.name) behaves like a
+# configured one instead of failing every `git commit` in the suite.
+fixture_git_identity() {
+  git -C "$1" config user.name "TestUser" && git -C "$1" config user.email "testuser@example.invalid"
+}
 
 log() { :; } # silence the library's own logging for the unit tests below; re-defined per-case when a test needs to assert on it.
 
@@ -215,7 +223,7 @@ assert_eq "1" "$count" "re-running install_hooks does not duplicate the guard in
 # here simulates an agent (or a hostile prompt injection) forcing it into the
 # index anyway, which is exactly the case the pre-commit hook defends against.
 mkdir -p "${REPO1}/hookrepo3/.squad-pr"
-(cd "${REPO1}/hookrepo3" && git_quiet init && echo ok >tracked.txt && git_quiet add tracked.txt && git_quiet commit -m baseline)
+(cd "${REPO1}/hookrepo3" && git_quiet init && fixture_git_identity . && echo ok >tracked.txt && git_quiet add tracked.txt && git_quiet commit -m baseline)
 squad_pr_content_install_hooks "${REPO1}/hookrepo3"
 (cd "${REPO1}/hookrepo3" && printf 'sneaky\n' >.squad-pr/title && git add -f .squad-pr/title 2>/dev/null)
 commit_out="$(cd "${REPO1}/hookrepo3" && git commit -m "try to commit .squad-pr" 2>&1)"; commit_rc=$?
@@ -243,7 +251,7 @@ echo "-- 6b. Squad 1.0 transient casting files are never published (issue #148) 
 
 CAST="${REPO1}/castingrepo"
 mkdir -p "${CAST}/.squad/casting"
-(cd "$CAST" && git_quiet init && git config user.email t@example.invalid && git config user.name t)
+(cd "$CAST" && git_quiet init && fixture_git_identity .)
 printf '{"agents":{}}\n' >"${CAST}/.squad/casting/registry.json"
 printf '{"assignments":[]}\n' >"${CAST}/.squad/casting/history.json"
 printf '{"registry_sha256":"x"}\n' >"${CAST}/.squad/casting/registry-history.commit.json"
@@ -301,6 +309,7 @@ make_remote_pair() {
   rm -rf "$base"; mkdir -p "$base"
   git -C /tmp init -q --bare "${base}/remote.git" 2>/dev/null || git init -q --bare "${base}/remote.git"
   git_quiet clone "${base}/remote.git" "${base}/seed"
+  fixture_git_identity "${base}/seed"
   (
     cd "${base}/seed"
     echo "original work" >src.txt
@@ -315,6 +324,7 @@ make_remote_pair() {
     done
   ) >/dev/null 2>&1
   git_quiet clone "${base}/remote.git" "${base}/client"
+  fixture_git_identity "${base}/client"
   git_quiet -C "${base}/client" checkout main
 }
 
@@ -520,3 +530,5 @@ assert_contains "$(gh_call 1)" "Custom narrative body." \
 assert_contains "$(gh_call 1)" "Reported-mutable governance changes" \
   "...and the governance report is appended after it, not replaced by it"
 assert_contains "$(gh_call 1)" "casting/registry.json" "...with its actual content intact"
+
+test_summary
