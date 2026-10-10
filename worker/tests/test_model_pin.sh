@@ -1094,8 +1094,50 @@ assert_eq "" "$(leaked_pids)" "pinned launch failure: no Squad, wrapper or copil
 # SQUAD_CLI_ENTRY (<squad-cli>/dist/cli-entry.js) or, as CI has it, next to
 # SQUAD_SDK_DIR. When it cannot be found, is not the shipped version, or the
 # host's node cannot execFile a bash script (Git Bash on Windows cannot), the
-# scenario is SKIPPED, visibly, and everything above still stands.
+# scenario is SKIPPED, visibly, and everything above still stands -- on a
+# developer machine. In CI (CI or GITHUB_ACTIONS true) the workflow installs the
+# checksum-verified bundle precisely so these run, and a skip there would pass the
+# suite with exit 0, which the workflow's "0 skipped" summary cannot see: so in CI
+# a skip is a FAILURE of this suite.
 echo "-- the lifecycle against the real Squad --"
+
+real_squad_skip_is_failure() {
+  local v
+  for v in "${CI:-}" "${GITHUB_ACTIONS:-}"; do
+    case "${v,,}" in true|1) return 0 ;; esac
+  done
+  return 1
+}
+report_real_squad_skip() {
+  local reason="$1"
+  if real_squad_skip_is_failure; then
+    assert_eq "the real-Squad lifecycle scenarios run in CI" "they were skipped: ${reason}" \
+      "CI requires the real-Squad lifecycle scenarios (a skip here would pass the worker-tests summary unseen)"
+  else
+    echo "SKIP: the real-Squad lifecycle scenarios -- ${reason}. The stub-Squad scenarios above still ran."
+  fi
+}
+
+# The decision itself, run in subshells so a deliberate failure is not counted
+# against this suite. Not CI: a visible SKIP and no failure. CI: a FAIL.
+for env_case in "CI=true GITHUB_ACTIONS=" "CI= GITHUB_ACTIONS=true" "CI=1 GITHUB_ACTIONS=" "CI=TRUE GITHUB_ACTIONS=false"; do
+  # shellcheck disable=SC2086
+  skip_out="$(env ${env_case} bash -c 'source "'"${TEST_DIR}"'/lib/assert.sh"; '"$(declare -f real_squad_skip_is_failure report_real_squad_skip)"'; report_real_squad_skip "no Squad CLI found"')"
+  assert_contains "$skip_out" "FAIL: CI requires the real-Squad lifecycle scenarios" "with [${env_case}] a skipped real-Squad scenario is a failure"
+  assert_contains "$skip_out" "they were skipped: no Squad CLI found" "...and the failure carries the reason it was skipped"
+  assert_not_contains "$skip_out" "SKIP:" "...and is not downgraded to a SKIP line"
+done
+for env_case in "CI= GITHUB_ACTIONS=" "CI=false GITHUB_ACTIONS=false" "CI=0 GITHUB_ACTIONS=" "CI=no GITHUB_ACTIONS=maybe"; do
+  # shellcheck disable=SC2086
+  skip_out="$(env ${env_case} bash -c 'source "'"${TEST_DIR}"'/lib/assert.sh"; '"$(declare -f real_squad_skip_is_failure report_real_squad_skip)"'; report_real_squad_skip "the Squad CLI found reports 1.0.0"')"
+  assert_contains "$skip_out" "SKIP: the real-Squad lifecycle scenarios -- the Squad CLI found reports 1.0.0" "with [${env_case}] (not CI) the skip stays a clear SKIP line"
+  assert_not_contains "$skip_out" "FAIL" "...and does not fail a local run"
+done
+# Every way of not running them goes through that decision.
+assert_eq "1" "$(grep -cE '^[[:space:]]*report_real_squad_skip "\$REAL_SKIP"$' "${BASH_SOURCE[0]}")" \
+  "the real-Squad section reports an unavailable Squad through report_real_squad_skip, for every reason it can be unavailable"
+assert_eq "1" "$(grep -cE '^[[:space:]]*echo "SKIP: the real-Squad' "${BASH_SOURCE[0]}")" \
+  "report_real_squad_skip is the only place that prints the real-Squad SKIP line"
 
 real_squad_entry() {
   local cand=""
@@ -1130,7 +1172,7 @@ if [[ -z "$REAL_SKIP" ]]; then
 fi
 
 if [[ -n "$REAL_SKIP" ]]; then
-  echo "SKIP: the real-Squad lifecycle scenarios -- ${REAL_SKIP}. The stub-Squad scenarios above still ran."
+  report_real_squad_skip "$REAL_SKIP"
 else
   cp "${FAKE_BIN}/copilot" "${REAL_BIN}/copilot"
   # `squad`: the real CLI, with the production agent-cmd path (which does not

@@ -832,6 +832,17 @@ case "${1:-}" in
         big) printf '{"protocolVersion":1,"requiredModel":true,"pad":"%s"}' "$(head -c 5000 /dev/zero | tr '\0' a)"; exit 0 ;;
         fail) echo 'capabilities failed' >&2; exit 1 ;;
         hang) exec sleep 30 ;;
+        # A valid, complete "yes" and a clean exit 0 -- but a descendant the hub never
+        # reaped is still running (immune to TERM and HUP) and holds the probe's stdout.
+        bg) (trap '' TERM HUP INT; exec sleep 25) & echo $! > "${root}/capabilities.child"
+            printf '%s' "${STUB_CAP_JSON:-}"; exit 0 ;;
+        # A hub that hangs AND has such a descendant.
+        hangbg) (trap '' TERM HUP INT; exec sleep 25) & echo $! > "${root}/capabilities.child"
+                exec sleep 30 ;;
+        # A hub that will not stop writing; records how much its stdout file holds.
+        flood) head -c 5000000 /dev/zero | tr '\0' a
+               if [[ -r /proc/$$/fd/1 ]]; then wc -c < /proc/$$/fd/1 | tr -d '[:space:]' > "${root}/capabilities.written"; fi
+               exit 0 ;;
         # squad-hub 0.6.0: oneshot ignores its argv, needs the cloud device
         # variables, and would otherwise go on to attach and run a session.
         old)
@@ -921,6 +932,74 @@ assert_eq "78:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit)" \
   "a capability probe that hangs is bounded by a timeout and refuses the session"
 assert_eq "present" "$(hub_state capabilities.argv)" "...after it was actually asked"
 
+# The probe is bounded as a TREE, not just as a process. Each stub below really
+# leaves a descendant that ignores TERM and holds the probe's stdout (25s), the
+# way a build that forgot to reap a helper would. A pipe reader waits for EOF
+# until that descendant exits -- 25s with a 3s probe timeout.
+mkdir -p "${PIN_STUB_ROOT}/tmp"
+pid_gone() {
+  # kill -0 succeeds for a zombie, which is already dead: treat state Z as gone.
+  local pid="$1" i state
+  for i in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    if [[ -r "/proc/${pid}/stat" ]]; then
+      state="$(sed -E 's/^[0-9]+ \(.*\) (.).*/\1/' "/proc/${pid}/stat" 2>/dev/null)"
+      [[ "$state" == Z ]] && return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+probe_tree_case() {
+  # usage: probe_tree_case <label> <cap-mode> [VAR=value ...]
+  local label="$1" mode="$2" started child
+  shift 2
+  started=$SECONDS
+  hub_run_with "$mode" SQUAD_MODEL=model-alpha SQUAD_HUB_CAPABILITY_TIMEOUT_SECONDS=3 TMPDIR="${PIN_STUB_ROOT}/tmp" "$@"
+  PROBE_TOOK=$((SECONDS - started))
+  child="$(hub_file capabilities.child)"
+  PROBE_CHILD="$child"
+  assert_eq "78:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit)" "${label}: the session is refused (78) and oneshot is not invoked"
+  assert_eq "absent" "$(hub_state oneshot.count)" "${label}: squad-hub oneshot is never run"
+  if [[ "$PROBE_TOOK" -lt 12 ]]; then
+    assert_eq "ok" "ok" "${label}: the probe returned in ${PROBE_TOOK}s -- inside its own deadline, not the descendant's 25s"
+  else
+    assert_eq "under 12s" "${PROBE_TOOK}s" "${label}: the probe is bounded as a tree"
+  fi
+  assert_eq "" "$(ls -A "${PIN_STUB_ROOT}/tmp")" "${label}: the probe's private answer file is removed"
+}
+probe_tree_case "valid answer, exit 0, descendant left running" bg STUB_CAP_JSON="$CAPABLE"
+assert_contains "$PIN_RUN_OUT" "left processes running" "...and the log says why a valid-looking answer was not accepted"
+assert_ne "" "$PROBE_CHILD" "...the stub really started a descendant (pid ${PROBE_CHILD:-none})"
+if pid_gone "$PROBE_CHILD"; then
+  assert_eq "ok" "ok" "...and that descendant was stopped by the probe's own cleanup, not left to run out its 25s"
+else
+  assert_eq "gone" "alive (pid ${PROBE_CHILD})" "...and that descendant was stopped by the probe's own cleanup"
+  kill -s KILL "$PROBE_CHILD" 2>/dev/null || true
+fi
+probe_tree_case "hung hub with a TERM-immune descendant" hangbg
+assert_ne "" "$PROBE_CHILD" "...the stub really started a descendant (pid ${PROBE_CHILD:-none})"
+if pid_gone "$PROBE_CHILD"; then
+  assert_eq "ok" "ok" "...and the deadline removed that descendant too"
+else
+  assert_eq "gone" "alive (pid ${PROBE_CHILD})" "...and the deadline removed that descendant too"
+  kill -s KILL "$PROBE_CHILD" 2>/dev/null || true
+fi
+probe_tree_case "a hub that writes without end" flood
+# The on-disk cap is RLIMIT_FSIZE, which Linux enforces and Git Bash on Windows
+# does not (the refusal above does not depend on it: the answer is over 4096 bytes
+# either way). So the size is only asserted where the limit exists.
+written="$(hub_file capabilities.written)"
+if [[ "$(uname -s)" == Linux ]]; then
+  if [[ "$written" =~ ^[0-9]+$ && "$written" -le 16384 ]]; then
+    assert_eq "ok" "ok" "...the probe's stdout file stopped at ${written} bytes of the 5000000 the hub tried to write (cap 16384)"
+  else
+    assert_eq "at most 16384 bytes" "${written} bytes" "...the probe's stdout file is capped on disk"
+  fi
+else
+  echo "SKIP: the on-disk cap of a flooded probe answer is only measured on Linux (this host does not enforce RLIMIT_FSIZE); the refusal above still ran."
+fi
+
 # A hub that does say yes gets the model explicitly, for this one command only.
 hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON="$CAPABLE"
 assert_eq "0" "$PIN_RUN_RC" "a hub that answers the probe with protocolVersion 1 / requiredModel true runs the session"
@@ -932,7 +1011,8 @@ assert_eq "present" "$(hub_state oneshot.prompt-sent)" "the capable hub confirme
 assert_contains "$PIN_RUN_OUT" "AFTER model=<unset> require=<unset>" "the model variables were scoped to the oneshot command and not left in the caller's environment"
 assert_eq "a prompt" "$(hub_file oneshot.prompt)" "the prompt is still delivered through the one-shot environment"
 assert_contains "$(hub_file oneshot.identity)" "https://hub.example|sqhd1.x|aca-" \
-  "supervision is intact: the same hub URL, device token and aca- device id reach oneshot"assert_not_contains "$(hub_file oneshot.argvjson)" "--model" "no --model rides in the hub agent argv, where copilot --acp would ignore it"
+  "supervision is intact: the same hub URL, device token and aca- device id reach oneshot"
+assert_not_contains "$(hub_file oneshot.argvjson)" "--model" "no --model rides in the hub agent argv, where copilot --acp would ignore it"
 assert_contains "$(hub_file oneshot.argvjson)" '"shell(git config)"' "the supervised tool policy (deny list) is unchanged by the model gate"
 assert_not_contains "$(hub_file oneshot.argvjson)" '"--allow-all-tools"' "ask mode still drops --allow-all-tools on the required-model path"
 assert_contains "$PIN_RUN_OUT" "Required model: model-alpha" "the log says which model the hub was required to use"
