@@ -1111,7 +1111,7 @@ REAL_SKIP=""
 if [[ -z "$REAL_ENTRY" ]]; then
   REAL_SKIP="no Squad CLI found (set SQUAD_CLI_ENTRY=<squad-cli>/dist/cli-entry.js, or SQUAD_SDK_DIR as CI does)"
 else
-  want_version="$(sed -n 's/^ARG SQUAD_VERSION=//p' "${WORKER_DIR}/Dockerfile" | head -n1)"
+  want_version="$(sed -n 's/^ARG SQUAD_VERSION=//p' "${WORKER_DIR}/Dockerfile" | head -n1 | tr -d '[:space:]')"
   have_version="$(node "$REAL_ENTRY" --version 2>/dev/null | head -n1 | tr -d '[:space:]')"
   if [[ -z "$want_version" || "$want_version" != "$have_version" ]]; then
     REAL_SKIP="the Squad CLI found reports '${have_version:-nothing}', not the '${want_version:-unknown}' worker/Dockerfile ships"
