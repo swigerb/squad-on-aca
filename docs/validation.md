@@ -121,6 +121,7 @@ Mutation-proof targets covered by `worker/tests/test_credential_withholding.sh` 
 The pre-existing M1–M11 mutation-proof targets and their assertions in `test_credential_withholding.sh` and `test_agent_policy.sh` are unchanged by this work.
 
 | `worker/tests/test_dispatch_registry_exhaustiveness.sh` | Scans every production dispatcher (excluding test directories) for literal `SQUAD_DISPATCH_SOURCE=`/`SQUAD_MODE=` assignments and fails if any names a source or mode absent from `agent-policy.js`'s registry — a new dispatcher cannot silently bypass the matrix. |
+| `worker/tests/test_model_pin.sh` | The per-role model pin: the role for every mode; absent, matching, conflicting and invalid operator overrides from every source; malformed policy files; and the real `argv` that `copilot` receives from the real `prompt`, `new-project`, `loop` and `watch`/`triage` entrypoint blocks (and through `worker/squad-agent` for watch/loop), including a model-unavailable exit that ends the session with no retry and nothing published. `test_squad_hub.sh` also asserts a model-pinned session is refused by the hub one-shot path and `squad-hub oneshot` is never invoked. |
 | `worker/tests/test_squad_hub.sh` | Trust-conditioned hub policy: untrusted sources' `hub-argv-json` carries the narrowed untrusted deny patterns; `local-cli`'s does not. |
 
 ## CLI contract validation
@@ -174,6 +175,7 @@ require_deps node git
 | `test_ralph_dispatch.sh` | `node`, `mktemp`, `date` |
 | `test_run_tests.sh` | `env`, `find` |
 | `test_agent_policy.sh` | `node` |
+| `test_model_pin.sh` | `node` |
 | `test_dispatch_registry_exhaustiveness.sh` | `node`, `grep` |
 | `test_credential_withholding.sh` | `node`, `git`, `openssl` |
 

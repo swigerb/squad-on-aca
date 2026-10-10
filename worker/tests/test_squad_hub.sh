@@ -777,13 +777,29 @@ assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_NAME="$device_name"' \
   "the oneshot env block exports the computed device name"
 assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_META_JSON="$device_meta_json"' \
   "the oneshot env block exports the computed device metadata JSON"
-# #135: the workflow's `model` input must reach the supervised path too.
-# `copilot --acp` ignores a --model argv flag, so it travels as SQUAD_HUB_MODEL
-# (squad-hub oneshot selects it over ACP), never in the extra-args JSON.
-assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_MODEL="${SQUAD_MODEL:-}"' \
-  "the oneshot env block passes the session model override as SQUAD_HUB_MODEL"
+# The role model pin (#135, then the per-role pin): the hub one-shot path cannot
+# GUARANTEE a model. `copilot --acp` ignores a --model argv flag, the pinned
+# squad-hub build does not read SQUAD_HUB_MODEL, and an unavailable model falls
+# back to the default with only a warning. So a pinned session is refused rather
+# than handed to it, and SQUAD_HUB_MODEL is no longer offered as if it worked.
+assert_not_contains "$(grep -v '^[[:space:]]*#' <<<"$HUB_RUN_BLOCK")" 'SQUAD_HUB_MODEL' \
+  "the oneshot invocation no longer passes SQUAD_HUB_MODEL, which the pinned hub build ignores"
 assert_not_contains "$(sed -n '/^squad_hub_policy_json()/,/^}/p' "$HUB_LIB")" '--model' \
   "the model is not smuggled into the hub argv JSON, which copilot --acp would silently ignore"
+
+PIN_STUB_ROOT="$(mktemp -d)"
+mkdir -p "${PIN_STUB_ROOT}/bin"
+printf '#!/usr/bin/env bash\n: > "%s/oneshot.hit"\nexit 0\n' "$PIN_STUB_ROOT" > "${PIN_STUB_ROOT}/bin/squad-hub"
+chmod +x "${PIN_STUB_ROOT}/bin/squad-hub"
+PIN_RUN_OUT="$(env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN PATH="${PIN_STUB_ROOT}/bin:$PATH" SQUAD_MODEL=model-alpha \
+  bash -c 'source "'"$HUB_LIB"'"; squad_hub_run "a prompt"' 2>&1)"
+PIN_RUN_RC=$?
+assert_eq "78" "$PIN_RUN_RC" "a model-pinned session is refused by the hub one-shot path (exit 78)"
+assert_contains "$PIN_RUN_OUT" "model-alpha" "the refusal names the pinned model"
+assert_contains "$PIN_RUN_OUT" "cannot guarantee" "the refusal says the hub cannot guarantee the model"
+assert_eq "absent" "$([[ -e "${PIN_STUB_ROOT}/oneshot.hit" ]] && echo present || echo absent)" \
+  "squad-hub oneshot is never invoked for a model-pinned session"
+rm -rf "$PIN_STUB_ROOT"
 
 report_pr_status() {
   env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN \

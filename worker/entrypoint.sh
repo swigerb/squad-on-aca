@@ -543,25 +543,24 @@ squad_casting_transient_install_exclude "$REPO_DIR"
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
 
-# --- manual dispatch model override (issue #135) -----------------------------
-# OV_SQUAD_MODEL (workflow_dispatch's `model` input) becomes SQUAD_MODEL in
-# this container's environment (see worker/lib/ralph-dispatch.sh's OV_* ->
-# bare-name merge). worker/lib/dispatch-inputs.js already rejects a leading
-# '-' and anything outside [A-Za-z0-9._-] before the session is ever started,
-# but this is the one place the value actually reaches an argv, so it is
-# re-checked here too rather than trusted blindly from the environment --
-# fail closed rather than hand a widened flag to `copilot`.
-if [[ -n "${SQUAD_MODEL:-}" ]]; then
-  if [[ "$SQUAD_MODEL" == -* ]]; then
-    squad_policy_abort "SQUAD_MODEL ('${SQUAD_MODEL}') starts with '-' and would be read as a flag, not a model name; refusing to start."
-  fi
-  COPILOT_ARGV+=(--model "$SQUAD_MODEL")
-fi
-# squad-agent (the watch/loop --agent-cmd wrapper) builds its own argv rather
-# than reusing COPILOT_ARGV -- see the policy-argv export below -- so the
-# model override is handed to it the same way: a dedicated env var it reads
-# itself, not by assuming it inherits SQUAD_MODEL unchanged.
-export SQUAD_AGENT_MODEL="${SQUAD_MODEL:-}"
+# --- the session's model pin (issue #135, and the per-role pin) ---------------
+# Until now `copilot` ran on whatever model the CLI defaulted to unless an
+# operator typed one in. The model is now resolved HERE, once, before any
+# launch below: the repository's own choice for the role this mode runs as
+# (`ralph` for watch/triage/loop, `lead` for prompt/new-project/smoke --
+# see agent-policy.js "Model pin"), read from .squad/config.json. An operator
+# override (OV_SQUAD_MODEL -> SQUAD_MODEL, workflow_dispatch's `model` input;
+# SQUAD_AGENT_MODEL; COPILOT_MODEL; a --model in SQUAD_COPILOT_FLAGS) is
+# accepted only when it names that same model; a conflicting or malformed one
+# aborts the session (78) with no fallback to either side.
+#
+# squad_policy_resolve_model appends `--model` to COPILOT_ARGV (so the direct
+# smoke / prompt / new-project launches carry it), exports SQUAD_AGENT_MODEL
+# for worker/squad-agent (which builds its own argv for watch/loop -- see the
+# policy-argv export below), and exports SQUAD_MODEL / SQUAD_MODEL_PINNED for
+# the hub path and for squad-agent's own check. After squad_policy_harden, so
+# the policy file it reads is already under the governance lock.
+squad_policy_resolve_model "$REPO_DIR"
 
 # --- watch/loop agent-cmd wrapper policy (issue #112) ------------------------
 # `squad watch` and `squad loop` own their own loop and spawn Copilot

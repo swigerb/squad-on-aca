@@ -99,12 +99,23 @@
 #                                  added -- that is a feature gap (squad_state_*
 #                                  tools unavailable), not a security failure,
 #                                  so it does not abort the session.
-#   SQUAD_AGENT_MODEL              optional. Issue #135's manual dispatch
-#                                  `model` override, already re-validated by
-#                                  worker/entrypoint.sh. Appended to the exec'd
-#                                  argv as `--model <value>` when set. A value
-#                                  starting with '-' aborts (78) rather than
-#                                  being passed through as a flag.
+#   SQUAD_AGENT_MODEL              optional. The model this session's Copilot
+#                                  runs on: the `ralph` role's model from the
+#                                  repository's .squad/config.json, resolved
+#                                  once (and checked against any operator
+#                                  override) by worker/entrypoint.sh, which
+#                                  also issue #135's `model` input feeds into.
+#                                  Appended to the exec'd argv as `--model
+#                                  <value>`, LAST, so it is the one copilot
+#                                  honours. A value starting with '-' aborts
+#                                  (78) rather than being passed through as a
+#                                  flag, and a different `--model` anywhere in
+#                                  the policy argv or Squad's own arguments
+#                                  aborts too.
+#   SQUAD_MODEL_PINNED             optional. `1` when the entrypoint required a
+#                                  specific model for this session. Then an
+#                                  empty SQUAD_AGENT_MODEL aborts (78) instead
+#                                  of letting copilot run on its own default.
 #   SQUAD_POLICY_MCP_CONFIG_SHA256 set by squad_policy_harden: the harden-time
 #                                  SHA-256 of .mcp.json, or `absent`. The
 #                                  AUTHORITATIVE baseline (see the F8 block).
@@ -241,13 +252,22 @@ if [[ -n "$REPO_DIR" ]]; then
   fi
 fi
 
-# Issue #135: the manual dispatch `model` override. worker/entrypoint.sh
-# exports SQUAD_AGENT_MODEL (already re-validated there -- no leading '-')
-# rather than this script trusting SQUAD_MODEL directly, so there is exactly
-# one place that decides the value reaching this script is safe to use as an
-# argv element. Re-checked here anyway as the same defense-in-depth pattern
-# the policy-argv and MCP integrity checks above already use.
+# Issue #135 / the role model pin: the model this session's Copilot runs on.
+# worker/entrypoint.sh resolves it ONCE (worker/lib/agent-policy.js `model-pin`,
+# via squad_policy_resolve_model: the `ralph` role's model for watch/loop),
+# re-validates it, and exports it here as SQUAD_AGENT_MODEL rather than this
+# script trusting SQUAD_MODEL directly or re-deriving a model on its own -- so
+# there is exactly one place that decides what runs. Re-checked here anyway as
+# the same defense-in-depth pattern the policy-argv and MCP integrity checks
+# above already use.
+#
+# SQUAD_MODEL_PINNED=1 is the entrypoint saying "a model was required". If it
+# is set and SQUAD_AGENT_MODEL did not arrive, the session would silently run on
+# Copilot's own default model, so that aborts rather than proceeding unpinned.
 MODEL_ARGV=()
+if [[ "${SQUAD_MODEL_PINNED:-0}" == 1 && -z "${SQUAD_AGENT_MODEL:-}" ]]; then
+  squad_agent_abort "SQUAD_MODEL_PINNED=1 but SQUAD_AGENT_MODEL is empty: this session was required to run on a specific model and would silently run on Copilot's default instead; refusing to exec copilot."
+fi
 if [[ -n "${SQUAD_AGENT_MODEL:-}" ]]; then
   if [[ "$SQUAD_AGENT_MODEL" == -* ]]; then
     squad_agent_abort "SQUAD_AGENT_MODEL ('${SQUAD_AGENT_MODEL}') starts with '-' and would be read as a flag, not a model name; refusing to exec copilot."
@@ -411,6 +431,35 @@ for token in "$@"; do
     fi
   done
 done
+
+# When a model is pinned, no OTHER `--model` may ride in on the policy argv or
+# on what Squad appended. The pinned one is last, so it would win at copilot's
+# parser anyway -- but "it happened to win" is not the same as "nothing tried
+# to choose another model", and a conflicting value is exactly the situation
+# the entrypoint's resolver already refuses to start for. Same stance here, for
+# an argv that reaches this script by some route the resolver did not see.
+# `-p`'s value is a prompt, not an option, so it is skipped.
+if [[ -n "${SQUAD_AGENT_MODEL:-}" ]]; then
+  squad_agent_check_model_tokens() {
+    local label="$1" i val tok
+    shift
+    local -a args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      tok="${args[i]}"
+      case "$tok" in
+        -p|--prompt) i=$((i + 1)); continue ;;
+        --model) val="${args[i + 1]:-}" ;;
+        --model=*) val="${tok#--model=}" ;;
+        *) continue ;;
+      esac
+      if [[ "${val,,}" != "${SQUAD_AGENT_MODEL,,}" ]]; then
+        squad_agent_abort "${label} carries '--model ${val}', which conflicts with the pinned model '${SQUAD_AGENT_MODEL}'. There is no fallback to either; refusing to exec copilot."
+      fi
+    done
+  }
+  squad_agent_check_model_tokens "SQUAD_AGENT_POLICY_ARGV_JSON" "${POLICY_ARGV[@]}"
+  squad_agent_check_model_tokens "The arguments Squad appended" "$@"
+fi
 
 # Order: Squad's own trailing arguments ("$@" -- today exactly `-p <prompt>`)
 # FIRST, then the resolved policy argv, then the MCP config this script adds

@@ -310,6 +310,24 @@ squad_hub_policy_json() {
 squad_hub_run() {
   local prompt="$1"
   local policy_json device_name device_meta_json
+
+  # A session that was required to run on a specific model cannot be supervised
+  # through the hub's one-shot path, because the hub cannot guarantee that model:
+  # `copilot --acp` silently ignores a --model argv flag, the pinned squad-hub
+  # build does not read SQUAD_HUB_MODEL at all, and an ACP session whose model
+  # is unavailable falls back to the default with only a warning (squad-hub
+  # 0.6.0, acp-session.js). Any of those would run the session on a model
+  # nobody chose and report success -- the silent fallback the model pin exists
+  # to rule out. So refuse, loudly, rather than run on whatever the default is.
+  # (watch/loop under the hub are unaffected: their agent is worker/squad-agent,
+  # which execs `copilot --model <pin>` directly.)
+  if [[ -n "${SQUAD_MODEL:-}" ]]; then
+    squad_hub_abort \
+      "This session is pinned to model '${SQUAD_MODEL}', and the hub one-shot path cannot guarantee it." \
+      "It would run on the hub's default model if that model is unavailable, with no error." \
+      "Dispatch this run without hub supervision (unset SQUAD_HUB_URL and SQUAD_HUB_TOKEN), or use a hub build that fails closed on an unavailable model."
+  fi
+
   policy_json="$(squad_hub_policy_json)"
   device_name="${SQUAD_HUB_DEVICE_NAME:-$(squad_hub_device_name)}"
   device_name="$(squad_hub_truncate "$device_name" 200)"
@@ -327,13 +345,6 @@ squad_hub_run() {
     squad_hub_log "  A denied tool is still refused outright and is never offered to a human."
     squad_hub_log "  Anything else now asks, and waits for a person to answer."
   fi
-  if [[ -n "${SQUAD_MODEL:-}" ]]; then
-    # `copilot --acp` silently ignores a --model argv flag, so the model cannot
-    # travel in SQUAD_HUB_AGENT_EXTRA_ARGS_JSON. The hub's one-shot verb reads
-    # SQUAD_HUB_MODEL and selects it through ACP (session/set_model) instead.
-    # A squad-hub build that predates SQUAD_HUB_MODEL ignores it, so say so.
-    squad_hub_log "Model override: ${SQUAD_MODEL} (passed to the hub one-shot session as SQUAD_HUB_MODEL; squad-hub builds without SQUAD_HUB_MODEL support use the default model)."
-  fi
 
   local rc=0
   # Same telemetry wiring as the unsupervised `copilot -p` path in entrypoint.sh.
@@ -350,7 +361,6 @@ squad_hub_run() {
   SQUAD_HUB_DEVICE_NAME="$device_name" \
   SQUAD_HUB_DEVICE_META_JSON="$device_meta_json" \
   SQUAD_HUB_AGENT_EXTRA_ARGS_JSON="$policy_json" \
-  SQUAD_HUB_MODEL="${SQUAD_MODEL:-}" \
     squad-hub oneshot || rc=$?
 
   case "$rc" in

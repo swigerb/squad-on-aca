@@ -83,7 +83,8 @@ printf '{"mcpServers":{}}\n' > "${REPO_WITH_MCP}/.mcp.json"
 # DUMPED_ARGV (a bash array: one element per line the stub copilot dumped;
 # empty if copilot was never reached because the wrapper aborted first).
 # Honours RUN_WRAPPER_MODEL (SQUAD_AGENT_MODEL to export for this one call;
-# unset/empty means "do not export it at all") so callers can exercise the
+# unset/empty means "do not export it at all") and RUN_WRAPPER_PINNED
+# (SQUAD_MODEL_PINNED, same convention) so callers can exercise the
 # issue #135 model-override path without threading a new parameter through
 # every existing call site.
 run_wrapper() {
@@ -91,9 +92,9 @@ run_wrapper() {
   shift 2
   : > "$DUMP_FILE"
   if [[ "$policy_json" == "__UNSET__" ]]; then
-    WRAPPER_OUT="$(env -u SQUAD_AGENT_POLICY_ARGV_JSON -u SQUAD_AGENT_MODEL SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
+    WRAPPER_OUT="$(env -u SQUAD_AGENT_POLICY_ARGV_JSON -u SQUAD_AGENT_MODEL -u SQUAD_MODEL_PINNED SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} ${RUN_WRAPPER_PINNED:+SQUAD_MODEL_PINNED="$RUN_WRAPPER_PINNED"} bash "$WRAPPER" "$@" 2>&1)"
   else
-    WRAPPER_OUT="$(env -u SQUAD_AGENT_MODEL SQUAD_AGENT_POLICY_ARGV_JSON="$policy_json" SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
+    WRAPPER_OUT="$(env -u SQUAD_AGENT_MODEL -u SQUAD_MODEL_PINNED SQUAD_AGENT_POLICY_ARGV_JSON="$policy_json" SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} ${RUN_WRAPPER_PINNED:+SQUAD_MODEL_PINNED="$RUN_WRAPPER_PINNED"} bash "$WRAPPER" "$@" 2>&1)"
   fi
   WRAPPER_RC=$?
   DUMPED_ARGV=()
@@ -277,6 +278,54 @@ unset RUN_WRAPPER_MODEL
 assert_eq "78" "$WRAPPER_RC" "a model value starting with '-' is refused (exit 78), not passed through as a flag"
 assert_eq "1" "$(copilot_never_ran)" "... and copilot is never exec'd for that rejected model value"
 
+# ---------------------------------------------------------------------------
+# (b3) The role model pin. SQUAD_MODEL_PINNED=1 means the entrypoint REQUIRED a
+#      model for this session: an empty SQUAD_AGENT_MODEL then aborts instead of
+#      running on Copilot's own default, no other --model may ride in on the
+#      policy argv or Squad's arguments, and a copilot that cannot run the
+#      pinned model ends the session with its own status (no retry, no fallback).
+# ---------------------------------------------------------------------------
+echo "-- (b3) the role model pin: required, exclusive, and no fallback --"
+
+RUN_WRAPPER_PINNED=1 run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned but SQUAD_AGENT_MODEL empty: refused (exit 78)"
+assert_contains "$WRAPPER_OUT" "SQUAD_MODEL_PINNED=1" "pinned but empty: the diagnostic names the pin"
+assert_eq "1" "$(copilot_never_ran)" "pinned but empty: copilot is never exec'd, so it cannot pick its own model"
+
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned with a model: execs successfully"
+assert_eq "model-beta" "${DUMPED_ARGV[$(( ${#DUMPED_ARGV[@]} - 1 ))]:-}" "pinned: the pinned model is the LAST argv element"
+assert_eq "--model" "${DUMPED_ARGV[$(( ${#DUMPED_ARGV[@]} - 2 ))]:-}" "pinned: ... preceded by --model"
+
+RUN_WRAPPER_PINNED=0 run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "0" "$WRAPPER_RC" "not pinned (0) and no model: execs, copilot's default applies"
+assert_no_exact_token "not pinned and no model: no --model is invented" "--model" "${DUMPED_ARGV[@]}"
+
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper '["--allow-all-tools","--model","model-other"]' "$REPO_NO_MCP" -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a different --model in the policy argv is refused (78)"
+assert_contains "$WRAPPER_OUT" "conflicts with the pinned model" "pinned: ... and the diagnostic says why"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd"
+
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper '["--allow-all-tools","--model=model-other"]' "$REPO_NO_MCP" -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a different --model=<value> in the policy argv is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd for the = form"
+
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" --model model-other -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a different --model among Squad's own arguments is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd for Squad's arguments"
+
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper '["--allow-all-tools","--model","MODEL-BETA"]' "$REPO_NO_MCP" -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned: the same model in a different case is the same model, not a conflict"
+assert_eq "model-beta" "${DUMPED_ARGV[$(( ${#DUMPED_ARGV[@]} - 1 ))]:-}" "pinned: ... and the pinned spelling is the one that is last"
+
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "--model model-other"
+assert_eq "0" "$WRAPPER_RC" "pinned: a prompt that merely says '--model' is a prompt, not an option"
+assert_eq "--model model-other" "${DUMPED_ARGV[1]:-}" "pinned: ... and it reaches copilot untouched, as one element"
+
+COPILOT_STUB_EXIT=7 RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "7" "$WRAPPER_RC" "pinned: copilot's own non-zero status (model unavailable / over quota) is the wrapper's status"
+assert_eq "0" "$(copilot_never_ran)" "pinned: ... after copilot was exec'd on the pinned model, not on some other"
+assert_eq "model-beta" "${DUMPED_ARGV[$(( ${#DUMPED_ARGV[@]} - 1 ))]:-}" "pinned: ... and no second attempt replaced the argv"
 # ---------------------------------------------------------------------------
 # (c) Squad's trailing -p <prompt> is preserved intact, including a prompt
 #     containing spaces.

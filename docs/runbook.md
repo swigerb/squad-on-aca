@@ -193,8 +193,26 @@ Governance paths are classified before the agent starts:
 
 The baseline is held in entrypoint memory and, in the container, sealed into a root-owned `0711` directory under `/run` before the `runuser` drop. Sealed files are root-owned `0644`: readable by design, because this is an integrity boundary, not a secrecy boundary. A policy failure or governance violation aborts with worker exit `78` and still tries to emit the governance report. The session-only memory-audit-rotation pin is one such locked path: the worker never commits it; it lives in the working tree, sealed out of git staging (an index property when the path is tracked, only an ignore rule when it is not). The sampler, `worker/squad-agent`, git hooks and `squad_push_branch` detect or refuse a broken seal (exit `78`, nothing pushed by the container). A deleted pin is re-pinned. See [security.md](security.md#session-only-memory-audit-pin) for exactly what is prevented and what is only detected.
 
-`SQUAD_COPILOT_FLAGS` supports extras such as `--model` or `--log-level`. Permission-widening flags (`--yolo`, `--allow-all`, `--allow-all-paths`, `--allow-all-urls`, `--add-dir`) abort the worker session with exit `78`.
+`SQUAD_COPILOT_FLAGS` supports extras such as `--model` or `--log-level`. Permission-widening flags (`--yolo`, `--allow-all`, `--allow-all-paths`, `--allow-all-urls`, `--add-dir`) abort the worker session with exit `78`. A `--model` in it must match the pinned model (see [Model pin](#model-pin)).
 
+### Model pin
+
+Every Copilot launch the worker makes runs on an explicit `--model`, resolved once before `copilot` starts by `squad_policy_resolve_model` (`worker/lib/squad-policy.sh`, backed by `agent-policy.js model-pin`). The model comes from the checked-out repository's `.squad/config.json`, for the role the session plays, so the policy stays per role and no single model is applied to everything:
+
+| Session mode | Role | Model comes from |
+| --- | --- | --- |
+| `prompt`, `new-project`, `smoke` (this includes every session Ralph dispatches) | `lead`, the coordinator | `agentModelOverrides.lead`, else `defaultModel` |
+| `watch`, `triage`, `loop` (the sessions that run Ralph's charter) | `ralph` | `agentModelOverrides.ralph`, else `defaultModel` |
+| `ralph` dispatcher, `telemetry-smoke`, `shell` | none: no Copilot session starts | not applicable |
+
+- There is no model list in the image: the worker checks only that the value is a plain token, so a model newer than the image is never rejected by a stale catalog. `defaultModel: "auto"` means the repository does not choose.
+- An operator override (`SQUAD_MODEL`, `SQUAD_AGENT_MODEL`, `COPILOT_MODEL`, or `--model` in `SQUAD_COPILOT_FLAGS`, including the `model` dispatch input) is accepted only when it names the same model as the policy. A different one aborts with exit `78` and an error naming both; there is no fallback to either. Overrides that disagree with each other, with no policy to arbitrate, also abort.
+- A repository with no model for the role runs on Copilot's own default, and the session log says `Model: NOT PINNED`.
+- `worker/squad-agent` (the watch/loop agent) refuses to start if the pin was required but the model did not arrive, and rejects any different `--model` it is handed.
+- If the pinned model is unavailable or over quota, Copilot exits non-zero and that is the session's result: no retry, no other model, and no output is read for a success message. Nothing is published.
+- Hub supervision of `prompt` and `new-project` sessions is refused (exit `78`) while a model is pinned, because the hub one-shot path cannot guarantee a model; the squad-hub 0.6.0 build ignores `SQUAD_HUB_MODEL` and falls back to its default with only a warning. Watch/loop under the hub are unaffected.
+
+`worker/tests/test_model_pin.sh` runs the real entrypoint blocks and asserts the argv `copilot` actually receives.
 ## watch/loop policy
 
 The `watch` and `loop` modes run continuously and spawn their own Copilot CLI invocations. squad-on-aca routes these through a wrapper at `/usr/local/lib/squad-on-aca/squad-agent` (instead of the default `copilot` CLI path) that:

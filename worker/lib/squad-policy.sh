@@ -316,6 +316,97 @@ squad_policy_announce() {
 }
 
 # ---------------------------------------------------------------------------
+# 1b. Model pin
+# ---------------------------------------------------------------------------
+# Resolve, ONCE and before any `copilot` launch, the model this session's
+# Copilot runs on, and hand it to every launch path the same way:
+#   - COPILOT_ARGV (the caller's array: direct smoke / prompt / new-project)
+#     gets `--model <model>` appended;
+#   - SQUAD_AGENT_MODEL is exported for worker/squad-agent (the `--agent-cmd`
+#     wrapper `squad watch` / `squad loop` run through);
+#   - SQUAD_MODEL is exported as the resolved value, which is what the Squad
+#     Hub path reads (and refuses on -- see squad_hub_run);
+#   - SQUAD_MODEL_PINNED=1 tells squad-agent a model was REQUIRED, so one that
+#     fails to arrive aborts rather than running on Copilot's own default.
+#
+# The decision is agent-policy.js's `model-pin` (see "Model pin" there for the
+# role per mode and why): the role's entry in the repository's
+# .squad/config.json, with an operator override (SQUAD_MODEL, SQUAD_AGENT_MODEL,
+# COPILOT_MODEL, a --model in SQUAD_COPILOT_FLAGS) accepted only when it names
+# the same model. A conflicting or malformed override, or a policy file that
+# cannot be read, aborts (78): there is no fallback to either side, and no
+# catalog of "known" models consulted, so a model the repository approved is
+# never rejected for being newer than this image.
+#
+# Nothing here retries or falls back if the pinned model turns out to be
+# unavailable or over quota. Copilot's non-zero exit is the session's result
+# (squad-agent `exec`s copilot; the direct paths run it under the session
+# deadline and publish nothing on failure), and no output is parsed for a
+# success message in its place.
+#
+# Run AFTER squad_policy_harden: the governance lock covers .squad/config.json,
+# so the policy read here cannot be rewritten by the agent it is about to
+# constrain.
+#
+# Usage: squad_policy_resolve_model <repo-dir>
+# Sets SQUAD_MODEL_PIN_STATUS (pinned|unpinned|not-applicable), _ROLE, _MODEL
+# and _SOURCE.
+squad_policy_resolve_model() {
+  local repo_dir="$1"
+  if ! command -v node >/dev/null 2>&1; then
+    squad_policy_abort "node is not available, so the session model cannot be resolved."
+  fi
+  if [[ ! -f "$SQUAD_POLICY_RESOLVER" ]]; then
+    squad_policy_abort "Policy resolver not found at ${SQUAD_POLICY_RESOLVER}."
+  fi
+
+  local pin_output rc=0
+  # `|| rc=$?` keeps errexit from ending the shell before the failure is logged.
+  pin_output="$(node "$SQUAD_POLICY_RESOLVER" model-pin "$repo_dir" 2>&1)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    squad_policy_log "Model resolution failed (exit ${rc}): ${pin_output}"
+    squad_policy_abort "The session model could not be resolved."
+  fi
+
+  local -a pin_lines=()
+  mapfile -t pin_lines <<<"$pin_output"
+  SQUAD_MODEL_PIN_STATUS="${pin_lines[0]:-}"
+  SQUAD_MODEL_PIN_ROLE="${pin_lines[1]:-}"
+  SQUAD_MODEL_PIN_MODEL="${pin_lines[2]:-}"
+  SQUAD_MODEL_PIN_SOURCE="${pin_lines[3]:-}"
+
+  case "$SQUAD_MODEL_PIN_STATUS" in
+    pinned)
+      # Shape was already checked by the resolver; this is the one place the
+      # value reaches an argv, so it is checked once more rather than trusted.
+      if [[ -z "$SQUAD_MODEL_PIN_MODEL" || "$SQUAD_MODEL_PIN_MODEL" == -* ]]; then
+        squad_policy_abort "The model resolver returned an unusable model ('${SQUAD_MODEL_PIN_MODEL}'); refusing to start."
+      fi
+      COPILOT_ARGV+=(--model "$SQUAD_MODEL_PIN_MODEL")
+      export SQUAD_AGENT_MODEL="$SQUAD_MODEL_PIN_MODEL"
+      export SQUAD_MODEL="$SQUAD_MODEL_PIN_MODEL"
+      export SQUAD_MODEL_PINNED=1
+      squad_policy_log "Model: ${SQUAD_MODEL_PIN_MODEL} for role '${SQUAD_MODEL_PIN_ROLE}' (${SQUAD_MODEL_PIN_SOURCE})."
+      squad_policy_log "  No fallback: if this model is unavailable or over quota, the session stops with Copilot's own error."
+      ;;
+    unpinned)
+      export SQUAD_AGENT_MODEL=""
+      export SQUAD_MODEL_PINNED=0
+      squad_policy_log "Model: NOT PINNED for role '${SQUAD_MODEL_PIN_ROLE}' -- ${SQUAD_MODEL_PIN_SOURCE}."
+      squad_policy_log "  Copilot will run on its own default model; this repository is not choosing it."
+      ;;
+    not-applicable)
+      export SQUAD_AGENT_MODEL=""
+      export SQUAD_MODEL_PINNED=0
+      ;;
+    *)
+      squad_policy_abort "The model resolver returned an unrecognised status ('${SQUAD_MODEL_PIN_STATUS}'); refusing to start."
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 2. State directory
 # ---------------------------------------------------------------------------
 # Where the TRIPWIRE copies of the integrity state are written. Outside the
