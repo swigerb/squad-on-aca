@@ -92,6 +92,15 @@ function Add-Fail($text) { $script:Failures += $text; Write-Host "  [FAIL] $text
 # a pass is a check that stops existing the moment the dependency goes missing.
 function Add-Skip($text) { $script:Skips += $text; Write-Host "  [SKIP] $text" -ForegroundColor Yellow }
 
+# Test-only writer shared by every generated .cmd stub (see the file header): the
+# logs-fallback stub below is written here, before any harness is dot-sourced.
+$cmdStubWriterPath = Join-Path $RepoRoot "scripts\tests\cmd-stub-writer.ps1"
+if (Test-Path -LiteralPath $cmdStubWriterPath) {
+    . $cmdStubWriterPath
+} else {
+    Add-Fail "scripts/tests/cmd-stub-writer.ps1 is missing (every generated .cmd stub is written through it)"
+}
+
 # ---------------------------------------------------------------------------
 # 1. PowerShell parse
 # ---------------------------------------------------------------------------
@@ -107,6 +116,157 @@ foreach ($file in $psFiles) {
         }
     } else {
         Add-Pass "$($file.Name) parsed clean"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 1b. Generated .cmd stubs are CRLF whatever the checkout's line endings
+# ---------------------------------------------------------------------------
+# Every stub harness writes its fake az / gh / squad / curl / aca from a
+# here-string, which takes the line endings of the harness source. cmd.exe cannot
+# resolve `goto <label>` in an LF-only batch file ("The system cannot find the
+# batch label specified"), so each writer has to produce CRLF whatever the
+# checkout gave the source. Two proofs: no script writes a .cmd except through
+# Write-SquadCliCmdStub, and each harness, loaded from an LF-only copy of its own
+# source, generates CRLF-only shims -- the three az stubs' deepest label actions
+# are then actually run.
+Write-Section "Generated .cmd stubs are CRLF whatever the checkout EOL"
+$rawCmdWritePattern = '(Set-Content|Add-Content|Out-File|WriteAllText|WriteAllBytes)[^\r\n]*[.]cmd"'
+$rawCmdWriters = @()
+foreach ($file in $psFiles) {
+    foreach ($line in (Get-Content -LiteralPath $file.FullName)) {
+        if ($line -match $rawCmdWritePattern) { $rawCmdWriters += "$($file.Name): $($line.Trim())" }
+    }
+}
+if ($rawCmdWriters.Count -eq 0) {
+    Add-Pass "No script writes a .cmd stub except through Write-SquadCliCmdStub"
+} else {
+    Add-Fail "Raw .cmd writers bypass Write-SquadCliCmdStub (an LF checkout makes them LF-only): $($rawCmdWriters -join ' | ')"
+}
+
+if (-not $IsWindowsHost) {
+    Add-Skip "Generated .cmd stub CRLF checks require Windows (.cmd stubs)"
+} elseif (-not (Test-Path -LiteralPath $cmdStubWriterPath)) {
+    Add-Fail "Generated .cmd stub CRLF checks cannot run: scripts/tests/cmd-stub-writer.ps1 is missing"
+} else {
+    $lfLatin1 = [System.Text.Encoding]::GetEncoding(28591)
+    # Byte-exact LF copy of a source file: Latin-1 maps every byte to one char.
+    $toLfCopy = {
+        param([string]$Source, [string]$Destination)
+        $text = $lfLatin1.GetString([System.IO.File]::ReadAllBytes($Source))
+        [System.IO.File]::WriteAllBytes($Destination, $lfLatin1.GetBytes([regex]::Replace($text, "\r\n", "`n")))
+    }
+    $restoreEnv = {
+        param([string]$Name, $Value)
+        if ($null -eq $Value) { Remove-Item -LiteralPath "Env:\$Name" -ErrorAction SilentlyContinue } else { Set-Item -LiteralPath "Env:\$Name" -Value $Value }
+    }
+    $lfRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cmd-stub-lf-" + [guid]::NewGuid().ToString("N"))
+    $lfTests = Join-Path $lfRoot "tests"
+    $lfCases = @(
+        @{ File = "cli-stub-harness.ps1";            Factory = "New-SquadCliStubEnvironment";  Shims = @("az", "gh", "squad", "curl", "aca") },
+        @{ File = "rbac-drift-stub-harness.ps1";     Factory = "New-RbacDriftStubEnvironment"; Shims = @("az") },
+        @{ File = "job-drift-stub-harness.ps1";      Factory = "New-JobDriftStubEnvironment";  Shims = @("az") },
+        @{ File = "proc-isolation-stub-harness.ps1"; Factory = "New-ProcIsoStubEnvironment";   Shims = @("az") }
+    )
+    $lfEnvs = @{}
+    try {
+        New-Item -ItemType Directory -Force -Path $lfTests | Out-Null
+        & $toLfCopy $cmdStubWriterPath (Join-Path $lfTests "cmd-stub-writer.ps1")
+        foreach ($case in $lfCases) {
+            $caseSource = Join-Path $RepoRoot ("scripts\tests\" + $case.File)
+            if (-not (Test-Path -LiteralPath $caseSource)) {
+                Add-Fail "scripts/tests/$($case.File) is missing (generated .cmd stub CRLF check)"
+                continue
+            }
+            $caseCopy = Join-Path $lfTests $case.File
+            & $toLfCopy $caseSource $caseCopy
+            if ([regex]::IsMatch([System.IO.File]::ReadAllText($caseCopy), "\r")) {
+                Add-Fail "$($case.File): the LF-only copy still contains CR, so the CRLF check proves nothing"
+                continue
+            }
+            $caseEnvRoot = Join-Path $lfRoot ("env-" + [System.IO.Path]::GetFileNameWithoutExtension($case.File))
+            $created = @(& { param($Harness, $Factory, $Root) . $Harness; & $Factory -Root $Root } $caseCopy $case.Factory $caseEnvRoot)
+            $caseEnv = $created | Where-Object { $_ -and $_.BinDir } | Select-Object -Last 1
+            if (-not $caseEnv) {
+                Add-Fail "$($case.File): the LF-only copy did not produce a stub environment"
+                continue
+            }
+            $badShims = @()
+            foreach ($shim in $case.Shims) {
+                $shimPath = Join-Path $caseEnv.BinDir "$shim.cmd"
+                if (-not (Test-Path -LiteralPath $shimPath)) {
+                    $badShims += "$shim.cmd (missing)"
+                } elseif ([regex]::IsMatch([System.IO.File]::ReadAllText($shimPath), "(?<!\r)\n")) {
+                    $badShims += "$shim.cmd (bare LF)"
+                }
+            }
+            if ($badShims.Count -eq 0) {
+                Add-Pass "$($case.File): from an LF-only source every generated shim ($($case.Shims -join '/')) is CRLF-only"
+            } else {
+                Add-Fail "$($case.File): from an LF-only source these shims are wrong: $($badShims -join ', ')"
+            }
+            $lfEnvs[$case.File] = $caseEnv
+        }
+
+        # The deepest label of each drift/isolation az stub, run for real.
+        $rbacLf = $lfEnvs["rbac-drift-stub-harness.ps1"]
+        if ($rbacLf) {
+            $prevClean = $env:SQUAD_RBAC_STUB_CLEAN; $prevLog = $env:SQUAD_RBAC_STUB_LOG
+            try {
+                $env:SQUAD_RBAC_STUB_CLEAN = "1"
+                $env:SQUAD_RBAC_STUB_LOG = $rbacLf.AzLog
+                $rbacOut = (& (Join-Path $rbacLf.BinDir "az.cmd") role assignment list --scope "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-cv1-stub/providers/Microsoft.App/jobs/caj-cv1stub-session" 2>&1) -join " "
+                $rbacRc = $LASTEXITCODE
+            } finally {
+                & $restoreEnv "SQUAD_RBAC_STUB_CLEAN" $prevClean
+                & $restoreEnv "SQUAD_RBAC_STUB_LOG" $prevLog
+            }
+            if ($rbacRc -eq 0 -and $rbacOut -match "Container Apps Jobs Operator" -and $rbacOut -notmatch "batch label") {
+                Add-Pass "rbac-drift-stub-harness.ps1: the LF-sourced az.cmd reaches its deepest label (rbrolescopejobclean)"
+            } else {
+                Add-Fail "rbac-drift-stub-harness.ps1: the LF-sourced az.cmd did not run its label actions (rc=$rbacRc out='$rbacOut')"
+            }
+        }
+        $jobLf = $lfEnvs["job-drift-stub-harness.ps1"]
+        if ($jobLf) {
+            $prevClean = $env:SQUAD_JOB_STUB_CLEAN; $prevLog = $env:SQUAD_JOB_STUB_LOG
+            try {
+                $env:SQUAD_JOB_STUB_CLEAN = "1"
+                $env:SQUAD_JOB_STUB_LOG = $jobLf.AzLog
+                $jobOut = (& (Join-Path $jobLf.BinDir "az.cmd") containerapp job show 2>&1) -join " "
+                $jobRc = $LASTEXITCODE
+            } finally {
+                & $restoreEnv "SQUAD_JOB_STUB_CLEAN" $prevClean
+                & $restoreEnv "SQUAD_JOB_STUB_LOG" $prevLog
+            }
+            if ($jobRc -eq 0 -and $jobOut -match "github-token" -and $jobOut -notmatch "batch label") {
+                Add-Pass "job-drift-stub-harness.ps1: the LF-sourced az.cmd reaches its deepest label (jdjob)"
+            } else {
+                Add-Fail "job-drift-stub-harness.ps1: the LF-sourced az.cmd did not run its label actions (rc=$jobRc out='$jobOut')"
+            }
+        }
+        $procLf = $lfEnvs["proc-isolation-stub-harness.ps1"]
+        if ($procLf) {
+            $prevMode = $env:SQUAD_PROC_ISO_STUB_MODE; $prevLog = $env:SQUAD_PROC_ISO_STUB_LOG
+            try {
+                $env:SQUAD_PROC_ISO_STUB_MODE = "observed-yes"
+                $env:SQUAD_PROC_ISO_STUB_LOG = $procLf.AzLog
+                $procOut = (& (Join-Path $procLf.BinDir "az.cmd") containerapp job logs show --name caj-pc1stub-session --execution caj-pc1stub-session-stub01 --container squad-probe --tail 10 --format json 2>&1) -join " "
+                $procRc = $LASTEXITCODE
+            } finally {
+                & $restoreEnv "SQUAD_PROC_ISO_STUB_MODE" $prevMode
+                & $restoreEnv "SQUAD_PROC_ISO_STUB_LOG" $prevLog
+            }
+            if ($procRc -eq 0 -and $procOut -match "same-uid-environ-readable=yes" -and $procOut -notmatch "batch label") {
+                Add-Pass "proc-isolation-stub-harness.ps1: the LF-sourced az.cmd reaches its deepest label (pilogsok)"
+            } else {
+                Add-Fail "proc-isolation-stub-harness.ps1: the LF-sourced az.cmd did not run its label actions (rc=$procRc out='$procOut')"
+            }
+        }
+    } catch {
+        Add-Fail "Generated .cmd stub CRLF checks threw: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $lfRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -790,7 +950,21 @@ exit /b 0
 echo ERROR: simulated Log Analytics query failure>&2
 exit /b 1
 '@
-    Set-Content -LiteralPath (Join-Path $stubBin "az.cmd") -Value $azStub -Encoding ascii
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $stubBin "az.cmd") -Value $azStub
+
+    # This stub is also written from a here-string, so it must come out CRLF on an
+    # LF checkout too: both the file actually written and an LF-only copy of its
+    # source are checked, byte for byte.
+    $azStubBytesText = [System.IO.File]::ReadAllText((Join-Path $stubBin "az.cmd"))
+    $azStubLfProbe = Join-Path $stubRoot "az-lf-probe.cmd"
+    Write-SquadCliCmdStub -LiteralPath $azStubLfProbe -Value ([regex]::Replace($azStub, "\r\n", "`n"))
+    $azStubLfProbeText = [System.IO.File]::ReadAllText($azStubLfProbe)
+    if (-not [regex]::IsMatch($azStubBytesText, "(?<!\r)\n") -and -not [regex]::IsMatch($azStubLfProbeText, "(?<!\r)\n") `
+            -and $azStubLfProbeText -ceq $azStubBytesText) {
+        Add-Pass "The logs-fallback az.cmd stub is CRLF-only, and an LF-only source of it is written byte-identically"
+    } else {
+        Add-Fail "The logs-fallback az.cmd stub is not CRLF-only independent of the source line endings"
+    }
 
     $prevPath = $env:PATH
     $prevDynamic = $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL

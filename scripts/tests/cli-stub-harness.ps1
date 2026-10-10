@@ -104,28 +104,9 @@
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here. This file
 # is dot-sourced into validate.ps1's scope and must not change its behaviour.
 
-function Write-SquadCliCmdStub {
-    <#
-    .SYNOPSIS
-        Writes a .cmd shim with CRLF line endings, whatever line endings this
-        harness source was checked out with.
-
-    .DESCRIPTION
-        The shims are here-strings, so a shim inherits the EOL of THIS file. With
-        an LF checkout (core.autocrlf off, or a worktree made that way) cmd.exe
-        reads an LF-only batch file wrongly and `goto <label>` fails with "The
-        system cannot find the batch label specified". Normalising to CRLF here
-        makes the shims independent of the checkout. The content stays ASCII and
-        ends with exactly one CRLF, as Set-Content's own trailing newline did.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$LiteralPath,
-        [Parameter(Mandatory = $true)][string]$Value
-    )
-    $crlfValue = [regex]::Replace($Value, "\r\n|\r|\n", "`r`n")
-    if (-not $crlfValue.EndsWith("`r`n")) { $crlfValue += "`r`n" }
-    Set-Content -LiteralPath $LiteralPath -Value $crlfValue -Encoding ascii -NoNewline
-}
+# The shims below are written as CRLF whatever this file's own line endings are;
+# see scripts/tests/cmd-stub-writer.ps1.
+. (Join-Path $PSScriptRoot "cmd-stub-writer.ps1")
 
 function New-SquadCliStubEnvironment {
     <#

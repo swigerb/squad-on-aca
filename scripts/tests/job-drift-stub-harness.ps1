@@ -33,6 +33,10 @@
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here, matching
 # scripts/tests/rbac-drift-stub-harness.ps1.
 
+# The stub below is written as CRLF whatever this file's own line endings are;
+# see scripts/tests/cmd-stub-writer.ps1.
+. (Join-Path $PSScriptRoot "cmd-stub-writer.ps1")
+
 $script:JobDriftStubSubscriptionId = "66666666-6666-6666-6666-666666666666"
 $script:JobDriftStubResourceGroup = "rg-cv2-stub"
 $script:JobDriftStubNamePrefix = "cv2stub"
@@ -64,7 +68,7 @@ function New-JobDriftStubEnvironment {
     Set-Content -LiteralPath (Join-Path $binDir "clean-job.json") -Value $cleanJobJson -NoNewline -Encoding ascii
     Set-Content -LiteralPath (Join-Path $binDir "drifted-job.json") -Value $drifted_JobJson -NoNewline -Encoding ascii
 
-    Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "az.cmd") -Value @'
 @echo off
 setlocal enabledelayedexpansion
 if not "%SQUAD_JOB_STUB_LOG%"=="" (>>"%SQUAD_JOB_STUB_LOG%" echo %*)
