@@ -287,7 +287,8 @@ $bashScripts = @(
     (Join-Path $RepoRoot "worker\tests\test_governance_guard.sh"),
     (Join-Path $RepoRoot "worker\tests\test_image_evidence.sh"),
     (Join-Path $RepoRoot "worker\tests\test_manifest_path_corpus.sh"),
-    (Join-Path $RepoRoot "worker\tests\test_squad_agent_wrapper.sh")
+    (Join-Path $RepoRoot "worker\tests\test_squad_agent_wrapper.sh"),
+    (Join-Path $RepoRoot "worker\tests\test_model_pin.sh")
 )
 if ($SkipBash) {
     Write-Host "  [SKIP] -SkipBash specified"

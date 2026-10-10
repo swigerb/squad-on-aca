@@ -808,7 +808,7 @@ assert_contains "$json_parity" '"watchAgentPolicyMode": "parity"' "json (unset):
 unknown_out="$(watch_policy __UNSET__ no-such-subcommand)"
 assert_eq "78" "$(watch_policy_status __UNSET__ no-such-subcommand)" \
   "an unknown resolver sub-command still exits 78 after adding the watch-agent-* verbs"
-for verb in watch-agent-argv-json watch-agent-parity-argv-json watch-agent-strict-argv-json watch-agent-policy-mode; do
+for verb in watch-agent-argv-json watch-agent-parity-argv-json watch-agent-strict-argv-json watch-agent-policy-mode model-role model-pin; do
   assert_contains "$unknown_out" "$verb" "the usage string lists the new verb '${verb}'"
 done
 

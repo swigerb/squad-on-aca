@@ -61,7 +61,10 @@
 #      REPLACED by the copilot process (same reason worker/entrypoint.sh's own
 #      identity-drop uses `exec runuser`): no wrapper process survives to be a
 #      second thing watch/loop have to manage or that could swallow a signal
-#      meant for copilot.
+#      meant for copilot. The one exception is a session with a REQUIRED model
+#      (SQUAD_MODEL_PINNED=1): there copilot runs as this script's child, with
+#      TERM/INT/HUP forwarded to it, so that a launch failure on that model can
+#      be recorded and stop Squad's polling (see SQUAD_MODEL_PIN_FAILURE_FILE).
 #
 # PARITY VS STRICT (issue #112's `undeliverableViaSquad` gap). Before this
 # fix, `watch`/`loop` passed the resolved policy through `squad
@@ -85,8 +88,10 @@
 # EXIT CODES:
 #   78  EX_CONFIG -- the policy argv could not be resolved, or was found to
 #       contain a permission-widening flag. Mirrors
-#       worker/lib/squad-policy.sh's squad_policy_abort.
-#   Anything else -- whatever `copilot` itself exits with, via `exec`.
+#       worker/lib/squad-policy.sh's squad_policy_abort. Also a pinned launch
+#       refused because an earlier one on the required model already failed.
+#   Anything else -- whatever `copilot` itself exits with (via `exec`, or as
+#       the pinned child's own status).
 #
 # Environment:
 #   SQUAD_AGENT_POLICY_ARGV_JSON   required. JSON array of strings: the
@@ -99,12 +104,38 @@
 #                                  added -- that is a feature gap (squad_state_*
 #                                  tools unavailable), not a security failure,
 #                                  so it does not abort the session.
-#   SQUAD_AGENT_MODEL              optional. Issue #135's manual dispatch
-#                                  `model` override, already re-validated by
-#                                  worker/entrypoint.sh. Appended to the exec'd
-#                                  argv as `--model <value>` when set. A value
+#   SQUAD_AGENT_MODEL              optional. The model this session's Copilot
+#                                  runs on: the `ralph` role's model from the
+#                                  repository's .squad/config.json, resolved
+#                                  once (and checked against any operator
+#                                  override) by worker/entrypoint.sh, which
+#                                  also issue #135's `model` input feeds into.
+#                                  Passed to copilot as exactly ONE `--model
+#                                  <value>`, placed right after Squad's own
+#                                  arguments and before the policy argv. Every
+#                                  other `--model` on the policy argv or in
+#                                  Squad's arguments is removed when it names
+#                                  the same model (any spelling: `--model X`,
+#                                  `--model=X`, other case) and aborts (78)
+#                                  when it names a different one. A value
 #                                  starting with '-' aborts (78) rather than
-#                                  being passed through as a flag.
+#                                  being passed through as a flag, and so does
+#                                  a COPILOT_MODEL that differs from it.
+#   SQUAD_MODEL_PINNED             optional. `1` when the entrypoint required a
+#                                  specific model for this session. Then an
+#                                  empty SQUAD_AGENT_MODEL aborts (78) instead
+#                                  of letting copilot run on its own default,
+#                                  and copilot is run as a CHILD (not `exec`)
+#                                  so a failure to run on the model can stop
+#                                  Squad's polling -- see
+#                                  SQUAD_MODEL_PIN_FAILURE_FILE.
+#   SQUAD_MODEL_PIN_FAILURE_FILE   required when SQUAD_MODEL_PINNED=1 (set by
+#                                  worker/entrypoint.sh). An unsolicited
+#                                  non-zero exit of the pinned copilot writes
+#                                  its status here, which makes the supervisor
+#                                  stop Squad. If the file already exists, no
+#                                  copilot is launched (exit 78): one failed
+#                                  attempt, never a retry.
 #   SQUAD_POLICY_MCP_CONFIG_SHA256 set by squad_policy_harden: the harden-time
 #                                  SHA-256 of .mcp.json, or `absent`. The
 #                                  AUTHORITATIVE baseline (see the F8 block).
@@ -241,13 +272,22 @@ if [[ -n "$REPO_DIR" ]]; then
   fi
 fi
 
-# Issue #135: the manual dispatch `model` override. worker/entrypoint.sh
-# exports SQUAD_AGENT_MODEL (already re-validated there -- no leading '-')
-# rather than this script trusting SQUAD_MODEL directly, so there is exactly
-# one place that decides the value reaching this script is safe to use as an
-# argv element. Re-checked here anyway as the same defense-in-depth pattern
-# the policy-argv and MCP integrity checks above already use.
+# Issue #135 / the role model pin: the model this session's Copilot runs on.
+# worker/entrypoint.sh resolves it ONCE (worker/lib/agent-policy.js `model-pin`,
+# via squad_policy_resolve_model: the `ralph` role's model for watch/loop),
+# re-validates it, and exports it here as SQUAD_AGENT_MODEL rather than this
+# script trusting SQUAD_MODEL directly or re-deriving a model on its own -- so
+# there is exactly one place that decides what runs. Re-checked here anyway as
+# the same defense-in-depth pattern the policy-argv and MCP integrity checks
+# above already use.
+#
+# SQUAD_MODEL_PINNED=1 is the entrypoint saying "a model was required". If it
+# is set and SQUAD_AGENT_MODEL did not arrive, the session would silently run on
+# Copilot's own default model, so that aborts rather than proceeding unpinned.
 MODEL_ARGV=()
+if [[ "${SQUAD_MODEL_PINNED:-0}" == 1 && -z "${SQUAD_AGENT_MODEL:-}" ]]; then
+  squad_agent_abort "SQUAD_MODEL_PINNED=1 but SQUAD_AGENT_MODEL is empty: this session was required to run on a specific model and would silently run on Copilot's default instead; refusing to exec copilot."
+fi
 if [[ -n "${SQUAD_AGENT_MODEL:-}" ]]; then
   if [[ "$SQUAD_AGENT_MODEL" == -* ]]; then
     squad_agent_abort "SQUAD_AGENT_MODEL ('${SQUAD_AGENT_MODEL}') starts with '-' and would be read as a flag, not a model name; refusing to exec copilot."
@@ -412,12 +452,144 @@ for token in "$@"; do
   done
 done
 
-# Order: Squad's own trailing arguments ("$@" -- today exactly `-p <prompt>`)
-# FIRST, then the resolved policy argv, then the MCP config this script adds
-# itself, then the model override. `copilot`'s flag parser does not require a
-# particular order, but putting the policy argv and this script's own
-# additions AFTER whatever Squad appended means a future Squad that starts
-# appending its own `--deny-tool`/`--additional-mcp-config` could never
-# silently override what this script resolved -- the LAST occurrence of a
-# given flag is this script's, not Squad's.
-exec copilot "$@" "${POLICY_ARGV[@]}" "${MCP_ARGV[@]}" "${MODEL_ARGV[@]}"
+# Squad's own trailing arguments ("$@" -- today exactly `-p <prompt>`), as an
+# array this script may rewrite.
+SQUAD_ARGV=("$@")
+
+# When a model is pinned, copilot gets exactly ONE `--model`: the pin. Every
+# `--model <id>` / `--model=<id>` on the policy argv (a matching one rides in
+# from SQUAD_COPILOT_FLAGS) or on what Squad appended is checked and REMOVED:
+# one that names the pinned model (case-insensitively) is just another spelling
+# of it and is dropped so it is not forwarded next to the canonical pin; one
+# that names anything else, or has no value, aborts -- the entrypoint's resolver
+# already refuses to start for that, and this is the same stance for an argv
+# that reaches this script by some route the resolver did not see. `-p`'s value
+# is a prompt, not an option, so it is skipped.
+if [[ -n "${SQUAD_AGENT_MODEL:-}" ]]; then
+  # Copilot's own model environment variable is a second place a stale override
+  # could live. The resolver already compared it; compared again here for the
+  # same reason as everything else in this block.
+  if [[ -n "${COPILOT_MODEL:-}" && "${COPILOT_MODEL,,}" != "${SQUAD_AGENT_MODEL,,}" ]]; then
+    squad_agent_abort "COPILOT_MODEL ('${COPILOT_MODEL}') conflicts with the pinned model '${SQUAD_AGENT_MODEL}'. There is no fallback to either; refusing to exec copilot."
+  fi
+  squad_agent_strip_model_tokens() {
+    local label="$1"
+    local -n _model_ref="$2"
+    local -a kept=()
+    local i tok val
+    for ((i = 0; i < ${#_model_ref[@]}; i++)); do
+      tok="${_model_ref[i]}"
+      case "$tok" in
+        -p|--prompt)
+          kept+=("$tok")
+          i=$((i + 1))
+          if [[ "$i" -lt "${#_model_ref[@]}" ]]; then
+            kept+=("${_model_ref[i]}")
+          fi
+          continue
+          ;;
+        --model)
+          if [[ $((i + 1)) -ge "${#_model_ref[@]}" ]]; then
+            squad_agent_abort "${label} ends with '--model' and no model id; refusing to exec copilot."
+          fi
+          i=$((i + 1))
+          val="${_model_ref[i]}"
+          ;;
+        --model=*) val="${tok#--model=}" ;;
+        *) kept+=("$tok"); continue ;;
+      esac
+      if [[ -z "$val" || "${val,,}" != "${SQUAD_AGENT_MODEL,,}" ]]; then
+        squad_agent_abort "${label} carries '--model ${val}', which conflicts with the pinned model '${SQUAD_AGENT_MODEL}'. There is no fallback to either; refusing to exec copilot."
+      fi
+    done
+    _model_ref=(${kept[@]+"${kept[@]}"})
+  }
+  squad_agent_strip_model_tokens "SQUAD_AGENT_POLICY_ARGV_JSON" POLICY_ARGV
+  squad_agent_strip_model_tokens "The arguments Squad appended" SQUAD_ARGV
+fi
+
+# Order: Squad's own trailing arguments FIRST, then the model pin, then the
+# resolved policy argv, then the MCP config this script adds itself.
+# `copilot`'s flag parser does not require a particular order, but putting the
+# policy argv and this script's own additions AFTER whatever Squad appended
+# means a future Squad that starts appending its own
+# `--deny-tool`/`--additional-mcp-config` could never silently override what
+# this script resolved. The pin sits before the operator-supplied policy extras
+# on purpose: an extra that takes a value and was left dangling at the end of
+# SQUAD_COPILOT_FLAGS would otherwise swallow a trailing `--model` as its
+# argument and leave the session on Copilot's default model.
+COPILOT_ARGV_FINAL=("${SQUAD_ARGV[@]}" "${MODEL_ARGV[@]}" "${POLICY_ARGV[@]}" "${MCP_ARGV[@]}")
+
+# Unpinned session: nothing required a model, so keep the plain `exec` -- this
+# process BECOMES copilot, and Squad sees copilot's own exit status.
+if [[ "${SQUAD_MODEL_PINNED:-0}" != 1 ]]; then
+  exec copilot "${COPILOT_ARGV_FINAL[@]}"
+fi
+
+# Pinned session. Real Squad keeps polling (`watch`) or reschedules (`loop`)
+# after its agent command exits non-zero, so a copilot that cannot run on the
+# required model would be re-launched against it every interval. This process
+# therefore stays alive as copilot's PARENT and, when copilot exits non-zero on
+# its own, records that in SQUAD_MODEL_PIN_FAILURE_FILE, which stops the
+# supervisor's Squad (worker/lib/squad-signal-forwarding.sh) and LATCHES here:
+# once the file exists no further copilot launch is made. There is no retry and
+# no fallback model, and no copilot output is read to decide any of it (Copilot
+# has no distinct exit status for "model not available", so ANY unsolicited
+# non-zero exit of the pinned copilot counts). A clean 0 is the normal
+# completed workflow, and an exit caused by a TERM/INT/HUP this script was
+# forwarding (Squad's timeout, a drain) is not a model failure and is not
+# recorded.
+MODEL_FAILURE_FILE="${SQUAD_MODEL_PIN_FAILURE_FILE:-}"
+if [[ -z "$MODEL_FAILURE_FILE" ]]; then
+  squad_agent_abort "SQUAD_MODEL_PINNED=1 but SQUAD_MODEL_PIN_FAILURE_FILE is empty: a launch failure on the required model could not stop Squad's polling, so it would be retried every interval; refusing to exec copilot."
+fi
+if [[ ! -d "$(dirname "$MODEL_FAILURE_FILE")" || ! -w "$(dirname "$MODEL_FAILURE_FILE")" ]]; then
+  squad_agent_abort "$(dirname "$MODEL_FAILURE_FILE") is not a writable directory, so a launch failure on the required model could not be recorded; refusing to exec copilot."
+fi
+if [[ -e "$MODEL_FAILURE_FILE" ]]; then
+  latched_rc=""
+  IFS= read -r latched_rc <"$MODEL_FAILURE_FILE" || true
+  squad_agent_log "A launch on the pinned model '${SQUAD_AGENT_MODEL}' already failed this session (copilot exit ${latched_rc:-unknown}); not launching copilot again. No retry, no fallback model."
+  exit 78
+fi
+
+copilot_pid=""
+copilot_signalled=0
+squad_agent_forward_signal() {
+  copilot_signalled=1
+  if [[ -n "$copilot_pid" ]]; then
+    kill -s TERM "$copilot_pid" 2>/dev/null || true
+  fi
+}
+trap squad_agent_forward_signal TERM INT HUP
+
+# A background job gets /dev/null for stdin unless it is redirected explicitly;
+# keep copilot's stdin the same as it was under `exec`, unless stdin is closed.
+if { : <&0; } 2>/dev/null; then
+  copilot "${COPILOT_ARGV_FINAL[@]}" <&0 &
+else
+  copilot "${COPILOT_ARGV_FINAL[@]}" &
+fi
+copilot_pid=$!
+if [[ "$copilot_signalled" -eq 1 ]]; then
+  kill -s TERM "$copilot_pid" 2>/dev/null || true
+fi
+
+# A trapped signal interrupts `wait` with a synthetic 128+signo status while
+# copilot may still be running; keep waiting until it is really gone, then use
+# ITS status.
+copilot_rc=0
+while :; do
+  copilot_rc=0
+  wait "$copilot_pid" || copilot_rc=$?
+  kill -0 "$copilot_pid" 2>/dev/null || break
+done
+trap - TERM INT HUP
+
+if [[ "$copilot_rc" -ne 0 && "$copilot_signalled" -eq 0 ]]; then
+  squad_agent_log "copilot exited ${copilot_rc} on the pinned model '${SQUAD_AGENT_MODEL}'; recording the failure so Squad's iterations stop. No retry, no fallback model."
+  if ! { printf '%s\n' "$copilot_rc" >"${MODEL_FAILURE_FILE}.$$" && mv -f -- "${MODEL_FAILURE_FILE}.$$" "$MODEL_FAILURE_FILE"; }; then
+    squad_agent_log "Could not record the failure in ${MODEL_FAILURE_FILE}; Squad's iterations will NOT be stopped by this launch failure."
+  fi
+fi
+exit "$copilot_rc"

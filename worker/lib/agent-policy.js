@@ -1144,6 +1144,333 @@ function pinMemoryAuditConfig(repoDir) {
   fs.writeFileSync(target, `${JSON.stringify(config, null, 2)}\n`);
 }
 
+// ---------------------------------------------------------------------------
+// Model pin (which model each launch runs on)
+// ---------------------------------------------------------------------------
+// Until this existed, `copilot` was launched with NO `--model` unless an
+// operator happened to type one (issue #135), so which model actually ran a
+// session was whatever the Copilot CLI's own default was that day -- not a
+// decision this repository had made or could audit.
+//
+// The repository already records its decision per role in
+// `.squad/config.json` (`agentModelOverrides[<role>]`, then `defaultModel` --
+// Squad's own Layer 0 order). This section reads THAT, once, and turns it into
+// the one explicit `--model` every launch passes. It adds no model list of its
+// own: a catalog baked into this image would go stale and reject a model the
+// repository has legitimately approved, so the only thing checked about a
+// model id here is that it is shaped like one (see MODEL_VALUE_PATTERN).
+//
+// WHICH ROLE. Every session this worker starts runs Copilot as the `squad`
+// coordinator agent (`--agent squad` is part of the resolved policy), but the
+// two families of launch do different jobs:
+//   - watch / triage / loop: Squad's own work monitor. The prompt `squad watch`
+//     builds is Ralph's charter ("You are an AI agent ... YOUR CHARTER:
+//     <ralph>"; squad-cli 1.0.1, dist/cli/commands/watch/capabilities/
+//     execute.js) and `squad loop` documents itself as "Ralph" too, so these
+//     run on the `ralph` role's model.
+//   - prompt / new-project / smoke (including every session Ralph dispatches,
+//     which is a `prompt` session): the coordinator that decides and delegates.
+//     Coordination is judgement, so these run on the `lead` role's model.
+// The modes that start no Copilot at all (`ralph` the dispatcher,
+// `telemetry-smoke`, `shell`) have no role and are not pinned.
+//
+// There is deliberately NO single model for everything: roles keep their own
+// tier, and a repository can move one role without moving the rest.
+const MODEL_ROLE_BY_MODE = Object.freeze({
+  smoke: 'lead',
+  prompt: 'lead',
+  'new-project': 'lead',
+  loop: 'ralph',
+  watch: 'ralph',
+  triage: 'ralph',
+});
+
+// A model id is a plain token. Same shape worker/lib/dispatch-inputs.js
+// enforces on the workflow `model` input, plus the property that matters at
+// the argv: it can never start with '-' and be read as a flag.
+const MODEL_VALUE_PATTERN = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
+
+// `auto` asks Copilot to choose, which is the opposite of a pin. A repository
+// that declares it has declined to name a model; that is honoured as "not
+// pinned" (and reported as such) rather than passed to `--model` as if it
+// were an id.
+const MODEL_POLICY_AUTO = 'auto';
+
+const MODEL_PIN_PINNED = 'pinned';
+const MODEL_PIN_UNPINNED = 'unpinned';
+const MODEL_PIN_NOT_APPLICABLE = 'not-applicable';
+
+function modelRoleForMode(mode) {
+  const m = normalize(mode);
+  return Object.prototype.hasOwnProperty.call(MODEL_ROLE_BY_MODE, m) ? MODEL_ROLE_BY_MODE[m] : '';
+}
+
+function checkModelValue(value, where) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new AgentPolicyError(`${where} is not a model id (expected a non-empty string); refusing to start.`);
+  }
+  if (value.startsWith('-')) {
+    throw new AgentPolicyError(
+      `${where} ('${value}') starts with '-' and would be read as a flag, not a model name; refusing to start.`
+    );
+  }
+  if (!MODEL_VALUE_PATTERN.test(value)) {
+    throw new AgentPolicyError(
+      `${where} ('${value}') is not a valid model id (letters, digits, '.', '_' and '-' only); refusing to start.`
+    );
+  }
+  return value;
+}
+
+/**
+ * Every model an OPERATOR asked for, by where they asked: the workflow `model`
+ * input (SQUAD_MODEL), a pre-set SQUAD_AGENT_MODEL, Copilot's own COPILOT_MODEL
+ * and a `--model` inside SQUAD_COPILOT_FLAGS. Blank values are "not asked".
+ * Each one is checked for shape here, so a malformed override is rejected
+ * rather than being compared (or passed on) as if it were a model.
+ */
+function collectOperatorModels(env) {
+  const e = env || {};
+  const found = [];
+  const add = (source, raw) => {
+    const value = String(raw === undefined || raw === null ? '' : raw).trim();
+    if (value !== '') {
+      found.push({ source, value: checkModelValue(value, source) });
+    }
+  };
+  add('SQUAD_MODEL', e.SQUAD_MODEL);
+  add('SQUAD_AGENT_MODEL', e.SQUAD_AGENT_MODEL);
+  add('COPILOT_MODEL', e.COPILOT_MODEL);
+
+  const tokens = splitFlags(e.SQUAD_COPILOT_FLAGS);
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === '--model') {
+      if (i + 1 >= tokens.length) {
+        throw new AgentPolicyError('SQUAD_COPILOT_FLAGS ends with --model and no model id; refusing to start.');
+      }
+      i += 1;
+      add('SQUAD_COPILOT_FLAGS --model', tokens[i]);
+    } else if (token.startsWith('--model=')) {
+      const value = token.slice('--model='.length);
+      if (value === '') {
+        throw new AgentPolicyError('SQUAD_COPILOT_FLAGS has --model= with no model id; refusing to start.');
+      }
+      add('SQUAD_COPILOT_FLAGS --model', value);
+    }
+  }
+  return found;
+}
+
+/**
+ * Read the model policy a repository declares in `.squad/config.json`.
+ *
+ * Returns null when there is no such file (a repository that never declared a
+ * policy is not an error). A file that IS there but cannot be read, parsed or
+ * understood is an error -- a declared policy that cannot be applied must not
+ * quietly become "no policy".
+ */
+function readSquadModelConfig(repoDir) {
+  const fs = require('fs');
+  const path = require('path');
+  const target = path.join(repoDir, '.squad', 'config.json');
+  if (!fs.existsSync(target)) {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(target, 'utf8'));
+  } catch (error) {
+    throw new AgentPolicyError(
+      `.squad/config.json could not be read as JSON (${error.message}); the model policy it declares ` +
+        'cannot be applied, and no model is guessed in its place. Refusing to start.'
+    );
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new AgentPolicyError(
+      '.squad/config.json is not a JSON object; the model policy it declares cannot be applied. Refusing to start.'
+    );
+  }
+  const overrides = parsed.agentModelOverrides;
+  if (overrides !== undefined && (overrides === null || typeof overrides !== 'object' || Array.isArray(overrides))) {
+    throw new AgentPolicyError(
+      '.squad/config.json agentModelOverrides is not an object mapping role -> model; refusing to start.'
+    );
+  }
+  if (parsed.defaultModel !== undefined && typeof parsed.defaultModel !== 'string') {
+    throw new AgentPolicyError('.squad/config.json defaultModel is not a string; refusing to start.');
+  }
+  return { agentModelOverrides: overrides || {}, defaultModel: parsed.defaultModel };
+}
+
+/**
+ * What a repository's policy says for `role`: null when it says nothing (no
+ * config, or no entry and no defaultModel), otherwise
+ *   { model, source, generic, auto }
+ * where `auto` means the policy explicitly declared 'auto' (Copilot chooses --
+ * model is then null) and `generic` means the answer came from the
+ * repository-wide `defaultModel` because the role has no entry of its own.
+ * The role's own entry wins over `defaultModel`; a role entry that is present
+ * but malformed is an error rather than a reason to fall through to the
+ * default. An 'auto' in the role's entry does NOT fall through either: it is the
+ * role's answer.
+ */
+function policyModelForRole(config, role) {
+  if (!config) {
+    return null;
+  }
+  const keys = Object.keys(config.agentModelOverrides).filter((key) => normalize(key) === role);
+  const values = new Set(keys.map((key) => String(config.agentModelOverrides[key]).trim().toLowerCase()));
+  if (values.size > 1) {
+    throw new AgentPolicyError(
+      `.squad/config.json agentModelOverrides names role '${role}' more than once with different models ` +
+        `(${keys.join(', ')}); refusing to guess which one applies.`
+    );
+  }
+  let model;
+  let source;
+  let generic = false;
+  if (keys.length > 0) {
+    model = config.agentModelOverrides[keys[0]];
+    source = `.squad/config.json agentModelOverrides.${keys[0]}`;
+    checkModelValue(model, source);
+  } else if (config.defaultModel !== undefined) {
+    model = config.defaultModel;
+    source = '.squad/config.json defaultModel';
+    generic = true;
+    checkModelValue(model, source);
+  } else {
+    return null;
+  }
+  if (normalize(model) === MODEL_POLICY_AUTO) {
+    return { model: null, source, generic, auto: true };
+  }
+  return { model, source, generic, auto: false };
+}
+/**
+ * Decide the one model a session's Copilot launches run on.
+ *
+ * @param {object} input
+ * @param {string} input.mode      SQUAD_MODE
+ * @param {object|null} input.config  readSquadModelConfig's result
+ * @param {Array<{source:string,value:string}>} input.operator  collectOperatorModels' result
+ * @returns {{status:string, role:string, model:string, source:string, declared:string, warning:string}}
+ *   `model` is '' unless status is `pinned`. `declared` says what the
+ *   REPOSITORY declared for the role -- `model` (a model id), `auto` (an
+ *   explicit 'auto': Copilot chooses) or `none` (nothing) -- which is not
+ *   always what `status` says, because an operator override can pin a role the
+ *   repository left open. `warning` is '' unless the answer rests on a fallback
+ *   the repository did not spell out for this role: the repository-wide
+ *   `defaultModel` standing in for a role with no entry of its own. It never
+ *   changes the answer -- a fallback is still a required model -- it makes the
+ *   fallback visible. Throws AgentPolicyError when an operator override
+ *   disagrees with the repository policy (or, with no policy, with another
+ *   override): there is NO fallback to either side.
+ */
+function resolveModelPin(input) {
+  const opts = input || {};
+  const role = modelRoleForMode(opts.mode);
+  const operator = opts.operator || [];
+
+  if (role === '') {
+    return {
+      status: MODEL_PIN_NOT_APPLICABLE,
+      role: '',
+      model: '',
+      source: `mode '${normalize(opts.mode)}' starts no Copilot session`,
+      declared: 'none',
+      warning: '',
+    };
+  }
+
+  const declaredPolicy = policyModelForRole(opts.config, role);
+  const policy = declaredPolicy && !declaredPolicy.auto ? declaredPolicy : null;
+  const auto = declaredPolicy && declaredPolicy.auto ? declaredPolicy : null;
+  const declared = policy ? 'model' : auto ? 'auto' : 'none';
+  const describe = (list) => list.map((o) => `${o.source}='${o.value}'`).join(', ');
+  const fallbackWarning = (value) =>
+    declaredPolicy && declaredPolicy.generic
+      ? `role '${role}' has no agentModelOverrides.${role} entry in .squad/config.json, so the repository-wide ` +
+        `defaultModel '${value}' applies to it. Add an explicit entry to choose this role's model on purpose.`
+      : '';
+
+  if (policy) {
+    const conflicting = operator.filter((o) => o.value.toLowerCase() !== policy.model.toLowerCase());
+    if (conflicting.length > 0) {
+      throw new AgentPolicyError(
+        `Model override conflict for role '${role}' (mode '${normalize(opts.mode)}'): ${describe(conflicting)} ` +
+          `does not match the repository model policy '${policy.model}' (${policy.source}). ` +
+          'No model is chosen on the override\'s behalf and there is no fallback: remove the override, ' +
+          'or change the policy in .squad/config.json through review. Refusing to start.'
+      );
+    }
+    return {
+      status: MODEL_PIN_PINNED,
+      role,
+      model: policy.model,
+      source:
+        operator.length > 0
+          ? `${policy.source} (operator override ${describe(operator)} matches)`
+          : policy.source,
+      declared,
+      warning: fallbackWarning(policy.model),
+    };
+  }
+
+  if (operator.length > 0) {
+    const distinct = new Set(operator.map((o) => o.value.toLowerCase()));
+    if (distinct.size > 1) {
+      throw new AgentPolicyError(
+        `Conflicting model overrides for role '${role}' (mode '${normalize(opts.mode)}'): ${describe(operator)}. ` +
+          'There is no repository model policy to arbitrate and no fallback: set one value. Refusing to start.'
+      );
+    }
+    return {
+      status: MODEL_PIN_PINNED,
+      role,
+      model: operator[0].value,
+      source: auto
+        ? `operator override ${describe(operator)} (${auto.source} is 'auto', which names no model for role '${role}')`
+        : `operator override ${describe(operator)} (the repository declares no model for role '${role}')`,
+      declared,
+      warning: fallbackWarning("auto"),
+    };
+  }
+
+  if (auto) {
+    return {
+      status: MODEL_PIN_UNPINNED,
+      role,
+      model: '',
+      source:
+        `${auto.source} is 'auto' for role '${role}': the repository asks Copilot to choose the model, ` +
+        'which is NOT a pin',
+      declared,
+      warning: fallbackWarning("auto"),
+    };
+  }
+
+  return {
+    status: MODEL_PIN_UNPINNED,
+    role,
+    model: '',
+    source:
+      `the repository declares no model for role '${role}' (no .squad/config.json agentModelOverrides.${role} ` +
+      'and no defaultModel) and no operator override was given',
+    declared,
+    warning: '',
+  };
+}
+/** resolveModelPin, fed from a process environment and a checked-out repo. */
+function resolveModelPinFromEnv(env, repoDir) {
+  const e = env || {};
+  const operator = collectOperatorModels(e);
+  const role = modelRoleForMode(e.SQUAD_MODE);
+  // Only a mode that starts Copilot has a policy worth reading (or failing on).
+  const config = role === '' ? null : readSquadModelConfig(repoDir);
+  return resolveModelPin({ mode: e.SQUAD_MODE, config, operator });
+}
+
 module.exports = {
   ATTENDED_MODES,
   ATTENDED_SOURCES,
@@ -1176,6 +1503,16 @@ module.exports = {
   POLICY_MATRIX,
   serializeGovernanceBundle,
   pinMemoryAuditConfig,
+  MODEL_ROLE_BY_MODE,
+  MODEL_VALUE_PATTERN,
+  MODEL_PIN_PINNED,
+  MODEL_PIN_UNPINNED,
+  MODEL_PIN_NOT_APPLICABLE,
+  modelRoleForMode,
+  collectOperatorModels,
+  readSquadModelConfig,
+  resolveModelPin,
+  resolveModelPinFromEnv,
 };
 
 
@@ -1353,6 +1690,43 @@ function main(argv) {
     case 'watch-agent-policy-mode':
       process.stdout.write(`${policy.watchAgentPolicyMode}\n`);
       return 0;
+    // The role whose model pins SQUAD_MODE's Copilot launches (`lead` |
+    // `ralph`), or an empty line for a mode that starts no Copilot. See
+    // MODEL_ROLE_BY_MODE for which mode maps where and why.
+    case 'model-role':
+      process.stdout.write(`${modelRoleForMode(process.env.SQUAD_MODE)}\n`);
+      return 0;
+    // `model-pin <repo-dir>`: the ONE model this session's Copilot launches
+    // run on, resolved from <repo-dir>/.squad/config.json and the operator's
+    // overrides (SQUAD_MODEL, SQUAD_AGENT_MODEL, COPILOT_MODEL, a --model in
+    // SQUAD_COPILOT_FLAGS). Six lines, so bash can `mapfile` them whole even
+    // when one is empty:
+    //   status    `pinned` | `unpinned` | `not-applicable`
+    //   role      `lead` | `ralph` | empty
+    //   model     the model id when pinned, otherwise empty
+    //   source    one human-readable line saying where the answer came from
+    //   declared  what the REPOSITORY declared for the role: `model` | `auto`
+    //             (Copilot chooses; not a pin) | `none`
+    //   warning   empty, or one line when the answer rests on the repository-wide
+    //             defaultModel standing in for a role with no entry of its own
+    // Exit 78, with nothing on stdout, when an override conflicts with the
+    // repository policy or the policy cannot be read: there is no fallback.
+    case 'model-pin': {
+      const repoDir = argv[1];
+      if (repoDir === undefined || String(repoDir).trim() === '') {
+        process.stderr.write('Usage: agent-policy.js model-pin <repo-dir>\n');
+        return 78;
+      }
+      let pin;
+      try {
+        pin = resolveModelPinFromEnv(process.env, repoDir);
+      } catch (error) {
+        process.stderr.write(`${error.message}\n`);
+        return 78;
+      }
+      process.stdout.write(`${pin.status}\n${pin.role}\n${pin.model}\n${pin.source}\n${pin.declared}\n${pin.warning}\n`);
+      return 0;
+    }
     default:
       process.stderr.write(
         'Usage: agent-policy.js [json|flags|argv|squad-flags|hub-argv-json|undeliverable|tier|reason|' +
@@ -1360,7 +1734,7 @@ function main(argv) {
           'governance-paths|mutable-governance-patterns|reported-mutable-governance-patterns|' +
           'classify-governance-path <path>|bundle|harden-init <repo-dir>|' +
           'watch-agent-argv-json|watch-agent-parity-argv-json|watch-agent-strict-argv-json|' +
-          'watch-agent-policy-mode]\n'
+          'watch-agent-policy-mode|model-role|model-pin <repo-dir>]\n'
       );
       return 78;
   }
