@@ -165,12 +165,16 @@ elif [[ "$(id -u)" -ne 0 ]]; then
   skip_reason="this suite is not running as root and passwordless sudo is unavailable"
 else
   # The child runs as `nobody`; the readers are `nobody` itself (control) and a
-  # different unprivileged uid (cross). Both are dropped from root with
-  # setpriv, which execs in place, so the pid under test is the real process.
+  # different unprivileged uid (cross): the existing `daemon` account, else the
+  # next uid down. Both are dropped from root with setpriv, which execs in
+  # place, so the pid under test is the real process.
   victim_uid="$(id -u nobody 2>/dev/null || true)"
   reader_uid=""
   if [[ "$victim_uid" =~ ^[0-9]+$ && "$victim_uid" -gt 0 ]]; then
-    reader_uid=$(( victim_uid > 1 ? victim_uid - 1 : victim_uid + 1 ))
+    reader_uid="$(id -u daemon 2>/dev/null || true)"
+    if ! [[ "$reader_uid" =~ ^[0-9]+$ && "$reader_uid" -gt 0 && "$reader_uid" -ne "$victim_uid" ]]; then
+      reader_uid=$(( victim_uid > 1 ? victim_uid - 1 : victim_uid + 1 ))
+    fi
   fi
   missing=""
   for dep in setpriv awk mktemp; do
@@ -183,6 +187,16 @@ else
   fixture_child_ok() { [[ "$1" == "sleep" && "$2" == "$victim_uid" ]]; }
   fixture_readers_ok() { # <same uid> <cross uid> <child uid> <same CapEff> <cross CapEff>
     [[ "$1" == "$3" && "$2" == "$reader_uid" && "$2" != "$3" && "$2" != "0" && "$4" =~ ^0+$ && "$5" =~ ^0+$ ]]
+  }
+  # The denial only counts when it cannot be vacuous: the child really runs as
+  # nobody, the two readers are different unprivileged uids, the SAME-uid read of
+  # that very child classifies 'yes' (sentinel seen), and the child outlived both.
+  cross_proof_nonvacuous() {
+    fixture_child_ok "${real[comm]:-}" "${real[child_uid]:-}" \
+      && fixture_readers_ok "${real[same_uid]:-}" "${real[cross_uid]:-}" "${real[child_uid]:-}" "${real[same_cap]:-}" "${real[cross_cap]:-}" \
+      && same_uid_readable "${real[same]:-}" \
+      && [[ "${real[alive]:-}" == "sleep" ]] \
+      && cross_uid_denied "${real[cross]:-}"
   }
   mutant_rejected() { # <token the mutant produced> <token it must produce> <assertion it must fail>
     [[ "$1" == "$2" ]] && ! "$3" "$1"
@@ -268,10 +282,8 @@ READER
       fixture_readers_ok "${real[same_uid]:-}" "${real[cross_uid]:-}" "${real[child_uid]:-}" "${real[same_cap]:-}" "${real[cross_cap]:-}"
     check "control case: a same-uid child's /proc/<pid>/environ is readable here (got '${real[same]:-}') -- the exact condition PC-2 defends against" \
       same_uid_readable "${real[same]:-}"
-    check "a DIFFERENT-uid child's /proc/<pid>/environ is NOT readable here (got '${real[cross]:-}'; real uid ${real[cross_uid]:-?} reading real uid ${real[child_uid]:-?}) -- the property a real squad/squad-identity UID split relies on" \
-      cross_uid_denied "${real[cross]:-}"
-    check "the child was still running when both reads finished (a denial is the kernel's, not an exit; comm '${real[alive]:-}')" \
-      test "${real[alive]:-}" = "sleep"
+    check "a DIFFERENT-uid child's /proc/<pid>/environ is NOT readable here (got '${real[cross]:-}'; real uid ${real[cross_uid]:-?} reading real uid ${real[child_uid]:-?}; child still '${real[alive]:-}' after both reads) -- the property a real squad/squad-identity UID split relies on" \
+      cross_proof_nonvacuous
     check "negative proof: a classifier that always answers 'yes' fails the cross-uid assertion (got '${always_yes[cross]:-}')" \
       mutant_rejected "${always_yes[cross]:-}" "yes/present" cross_uid_denied
     check "negative proof: a classifier that always answers 'no' fails the same-uid control (got '${always_no[same]:-}')" \
@@ -280,9 +292,9 @@ READER
 fi
 
 if [[ -n "$skip_reason" ]]; then
-  echo "  SKIP cross-uid proof: NOT RUN -- ${skip_reason}."
-  echo "  SKIP   it needs real root on Linux, e.g.: wsl -d <distro> -u root -- bash worker/tests/test_uid_separation.sh"
-  echo "  SKIP   on CI/Linux with passwordless sudo this suite re-runs itself as root."
+  echo "SKIP: test_uid_separation.sh — cross-uid proof NOT RUN: ${skip_reason}."
+  echo "SKIP:   run it as real root on Linux, e.g.: wsl -d Ubuntu -u root -- bash worker/tests/test_uid_separation.sh"
+  echo "SKIP:   on CI/Linux with passwordless sudo, run it normally and it will re-exec itself under sudo."
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
