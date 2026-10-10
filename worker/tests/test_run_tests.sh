@@ -19,6 +19,12 @@
 # They also prove the default (no override) discovery path still works, and that
 # lib/deps.sh emits a visible SKIP rather than a silent pass.
 #
+# Finally they check the other half of "a failing suite must fail": a suite
+# that sources lib/assert.sh only fails if it ends in test_summary (or the
+# squad-hub equivalent). The runner cannot detect a missing footer from the
+# exit code alone, so every such suite is checked structurally, with scratch
+# mutants proving the check refuses a footerless suite that exits 0.
+#
 # Everything is created under a self-cleaning temp root; no synthetic suite is
 # ever left in worker/tests/, so a normal run is unaffected.
 set -uo pipefail
@@ -296,6 +302,102 @@ assert_eq "0" "$RUNNER_RC" "dep skip via runner: run is not failed by a skip"
 assert_contains "$RUNNER_OUT" "SKIP: test_dep_skip.sh — missing definitely-not-a-real-binary-9999" "dep skip via runner: SKIP line reaches the runner output"
 assert_contains "$RUNNER_OUT" "Suites: 1 passed, 0 failed, 1 skipped." "dep skip via runner: skip is not counted as a pass"
 rm -rf "$dir"
+
+# --- lib/assert.sh suites must exit non-zero when an assertion fails --------
+
+# lib/assert.sh only COUNTS failures; the exit status comes from test_summary.
+# A suite that sources it and never reaches test_summary prints FAIL lines and
+# still exits 0, which the runner correctly reads as a pass -- the runner only
+# has the exit code. test_squad_pr_content.sh shipped like that (21 failing
+# assertions, exit 0). So this is checked structurally: the suite's final
+# statement must be test_summary, or test_squad_hub.sh's own equivalent.
+
+# suite_sources_assert <file>: the suite sources lib/assert.sh.
+suite_sources_assert() {
+  grep -q -E '^[[:space:]]*(source|\.)[[:space:]].*lib/assert\.sh' "$1"
+}
+
+# suite_last_statement <file>: the last line that is neither blank nor a comment.
+suite_last_statement() {
+  grep -v -E '^[[:space:]]*(#|$)' "$1" | tail -n 1 | sed -e 's/[[:space:]]*$//'
+}
+
+# suite_ends_in_failure_exit <file>: succeeds when the suite's last statement
+# turns the assertion counters into its exit status.
+suite_ends_in_failure_exit() {
+  local last
+  last="$(suite_last_statement "$1")"
+  [[ "$last" == 'test_summary' || "$last" == 'exit $(( TESTS_FAILED > 0 ? 1 : 0 ))' ]]
+}
+
+# make_assert_suite <dir> <name> [footer]
+# Writes a synthetic suite that sources the REAL lib/assert.sh, runs one
+# passing and one deliberately failing assertion, then appends <footer>.
+make_assert_suite() {
+  local dir="$1" name="$2" footer="${3:-}"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'source "%s"\n' "${TEST_DIR}/lib/assert.sh"
+    printf 'echo "== %s =="\n' "$name"
+    printf 'assert_eq "same" "same" "a passing assertion"\n'
+    printf 'assert_eq "expected" "actual" "a deliberately failing assertion"\n'
+    if [[ -n "$footer" ]]; then printf '%s\n' "$footer"; fi
+  } > "${dir}/${name}"
+  chmod +x "${dir}/${name}"
+}
+
+# 16a. With test_summary as its footer, a failing assertion fails the suite --
+#      directly and through the real runner.
+dir="$(make_fixture_dir)"
+make_assert_suite "$dir" "test_footer.sh" "test_summary"
+out="$(bash "${dir}/test_footer.sh" 2>&1)"
+rc=$?
+assert_eq "1" "$rc" "assert.sh suite with test_summary: a failing assertion exits 1"
+assert_contains "$out" "FAIL: a deliberately failing assertion" "assert.sh suite with test_summary: the FAIL line is printed"
+assert_contains "$out" "2 assertions run, 1 failed." "assert.sh suite with test_summary: the summary counts the failure"
+run_runner "$dir"
+assert_eq "1" "$RUNNER_RC" "assert.sh suite with test_summary: the runner exits non-zero"
+assert_contains "$RUNNER_OUT" "Suites: 0 passed, 1 failed, 0 skipped." "assert.sh suite with test_summary: the runner counts it as failed"
+assert_eq "0" "$(suite_ends_in_failure_exit "${dir}/test_footer.sh" && echo 0 || echo 1)" "assert.sh suite with test_summary: accepted by the footer check"
+rm -rf "$dir"
+
+# 16b. test_squad_hub.sh's own footer is a recognised failure exit too.
+dir="$(make_fixture_dir)"
+make_assert_suite "$dir" "test_custom.sh" 'exit $(( TESTS_FAILED > 0 ? 1 : 0 ))'
+bash "${dir}/test_custom.sh" >/dev/null 2>&1
+assert_eq "1" "$?" "assert.sh suite with the squad-hub footer: a failing assertion exits 1"
+assert_eq "0" "$(suite_ends_in_failure_exit "${dir}/test_custom.sh" && echo 0 || echo 1)" "assert.sh suite with the squad-hub footer: accepted by the footer check"
+rm -rf "$dir"
+
+# 16c. Scratch mutants. Each one is a genuinely false green -- it prints FAIL
+#      and still exits 0 -- and must be refused by the footer check.
+dir="$(make_fixture_dir)"
+make_assert_suite "$dir" "test_dropped.sh"
+make_assert_suite "$dir" "test_commented.sh" "# test_summary"
+make_assert_suite "$dir" "test_buried.sh" "$(printf 'test_summary\nassert_eq "a" "a" "after the footer, so it never runs"')"
+for mutant in test_dropped.sh test_commented.sh; do
+  out="$(bash "${dir}/${mutant}" 2>&1)"
+  rc=$?
+  assert_eq "0" "$rc" "mutant ${mutant}: a failing assertion still exits 0 (a real false green)"
+  assert_contains "$out" "FAIL: a deliberately failing assertion" "mutant ${mutant}: it printed the FAIL line"
+done
+for mutant in test_dropped.sh test_commented.sh test_buried.sh; do
+  assert_eq "1" "$(suite_ends_in_failure_exit "${dir}/${mutant}" && echo 0 || echo 1)" "mutant ${mutant}: refused by the footer check"
+done
+rm -rf "$dir"
+
+# 16d. Every real suite that sources lib/assert.sh ends in a failure exit.
+no_footer=()
+checked=0
+for suite_file in "${TEST_DIR}"/test_*.sh; do
+  suite_sources_assert "$suite_file" || continue
+  checked=$((checked + 1))
+  suite_ends_in_failure_exit "$suite_file" || no_footer+=("$(basename "$suite_file")")
+done
+assert_eq "0" "$(suite_sources_assert "${TEST_DIR}/test_run_tests.sh" && echo 0 || echo 1)" "footer check: recognises a suite that sources lib/assert.sh (this one)"
+assert_ne "0" "$checked" "footer check: found assert.sh suites to check (${checked})"
+assert_eq "" "${no_footer[*]:-}" \
+  "every suite that sources lib/assert.sh exits non-zero on a failed assertion (no failure exit: ${no_footer[*]:-none})"
 
 # 15. The synthetic fixtures must never leak into the real test directory.
 leaked="$(find "$TEST_DIR" -maxdepth 1 -name 'test_ok*.sh' -o -maxdepth 1 -name 'test_boom.sh' | wc -l | tr -d ' ')"
