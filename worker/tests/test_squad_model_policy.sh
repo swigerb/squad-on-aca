@@ -42,6 +42,8 @@
 # fails loudly rather than passing as a no-op.
 set -uo pipefail
 
+echo "== Squad role model policy and complete Scribe workflow (issue #150) =="
+
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/assert.sh
 source "${TEST_DIR}/lib/assert.sh"
