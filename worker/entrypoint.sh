@@ -1439,12 +1439,21 @@ NODE
     # squad_policy_exec_agent runs INSIDE the forwarding wrapper's background
     # job, closes the policy sampler/seal descriptors there, then execs
     # `squad` -- so `$!` is still squad's own pid and forwarding is unchanged.
+    # A pinned session must stop when its model cannot run: Squad itself keeps
+    # rescheduling after a failed agent. See "Pinned-model failure lifecycle" in
+    # worker/lib/squad-policy.sh. With a stop file the supervisor leaves the
+    # Squad status in SQUAD_FOREGROUND_RC; squad_model_pin_settle_session ends
+    # the session on any non-zero status other than a recorded pin failure, as
+    # errexit did before, and an unpinned session never has a stop file.
+    squad_model_pin_lifecycle_init
     squad_run_foreground_with_signal_forwarding \
       squad_policy_exec_agent \
       squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
+    squad_model_pin_settle_session "$SQUAD_FOREGROUND_RC"
     squad_defer_shutdown_signals
     squad_policy_checkpoint
     squad_watch_governance_report_if_any
+    squad_model_pin_exit_if_failed
     squad_release_shutdown_signals
     ;;
   ralph)
@@ -1619,6 +1628,8 @@ NODE
     # sentinel file at all.
     export SQUAD_WATCH_SENTINEL_FILE="${SQUAD_WATCH_SENTINEL_FILE:-${WORKDIR:-/workspace}/${SESSION_NAME}/watch-sentinel}"
     mkdir -p "$(dirname "$SQUAD_WATCH_SENTINEL_FILE")"
+    # Same pinned-model stop as the loop branch above.
+    squad_model_pin_lifecycle_init
     squad_run_foreground_with_signal_forwarding \
       squad_policy_exec_agent \
       squad watch \
@@ -1630,9 +1641,11 @@ NODE
       --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
       --sentinel-file "$SQUAD_WATCH_SENTINEL_FILE" \
       --verbose
+    squad_model_pin_settle_session "$SQUAD_FOREGROUND_RC"
     squad_defer_shutdown_signals
     squad_policy_checkpoint
     squad_watch_governance_report_if_any
+    squad_model_pin_exit_if_failed
     squad_release_shutdown_signals
     ;;
   shell)

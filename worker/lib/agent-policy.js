@@ -1304,10 +1304,16 @@ function readSquadModelConfig(repoDir) {
 }
 
 /**
- * The model a repository's policy names for `role`, or null when it names none
- * (no entry, no default, or an explicit `auto`). The role's own entry wins
- * over `defaultModel`; a role entry that is present but malformed is an error
- * rather than a reason to fall through to the default.
+ * What a repository's policy says for `role`: null when it says nothing (no
+ * config, or no entry and no defaultModel), otherwise
+ *   { model, source, generic, auto }
+ * where `auto` means the policy explicitly declared 'auto' (Copilot chooses --
+ * model is then null) and `generic` means the answer came from the
+ * repository-wide `defaultModel` because the role has no entry of its own.
+ * The role's own entry wins over `defaultModel`; a role entry that is present
+ * but malformed is an error rather than a reason to fall through to the
+ * default. An 'auto' in the role's entry does NOT fall through either: it is the
+ * role's answer.
  */
 function policyModelForRole(config, role) {
   if (!config) {
@@ -1323,6 +1329,7 @@ function policyModelForRole(config, role) {
   }
   let model;
   let source;
+  let generic = false;
   if (keys.length > 0) {
     model = config.agentModelOverrides[keys[0]];
     source = `.squad/config.json agentModelOverrides.${keys[0]}`;
@@ -1330,16 +1337,16 @@ function policyModelForRole(config, role) {
   } else if (config.defaultModel !== undefined) {
     model = config.defaultModel;
     source = '.squad/config.json defaultModel';
+    generic = true;
     checkModelValue(model, source);
   } else {
     return null;
   }
   if (normalize(model) === MODEL_POLICY_AUTO) {
-    return null;
+    return { model: null, source, generic, auto: true };
   }
-  return { model, source };
+  return { model, source, generic, auto: false };
 }
-
 /**
  * Decide the one model a session's Copilot launches run on.
  *
@@ -1347,10 +1354,18 @@ function policyModelForRole(config, role) {
  * @param {string} input.mode      SQUAD_MODE
  * @param {object|null} input.config  readSquadModelConfig's result
  * @param {Array<{source:string,value:string}>} input.operator  collectOperatorModels' result
- * @returns {{status:string, role:string, model:string, source:string}}
- *   `model` is '' unless status is `pinned`. Throws AgentPolicyError when an
- *   operator override disagrees with the repository policy (or, with no
- *   policy, with another override): there is NO fallback to either side.
+ * @returns {{status:string, role:string, model:string, source:string, declared:string, warning:string}}
+ *   `model` is '' unless status is `pinned`. `declared` says what the
+ *   REPOSITORY declared for the role -- `model` (a model id), `auto` (an
+ *   explicit 'auto': Copilot chooses) or `none` (nothing) -- which is not
+ *   always what `status` says, because an operator override can pin a role the
+ *   repository left open. `warning` is '' unless the answer rests on a fallback
+ *   the repository did not spell out for this role: the repository-wide
+ *   `defaultModel` standing in for a role with no entry of its own. It never
+ *   changes the answer -- a fallback is still a required model -- it makes the
+ *   fallback visible. Throws AgentPolicyError when an operator override
+ *   disagrees with the repository policy (or, with no policy, with another
+ *   override): there is NO fallback to either side.
  */
 function resolveModelPin(input) {
   const opts = input || {};
@@ -1363,11 +1378,21 @@ function resolveModelPin(input) {
       role: '',
       model: '',
       source: `mode '${normalize(opts.mode)}' starts no Copilot session`,
+      declared: 'none',
+      warning: '',
     };
   }
 
-  const policy = policyModelForRole(opts.config, role);
+  const declaredPolicy = policyModelForRole(opts.config, role);
+  const policy = declaredPolicy && !declaredPolicy.auto ? declaredPolicy : null;
+  const auto = declaredPolicy && declaredPolicy.auto ? declaredPolicy : null;
+  const declared = policy ? 'model' : auto ? 'auto' : 'none';
   const describe = (list) => list.map((o) => `${o.source}='${o.value}'`).join(', ');
+  const fallbackWarning = (value) =>
+    declaredPolicy && declaredPolicy.generic
+      ? `role '${role}' has no agentModelOverrides.${role} entry in .squad/config.json, so the repository-wide ` +
+        `defaultModel '${value}' applies to it. Add an explicit entry to choose this role's model on purpose.`
+      : '';
 
   if (policy) {
     const conflicting = operator.filter((o) => o.value.toLowerCase() !== policy.model.toLowerCase());
@@ -1387,6 +1412,8 @@ function resolveModelPin(input) {
         operator.length > 0
           ? `${policy.source} (operator override ${describe(operator)} matches)`
           : policy.source,
+      declared,
+      warning: fallbackWarning(policy.model),
     };
   }
 
@@ -1402,7 +1429,24 @@ function resolveModelPin(input) {
       status: MODEL_PIN_PINNED,
       role,
       model: operator[0].value,
-      source: `operator override ${describe(operator)} (the repository declares no model for role '${role}')`,
+      source: auto
+        ? `operator override ${describe(operator)} (${auto.source} is 'auto', which names no model for role '${role}')`
+        : `operator override ${describe(operator)} (the repository declares no model for role '${role}')`,
+      declared,
+      warning: fallbackWarning("auto"),
+    };
+  }
+
+  if (auto) {
+    return {
+      status: MODEL_PIN_UNPINNED,
+      role,
+      model: '',
+      source:
+        `${auto.source} is 'auto' for role '${role}': the repository asks Copilot to choose the model, ` +
+        'which is NOT a pin',
+      declared,
+      warning: fallbackWarning("auto"),
     };
   }
 
@@ -1411,11 +1455,12 @@ function resolveModelPin(input) {
     role,
     model: '',
     source:
-      `the repository declares no model for role '${role}' (no .squad/config.json agentModelOverrides.${role}, ` +
-      "no defaultModel, or 'auto') and no operator override was given",
+      `the repository declares no model for role '${role}' (no .squad/config.json agentModelOverrides.${role} ` +
+      'and no defaultModel) and no operator override was given',
+    declared,
+    warning: '',
   };
 }
-
 /** resolveModelPin, fed from a process environment and a checked-out repo. */
 function resolveModelPinFromEnv(env, repoDir) {
   const e = env || {};
@@ -1654,12 +1699,16 @@ function main(argv) {
     // `model-pin <repo-dir>`: the ONE model this session's Copilot launches
     // run on, resolved from <repo-dir>/.squad/config.json and the operator's
     // overrides (SQUAD_MODEL, SQUAD_AGENT_MODEL, COPILOT_MODEL, a --model in
-    // SQUAD_COPILOT_FLAGS). Four lines, so bash can `mapfile` them whole even
+    // SQUAD_COPILOT_FLAGS). Six lines, so bash can `mapfile` them whole even
     // when one is empty:
-    //   status  `pinned` | `unpinned` | `not-applicable`
-    //   role    `lead` | `ralph` | empty
-    //   model   the model id when pinned, otherwise empty
-    //   source  one human-readable line saying where the answer came from
+    //   status    `pinned` | `unpinned` | `not-applicable`
+    //   role      `lead` | `ralph` | empty
+    //   model     the model id when pinned, otherwise empty
+    //   source    one human-readable line saying where the answer came from
+    //   declared  what the REPOSITORY declared for the role: `model` | `auto`
+    //             (Copilot chooses; not a pin) | `none`
+    //   warning   empty, or one line when the answer rests on the repository-wide
+    //             defaultModel standing in for a role with no entry of its own
     // Exit 78, with nothing on stdout, when an override conflicts with the
     // repository policy or the policy cannot be read: there is no fallback.
     case 'model-pin': {
@@ -1675,7 +1724,7 @@ function main(argv) {
         process.stderr.write(`${error.message}\n`);
         return 78;
       }
-      process.stdout.write(`${pin.status}\n${pin.role}\n${pin.model}\n${pin.source}\n`);
+      process.stdout.write(`${pin.status}\n${pin.role}\n${pin.model}\n${pin.source}\n${pin.declared}\n${pin.warning}\n`);
       return 0;
     }
     default:

@@ -448,7 +448,7 @@ assert_contains "$(cat "$HUB_LIB")" "squad-hub oneshot" \
 # A supervised session is still a Copilot session and must export telemetry the
 # same way the unsupervised `copilot -p` path does. It once shipped without this,
 # so every hub-supervised run was invisible in Aspire.
-HUB_RUN_BLOCK="$(sed -n '/^squad_hub_run()/,/squad-hub oneshot/p' "$HUB_LIB")"
+HUB_RUN_BLOCK="$(sed -n '/^squad_hub_run()/,/"\${hub_oneshot\[@\]}"/p' "$HUB_LIB")"
 assert_contains "$HUB_RUN_BLOCK" "COPILOT_OTEL_ENABLED=true" \
   "supervised sessions enable Copilot OpenTelemetry"
 assert_contains "$HUB_RUN_BLOCK" "COPILOT_OTEL_EXPORTER_TYPE=otlp-http" \
@@ -777,28 +777,213 @@ assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_NAME="$device_name"' \
   "the oneshot env block exports the computed device name"
 assert_contains "$HUB_RUN_BLOCK" 'SQUAD_HUB_DEVICE_META_JSON="$device_meta_json"' \
   "the oneshot env block exports the computed device metadata JSON"
-# The role model pin (#135, then the per-role pin): the hub one-shot path cannot
-# GUARANTEE a model. `copilot --acp` ignores a --model argv flag, the pinned
-# squad-hub build does not read SQUAD_HUB_MODEL, and an unavailable model falls
-# back to the default with only a warning. So a pinned session is refused rather
-# than handed to it, and SQUAD_HUB_MODEL is no longer offered as if it worked.
-assert_not_contains "$(grep -v '^[[:space:]]*#' <<<"$HUB_RUN_BLOCK")" 'SQUAD_HUB_MODEL' \
-  "the oneshot invocation no longer passes SQUAD_HUB_MODEL, which the pinned hub build ignores"
+# The role model pin (#135, then the per-role pin). The hub one-shot path cannot
+# GUARANTEE a model on its own: `copilot --acp` ignores a --model argv flag, the
+# pinned squad-hub build (0.6.0) neither reads a required model nor answers a
+# capability probe, and a hub that treats the model as a preference falls back to
+# its default with only a warning. So a session that REQUIRES a model is handed to
+# the hub only when the hub says -- via the bounded, side-effect-free
+# `squad-hub oneshot --capabilities` probe, {"protocolVersion":1,"requiredModel":
+# true} -- that it can run `oneshot` strictly on SQUAD_HUB_MODEL with
+# SQUAD_HUB_REQUIRE_MODEL=1 (exit 78 when the agent did not confirm the model);
+# any other build is refused. These assertions are about the observed argv/env and
+# exit codes of a stub hub, not about the prose in the file.
+HUB_RUN_CODE="$(grep -v '^[[:space:]]*#' <<<"$HUB_RUN_BLOCK")"
+assert_contains "$HUB_RUN_CODE" 'env "SQUAD_HUB_MODEL=${required_model}" SQUAD_HUB_REQUIRE_MODEL=1 squad-hub oneshot' \
+  "a required model is forwarded as a command-scoped SQUAD_HUB_MODEL plus SQUAD_HUB_REQUIRE_MODEL=1"
+assert_not_contains "$(grep -v '^[[:space:]]*#' "$HUB_LIB")" 'SQUAD_HUB_REQUIRED_MODEL' \
+  "no invented SQUAD_HUB_REQUIRED_MODEL variable remains in the hub library"
+assert_not_contains "$(grep -v '^[[:space:]]*#' "$HUB_LIB")" 'capabilities --json' \
+  "the retired 'capabilities --json' probe is gone"
 assert_not_contains "$(sed -n '/^squad_hub_policy_json()/,/^}/p' "$HUB_LIB")" '--model' \
   "the model is not smuggled into the hub argv JSON, which copilot --acp would silently ignore"
 
 PIN_STUB_ROOT="$(mktemp -d)"
-mkdir -p "${PIN_STUB_ROOT}/bin"
-printf '#!/usr/bin/env bash\n: > "%s/oneshot.hit"\nexit 0\n' "$PIN_STUB_ROOT" > "${PIN_STUB_ROOT}/bin/squad-hub"
+mkdir -p "${PIN_STUB_ROOT}/bin" "${PIN_STUB_ROOT}/repo"
+cat > "${PIN_STUB_ROOT}/bin/squad-hub" <<'HUBSTUB'
+#!/usr/bin/env bash
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hub_env_names() { env | sed -n 's/^\(SQUAD_HUB_[A-Z_]*\)=.*/\1/p' | sort | tr '\n' ' '; }
+run_session() {
+  : > "${root}/oneshot.hit"
+  echo run >> "${root}/oneshot.count"
+  printf '%s' "$*" > "${root}/oneshot.argv"
+  printf '%s' "${SQUAD_HUB_MODEL-<unset>}" > "${root}/oneshot.model"
+  printf '%s' "${SQUAD_HUB_REQUIRE_MODEL-<unset>}" > "${root}/oneshot.require"
+  printf '%s' "${SQUAD_HUB_AGENT_EXTRA_ARGS_JSON-<unset>}" > "${root}/oneshot.argvjson"
+  printf '%s' "${SQUAD_HUB_PROMPT-<unset>}" > "${root}/oneshot.prompt"
+  printf '%s' "${SQUAD_HUB_URL-<unset>}|${SQUAD_HUB_TOKEN-<unset>}|${SQUAD_HUB_DEVICE_ID-<unset>}" > "${root}/oneshot.identity"
+  # The strict contract: a required model the agent cannot confirm sends no
+  # prompt and exits 78.
+  if [[ "${SQUAD_HUB_REQUIRE_MODEL:-}" == 1 && ",${STUB_AVAILABLE_MODELS:-model-alpha}," != *",${SQUAD_HUB_MODEL:-},"* ]]; then
+    echo "required-model-refused code=MODEL_UNAVAILABLE reason=not offered" >&2
+    exit 78
+  fi
+  : > "${root}/oneshot.prompt-sent"
+  exit "${STUB_ONESHOT_EXIT:-0}"
+}
+case "${1:-}" in
+  oneshot)
+    if [[ "${2:-}" == "--capabilities" ]]; then
+      printf '%s' "$*" > "${root}/capabilities.argv"
+      hub_env_names > "${root}/capabilities.hubenv"
+      case "${STUB_CAP_MODE:-old}" in
+        json) printf '%s' "${STUB_CAP_JSON:-}"; exit 0 ;;
+        big) printf '{"protocolVersion":1,"requiredModel":true,"pad":"%s"}' "$(head -c 5000 /dev/zero | tr '\0' a)"; exit 0 ;;
+        fail) echo 'capabilities failed' >&2; exit 1 ;;
+        hang) exec sleep 30 ;;
+        # squad-hub 0.6.0: oneshot ignores its argv, needs the cloud device
+        # variables, and would otherwise go on to attach and run a session.
+        old)
+          if [[ -z "${SQUAD_HUB_URL:-}" || -z "${SQUAD_HUB_TOKEN:-}" ]]; then
+            echo 'SQUAD_HUB_URL and SQUAD_HUB_TOKEN are required for a cloud device' >&2
+            exit 64
+          fi
+          run_session "$@"
+          ;;
+      esac
+    fi
+    run_session "$@"
+    ;;
+  *) echo "squad-hub: unknown command '${1:-}'" >&2; exit 2 ;;
+esac
+HUBSTUB
 chmod +x "${PIN_STUB_ROOT}/bin/squad-hub"
-PIN_RUN_OUT="$(env -u SQUAD_HUB_URL -u SQUAD_HUB_TOKEN PATH="${PIN_STUB_ROOT}/bin:$PATH" SQUAD_MODEL=model-alpha \
-  bash -c 'source "'"$HUB_LIB"'"; squad_hub_run "a prompt"' 2>&1)"
-PIN_RUN_RC=$?
-assert_eq "78" "$PIN_RUN_RC" "a model-pinned session is refused by the hub one-shot path (exit 78)"
-assert_contains "$PIN_RUN_OUT" "model-alpha" "the refusal names the pinned model"
-assert_contains "$PIN_RUN_OUT" "cannot guarantee" "the refusal says the hub cannot guarantee the model"
-assert_eq "absent" "$([[ -e "${PIN_STUB_ROOT}/oneshot.hit" ]] && echo present || echo absent)" \
-  "squad-hub oneshot is never invoked for a model-pinned session"
+
+CAPABLE='{"protocolVersion":1,"requiredModel":true}'
+hub_run_with() {
+  # usage: hub_run_with <cap-mode> [VAR=value ...]   (sets PIN_RUN_OUT, PIN_RUN_RC)
+  local cap_mode="$1"
+  shift
+  rm -f "${PIN_STUB_ROOT}"/oneshot.* "${PIN_STUB_ROOT}"/capabilities.*
+  PIN_RUN_OUT="$(env -u SQUAD_MODE -u SQUAD_DISPATCH_SOURCE -u SQUAD_COPILOT_FLAGS -u SQUAD_EXECUTION_MODE \
+    -u SQUAD_MODEL -u SQUAD_MODEL_PINNED -u SQUAD_HUB_MODEL -u SQUAD_HUB_REQUIRE_MODEL \
+    PATH="${PIN_STUB_ROOT}/bin:$PATH" SQUAD_MODE=prompt SQUAD_DISPATCH_SOURCE=local-cli \
+    SQUAD_POLICY_RESOLVER="$RESOLVER" REPO_DIR="${PIN_STUB_ROOT}/repo" \
+    SQUAD_HUB_URL=https://hub.example SQUAD_HUB_TOKEN=sqhd1.x \
+    STUB_CAP_MODE="$cap_mode" "$@" \
+    bash -c 'source "'"$HUB_LIB"'"; squad_hub_run "a prompt"; rc=$?; echo "AFTER model=${SQUAD_HUB_MODEL-<unset>} require=${SQUAD_HUB_REQUIRE_MODEL-<unset>}"; exit $rc' 2>&1)"
+  PIN_RUN_RC=$?
+}
+hub_state() { [[ -e "${PIN_STUB_ROOT}/$1" ]] && echo present || echo absent; }
+hub_file() { cat "${PIN_STUB_ROOT}/$1" 2>/dev/null || printf '<missing>'; }
+
+# An older hub (the pinned 0.6.0): `oneshot` ignores --capabilities. With the hub
+# variables scrubbed from the probe it stops at the missing URL (exit 64) -- and a
+# probe that was NOT scrubbed would have started a real session here.
+hub_run_with old SQUAD_MODEL=model-alpha
+assert_eq "78" "$PIN_RUN_RC" "a model-required session is refused by a hub that does not know the capability probe (exit 78)"
+assert_contains "$PIN_RUN_OUT" "model-alpha" "the refusal names the required model"
+assert_contains "$PIN_RUN_OUT" "oneshot --capabilities" "the refusal names the probe the hub did not answer"
+assert_contains "$PIN_RUN_OUT" '"requiredModel":true' "the refusal says what answer it needed"
+assert_contains "$PIN_RUN_OUT" "squad-hub@0.6.0" "the refusal says which pinned hub build lacks it"
+assert_not_contains "$PIN_RUN_OUT" "unset SQUAD_HUB" "the refusal never tells the operator to unset the Hub configuration"
+assert_not_contains "$PIN_RUN_OUT" "without hub supervision" "the refusal never suggests dropping hub supervision"
+assert_eq "present" "$(hub_state capabilities.argv)" "the capability was asked for, not guessed from a version"
+assert_eq "oneshot --capabilities" "$(hub_file capabilities.argv)" "the capability probe is exactly: squad-hub oneshot --capabilities"
+assert_eq "" "$(hub_file capabilities.hubenv)" "the probe runs with every SQUAD_HUB_* variable (URL, token, ...) removed from its environment"
+assert_eq "absent" "$(hub_state oneshot.hit)" "the probe did not start a session on a hub that ignores --capabilities"
+assert_eq "absent" "$(hub_state oneshot.count)" "squad-hub oneshot is never run on a hub that cannot guarantee the model"
+assert_contains "$PIN_RUN_OUT" "Refusing to run the session" "the refusal is the worker's own fail-closed abort"
+
+# Every other way of not clearly saying "yes" is a no.
+hub_run_with fail SQUAD_MODEL=model-alpha
+assert_eq "78" "$PIN_RUN_RC" "a capability probe that exits non-zero refuses the session"
+assert_eq "absent" "$(hub_state oneshot.hit)" "...and oneshot is not invoked after a failed capability probe"
+for doc in \
+  'not json' \
+  '' \
+  '[]' \
+  'null' \
+  '"protocolVersion"' \
+  '{}' \
+  '{"protocolVersion":1}' \
+  '{"requiredModel":true}' \
+  '{"protocolVersion":1,"requiredModel":false}' \
+  '{"protocolVersion":1,"requiredModel":"true"}' \
+  '{"protocolVersion":1,"requiredModel":1}' \
+  '{"protocolVersion":1,"requiredModel":null}' \
+  '{"protocolVersion":"1","requiredModel":true}' \
+  '{"protocolVersion":2,"requiredModel":true}' \
+  '{"protocolVersion":0,"requiredModel":true}' \
+  '{"protocolVersion":1.5,"requiredModel":true}' \
+  '{"schema":1,"capabilities":{"oneshotRequiredModel":true}}' \
+  $'starting hub...\n{"protocolVersion":1,"requiredModel":true}' \
+  '{"protocolVersion":1,"requiredModel":true} trailing'; do
+  hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON="$doc"
+  assert_eq "78:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit)" \
+    "probe output [${doc//$'\n'/\\n}] is not a strict yes: refused (78), oneshot not invoked"
+done
+hub_run_with big SQUAD_MODEL=model-alpha
+assert_eq "78:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit)" "a probe answer longer than 4096 bytes is refused even when it is otherwise the right document"
+hub_run_with hang SQUAD_MODEL=model-alpha SQUAD_HUB_CAPABILITY_TIMEOUT_SECONDS=1
+assert_eq "78:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit)" \
+  "a capability probe that hangs is bounded by a timeout and refuses the session"
+assert_eq "present" "$(hub_state capabilities.argv)" "...after it was actually asked"
+
+# A hub that does say yes gets the model explicitly, for this one command only.
+hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON="$CAPABLE"
+assert_eq "0" "$PIN_RUN_RC" "a hub that answers the probe with protocolVersion 1 / requiredModel true runs the session"
+assert_eq "present" "$(hub_state oneshot.hit)" "the capable hub's oneshot is invoked"
+assert_eq "oneshot" "$(hub_file oneshot.argv)" "the supervised session is a plain 'squad-hub oneshot' (no --capabilities)"
+assert_eq "model-alpha" "$(hub_file oneshot.model)" "the resolved model reaches oneshot as SQUAD_HUB_MODEL"
+assert_eq "1" "$(hub_file oneshot.require)" "oneshot is told SQUAD_HUB_REQUIRE_MODEL=1"
+assert_eq "present" "$(hub_state oneshot.prompt-sent)" "the capable hub confirmed the available model and sent the prompt"
+assert_contains "$PIN_RUN_OUT" "AFTER model=<unset> require=<unset>" "the model variables were scoped to the oneshot command and not left in the caller's environment"
+assert_eq "a prompt" "$(hub_file oneshot.prompt)" "the prompt is still delivered through the one-shot environment"
+assert_contains "$(hub_file oneshot.identity)" "https://hub.example|sqhd1.x|aca-" \
+  "supervision is intact: the same hub URL, device token and aca- device id reach oneshot"assert_not_contains "$(hub_file oneshot.argvjson)" "--model" "no --model rides in the hub agent argv, where copilot --acp would ignore it"
+assert_contains "$(hub_file oneshot.argvjson)" '"shell(git config)"' "the supervised tool policy (deny list) is unchanged by the model gate"
+assert_not_contains "$(hub_file oneshot.argvjson)" '"--allow-all-tools"' "ask mode still drops --allow-all-tools on the required-model path"
+assert_contains "$PIN_RUN_OUT" "Required model: model-alpha" "the log says which model the hub was required to use"
+hub_run_with json SQUAD_MODEL=model-alpha SQUAD_HUB_APPROVAL=auto STUB_CAP_JSON="$CAPABLE"
+assert_contains "$(hub_file oneshot.argvjson)" '"--allow-all-tools"' "watch-only approval (auto) is unchanged by the model gate"
+hub_run_with json SQUAD_MODEL=Model-Alpha SQUAD_HUB_MODEL=model-alpha STUB_CAP_JSON="$CAPABLE" STUB_AVAILABLE_MODELS=Model-Alpha
+assert_eq "0:Model-Alpha" "${PIN_RUN_RC}:$(hub_file oneshot.model)" \
+  "an ambient SQUAD_HUB_MODEL that names the same model (any case) is accepted and replaced by the resolved id"
+
+# The probe answer does not depend on who is asking: the same document is also
+# accepted pretty-printed and with fields the worker does not know.
+hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON=$'{\n  "protocolVersion": 1,\n  "requiredModel": true,\n  "extra": "ignored"\n}\n'
+assert_eq "0:present" "${PIN_RUN_RC}:$(hub_state oneshot.hit)" "the probe document may be pretty-printed and carry extra fields"
+
+# Two different models asked for is an ambiguity, refused before the hub is asked.
+hub_run_with json SQUAD_MODEL=model-alpha SQUAD_HUB_MODEL=stale-other STUB_CAP_JSON="$CAPABLE"
+assert_eq "78:absent:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit):$(hub_state capabilities.argv)" \
+  "an ambient SQUAD_HUB_MODEL that disagrees with the pinned model is refused without asking the hub"
+assert_contains "$PIN_RUN_OUT" "SQUAD_HUB_MODEL='stale-other' disagrees" "the refusal names both the variable and its value"
+assert_not_contains "$PIN_RUN_OUT" "SQUAD_HUB_URL" "the conflict refusal does not point at the hub URL/token configuration"
+
+# The strict hub's refusal to confirm the model is the session's result.
+hub_run_with json SQUAD_MODEL=model-unavailable STUB_CAP_JSON="$CAPABLE" STUB_AVAILABLE_MODELS=model-alpha
+assert_eq "78" "$PIN_RUN_RC" "a hub whose agent did not confirm the required model (exit 78) ends the session with 78"
+assert_contains "$PIN_RUN_OUT" "did not confirm the required model 'model-unavailable'" "the log says the required model was not confirmed"
+assert_contains "$PIN_RUN_OUT" "No retry, no fallback model" "the log says there is no retry or fallback"
+assert_eq "absent" "$(hub_state oneshot.prompt-sent)" "no prompt was sent on a model the agent did not confirm"
+assert_eq "1" "$(wc -l < "${PIN_STUB_ROOT}/oneshot.count" | tr -d ' ')" "oneshot was attempted exactly once, with no retry"
+hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON="$CAPABLE" STUB_ONESHOT_EXIT=3
+assert_eq "3" "$PIN_RUN_RC" "any other non-zero hub exit is still the session's exit status"
+
+# Without a required model nothing changes: no probe, and whatever Hub model
+# configuration the operator set is passed through exactly as it was.
+hub_run_with old
+assert_eq "0" "$PIN_RUN_RC" "an unpinned session is supervised by any hub build"
+assert_eq "absent" "$(hub_state capabilities.argv)" "an unpinned session does not probe the hub's capabilities"
+assert_eq "<unset>|<unset>" "$(hub_file oneshot.model)|$(hub_file oneshot.require)" "an unpinned session forwards no model and no requirement"
+hub_run_with old SQUAD_HUB_MODEL=operator-choice
+assert_eq "operator-choice|<unset>" "$(hub_file oneshot.model)|$(hub_file oneshot.require)" \
+  "an unpinned session leaves the operator's own SQUAD_HUB_MODEL alone (it is not the repository's pin)"
+assert_contains "$PIN_RUN_OUT" "AFTER model=operator-choice" "...and the caller's environment is untouched"
+
+# An inconsistent or malformed requirement is refused before the hub is asked.
+hub_run_with json SQUAD_MODEL_PINNED=1 STUB_CAP_JSON="$CAPABLE"
+assert_eq "78:absent:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit):$(hub_state capabilities.argv)" \
+  "SQUAD_MODEL_PINNED=1 with no SQUAD_MODEL is refused without asking the hub"
+for bad_model in '-model-alpha' 'model alpha'; do
+  hub_run_with json SQUAD_MODEL="$bad_model" STUB_CAP_JSON="$CAPABLE"
+  assert_eq "78:absent:absent" "${PIN_RUN_RC}:$(hub_state oneshot.hit):$(hub_state capabilities.argv)" \
+    "unusable model id [${bad_model}] is refused without asking the hub"
+done
 rm -rf "$PIN_STUB_ROOT"
 
 report_pr_status() {

@@ -321,11 +321,13 @@ squad_policy_announce() {
 # Resolve, ONCE and before any `copilot` launch, the model this session's
 # Copilot runs on, and hand it to every launch path the same way:
 #   - COPILOT_ARGV (the caller's array: direct smoke / prompt / new-project)
-#     gets `--model <model>` appended;
+#     gets exactly one `--model <model>` (any matching `--model` an operator
+#     put in SQUAD_COPILOT_FLAGS is removed, not forwarded next to it);
 #   - SQUAD_AGENT_MODEL is exported for worker/squad-agent (the `--agent-cmd`
 #     wrapper `squad watch` / `squad loop` run through);
 #   - SQUAD_MODEL is exported as the resolved value, which is what the Squad
-#     Hub path reads (and refuses on -- see squad_hub_run);
+#     Hub path reads (and forwards as a REQUIRED model, or refuses on -- see
+#     squad_hub_run);
 #   - SQUAD_MODEL_PINNED=1 tells squad-agent a model was REQUIRED, so one that
 #     fails to arrive aborts rather than running on Copilot's own default.
 #
@@ -340,17 +342,41 @@ squad_policy_announce() {
 #
 # Nothing here retries or falls back if the pinned model turns out to be
 # unavailable or over quota. Copilot's non-zero exit is the session's result
-# (squad-agent `exec`s copilot; the direct paths run it under the session
-# deadline and publish nothing on failure), and no output is parsed for a
+# (the direct paths run it under the session deadline and publish nothing on
+# failure; for watch/loop see squad_model_pin_* below, which stops the Squad
+# polling loop instead of letting it reschedule), and no output is parsed for a
 # success message in its place.
 #
 # Run AFTER squad_policy_harden: the governance lock covers .squad/config.json,
 # so the policy read here cannot be rewritten by the agent it is about to
 # constrain.
 #
+# Remove every `--model <id>` / `--model=<id>` from the array NAMED by $1. Only
+# meaningful after the resolver has validated each such token (a model value
+# that is missing or starts with '-' is a refusal there), which is why this
+# walks tokens positionally the same way the resolver's own scan of
+# SQUAD_COPILOT_FLAGS does.
+squad_policy_strip_model_tokens() {
+  local -n _strip_ref="$1"
+  local -a kept=()
+  local i tok
+  for ((i = 0; i < ${#_strip_ref[@]}; i++)); do
+    tok="${_strip_ref[i]}"
+    case "$tok" in
+      --model) i=$((i + 1)) ;;
+      --model=*) ;;
+      *) kept+=("$tok") ;;
+    esac
+  done
+  _strip_ref=(${kept[@]+"${kept[@]}"})
+}
+
 # Usage: squad_policy_resolve_model <repo-dir>
-# Sets SQUAD_MODEL_PIN_STATUS (pinned|unpinned|not-applicable), _ROLE, _MODEL
-# and _SOURCE.
+# Sets SQUAD_MODEL_PIN_STATUS (pinned|unpinned|not-applicable), _ROLE, _MODEL,
+# _SOURCE, _DECLARED (what the repository declared for the role: model|auto|none
+# -- `auto` is a declaration that Copilot chooses, not an absent one) and
+# _WARNING (non-empty when the repository-wide defaultModel stood in for a role
+# with no entry of its own; logged, and never a reason to skip the pin).
 squad_policy_resolve_model() {
   local repo_dir="$1"
   if ! command -v node >/dev/null 2>&1; then
@@ -374,6 +400,11 @@ squad_policy_resolve_model() {
   SQUAD_MODEL_PIN_ROLE="${pin_lines[1]:-}"
   SQUAD_MODEL_PIN_MODEL="${pin_lines[2]:-}"
   SQUAD_MODEL_PIN_SOURCE="${pin_lines[3]:-}"
+  SQUAD_MODEL_PIN_DECLARED="${pin_lines[4]:-}"
+  SQUAD_MODEL_PIN_WARNING="${pin_lines[5]:-}"
+  if [[ -n "$SQUAD_MODEL_PIN_WARNING" ]]; then
+    squad_policy_log "WARNING: ${SQUAD_MODEL_PIN_WARNING}"
+  fi
 
   case "$SQUAD_MODEL_PIN_STATUS" in
     pinned)
@@ -382,7 +413,17 @@ squad_policy_resolve_model() {
       if [[ -z "$SQUAD_MODEL_PIN_MODEL" || "$SQUAD_MODEL_PIN_MODEL" == -* ]]; then
         squad_policy_abort "The model resolver returned an unusable model ('${SQUAD_MODEL_PIN_MODEL}'); refusing to start."
       fi
-      COPILOT_ARGV+=(--model "$SQUAD_MODEL_PIN_MODEL")
+      # Exactly ONE `--model`, and it is the resolved one. A matching override
+      # in SQUAD_COPILOT_FLAGS rode into COPILOT_ARGV with the policy flags;
+      # the resolver has already refused a conflicting or malformed one, so the
+      # tokens left here are all spellings of the pin and are removed rather
+      # than forwarded next to it. The pin goes FIRST (right after the caller's
+      # own `-p <prompt>`), before any operator flag: an operator flag that
+      # takes a value and was left dangling at the end of SQUAD_COPILOT_FLAGS
+      # would otherwise swallow a trailing `--model` as its argument and leave
+      # the session on Copilot's default model.
+      squad_policy_strip_model_tokens COPILOT_ARGV
+      COPILOT_ARGV=(--model "$SQUAD_MODEL_PIN_MODEL" ${COPILOT_ARGV[@]+"${COPILOT_ARGV[@]}"})
       export SQUAD_AGENT_MODEL="$SQUAD_MODEL_PIN_MODEL"
       export SQUAD_MODEL="$SQUAD_MODEL_PIN_MODEL"
       export SQUAD_MODEL_PINNED=1
@@ -393,7 +434,11 @@ squad_policy_resolve_model() {
       export SQUAD_AGENT_MODEL=""
       export SQUAD_MODEL_PINNED=0
       squad_policy_log "Model: NOT PINNED for role '${SQUAD_MODEL_PIN_ROLE}' -- ${SQUAD_MODEL_PIN_SOURCE}."
-      squad_policy_log "  Copilot will run on its own default model; this repository is not choosing it."
+      if [[ "$SQUAD_MODEL_PIN_DECLARED" == auto ]]; then
+        squad_policy_log "  The repository declared 'auto': Copilot chooses the model for this role, on purpose."
+      else
+        squad_policy_log "  Copilot will run on its own default model; this repository declared none for this role."
+      fi
       ;;
     not-applicable)
       export SQUAD_AGENT_MODEL=""
@@ -407,7 +452,76 @@ squad_policy_resolve_model() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. State directory
+# 1b. Pinned-model failure lifecycle (`squad watch` / `squad loop`)
+# ---------------------------------------------------------------------------
+# Real Squad (1.0.1) does not stop when its `--agent-cmd` exits non-zero:
+# `watch` records {success:false} and keeps polling, `loop` logs the failure and
+# reschedules. Left alone, a session whose REQUIRED model is unavailable or over
+# quota would re-launch Copilot against it every interval and look healthy.
+# Copilot has no distinct exit status for "the model could not be selected", and
+# no output is parsed for one, so for a PINNED session ANY unsolicited non-zero
+# exit of the pinned Copilot is treated as terminal:
+#   1. worker/squad-agent runs Copilot as a child (not `exec`), and on a
+#      non-zero exit it did not itself cause (a TERM/INT/HUP it was forwarding
+#      is not a failure; a clean 0 is the normal completed workflow) it records
+#      the status in SQUAD_MODEL_PIN_FAILURE_FILE and exits with it;
+#   2. the same file LATCHES: once it exists, squad-agent refuses to launch
+#      Copilot again, so no further attempt can start while Squad is still
+#      being stopped;
+#   3. squad_run_foreground_with_signal_forwarding watches
+#      SQUAD_FOREGROUND_STOP_FILE (the same path) and sends TERM to the pid it
+#      owns, so Squad drains and stops, with KILL of that same pid after a
+#      grace period -- no other process is signalled and nothing is killed by
+#      name;
+#   4. the entrypoint then runs the governance checkpoint and exits non-zero
+#      with the recorded status (squad_model_pin_exit_if_failed).
+# The file is a liveness signal for an honest session, not a trust boundary: the
+# agent's uid could also write or delete it, which can only keep the old
+# keep-polling behaviour, never widen what the session may do.
+squad_model_pin_lifecycle_init() {
+  SQUAD_MODEL_PIN_FAILED_RC=0
+  # Never trust a value that merely arrived in the environment.
+  unset SQUAD_MODEL_PIN_FAILURE_FILE SQUAD_FOREGROUND_STOP_FILE
+  [[ "${SQUAD_MODEL_PINNED:-0}" == 1 ]] || return 0
+
+  local dir="${WORKDIR:-/workspace}/${SESSION_NAME:-session}"
+  if ! mkdir -p "$dir"; then
+    squad_policy_abort "Cannot create ${dir} for the pinned-model failure record; refusing to run a pinned watch/loop session that could not be stopped on a launch failure."
+  fi
+  export SQUAD_MODEL_PIN_FAILURE_FILE="${dir}/model-pin-failure"
+  rm -f -- "$SQUAD_MODEL_PIN_FAILURE_FILE"
+  SQUAD_FOREGROUND_STOP_FILE="$SQUAD_MODEL_PIN_FAILURE_FILE"
+}
+
+# Usage: squad_model_pin_settle_session <squad-exit-status>
+# Right after Squad returns. A recorded pin failure is noted (SQUAD_MODEL_PIN_FAILED_RC)
+# so the caller can still run the governance checkpoint; any other non-zero
+# Squad status ends the session with that status, as it always did.
+squad_model_pin_settle_session() {
+  local squad_rc="${1:-0}" recorded=""
+  SQUAD_MODEL_PIN_FAILED_RC=0
+  if [[ -n "${SQUAD_MODEL_PIN_FAILURE_FILE:-}" && -e "$SQUAD_MODEL_PIN_FAILURE_FILE" ]]; then
+    IFS= read -r recorded <"$SQUAD_MODEL_PIN_FAILURE_FILE" || true
+    if [[ ! "$recorded" =~ ^[0-9]+$ ]] || ((10#$recorded < 1 || 10#$recorded > 255)); then
+      recorded=1
+    fi
+    SQUAD_MODEL_PIN_FAILED_RC=$((10#$recorded))
+    squad_policy_log "The pinned model '${SQUAD_MODEL:-}' (role '${SQUAD_MODEL_PIN_ROLE:-}') failed to launch Copilot (exit ${SQUAD_MODEL_PIN_FAILED_RC}); Squad was stopped after that one attempt. No retry, no fallback model."
+    return 0
+  fi
+  if [[ "$squad_rc" -ne 0 ]]; then
+    exit "$squad_rc"
+  fi
+  return 0
+}
+
+squad_model_pin_exit_if_failed() {
+  if [[ "${SQUAD_MODEL_PIN_FAILED_RC:-0}" -ne 0 ]]; then
+    squad_policy_log "Exiting ${SQUAD_MODEL_PIN_FAILED_RC}: the session's required model did not run."
+    exit "$SQUAD_MODEL_PIN_FAILED_RC"
+  fi
+  return 0
+}
 # ---------------------------------------------------------------------------
 # Where the TRIPWIRE copies of the integrity state are written. Outside the
 # checkout (so the agent's FILE tools, confined to the repo without
