@@ -336,6 +336,20 @@ squad_hub_policy_json() {
 # The probe runs with every SQUAD_HUB_* variable removed from its environment
 # and with stdin closed. It is meant to need none of them, and a build that is
 # not what we think it is must not receive the device token or a URL to dial.
+#
+# The whole probe is bounded, children included. Its stdout goes to a private
+# file, not a pipe: a pipe reader waits for EOF, and any descendant the hub left
+# holding the write end (a backgrounded `sleep`, a helper it forgot) would keep
+# the reader -- and the session -- waiting long after the hub itself exited. The
+# hub runs in a process group of its own (`set -m`, the same idiom the Squad
+# supervisor uses), under `timeout` for the deadline, and that group is sent KILL
+# whenever the probe ends, however it ended: nothing a probe started outlives it.
+# A probe that left anything behind is treated as not supporting the capability,
+# like any other answer that is not a clean yes. The file is capped (a runaway
+# writer gets SIGXFSZ) and read only after the group is gone. Only the group this
+# function started is ever signalled: no name, no pattern, no other pid. A
+# descendant that deliberately leaves the group (setsid) is beyond a shell's
+# reach; that is the one case this does not claim to contain.
 squad_hub_supports_required_model() {
   command -v squad-hub >/dev/null 2>&1 || return 1
   command -v node >/dev/null 2>&1 || return 1
@@ -347,26 +361,41 @@ squad_hub_supports_required_model() {
   while IFS= read -r name; do
     [[ "$name" == SQUAD_HUB_* ]] && scrub+=(-u "$name")
   done < <(compgen -e)
+
+  local answer
+  answer="$(mktemp "${TMPDIR:-/tmp}/squad-hub-capabilities.XXXXXXXX" 2>/dev/null)" || return 1
+
+  local monitor_was_on=0 probe_pid="" probe_rc=0 left_behind=0 size="" supported=1
+  case "$-" in *m*) monitor_was_on=1 ;; esac
+  set -m
   (
-    set -o pipefail
-    env ${scrub[@]+"${scrub[@]}"} timeout -k 2 "${seconds}s" squad-hub oneshot --capabilities 2>/dev/null </dev/null \
-      | node -e '
-          let buf = "";
-          process.stdin.setEncoding("utf8");
-          process.stdin.on("data", (chunk) => {
-            buf += chunk;
-            if (buf.length > 4096) process.exit(1);
-          });
-          process.stdin.on("end", () => {
-            let doc;
-            try { doc = JSON.parse(buf); } catch { process.exit(1); }
-            const ok = doc !== null && typeof doc === "object" && !Array.isArray(doc)
-              && doc.protocolVersion === 1 && doc.requiredModel === true;
-            process.exit(ok ? 0 : 1);
-          });
-        '
-  ) >/dev/null 2>&1
+    ulimit -f 16 2>/dev/null || true
+    exec env ${scrub[@]+"${scrub[@]}"} timeout -k 2 "${seconds}s" squad-hub oneshot --capabilities
+  ) >"$answer" 2>/dev/null </dev/null &
+  probe_pid=$!
+  if [[ "$monitor_was_on" -eq 0 ]]; then set +m; fi
+
+  wait "$probe_pid" 2>/dev/null || probe_rc=$?
+  if kill -s KILL -- "-${probe_pid}" 2>/dev/null; then
+    left_behind=1
+    squad_hub_log "The capability probe left processes running after it ended; they were stopped, and the hub is treated as not confirming the capability."
+  fi
+
+  size="$(wc -c <"$answer" 2>/dev/null | tr -d '[:space:]')"
+  if [[ "$probe_rc" -eq 0 && "$left_behind" -eq 0 && "$size" =~ ^[0-9]+$ && "$size" -le 4096 ]] \
+     && timeout -k 1 "${seconds}s" node -e '
+          let doc;
+          try { doc = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch { process.exit(1); }
+          const ok = doc !== null && typeof doc === "object" && !Array.isArray(doc)
+            && doc.protocolVersion === 1 && doc.requiredModel === true;
+          process.exit(ok ? 0 : 1);
+        ' <"$answer" >/dev/null 2>&1; then
+    supported=0
+  fi
+  rm -f "$answer"
+  return "$supported"
 }
+
 # Run ONE supervised session and return its exit code.
 #
 # `squad-hub oneshot` is the hub's documented entry point for a job platform.
@@ -440,7 +469,9 @@ squad_hub_run() {
   local -a hub_oneshot=(squad-hub oneshot)
   if [[ -n "$required_model" ]]; then
     hub_oneshot=(env "SQUAD_HUB_MODEL=${required_model}" SQUAD_HUB_REQUIRE_MODEL=1 squad-hub oneshot)
-  fi  # Same telemetry wiring as the unsupervised `copilot -p` path in entrypoint.sh.
+  fi
+
+  # Same telemetry wiring as the unsupervised `copilot -p` path in entrypoint.sh.
   # squad-hub spawns `copilot --acp` with its own environment, so without these
   # the global default (COPILOT_OTEL_ENABLED=false, gRPC endpoint) wins and a
   # supervised session never reaches Aspire.
