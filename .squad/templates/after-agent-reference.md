@@ -22,11 +22,11 @@ After each batch of agent work:
 
 3. **Show compact results:** `{emoji} {Name} — {1-line summary of what they did}`
 
-4. **Spawn Scribe** (background, never wait). Only if agents ran or inbox has files:
+4. **Spawn Scribe** (background, never wait). Only if agents ran or inbox has files. `{scribe_model}` is `agentModelOverrides.scribe` from `.squad/config.json` — config first, never a hardcoded or task-based default. If that model is unavailable, stop and report it; do not spawn Scribe on another model:
 
 ```
 agent_type: "general-purpose"
-model: "claude-haiku-4.5"
+model: "{scribe_model}"
 mode: "background"
 name: "scribe"
 description: "📋 Scribe: Log session & merge decisions"

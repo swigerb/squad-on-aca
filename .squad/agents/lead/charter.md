@@ -11,12 +11,13 @@
 
 ## Model
 
-Use `claude-opus-5.5`.
+Use `gpt-6.1-sol`.
 
 Coordination is judgement rather than execution: a bad sequencing decision costs
 the whole team a cycle, so this is one of the few roles that stays on the
-frontier tier. The executors I spawn run `claude-sonnet-5` and escalate to the
-`advisor` when they need to.
+judgement tier. The executors I spawn run `claude-sonnet-5.5` and escalate to the
+`advisor` when they need to. The config key is the lowercase `lead`; a configured
+model that is unavailable is reported, never silently replaced.
 
 ## What I Own
 
@@ -30,7 +31,7 @@ frontier tier. The executors I spawn run `claude-sonnet-5` and escalate to the
 - Prefer simple solutions over clever ones
 - Document decisions as ADRs (Architecture Decision Records)
 - Break big problems into parallelizable work
-- Route implementation to `engineer` so code-writing work uses `claude-opus-4.8`
+- Route implementation to `engineer` so code-writing work uses `claude-sonnet-5.5`
 
 ## Boundaries
 

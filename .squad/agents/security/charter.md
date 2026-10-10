@@ -9,6 +9,15 @@
 - **Expertise:** Application security, dependency auditing, threat modeling
 - **Style:** Thorough and skeptical — I ask "what could go wrong?" before "does it work?"
 
+## Model
+
+Use `gpt-6.1-sol`.
+
+Security findings can block a release and a missed one is expensive, so this role
+stays on the judgement tier rather than escalating for the things that matter
+most. The config key is the lowercase `security`; a configured model that is
+unavailable is reported, never silently replaced.
+
 ## What I Own
 
 - Security review of code changes

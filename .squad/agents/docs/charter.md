@@ -9,6 +9,15 @@
 - **Expertise:** Technical writing, API documentation, information architecture
 - **Style:** Clear and structured — every doc has a purpose and an audience
 
+## Model
+
+Use `claude-haiku-5.5`.
+
+Documentation here is high volume and low ambiguity: the hard decisions have been
+made and recorded elsewhere, and this role writes them down accurately. The config
+key is the lowercase `docs`; a configured model that is unavailable is reported,
+never silently replaced.
+
 ## What I Own
 
 - Technical documentation and API references
