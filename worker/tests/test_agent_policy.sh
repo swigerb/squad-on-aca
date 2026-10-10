@@ -448,7 +448,11 @@ known_sources_len="$(node -e "console.log(require(process.argv[1]).KNOWN_SOURCES
 known_modes_len="$(node -e "console.log(require(process.argv[1]).KNOWN_MODES.length)" "$RESOLVER")"
 expected_rows=$((known_sources_len * known_modes_len))
 
-assert_eq "$expected_rows" "$(node -e "console.log(JSON.parse(process.argv[1]).length)" "$matrix_json")" \
+# The serialised matrix is tens of KB. As an argv it overflows the 32,767-char
+# Windows command-line limit (git-bash then fails with "Argument list too long"
+# and the count reads empty), so it is fed to node on stdin instead.
+matrix_rows="$(printf '%s' "$matrix_json" | node -e "console.log(JSON.parse(require('fs').readFileSync(0, 'utf8')).length)")"
+assert_eq "$expected_rows" "$matrix_rows" \
   "the matrix has exactly one row per KNOWN_SOURCES x KNOWN_MODES cell (${known_sources_len} x ${known_modes_len})"
 
 # MUTATION PROOF M1 target: deleting a row from POLICY_MATRIX (or from

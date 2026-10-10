@@ -1621,6 +1621,50 @@ if (-not (Test-Path $providerLib)) {
             Add-Fail "Could not stub 'aca' on PATH for the sandbox provider checks (resolved: $($resolvedAca.Source))"
         }
 
+        # The shims are here-strings, so they take the line endings of the
+        # harness source. cmd.exe mis-reads an LF-only batch file and `goto
+        # <label>` then fails with "The system cannot find the batch label
+        # specified" -- which is how `sandbox delete` and the cancel exec broke on
+        # an LF checkout. Every generated shim must be CRLF whatever the checkout
+        # gave the harness, and an LF-only SOURCE must still yield a shim whose
+        # label actions (acadelete, acacancel) run.
+        $sbBareLfShims = @()
+        foreach ($sbShim in @("az", "gh", "squad", "curl", "aca")) {
+            $sbShimPath = Join-Path $sbStub.BinDir "$sbShim.cmd"
+            if (-not (Test-Path -LiteralPath $sbShimPath)) {
+                $sbBareLfShims += "$sbShim.cmd (missing)"
+            } elseif ([regex]::IsMatch([System.IO.File]::ReadAllText($sbShimPath), "(?<!\r)\n")) {
+                $sbBareLfShims += "$sbShim.cmd"
+            }
+        }
+        if ($sbBareLfShims.Count -eq 0) {
+            Add-Pass "All five generated stub shims (az/gh/squad/curl/aca.cmd) are CRLF-only, independent of the harness checkout EOL"
+        } else {
+            Add-Fail "Generated stub shims with bare LF line endings or missing: $($sbBareLfShims -join ', ')"
+        }
+
+        $sbLfProbeDir = Join-Path $sbStub.Root "lf-source-probe"
+        New-Item -ItemType Directory -Force -Path $sbLfProbeDir | Out-Null
+        $sbLfProbe = Join-Path $sbLfProbeDir "aca.cmd"
+        $sbLfSource = [regex]::Replace([System.IO.File]::ReadAllText($sbCli), "\r\n", "`n")
+        Write-SquadCliCmdStub -LiteralPath $sbLfProbe -Value $sbLfSource
+        $sbLfProbeBare = [regex]::IsMatch([System.IO.File]::ReadAllText($sbLfProbe), "(?<!\r)\n")
+        $env:SQUAD_STUB_ACA_LOG = Join-Path $sbLfProbeDir "aca-calls.log"
+        try {
+            $sbLfDeleteOut = (& $sbLfProbe sandbox delete -l name=squad-stub-session --yes 2>&1) -join " "
+            $sbLfDeleteRc = $LASTEXITCODE
+            $sbLfCancelOut = (& $sbLfProbe sandbox exec -l name=squad-stub-session -c "echo squad-cancelled" 2>&1) -join " "
+            $sbLfCancelRc = $LASTEXITCODE
+        } finally {
+            $env:SQUAD_STUB_ACA_LOG = $sbStub.AcaLog
+        }
+        if (-not $sbLfProbeBare -and $sbLfDeleteRc -eq 0 -and $sbLfDeleteOut -notmatch "batch label" `
+                -and $sbLfCancelRc -eq 0 -and $sbLfCancelOut -match "squad-cancel-status=killed") {
+            Add-Pass "An LF-only stub source is written as CRLF and its acadelete / acacancel label actions run"
+        } else {
+            Add-Fail "An LF-only stub source did not yield a working shim (bareLF=$sbLfProbeBare deleteRc=$sbLfDeleteRc deleteOut='$sbLfDeleteOut' cancelRc=$sbLfCancelRc cancelOut='$sbLfCancelOut')"
+        }
+
         $sbClass = @'
 {
   "id": "sandbox-node-lts",

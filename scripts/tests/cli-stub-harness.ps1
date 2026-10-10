@@ -104,6 +104,29 @@
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here. This file
 # is dot-sourced into validate.ps1's scope and must not change its behaviour.
 
+function Write-SquadCliCmdStub {
+    <#
+    .SYNOPSIS
+        Writes a .cmd shim with CRLF line endings, whatever line endings this
+        harness source was checked out with.
+
+    .DESCRIPTION
+        The shims are here-strings, so a shim inherits the EOL of THIS file. With
+        an LF checkout (core.autocrlf off, or a worktree made that way) cmd.exe
+        reads an LF-only batch file wrongly and `goto <label>` fails with "The
+        system cannot find the batch label specified". Normalising to CRLF here
+        makes the shims independent of the checkout. The content stays ASCII and
+        ends with exactly one CRLF, as Set-Content's own trailing newline did.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+    $crlfValue = [regex]::Replace($Value, "\r\n|\r|\n", "`r`n")
+    if (-not $crlfValue.EndsWith("`r`n")) { $crlfValue += "`r`n" }
+    Set-Content -LiteralPath $LiteralPath -Value $crlfValue -Encoding ascii -NoNewline
+}
+
 function New-SquadCliStubEnvironment {
     <#
     .SYNOPSIS
@@ -355,7 +378,7 @@ null
     # --- Fake `az` ----------------------------------------------------------
     # Flat goto-based dispatch (no nested parenthesised blocks) so cmd.exe
     # parsing stays predictable for arguments containing [], {} and =.
-    Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "az.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_AZ_LOG%" echo %*
 set "A1=%~1"
@@ -500,7 +523,7 @@ exit /b 0
     # SQUAD_STUB_GH_PUSH / SQUAD_STUB_GH_LOGIN / SQUAD_STUB_GH_API_RC let a test
     # drive the read-only-account case and the probe-failed case without a
     # second harness.
-    Set-Content -LiteralPath (Join-Path $binDir "gh.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "gh.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_GH_LOG%" echo %*
 if "%~1"=="repo" goto ghrepo
@@ -542,7 +565,7 @@ exit /b 0
     # doctor golden portable. It logs like the other shims, so if any command
     # ever starts shelling out to it that becomes a visible capture diff rather
     # than a silent behaviour change.
-    Set-Content -LiteralPath (Join-Path $binDir "squad.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "squad.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_SQUAD_LOG%" echo %*
 if "%~1"=="health" if "%~2"=="--json" goto sqhealth
@@ -566,7 +589,7 @@ exit /b 0
     # OPERATION_TIMEDOUT (slow/unreachable). Any value is accepted so a test
     # can reproduce curl's full, real classification space without touching
     # a network.
-    Set-Content -LiteralPath (Join-Path $binDir "curl.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "curl.cmd") -Value @'
 @echo off
 if not "%SQUAD_STUB_CURL_LOG%"=="" (>>"%SQUAD_STUB_CURL_LOG%" echo %*)
 exit /b %SQUAD_STUB_CURL_RC%
@@ -589,7 +612,7 @@ exit /b %SQUAD_STUB_CURL_RC%
     # what turns "the credential is delivered out of band" into a behavioural
     # assertion: the test can prove BOTH that the token never appeared in the
     # recorded argv AND that the full value still reached the process.
-    Set-Content -LiteralPath (Join-Path $binDir "aca.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "aca.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_ACA_LOG%" echo %*
 set "A1=%~1"
