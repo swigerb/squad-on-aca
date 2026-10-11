@@ -61,6 +61,12 @@
 SQUAD_HUB_APPROVAL="${SQUAD_HUB_APPROVAL:-ask}"
 
 SQUAD_HUB_EXIT_NO_APPROVER=75
+# `squad-hub oneshot` with a REQUIRED model (see squad_hub_supports_required_model)
+# exits 78 when its agent did not confirm that model -- unavailable, or not
+# applied -- having sent no prompt at all. Not retried, never replaced by the
+# default model. (The same number squad_hub_abort uses for the worker's own
+# refusals: both mean "this session must not run as asked".)
+SQUAD_HUB_EXIT_MODEL_NOT_APPLIED=78
 SQUAD_HUB_EXIT_REFUSED=77
 SQUAD_HUB_DEVICE_TOKEN_PREFIX="sqhd1."
 
@@ -302,6 +308,94 @@ squad_hub_policy_json() {
   printf '%s' "$json"
 }
 
+# Does this squad-hub build run a one-shot session on a REQUIRED model, strictly?
+#
+# The contract (squad-hub's side; asked, never guessed from a version number):
+#
+#   squad-hub oneshot --capabilities
+#     is a bounded, side-effect-free CLI probe: it exits 0 and prints exactly one
+#     JSON object, {"protocolVersion":1,"requiredModel":true}, having touched no
+#     hub, device, config, daemon, agent, URL or token. It takes no other argv.
+#
+#   `oneshot` with SQUAD_HUB_MODEL=<id> and SQUAD_HUB_REQUIRE_MODEL=1 in its
+#   environment then
+#     * runs the session on exactly that model, and only after the hub's agent
+#       returned that model's configuration, confirmed applied, BEFORE the first
+#       prompt;
+#     * otherwise sends NO prompt and exits 78 -- no warning, no default model.
+#
+# What counts as the answer: ONLY the probe's own stdout, parsed as JSON, with
+# protocolVersion the number 1 and requiredModel the boolean true (the string
+# "true" is not true). Anything else is "not supported": a build that does not
+# know the flag (the pinned 0.6.0 ignores it and exits 64 for the missing hub
+# URL), a non-zero exit, a timeout, more than 4096 bytes, output that is not that
+# document. Not consulted, on purpose: a version number, the hub's public HTTP
+# endpoint, or any log line. A required-model session is refused for it; it is
+# never handed to a hub that would run it on another model and report success.
+#
+# The probe runs with every SQUAD_HUB_* variable removed from its environment
+# and with stdin closed. It is meant to need none of them, and a build that is
+# not what we think it is must not receive the device token or a URL to dial.
+#
+# The whole probe is bounded, children included. Its stdout goes to a private
+# file, not a pipe: a pipe reader waits for EOF, and any descendant the hub left
+# holding the write end (a backgrounded `sleep`, a helper it forgot) would keep
+# the reader -- and the session -- waiting long after the hub itself exited. The
+# hub runs in a process group of its own (`set -m`, the same idiom the Squad
+# supervisor uses), under `timeout` for the deadline, and that group is sent KILL
+# whenever the probe ends, however it ended: nothing a probe started outlives it.
+# A probe that left anything behind is treated as not supporting the capability,
+# like any other answer that is not a clean yes. The file is capped (a runaway
+# writer gets SIGXFSZ) and read only after the group is gone. Only the group this
+# function started is ever signalled: no name, no pattern, no other pid. A
+# descendant that deliberately leaves the group (setsid) is beyond a shell's
+# reach; that is the one case this does not claim to contain.
+squad_hub_supports_required_model() {
+  command -v squad-hub >/dev/null 2>&1 || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  command -v timeout >/dev/null 2>&1 || return 1
+  local seconds="${SQUAD_HUB_CAPABILITY_TIMEOUT_SECONDS:-10}"
+  [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]] || seconds=10
+  local -a scrub=()
+  local name
+  while IFS= read -r name; do
+    [[ "$name" == SQUAD_HUB_* ]] && scrub+=(-u "$name")
+  done < <(compgen -e)
+
+  local answer
+  answer="$(mktemp "${TMPDIR:-/tmp}/squad-hub-capabilities.XXXXXXXX" 2>/dev/null)" || return 1
+
+  local monitor_was_on=0 probe_pid="" probe_rc=0 left_behind=0 size="" supported=1
+  case "$-" in *m*) monitor_was_on=1 ;; esac
+  set -m
+  (
+    ulimit -f 16 2>/dev/null || true
+    exec env ${scrub[@]+"${scrub[@]}"} timeout -k 2 "${seconds}s" squad-hub oneshot --capabilities
+  ) >"$answer" 2>/dev/null </dev/null &
+  probe_pid=$!
+  if [[ "$monitor_was_on" -eq 0 ]]; then set +m; fi
+
+  wait "$probe_pid" 2>/dev/null || probe_rc=$?
+  if kill -s KILL -- "-${probe_pid}" 2>/dev/null; then
+    left_behind=1
+    squad_hub_log "The capability probe left processes running after it ended; they were stopped, and the hub is treated as not confirming the capability."
+  fi
+
+  size="$(wc -c <"$answer" 2>/dev/null | tr -d '[:space:]')"
+  if [[ "$probe_rc" -eq 0 && "$left_behind" -eq 0 && "$size" =~ ^[0-9]+$ && "$size" -le 4096 ]] \
+     && timeout -k 1 "${seconds}s" node -e '
+          let doc;
+          try { doc = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch { process.exit(1); }
+          const ok = doc !== null && typeof doc === "object" && !Array.isArray(doc)
+            && doc.protocolVersion === 1 && doc.requiredModel === true;
+          process.exit(ok ? 0 : 1);
+        ' <"$answer" >/dev/null 2>&1; then
+    supported=0
+  fi
+  rm -f "$answer"
+  return "$supported"
+}
+
 # Run ONE supervised session and return its exit code.
 #
 # `squad-hub oneshot` is the hub's documented entry point for a job platform.
@@ -310,6 +404,43 @@ squad_hub_policy_json() {
 squad_hub_run() {
   local prompt="$1"
   local policy_json device_name device_meta_json
+
+  # A session that was required to run on a specific model (SQUAD_MODEL, set by
+  # the entrypoint's model resolution) is only supervised by a hub that can
+  # guarantee it. `copilot --acp` silently ignores a --model argv flag, and a
+  # hub that treats the model as a preference falls back to its default with
+  # only a warning (squad-hub 0.6.0, acp-session.js) -- the session would run on
+  # a model nobody chose and report success, the silent fallback the model pin
+  # exists to rule out. So the hub is asked, once, with a bounded probe whether
+  # it has the strict required-model capability (squad_hub_supports_required_model);
+  # a build that does not say so is refused, loudly, instead of being run on its
+  # default. The supervision itself is untouched: the same approvals, device
+  # identity and lease apply; only the model becomes mandatory.
+  # (watch/loop under the hub are unaffected: their agent is worker/squad-agent,
+  # which runs `copilot --model <pin>` directly.)
+  local required_model="${SQUAD_MODEL:-}"
+  if [[ -z "$required_model" && "${SQUAD_MODEL_PINNED:-0}" == 1 ]]; then
+    squad_hub_abort \
+      "SQUAD_MODEL_PINNED=1 but SQUAD_MODEL is empty, so the model this session requires is unknown." \
+      "Refusing to hand it to the hub, which would choose a model itself."
+  fi
+  if [[ -n "$required_model" ]]; then
+    if [[ "$required_model" == -* || "$required_model" == *[[:space:]]* || "$required_model" == *[[:cntrl:]]* ]]; then
+      squad_hub_abort "SQUAD_MODEL '${required_model}' is not a usable model id; refusing to pass it to the hub."
+    fi
+    if [[ -n "${SQUAD_HUB_MODEL:-}" && "${SQUAD_HUB_MODEL,,}" != "${required_model,,}" ]]; then
+      squad_hub_abort \
+        "SQUAD_HUB_MODEL='${SQUAD_HUB_MODEL}' disagrees with the model this session is pinned to ('${required_model}')." \
+        "Two models were asked for; refusing to choose one. Make them the same, or remove SQUAD_HUB_MODEL."
+    fi
+    if ! squad_hub_supports_required_model; then
+      squad_hub_abort \
+        "This session is pinned to model '${required_model}', and the installed squad-hub did not confirm it can enforce that: 'squad-hub oneshot --capabilities' must print {\"protocolVersion\":1,\"requiredModel\":true} and exit 0." \
+        "Without that the hub could run the session on its default model if the pinned one is unavailable, with no error." \
+        "Install a squad-hub build that implements the probe (the image's pinned squad-hub@0.6.0 does not). The hub's own configuration is not at fault and is left as it is."
+    fi
+    squad_hub_log "Required model: ${required_model} (hub build confirmed it can fail closed on it; no fallback)."
+  fi
   policy_json="$(squad_hub_policy_json)"
   device_name="${SQUAD_HUB_DEVICE_NAME:-$(squad_hub_device_name)}"
   device_name="$(squad_hub_truncate "$device_name" 200)"
@@ -327,15 +458,19 @@ squad_hub_run() {
     squad_hub_log "  A denied tool is still refused outright and is never offered to a human."
     squad_hub_log "  Anything else now asks, and waits for a person to answer."
   fi
-  if [[ -n "${SQUAD_MODEL:-}" ]]; then
-    # `copilot --acp` silently ignores a --model argv flag, so the model cannot
-    # travel in SQUAD_HUB_AGENT_EXTRA_ARGS_JSON. The hub's one-shot verb reads
-    # SQUAD_HUB_MODEL and selects it through ACP (session/set_model) instead.
-    # A squad-hub build that predates SQUAD_HUB_MODEL ignores it, so say so.
-    squad_hub_log "Model override: ${SQUAD_MODEL} (passed to the hub one-shot session as SQUAD_HUB_MODEL; squad-hub builds without SQUAD_HUB_MODEL support use the default model)."
-  fi
 
   local rc=0
+  # A required model travels as SQUAD_HUB_MODEL=<id> with SQUAD_HUB_REQUIRE_MODEL=1,
+  # set for this one command only (`env` prefix; this shell's environment is not
+  # changed). Together they mean "this model, confirmed by the agent before the
+  # first prompt, or nothing runs" -- exit 78. A session that is NOT pinned gets
+  # neither from this function: the repository is not choosing a model for it,
+  # and whatever Hub configuration the operator set is passed through as it is.
+  local -a hub_oneshot=(squad-hub oneshot)
+  if [[ -n "$required_model" ]]; then
+    hub_oneshot=(env "SQUAD_HUB_MODEL=${required_model}" SQUAD_HUB_REQUIRE_MODEL=1 squad-hub oneshot)
+  fi
+
   # Same telemetry wiring as the unsupervised `copilot -p` path in entrypoint.sh.
   # squad-hub spawns `copilot --acp` with its own environment, so without these
   # the global default (COPILOT_OTEL_ENABLED=false, gRPC endpoint) wins and a
@@ -350,8 +485,7 @@ squad_hub_run() {
   SQUAD_HUB_DEVICE_NAME="$device_name" \
   SQUAD_HUB_DEVICE_META_JSON="$device_meta_json" \
   SQUAD_HUB_AGENT_EXTRA_ARGS_JSON="$policy_json" \
-  SQUAD_HUB_MODEL="${SQUAD_MODEL:-}" \
-    squad-hub oneshot || rc=$?
+    "${hub_oneshot[@]}" || rc=$?
 
   case "$rc" in
     0)
@@ -361,6 +495,10 @@ squad_hub_run() {
       squad_hub_log "The session asked for permission and no hub was connected, so nobody could answer."
       squad_hub_log "It was stopped rather than billed to the job timeout."
       squad_hub_log "Either make the hub reachable, or dispatch this run unattended."
+      ;;
+    "$SQUAD_HUB_EXIT_MODEL_NOT_APPLIED")
+      squad_hub_log "The hub did not confirm the required model '${required_model:-<none>}' (unavailable, or not applied); no prompt was sent."
+      squad_hub_log "No retry, no fallback model: the session stops here."
       ;;
     "$SQUAD_HUB_EXIT_REFUSED")
       squad_hub_log "The hub refused this device. Retrying a policy refusal never succeeds."

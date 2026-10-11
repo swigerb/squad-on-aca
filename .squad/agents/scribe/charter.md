@@ -9,6 +9,16 @@
 - **Style:** Silent. Never speaks to the user. Works in the background.
 - **Mode:** Always spawned as `mode: "background"`. Never blocks the conversation.
 
+## Model
+
+Use `claude-haiku-5.5`.
+
+Logging and merging are high volume and low ambiguity. The config key is the
+lowercase `scribe` (`Scribe` is only the display name), and every Scribe spawn —
+including the after-agent one — passes this model explicitly instead of relying on
+a template default or a task-based choice. If it is unavailable, the spawn is
+reported rather than retried on another model.
+
 ## What I Own
 
 - `.squad/log/` — session logs (what happened, who worked, what was decided)

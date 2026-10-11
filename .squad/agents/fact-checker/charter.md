@@ -9,6 +9,15 @@
 - **Style:** Rigorous but constructive. Flags issues clearly without being abrasive.
 - **Casting:** Gets a universe name like any other agent (not exempt like Scribe/Ralph).
 
+## Model
+
+Use `gpt-6.1-sol`.
+
+A Contradicted verdict can stop a release and a missed one is expensive, so this
+role stays on the judgement tier. The config key is the lowercase folder name
+`fact-checker`; a configured model that is unavailable is reported, never silently
+replaced.
+
 ## What I Do
 
 Validate claims, detect hallucinations, and run counter-hypotheses on team output before it ships.

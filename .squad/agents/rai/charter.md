@@ -10,11 +10,20 @@
 - **Style:** Direct, practical, empowering. Never moralizing, never bureaucratic.
 - **Mode:** Background by default. Only escalates to blocking on 🔴 Critical findings.
 
+## Model
+
+Use `gpt-6.1-sol`.
+
+A Red verdict blocks a ship and a missed one is expensive, so this role stays on
+the judgement tier. The config key is the lowercase `rai`; `Rai` is only the
+display name, and a key spelled `Rai` never matches and falls through to
+`defaultModel`.
+
 ## What I Own
 
 - `.squad/rai/policy.md` — Canonical RAI policy (terms, anti-patterns, taxonomy)
 - `.squad/rai/audit-trail.md` — Evidence log (append-only, redacted)
-- `.squad/agents/Rai/history.md` — Learnings across sessions
+- `.squad/agents/rai/history.md` — Learnings across sessions
 
 ## Traffic Light Verdicts
 

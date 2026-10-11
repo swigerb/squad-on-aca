@@ -104,6 +104,10 @@
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here. This file
 # is dot-sourced into validate.ps1's scope and must not change its behaviour.
 
+# The shims below are written as CRLF whatever this file's own line endings are;
+# see scripts/tests/cmd-stub-writer.ps1.
+. (Join-Path $PSScriptRoot "cmd-stub-writer.ps1")
+
 function New-SquadCliStubEnvironment {
     <#
     .SYNOPSIS
@@ -355,7 +359,7 @@ null
     # --- Fake `az` ----------------------------------------------------------
     # Flat goto-based dispatch (no nested parenthesised blocks) so cmd.exe
     # parsing stays predictable for arguments containing [], {} and =.
-    Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "az.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_AZ_LOG%" echo %*
 set "A1=%~1"
@@ -500,7 +504,7 @@ exit /b 0
     # SQUAD_STUB_GH_PUSH / SQUAD_STUB_GH_LOGIN / SQUAD_STUB_GH_API_RC let a test
     # drive the read-only-account case and the probe-failed case without a
     # second harness.
-    Set-Content -LiteralPath (Join-Path $binDir "gh.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "gh.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_GH_LOG%" echo %*
 if "%~1"=="repo" goto ghrepo
@@ -542,7 +546,7 @@ exit /b 0
     # doctor golden portable. It logs like the other shims, so if any command
     # ever starts shelling out to it that becomes a visible capture diff rather
     # than a silent behaviour change.
-    Set-Content -LiteralPath (Join-Path $binDir "squad.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "squad.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_SQUAD_LOG%" echo %*
 if "%~1"=="health" if "%~2"=="--json" goto sqhealth
@@ -566,7 +570,7 @@ exit /b 0
     # OPERATION_TIMEDOUT (slow/unreachable). Any value is accepted so a test
     # can reproduce curl's full, real classification space without touching
     # a network.
-    Set-Content -LiteralPath (Join-Path $binDir "curl.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "curl.cmd") -Value @'
 @echo off
 if not "%SQUAD_STUB_CURL_LOG%"=="" (>>"%SQUAD_STUB_CURL_LOG%" echo %*)
 exit /b %SQUAD_STUB_CURL_RC%
@@ -589,7 +593,7 @@ exit /b %SQUAD_STUB_CURL_RC%
     # what turns "the credential is delivered out of band" into a behavioural
     # assertion: the test can prove BOTH that the token never appeared in the
     # recorded argv AND that the full value still reached the process.
-    Set-Content -LiteralPath (Join-Path $binDir "aca.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "aca.cmd") -Value @'
 @echo off
 >>"%SQUAD_STUB_ACA_LOG%" echo %*
 set "A1=%~1"

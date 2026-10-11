@@ -19,17 +19,36 @@
 #
 # This suite checks the control two ways, mirroring
 # test_identity_drop_order.sh's own style: by reading the Dockerfile and
-# entrypoint.sh, and -- where the running host allows it -- by reproducing
-# the underlying kernel property being relied on.
+# entrypoint.sh, and by reproducing the underlying kernel property being
+# relied on between two REAL uids. That second half needs real root.
 
 set -uo pipefail
-
-echo "== UID separation between ralph and agent-running modes (PC-2 / issue #86) =="
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DOCKERFILE="$WORKER_DIR/Dockerfile"
 ENTRYPOINT="$WORKER_DIR/entrypoint.sh"
+
+# Same re-exec as test_security_n1b_root_sealed_state.sh: with passwordless
+# sudo (CI), run this whole suite as root so the real uid boundary is exercised.
+if [[ "$(id -u)" -ne 0 && "${SQUAD_UID_SEP_ROOT_REEXEC:-0}" != "1" ]] \
+  && command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+  sudo_env=("SQUAD_UID_SEP_ROOT_REEXEC=1" "PATH=${PATH:-}")
+  for name in TMPDIR TEMP TMP; do
+    if [[ -v "$name" ]]; then
+      sudo_env+=("${name}=${!name}")
+    fi
+  done
+  while IFS= read -r name; do
+    [[ "$name" == SQUAD_UID_SEP_ROOT_REEXEC ]] && continue
+    sudo_env+=("${name}=${!name}")
+  done < <(compgen -e SQUAD_ | sort)
+
+  echo "INFO: test_uid_separation.sh — re-execing under passwordless sudo to exercise the real uid boundary."
+  exec sudo -n /usr/bin/env "${sudo_env[@]}" "$(command -v bash)" "$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")" "$@"
+fi
+
+echo "== UID separation between ralph and agent-running modes (PC-2 / issue #86) =="
 
 pass=0
 fail=0
@@ -114,61 +133,175 @@ check "the drop clears the stale root HOME before preserving the rest of the env
 check "HOME's fallback is resolved from the ACTUAL current user, not hard-coded to /home/squad (a hard-coded fallback would break ralph, which now runs as squad-identity)" \
   bash -c "! grep -qE '^export HOME=\"\\\$\\{HOME:-/home/squad\\}\"\$' '$ENTRYPOINT'"
 
-# --- the mechanism, reproduced (where the host allows it) --------------------
+# --- the mechanism, reproduced across a REAL uid boundary --------------------
 #
-# Same style as test_identity_drop_order.sh's own reproduction: this is the
-# PROPERTY PC-2 relies on -- that Linux denies a /proc/<pid>/environ read
-# across a genuine UID boundary, independent of hidepid -- demonstrated
-# rather than merely asserted. Requires the ability to create an
-# unprivileged user namespace (no root needed); an explicit, visible skip
-# where that is unavailable, never a silent pass.
-if command -v unshare >/dev/null 2>&1 && unshare --user --pid --fork true 2>/dev/null; then
-  PROBE_LIB="$WORKER_DIR/lib/proc-isolation-probe.sh"
-  work="$(mktemp -d)"
+# The PROPERTY PC-2 relies on -- Linux denies a /proc/<pid>/environ read across
+# a genuine UID boundary, independent of hidepid -- demonstrated rather than
+# merely asserted. That needs two different REAL uids, so it needs real root:
+# directly, or through the passwordless-sudo re-exec above. A user namespace is
+# NOT a substitute: `unshare --user --map-root-user` maps the namespace's root
+# onto the caller's OWN uid, so its "different-uid" child kept the reader's
+# real uid (and the namespace's creator holds CAP_SYS_PTRACE over it anyway);
+# the read was allowed, and the old assertion measured nothing. Without root
+# the cross-uid proof is reported as SKIPPED (exit 77), never as a pass.
+PROBE_LIB="$WORKER_DIR/lib/proc-isolation-probe.sh"
+SENTINEL_NAME="SQUAD_UID_SEP_SENTINEL"
+skip_reason=""
 
+if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+  skip_reason="this host is not Linux, so there is no kernel uid boundary to exercise"
+elif [[ "$(id -u)" -ne 0 ]]; then
   # Same-uid case: a real child of THIS process, same real uid -- expected to
   # be readable (mirrors what PC-1 measured live: yes on this platform).
   same_uid_result="$(bash -c "
     source '$PROBE_LIB'
-    env SQUAD_UID_SEP_SENTINEL=probe-value sleep 2 &
+    env ${SENTINEL_NAME}=probe-value sleep 2 &
     child=\$!
-    squad_proc_iso_classify_environ_readable_settled \"/proc/\$child/environ\" SQUAD_UID_SEP_SENTINEL
+    squad_proc_iso_classify_environ_readable_settled \"/proc/\$child/environ\" ${SENTINEL_NAME}
     kill \$child 2>/dev/null || true
   ")"
   check "control case: a same-uid child's /proc/<pid>/environ is readable here (got '$same_uid_result') -- the exact condition PC-2 defends against" \
     test "$same_uid_result" = "yes"
-
-  # Cross-uid case: the child is placed in a NEW user namespace, mapped to a
-  # uid that is not this process's real uid. Reading its /proc/<pid>/environ
-  # from OUTSIDE that namespace must be denied by the kernel's ptrace/DAC
-  # check -- exactly the property a real squad vs squad-identity UID split
-  # relies on, reproduced without needing root or actual multi-user setup.
-  cat > "$work/child.sh" <<'CHILDSH'
-#!/bin/sh
-export SQUAD_UID_SEP_SENTINEL=probe-value
-exec sleep 2
-CHILDSH
-  chmod +x "$work/child.sh"
-  unshare --user --map-root-user --pid --fork --mount-proc "$work/child.sh" &
-  cross_child_wrapper=$!
-  sleep 0.3
-  # Find the actual sleep pid under the wrapper (best-effort; this is a
-  # reproduction aid, not production code).
-  cross_pid="$(pgrep -P "$cross_child_wrapper" 2>/dev/null | tail -1)"
-  if [[ -z "$cross_pid" ]]; then
-    cross_pid="$cross_child_wrapper"
-  fi
-  cross_uid_result="$(bash -c "source '$PROBE_LIB'; squad_proc_iso_classify_environ_readable_settled '/proc/$cross_pid/environ' SQUAD_UID_SEP_SENTINEL" 2>/dev/null || echo "no")"
-  kill "$cross_child_wrapper" 2>/dev/null || true
-  wait "$cross_child_wrapper" 2>/dev/null || true
-
-  check "a DIFFERENT-uid child's /proc/<pid>/environ is NOT readable here (got '$cross_uid_result') -- the property a real squad/squad-identity UID split relies on" \
-    bash -c "[[ '$cross_uid_result' == 'no' || '$cross_uid_result' == 'unknown' ]]"
-
-  rm -rf "$work"
+  skip_reason="this suite is not running as root and passwordless sudo is unavailable"
 else
-  echo "  skip cross-uid reproduction: this host cannot create an unprivileged user namespace (unshare unavailable or disabled) -- the static checks above still apply"
+  # The child runs as `nobody`; the readers are `nobody` itself (control) and a
+  # different unprivileged uid (cross): the existing `daemon` account, else the
+  # next uid down. Both are dropped from root with setpriv, which execs in
+  # place, so the pid under test is the real process.
+  victim_uid="$(id -u nobody 2>/dev/null || true)"
+  reader_uid=""
+  if [[ "$victim_uid" =~ ^[0-9]+$ && "$victim_uid" -gt 0 ]]; then
+    reader_uid="$(id -u daemon 2>/dev/null || true)"
+    if ! [[ "$reader_uid" =~ ^[0-9]+$ && "$reader_uid" -gt 0 && "$reader_uid" -ne "$victim_uid" ]]; then
+      reader_uid=$(( victim_uid > 1 ? victim_uid - 1 : victim_uid + 1 ))
+    fi
+  fi
+  missing=""
+  for dep in setpriv awk mktemp; do
+    command -v "$dep" >/dev/null 2>&1 || missing+=" $dep"
+  done
+
+  prereqs_ok() { [[ -z "$missing" && -n "$reader_uid" ]]; }
+  same_uid_readable() { [[ "$1" == "yes/present" ]]; }
+  cross_uid_denied() { [[ "$1" == "no/unreadable" ]]; }
+  fixture_child_ok() { [[ "$1" == "sleep" && "$2" == "$victim_uid" ]]; }
+  fixture_readers_ok() { # <same uid> <cross uid> <child uid> <same CapEff> <cross CapEff>
+    [[ "$1" == "$3" && "$2" == "$reader_uid" && "$2" != "$3" && "$2" != "0" && "$4" =~ ^0+$ && "$5" =~ ^0+$ ]]
+  }
+  # The denial only counts when it cannot be vacuous: the child really runs as
+  # nobody, the two readers are different unprivileged uids, the SAME-uid read of
+  # that very child classifies 'yes' (sentinel seen), and the child outlived both.
+  cross_proof_nonvacuous() {
+    fixture_child_ok "${real[comm]:-}" "${real[child_uid]:-}" \
+      && fixture_readers_ok "${real[same_uid]:-}" "${real[cross_uid]:-}" "${real[child_uid]:-}" "${real[same_cap]:-}" "${real[cross_cap]:-}" \
+      && same_uid_readable "${real[same]:-}" \
+      && [[ "${real[alive]:-}" == "sleep" ]] \
+      && cross_uid_denied "${real[cross]:-}"
+  }
+  mutant_rejected() { # <token the mutant produced> <token it must produce> <assertion it must fail>
+    [[ "$1" == "$2" ]] && ! "$3" "$1"
+  }
+
+  check "root-backed proof prerequisites are present (missing tools:${missing:- none}; 'nobody' uid: ${victim_uid:-absent})" \
+    prereqs_ok
+
+  if prereqs_ok; then
+    child_pid=""
+    work=""
+    cleanup() {
+      [[ -n "$child_pid" ]] && kill "$child_pid" 2>/dev/null
+      [[ -n "$work" ]] && rm -rf "$work"
+      return 0
+    }
+    trap cleanup EXIT
+    trap 'exit 143' INT TERM
+
+    work="$(mktemp -d)"
+    chmod 0755 "$work"
+    cp "$PROBE_LIB" "$work/proc-isolation-probe.sh"
+    # Runs as the dropped reader uid and prints one line; nothing else.
+    cat > "$work/reader.sh" <<'READER'
+source "$1"
+printf '%s/%s uid=%s capeff=%s\n' \
+  "$(squad_proc_iso_classify_environ_readable_settled "/proc/$2/environ" "$3")" \
+  "$(squad_proc_iso_classify_environ_detail "/proc/$2/environ" "$3")" \
+  "$(id -u)" \
+  "$(awk '/^CapEff:/ {print $2}' /proc/self/status)"
+READER
+    # Classifiers that always give one answer, to prove each assertion can fail.
+    printf '%s\n' \
+      "squad_proc_iso_classify_environ_readable_settled() { printf 'yes'; }" \
+      "squad_proc_iso_classify_environ_detail() { printf 'present'; }" > "$work/lib-always-yes.sh"
+    printf '%s\n' \
+      "squad_proc_iso_classify_environ_readable_settled() { printf 'no'; }" \
+      "squad_proc_iso_classify_environ_detail() { printf 'unreadable'; }" > "$work/lib-always-no.sh"
+    chmod 0644 "$work"/*.sh
+
+    read_as() { # <uid> <probe-lib> <pid>
+      env -i PATH="$PATH" setpriv --reuid="$1" --regid="$1" --clear-groups \
+        bash "$work/reader.sh" "$2" "$3" "$SENTINEL_NAME" 2>/dev/null
+    }
+
+    measure_reads() { # <assoc array name> <probe-lib>
+      local -n out="$1"
+      local lib="$2" waited=0 who rd_uid line tok uid_kv cap_kv
+      setpriv --reuid="$victim_uid" --regid="$victim_uid" --clear-groups \
+        env "${SENTINEL_NAME}=probe-value" sleep 30 &
+      child_pid=$!
+      # Wait for the exec chain (setpriv -> env -> sleep) to finish, so the
+      # environ under test is the final one and the pid really is a nobody sleep.
+      while [[ "$(cat "/proc/$child_pid/comm" 2>/dev/null)" != "sleep" && "$waited" -lt 100 ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+      done
+      out[comm]="$(cat "/proc/$child_pid/comm" 2>/dev/null)"
+      out[child_uid]="$(awk '/^Uid:/ {print $2}' "/proc/$child_pid/status" 2>/dev/null)"
+      for who in same cross; do
+        rd_uid="$reader_uid"
+        [[ "$who" == "same" ]] && rd_uid="$victim_uid"
+        line="$(read_as "$rd_uid" "$lib" "$child_pid")"
+        read -r tok uid_kv cap_kv <<<"$line"
+        out[$who]="$tok"
+        out[${who}_uid]="${uid_kv#uid=}"
+        out[${who}_cap]="${cap_kv#capeff=}"
+      done
+      out[alive]="$(cat "/proc/$child_pid/comm" 2>/dev/null)"
+      kill "$child_pid" 2>/dev/null
+      wait "$child_pid" 2>/dev/null
+      child_pid=""
+    }
+
+    declare -A real=() always_yes=() always_no=()
+    measure_reads real "$work/proc-isolation-probe.sh"
+    measure_reads always_yes "$work/lib-always-yes.sh"
+    measure_reads always_no "$work/lib-always-no.sh"
+
+    check "fixture: the child under test runs as real uid '${real[child_uid]:-?}' ('nobody' is $victim_uid), not root, exec'd to '${real[comm]:-?}'" \
+      fixture_child_ok "${real[comm]:-}" "${real[child_uid]:-}"
+    check "fixture: both readers are unprivileged with no capabilities -- same-uid reader '${real[same_uid]:-?}', cross-uid reader '${real[cross_uid]:-?}' (child '${real[child_uid]:-?}'; CapEff ${real[same_cap]:-?} / ${real[cross_cap]:-?})" \
+      fixture_readers_ok "${real[same_uid]:-}" "${real[cross_uid]:-}" "${real[child_uid]:-}" "${real[same_cap]:-}" "${real[cross_cap]:-}"
+    check "control case: a same-uid child's /proc/<pid>/environ is readable here (got '${real[same]:-}') -- the exact condition PC-2 defends against" \
+      same_uid_readable "${real[same]:-}"
+    check "a DIFFERENT-uid child's /proc/<pid>/environ is NOT readable here (got '${real[cross]:-}'; real uid ${real[cross_uid]:-?} reading real uid ${real[child_uid]:-?}; child still '${real[alive]:-}' after both reads) -- the property a real squad/squad-identity UID split relies on" \
+      cross_proof_nonvacuous
+    check "negative proof: a classifier that always answers 'yes' fails the cross-uid assertion (got '${always_yes[cross]:-}')" \
+      mutant_rejected "${always_yes[cross]:-}" "yes/present" cross_uid_denied
+    check "negative proof: a classifier that always answers 'no' fails the same-uid control (got '${always_no[same]:-}')" \
+      mutant_rejected "${always_no[same]:-}" "no/unreadable" same_uid_readable
+  fi
+fi
+
+if [[ -n "$skip_reason" ]]; then
+  echo "SKIP: test_uid_separation.sh — cross-uid proof NOT RUN: ${skip_reason}."
+  echo "SKIP:   run it as real root on Linux, e.g.: wsl -d Ubuntu -u root -- bash worker/tests/test_uid_separation.sh"
+  echo "SKIP:   on CI/Linux with passwordless sudo, run it normally and it will re-exec itself under sudo."
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
-[[ "$fail" -eq 0 ]]
+if [[ "$fail" -ne 0 ]]; then
+  exit 1
+fi
+if [[ -n "$skip_reason" ]]; then
+  exit 77
+fi
+exit 0

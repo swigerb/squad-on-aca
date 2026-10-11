@@ -58,6 +58,10 @@
 # matching scripts/tests/rbac-drift-stub-harness.ps1 and
 # scripts/tests/job-drift-stub-harness.ps1.
 
+# The stub below is written as CRLF whatever this file's own line endings are;
+# see scripts/tests/cmd-stub-writer.ps1.
+. (Join-Path $PSScriptRoot "cmd-stub-writer.ps1")
+
 $script:ProcIsoStubSubscriptionId = "aaaaaaaa-1111-1111-1111-111111111111"
 $script:ProcIsoStubResourceGroup = "rg-pc1-stub"
 $script:ProcIsoStubNamePrefix = "pc1stub"
@@ -73,7 +77,7 @@ function New-ProcIsoStubEnvironment {
     $azLog = Join-Path $Root "az-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
 
-    Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "az.cmd") -Value @'
 @echo off
 setlocal enabledelayedexpansion
 if not "%SQUAD_PROC_ISO_STUB_LOG%"=="" (>>"%SQUAD_PROC_ISO_STUB_LOG%" echo %*)

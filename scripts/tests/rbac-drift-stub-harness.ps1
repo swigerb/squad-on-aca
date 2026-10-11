@@ -40,6 +40,10 @@
 # Note: intentionally no Set-StrictMode / $ErrorActionPreference here, matching
 # scripts/tests/cli-stub-harness.ps1.
 
+# The stub below is written as CRLF whatever this file's own line endings are;
+# see scripts/tests/cmd-stub-writer.ps1.
+. (Join-Path $PSScriptRoot "cmd-stub-writer.ps1")
+
 $script:RbacDriftStubSubscriptionId = "11111111-1111-1111-1111-111111111111"
 $script:RbacDriftStubResourceGroup = "rg-cv1-stub"
 $script:RbacDriftStubNamePrefix = "cv1stub"
@@ -64,7 +68,7 @@ function New-RbacDriftStubEnvironment {
     $azLog = Join-Path $Root "az-calls.log"
     Set-Content -LiteralPath $azLog -Value "" -NoNewline -Encoding ascii
 
-    Set-Content -LiteralPath (Join-Path $binDir "az.cmd") -Encoding ascii -Value @'
+    Write-SquadCliCmdStub -LiteralPath (Join-Path $binDir "az.cmd") -Value @'
 @echo off
 if not "%SQUAD_RBAC_STUB_LOG%"=="" (>>"%SQUAD_RBAC_STUB_LOG%" echo %*)
 set "A1=%~1"

@@ -543,25 +543,24 @@ squad_casting_transient_install_exclude "$REPO_DIR"
 COPILOT_ARGV=("${SQUAD_POLICY_ARGV[@]}")
 SQUAD_COPILOT_FLAG_STRING="$SQUAD_POLICY_SQUAD_FLAGS"
 
-# --- manual dispatch model override (issue #135) -----------------------------
-# OV_SQUAD_MODEL (workflow_dispatch's `model` input) becomes SQUAD_MODEL in
-# this container's environment (see worker/lib/ralph-dispatch.sh's OV_* ->
-# bare-name merge). worker/lib/dispatch-inputs.js already rejects a leading
-# '-' and anything outside [A-Za-z0-9._-] before the session is ever started,
-# but this is the one place the value actually reaches an argv, so it is
-# re-checked here too rather than trusted blindly from the environment --
-# fail closed rather than hand a widened flag to `copilot`.
-if [[ -n "${SQUAD_MODEL:-}" ]]; then
-  if [[ "$SQUAD_MODEL" == -* ]]; then
-    squad_policy_abort "SQUAD_MODEL ('${SQUAD_MODEL}') starts with '-' and would be read as a flag, not a model name; refusing to start."
-  fi
-  COPILOT_ARGV+=(--model "$SQUAD_MODEL")
-fi
-# squad-agent (the watch/loop --agent-cmd wrapper) builds its own argv rather
-# than reusing COPILOT_ARGV -- see the policy-argv export below -- so the
-# model override is handed to it the same way: a dedicated env var it reads
-# itself, not by assuming it inherits SQUAD_MODEL unchanged.
-export SQUAD_AGENT_MODEL="${SQUAD_MODEL:-}"
+# --- the session's model pin (issue #135, and the per-role pin) ---------------
+# Until now `copilot` ran on whatever model the CLI defaulted to unless an
+# operator typed one in. The model is now resolved HERE, once, before any
+# launch below: the repository's own choice for the role this mode runs as
+# (`ralph` for watch/triage/loop, `lead` for prompt/new-project/smoke --
+# see agent-policy.js "Model pin"), read from .squad/config.json. An operator
+# override (OV_SQUAD_MODEL -> SQUAD_MODEL, workflow_dispatch's `model` input;
+# SQUAD_AGENT_MODEL; COPILOT_MODEL; a --model in SQUAD_COPILOT_FLAGS) is
+# accepted only when it names that same model; a conflicting or malformed one
+# aborts the session (78) with no fallback to either side.
+#
+# squad_policy_resolve_model appends `--model` to COPILOT_ARGV (so the direct
+# smoke / prompt / new-project launches carry it), exports SQUAD_AGENT_MODEL
+# for worker/squad-agent (which builds its own argv for watch/loop -- see the
+# policy-argv export below), and exports SQUAD_MODEL / SQUAD_MODEL_PINNED for
+# the hub path and for squad-agent's own check. After squad_policy_harden, so
+# the policy file it reads is already under the governance lock.
+squad_policy_resolve_model "$REPO_DIR"
 
 # --- watch/loop agent-cmd wrapper policy (issue #112) ------------------------
 # `squad watch` and `squad loop` own their own loop and spawn Copilot
@@ -1440,12 +1439,21 @@ NODE
     # squad_policy_exec_agent runs INSIDE the forwarding wrapper's background
     # job, closes the policy sampler/seal descriptors there, then execs
     # `squad` -- so `$!` is still squad's own pid and forwarding is unchanged.
+    # A pinned session must stop when its model cannot run: Squad itself keeps
+    # rescheduling after a failed agent. See "Pinned-model failure lifecycle" in
+    # worker/lib/squad-policy.sh. With a stop file the supervisor leaves the
+    # Squad status in SQUAD_FOREGROUND_RC; squad_model_pin_settle_session ends
+    # the session on any non-zero status other than a recorded pin failure, as
+    # errexit did before, and an unpinned session never has a stop file.
+    squad_model_pin_lifecycle_init
     squad_run_foreground_with_signal_forwarding \
       squad_policy_exec_agent \
       squad loop --interval "${LOOP_INTERVAL_MINUTES:-10}" --timeout "${LOOP_TIMEOUT_MINUTES:-30}" --agent-cmd /usr/local/lib/squad-on-aca/squad-agent
+    squad_model_pin_settle_session "$SQUAD_FOREGROUND_RC"
     squad_defer_shutdown_signals
     squad_policy_checkpoint
     squad_watch_governance_report_if_any
+    squad_model_pin_exit_if_failed
     squad_release_shutdown_signals
     ;;
   ralph)
@@ -1620,6 +1628,8 @@ NODE
     # sentinel file at all.
     export SQUAD_WATCH_SENTINEL_FILE="${SQUAD_WATCH_SENTINEL_FILE:-${WORKDIR:-/workspace}/${SESSION_NAME}/watch-sentinel}"
     mkdir -p "$(dirname "$SQUAD_WATCH_SENTINEL_FILE")"
+    # Same pinned-model stop as the loop branch above.
+    squad_model_pin_lifecycle_init
     squad_run_foreground_with_signal_forwarding \
       squad_policy_exec_agent \
       squad watch \
@@ -1631,9 +1641,11 @@ NODE
       --notify-level "${WATCH_NOTIFY_LEVEL:-important}" \
       --sentinel-file "$SQUAD_WATCH_SENTINEL_FILE" \
       --verbose
+    squad_model_pin_settle_session "$SQUAD_FOREGROUND_RC"
     squad_defer_shutdown_signals
     squad_policy_checkpoint
     squad_watch_governance_report_if_any
+    squad_model_pin_exit_if_failed
     squad_release_shutdown_signals
     ;;
   shell)

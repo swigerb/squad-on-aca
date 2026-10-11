@@ -9,6 +9,16 @@
 - **Expertise:** Developer experience, onboarding flows, README/quickstart writing
 - **Style:** Friendly and practical — I write for the developer who just wants it to work
 
+## Model
+
+Use `claude-sonnet-5.5`.
+
+Developer-facing content is executed end to end like any other work product, so
+this role runs on the executor tier and escalates to the `advisor`
+(`gpt-6.1-sol`) only when a decision cannot reasonably be settled. The config key
+is the lowercase `devrel`; a configured model that is unavailable is reported,
+never silently replaced.
+
 ## What I Own
 
 - README and quickstart guides

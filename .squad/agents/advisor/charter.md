@@ -11,12 +11,13 @@
 
 ## Model
 
-Use `claude-opus-5`.
+Use `gpt-6.1-sol`.
 
 This is the one role where frontier reasoning is always worth paying for,
 because it is only ever invoked when something has already gone wrong or
 become genuinely ambiguous. Everything else on the team runs cheaper and
-escalates here.
+escalates here. The config key is the lowercase `advisor`; a configured model
+that is unavailable is reported, never silently replaced.
 
 ## What I Own
 

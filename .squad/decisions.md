@@ -2,7 +2,28 @@
 
 ## Active Decisions
 
+### 2026-10-09: Squad member models are gpt-6.1-sol, claude-sonnet-5.5 and claude-haiku-5.5
+
+**By:** Brian (owner approval, issue #150), applied locally by a Scout worker under Brian's direct takeover. The failed ACA autowriter was not retried and no governance guard was bypassed.
+
+**Decision:**
+
+- `gpt-6.1-sol` for the roles that judge rather than execute: lead, advisor, security, rai, fact-checker. It replaces `claude-opus-5.5`, which `.squad/config.json` still named for these five roles.
+- `claude-sonnet-5.5` for the executors: engineer, reviewer, devrel, ralph. It is also `defaultModel` and `modelPolicy.executorModel`.
+- `claude-haiku-5.5` for scribe and docs (`modelPolicy.scribeModel`). `modelPolicy.advisorModel` is `gpt-6.1-sol`.
+- `.squad/config.json` `agentModelOverrides` keys are the exact lowercase member names (`rai`, `scribe`, `fact-checker`, ...): the same string as the `.squad/agents/<name>/` folder, the casting registry key and the spawn `name`. The config keys were already canonical and are preserved; no alias keys are added. `developer` is not a member (that work is `engineer`), so it gets no key.
+- Every spawn passes the member's model explicitly, including reviewers and the after-agent Scribe. `.squad/templates/after-agent-reference.md` takes the Scribe model as `{scribe_model}` from `agentModelOverrides.scribe`, and `.github/agents/squad.agent.md` is the authoritative overlay. The reference's full Scribe prompt (spawn manifest, archival safety rules and size gates, orchestration and session logs, permitted cross-agent history updates, history summarization gate, health report) is preserved; the overlay supplies only `name` and `model`.
+- If a configured model is unavailable or out of quota, stop and report which member and model; never downgrade silently or omit the `model` parameter.
+
+**Why:** The charters, `.squad/routing.md` and the after-agent Scribe template still described older models (the Sonnet 5, Opus 5 and Haiku 4.5 mappings; the lead charter even told the engineer to run `claude-opus-4.8`), the Scribe spawn took a template default despite the config, and the `claude-opus-5.5` judgement tier is replaced by the owner-approved `gpt-6.1-sol`.
+
+**Limits:** This changes the configuration and instructions the coordinator reads; it adds no new runtime enforcement mechanism, so each invocation's actual resolved model must still be recorded. Older generic SDK templates under `.squad/templates/` still describe their own defaults; they were not swept and do not override this decision.
+
+**Supersedes:** the 2026-07-28 "All Squad members run Claude Opus 5 only" decision and the model split in the 2026-07-15 decision, both kept below as superseded entries.
+
 ### 2026-07-28: All Squad members run Claude Opus 5 only
+
+> **Superseded 2026-10-09** — the single-model policy below no longer applies. See "Squad member models are gpt-6.1-sol, claude-sonnet-5.5 and claude-haiku-5.5". Kept unchanged as history.
 
 **Decision:** Every Squad member — lead, engineer, reviewer, security, docs, devrel, scribe, ralph, Rai, fact-checker — uses `claude-opus-5`. This supersedes the 2026-07-15 split model policy (`gpt-5.6-luna` for lead, `claude-opus-4.8` for engineer).
 
@@ -29,7 +50,7 @@ Critically, its `worker/tests/run-tests.sh` captures `status=$?` *inside* `if ! 
 
 ### 2026-07-15: Route development through Squad with explicit model policy
 
-> **Superseded 2026-07-28** — the model split below no longer applies. All members now run `claude-opus-5`. The routing half of this decision (development work goes through Squad) remains in force.
+> **Superseded 2026-07-28** — the model split below no longer applies. All members now run `claude-opus-5`. The routing half of this decision (development work goes through Squad) remains in force. The 2026-07-28 single-model policy was itself superseded 2026-10-09; see the current model decision at the top.
 
 **Decision:** Development work in this repo should route through Squad. The Lead handles planning, sequencing, and coordination using `gpt-5.6-luna`. Code-writing work routes to `engineer` using `claude-opus-4.8`.
 

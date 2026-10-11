@@ -65,6 +65,13 @@ cat > "${FAKE_BIN}/copilot" <<'COPILOT'
 for a in "$@"; do
   printf '%s\n' "$a" >> "${COPILOT_ARGV_DUMP}"
 done
+# COPILOT_STUB_HOLD=<file>: publish this process's pid there and stay alive
+# until TERMed, recording the TERM in COPILOT_STUB_TERM_FILE (exit 143).
+if [[ -n "${COPILOT_STUB_HOLD:-}" ]]; then
+  printf '%s\n' "$$" > "$COPILOT_STUB_HOLD"
+  trap 'printf "term\n" >> "${COPILOT_STUB_TERM_FILE:?}"; exit 143' TERM
+  while :; do sleep 0.2; done
+fi
 exit "${COPILOT_STUB_EXIT:-0}"
 COPILOT
 chmod +x "${FAKE_BIN}/copilot"
@@ -83,17 +90,19 @@ printf '{"mcpServers":{}}\n' > "${REPO_WITH_MCP}/.mcp.json"
 # DUMPED_ARGV (a bash array: one element per line the stub copilot dumped;
 # empty if copilot was never reached because the wrapper aborted first).
 # Honours RUN_WRAPPER_MODEL (SQUAD_AGENT_MODEL to export for this one call;
-# unset/empty means "do not export it at all") so callers can exercise the
+# unset/empty means "do not export it at all") and RUN_WRAPPER_PINNED
+# (SQUAD_MODEL_PINNED, same convention) so callers can exercise the
 # issue #135 model-override path without threading a new parameter through
-# every existing call site.
+# every existing call site. RUN_WRAPPER_FAILURE_FILE and RUN_WRAPPER_COPILOT_MODEL
+# are the same convention for SQUAD_MODEL_PIN_FAILURE_FILE and COPILOT_MODEL.
 run_wrapper() {
   local policy_json="$1" repo_dir="$2"
   shift 2
   : > "$DUMP_FILE"
   if [[ "$policy_json" == "__UNSET__" ]]; then
-    WRAPPER_OUT="$(env -u SQUAD_AGENT_POLICY_ARGV_JSON -u SQUAD_AGENT_MODEL SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
+    WRAPPER_OUT="$(env -u SQUAD_AGENT_POLICY_ARGV_JSON -u SQUAD_AGENT_MODEL -u SQUAD_MODEL_PINNED -u SQUAD_MODEL_PIN_FAILURE_FILE -u COPILOT_MODEL SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} ${RUN_WRAPPER_PINNED:+SQUAD_MODEL_PINNED="$RUN_WRAPPER_PINNED"} ${RUN_WRAPPER_FAILURE_FILE:+SQUAD_MODEL_PIN_FAILURE_FILE="$RUN_WRAPPER_FAILURE_FILE"} ${RUN_WRAPPER_COPILOT_MODEL:+COPILOT_MODEL="$RUN_WRAPPER_COPILOT_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
   else
-    WRAPPER_OUT="$(env -u SQUAD_AGENT_MODEL SQUAD_AGENT_POLICY_ARGV_JSON="$policy_json" SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
+    WRAPPER_OUT="$(env -u SQUAD_AGENT_MODEL -u SQUAD_MODEL_PINNED -u SQUAD_MODEL_PIN_FAILURE_FILE -u COPILOT_MODEL SQUAD_AGENT_POLICY_ARGV_JSON="$policy_json" SQUAD_AGENT_REPO_DIR="$repo_dir" ${RUN_WRAPPER_MODEL:+SQUAD_AGENT_MODEL="$RUN_WRAPPER_MODEL"} ${RUN_WRAPPER_PINNED:+SQUAD_MODEL_PINNED="$RUN_WRAPPER_PINNED"} ${RUN_WRAPPER_FAILURE_FILE:+SQUAD_MODEL_PIN_FAILURE_FILE="$RUN_WRAPPER_FAILURE_FILE"} ${RUN_WRAPPER_COPILOT_MODEL:+COPILOT_MODEL="$RUN_WRAPPER_COPILOT_MODEL"} bash "$WRAPPER" "$@" 2>&1)"
   fi
   WRAPPER_RC=$?
   DUMPED_ARGV=()
@@ -276,6 +285,174 @@ RUN_WRAPPER_MODEL="--allow-all-tools" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" 
 unset RUN_WRAPPER_MODEL
 assert_eq "78" "$WRAPPER_RC" "a model value starting with '-' is refused (exit 78), not passed through as a flag"
 assert_eq "1" "$(copilot_never_ran)" "... and copilot is never exec'd for that rejected model value"
+
+# ---------------------------------------------------------------------------
+# (b3) The role model pin. SQUAD_MODEL_PINNED=1 means the entrypoint REQUIRED a
+#      model for this session: an empty SQUAD_AGENT_MODEL then aborts instead of
+#      running on Copilot's own default, every other `--model` on the policy argv
+#      or in Squad's arguments is checked and removed so copilot gets exactly ONE
+#      (the pin, right after Squad's own arguments), and a copilot that cannot
+#      run the pinned model ends the session with its own status, once: the
+#      failure is recorded in SQUAD_MODEL_PIN_FAILURE_FILE (which stops Squad's
+#      polling via the supervisor) and latches, so there is no retry and no
+#      fallback. A TERM forwarded to copilot is not a model failure.
+# ---------------------------------------------------------------------------
+echo "-- (b3) the role model pin: required, exclusive, and no fallback --"
+
+PIN_DIR="${WORK}/pin-state"
+mkdir -p "$PIN_DIR"
+PIN_FILE="${PIN_DIR}/model-pin-failure"
+
+# run_pinned <model> <policy-json> [wrapper args...]
+# One pinned run with a fresh (absent) failure file.
+run_pinned() {
+  local model="$1" policy="$2"
+  shift 2
+  rm -f "$PIN_FILE" "${PIN_FILE}".*
+  RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="$model" RUN_WRAPPER_FAILURE_FILE="$PIN_FILE" run_wrapper "$policy" "$REPO_NO_MCP" "$@"
+}
+
+# How many tokens of the exec'd argv select a model, in either spelling.
+model_token_count() {
+  local n=0 t
+  for t in "${DUMPED_ARGV[@]}"; do
+    if [[ "$t" == "--model" || "$t" == --model=* ]]; then n=$((n + 1)); fi
+  done
+  printf '%s' "$n"
+}
+pin_file_state() { if [[ -e "$PIN_FILE" ]]; then printf 'present'; else printf 'absent'; fi; }
+
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_FAILURE_FILE="$PIN_FILE" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned but SQUAD_AGENT_MODEL empty: refused (exit 78)"
+assert_contains "$WRAPPER_OUT" "SQUAD_MODEL_PINNED=1" "pinned but empty: the diagnostic names the pin"
+assert_eq "1" "$(copilot_never_ran)" "pinned but empty: copilot is never exec'd, so it cannot pick its own model"
+
+run_pinned "model-beta" "$PARITY_JSON" -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned with a model: runs successfully"
+assert_eq "1" "$(model_token_count)" "pinned: copilot receives exactly ONE --model token"
+assert_eq "-p hi --model model-beta" "${DUMPED_ARGV[0]:-} ${DUMPED_ARGV[1]:-} ${DUMPED_ARGV[2]:-} ${DUMPED_ARGV[3]:-}" "pinned: Squad's own -p <prompt> first, then the pin, ahead of the policy argv"
+assert_eq "absent" "$(pin_file_state)" "pinned: a clean exit records nothing"
+
+RUN_WRAPPER_PINNED=0 run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "0" "$WRAPPER_RC" "not pinned (0) and no model: execs, copilot's default applies"
+assert_no_exact_token "not pinned and no model: no --model is invented" "--model" "${DUMPED_ARGV[@]}"
+
+run_pinned "model-beta" '["--allow-all-tools","--model","model-other"]' -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a different --model in the policy argv is refused (78)"
+assert_contains "$WRAPPER_OUT" "conflicts with the pinned model" "pinned: ... and the diagnostic says why"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd"
+
+run_pinned "model-beta" '["--allow-all-tools","--model=model-other"]' -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a different --model=<value> in the policy argv is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd for the = form"
+
+run_pinned "model-beta" "$PARITY_JSON" --model model-other -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a different --model among Squad's own arguments is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd for Squad's arguments"
+
+run_pinned "model-beta" '["--allow-all-tools","--model","model-beta","--model=model-other"]' -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a matching --model followed by a conflicting --model=<other> is refused (78): EVERY occurrence is checked"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd"
+
+run_pinned "model-beta" '["--allow-all-tools","--model","model-beta","--model"]' -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a trailing --model with no value is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd"
+
+run_pinned "model-beta" '["--allow-all-tools","--model="]' -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: an empty --model= is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd"
+
+run_pinned "model-beta" '["--allow-all-tools","--model","MODEL-BETA"]' -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned: the same model in a different case is the same model, not a conflict"
+assert_eq "1" "$(model_token_count)" "pinned: ... and it is not forwarded next to the pin: exactly one --model"
+assert_eq "--model model-beta" "${DUMPED_ARGV[2]:-} ${DUMPED_ARGV[3]:-}" "pinned: ... and the pinned spelling is the one copilot sees"
+
+run_pinned "model-beta" '["--allow-all-tools","--model=model-beta","--model","MODEL-BETA","--allow-all-tools"]' --model=model-beta -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned: the pinned model named several times, in both forms, in the policy argv AND by Squad, is accepted"
+assert_eq "1" "$(model_token_count)" "pinned: ... and canonicalizes to exactly ONE --model"
+assert_eq "-p hi --model model-beta" "${DUMPED_ARGV[0]:-} ${DUMPED_ARGV[1]:-} ${DUMPED_ARGV[2]:-} ${DUMPED_ARGV[3]:-}" "pinned: ... positioned right after -p <prompt>"
+assert_has_exact_token "pinned: the other policy flags around the removed tokens survive" "--allow-all-tools" "${DUMPED_ARGV[@]}"
+
+run_pinned "model-beta" '["--allow-all-tools","--log-level"]' -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned: a flag that takes a value, left dangling at the end of the policy argv, still runs"
+assert_eq "--model model-beta" "${DUMPED_ARGV[2]:-} ${DUMPED_ARGV[3]:-}" "pinned: ... the pin sits before it, so --log-level cannot swallow it"
+
+run_pinned "model-beta" "$PARITY_JSON" -p "--model model-other"
+assert_eq "0" "$WRAPPER_RC" "pinned: a prompt that merely says '--model' is a prompt, not an option"
+assert_eq "--model model-other" "${DUMPED_ARGV[1]:-}" "pinned: ... and it reaches copilot untouched, as one element"
+assert_eq "1" "$(model_token_count)" "pinned: ... without being mistaken for a model flag"
+
+RUN_WRAPPER_COPILOT_MODEL="model-other" run_pinned "model-beta" "$PARITY_JSON" -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a stale COPILOT_MODEL naming another model is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never exec'd"
+RUN_WRAPPER_COPILOT_MODEL="MODEL-BETA" run_pinned "model-beta" "$PARITY_JSON" -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned: a COPILOT_MODEL that names the same model is not a conflict"
+unset RUN_WRAPPER_COPILOT_MODEL
+
+# A launch failure on the pinned model. Squad would keep polling after its
+# agent command fails, so the wrapper records the failure and latches.
+COPILOT_STUB_EXIT=7 run_pinned "model-beta" "$PARITY_JSON" -p "hi"
+assert_eq "7" "$WRAPPER_RC" "pinned: copilot's own non-zero status (model unavailable / over quota) is the wrapper's status"
+assert_eq "0" "$(copilot_never_ran)" "pinned: ... after copilot was run on the pinned model, not on some other"
+assert_eq "model-beta" "${DUMPED_ARGV[3]:-}" "pinned: ... and the one attempt carried the pin"
+assert_eq "present" "$(pin_file_state)" "pinned: the failure is recorded for the supervisor"
+assert_eq "7" "$(head -n1 "$PIN_FILE" 2>/dev/null)" "pinned: ... with copilot's exit status in it"
+assert_contains "$WRAPPER_OUT" "No retry, no fallback model" "pinned: ... and the log says there is no retry or fallback"
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" RUN_WRAPPER_FAILURE_FILE="$PIN_FILE" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "again"
+assert_eq "78" "$WRAPPER_RC" "pinned: the next launch after a recorded failure is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... copilot is NOT launched a second time: no retry of the unavailable pin"
+assert_eq "7" "$(head -n1 "$PIN_FILE" 2>/dev/null)" "pinned: ... and the recorded failure is untouched"
+assert_contains "$WRAPPER_OUT" "already failed this session" "pinned: ... and the log says why"
+
+COPILOT_STUB_EXIT=0 run_pinned "model-beta" "$PARITY_JSON" -p "hi"
+assert_eq "0" "$WRAPPER_RC" "pinned: copilot exit 0 is the normal completed workflow: exit 0"
+assert_eq "absent" "$(pin_file_state)" "pinned: ... and nothing is recorded"
+
+# The failure has to be recordable, or a retry loop could not be stopped.
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: no SQUAD_MODEL_PIN_FAILURE_FILE at all is refused (78)"
+assert_contains "$WRAPPER_OUT" "SQUAD_MODEL_PIN_FAILURE_FILE is empty" "pinned: ... and the diagnostic names it"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never run"
+RUN_WRAPPER_PINNED=1 RUN_WRAPPER_MODEL="model-beta" RUN_WRAPPER_FAILURE_FILE="${WORK}/no-such-dir/model-pin-failure" run_wrapper "$PARITY_JSON" "$REPO_NO_MCP" -p "hi"
+assert_eq "78" "$WRAPPER_RC" "pinned: a failure file in a directory that does not exist is refused (78)"
+assert_eq "1" "$(copilot_never_ran)" "pinned: ... and copilot is never run"
+
+# A TERM aimed at the wrapper (Squad's timeout, a drain) is forwarded to the
+# copilot child, which is the only process signalled, and is NOT a model failure.
+HOLD_PID_FILE="${WORK}/copilot.hold.pid"
+HOLD_TERM_FILE="${WORK}/copilot.hold.term"
+rm -f "$PIN_FILE" "$HOLD_PID_FILE" "$HOLD_TERM_FILE"
+(
+  export SQUAD_AGENT_POLICY_ARGV_JSON="$PARITY_JSON" SQUAD_AGENT_REPO_DIR="$REPO_NO_MCP" \
+    SQUAD_AGENT_MODEL=model-beta SQUAD_MODEL_PINNED=1 SQUAD_MODEL_PIN_FAILURE_FILE="$PIN_FILE" \
+    COPILOT_STUB_HOLD="$HOLD_PID_FILE" COPILOT_STUB_TERM_FILE="$HOLD_TERM_FILE"
+  unset COPILOT_MODEL
+  exec bash "$WRAPPER" -p "hold"
+) >"${WORK}/hold.out" 2>&1 &
+HOLD_WRAPPER_PID=$!
+for _ in $(seq 1 100); do
+  [[ -s "$HOLD_PID_FILE" ]] && break
+  sleep 0.1
+done
+assert_eq "yes" "$([[ -s "$HOLD_PID_FILE" ]] && echo yes || echo no)" "signal: the pinned wrapper started copilot as a child it supervises"
+HOLD_COPILOT_PID="$(head -n1 "$HOLD_PID_FILE" 2>/dev/null)"
+if kill -0 "$HOLD_WRAPPER_PID" 2>/dev/null; then
+  assert_eq "ok" "ok" "signal: the wrapper stays alive while copilot runs (it is not exec'd away)"
+else
+  assert_eq "alive" "exited" "signal: the wrapper stays alive while copilot runs"
+fi
+kill -s TERM "$HOLD_WRAPPER_PID" 2>/dev/null
+hold_rc=0
+wait "$HOLD_WRAPPER_PID" || hold_rc=$?
+assert_eq "143" "$hold_rc" "signal: a TERM to the wrapper ends it with copilot's own TERM status"
+assert_eq "term" "$(head -n1 "$HOLD_TERM_FILE" 2>/dev/null)" "signal: ... because it forwarded the TERM to its copilot child"
+assert_eq "absent" "$(pin_file_state)" "signal: ... and a signalled exit is not recorded as a model failure"
+if [[ -n "$HOLD_COPILOT_PID" ]] && kill -0 "$HOLD_COPILOT_PID" 2>/dev/null; then
+  assert_eq "gone" "still running (pid ${HOLD_COPILOT_PID})" "signal: ... and no copilot process is left behind"
+else
+  assert_eq "ok" "ok" "signal: ... and no copilot process is left behind"
+fi
+rm -f "$HOLD_PID_FILE" "$HOLD_TERM_FILE"
 
 # ---------------------------------------------------------------------------
 # (c) Squad's trailing -p <prompt> is preserved intact, including a prompt
