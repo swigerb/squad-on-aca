@@ -437,7 +437,7 @@ squad_hub_run() {
       squad_hub_abort \
         "This session is pinned to model '${required_model}', and the installed squad-hub did not confirm it can enforce that: 'squad-hub oneshot --capabilities' must print {\"protocolVersion\":1,\"requiredModel\":true} and exit 0." \
         "Without that the hub could run the session on its default model if the pinned one is unavailable, with no error." \
-        "Install a squad-hub build that implements the probe (the image's pinned squad-hub@0.6.0 does not). The hub's own configuration is not at fault and is left as it is."
+        "Install a squad-hub build that implements the probe (squad-hub@0.7.0 or later). The hub's own configuration is not at fault and is left as it is."
     fi
     squad_hub_log "Required model: ${required_model} (hub build confirmed it can fail closed on it; no fallback)."
   fi
@@ -515,8 +515,8 @@ squad_hub_run() {
 
 # Report the pull request this session opened, if this image knows how.
 #
-# The worker image pins squad-hub@0.6.0 until the hub's v0.7.0 rollout, so this
-# must detect the new verb rather than assume it.
+# The default image pins squad-hub@0.7.0. Custom builds can still use an older
+# hub, so detect the new verb rather than assuming every image has it.
 #
 # Deliberately NOT squad_hub_enabled: that function `squad_hub_abort`s (exit 78)
 # on a half-configuration, which is correct for the SUPERVISION gate -- a
