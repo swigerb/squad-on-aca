@@ -879,7 +879,7 @@ hub_run_with() {
 hub_state() { [[ -e "${PIN_STUB_ROOT}/$1" ]] && echo present || echo absent; }
 hub_file() { cat "${PIN_STUB_ROOT}/$1" 2>/dev/null || printf '<missing>'; }
 
-# An older hub (the pinned 0.6.0): `oneshot` ignores --capabilities. With the hub
+# An older hub (0.6.0): `oneshot` ignores --capabilities. With the hub
 # variables scrubbed from the probe it stops at the missing URL (exit 64) -- and a
 # probe that was NOT scrubbed would have started a real session here.
 hub_run_with old SQUAD_MODEL=model-alpha
@@ -887,7 +887,7 @@ assert_eq "78" "$PIN_RUN_RC" "a model-required session is refused by a hub that 
 assert_contains "$PIN_RUN_OUT" "model-alpha" "the refusal names the required model"
 assert_contains "$PIN_RUN_OUT" "oneshot --capabilities" "the refusal names the probe the hub did not answer"
 assert_contains "$PIN_RUN_OUT" '"requiredModel":true' "the refusal says what answer it needed"
-assert_contains "$PIN_RUN_OUT" "squad-hub@0.6.0" "the refusal says which pinned hub build lacks it"
+assert_contains "$PIN_RUN_OUT" "squad-hub@0.7.0" "the refusal names a hub release that implements the probe"
 assert_not_contains "$PIN_RUN_OUT" "unset SQUAD_HUB" "the refusal never tells the operator to unset the Hub configuration"
 assert_not_contains "$PIN_RUN_OUT" "without hub supervision" "the refusal never suggests dropping hub supervision"
 assert_eq "present" "$(hub_state capabilities.argv)" "the capability was asked for, not guessed from a version"
