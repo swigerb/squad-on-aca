@@ -96,9 +96,11 @@ SQUAD_DEADLINE_DEFAULT_TERM_GRACE_SECONDS=30
 # caller can mark a session as timed out (which would turn its pull request
 # into a draft) or hand the agent a deadline this worker did not compute.
 SQUAD_SESSION_TIMED_OUT=0
+SQUAD_SESSION_AGENT_FAILED=0
 SQUAD_SESSION_DEADLINE_EPOCH=""
 SQUAD_SESSION_DEADLINE_SOURCE=""
 SQUAD_DEADLINE_AGENT_RC=0
+SQUAD_DEADLINE_AGENT_PID=""
 unset SQUAD_SESSION_DEADLINE_UTC
 
 squad_deadline_log() {
@@ -346,6 +348,7 @@ squad_deadline_run_agent() {
     local int_grace term_grace agent_pid had_monitor=0 rc
 
     SQUAD_SESSION_TIMED_OUT=0
+    SQUAD_SESSION_AGENT_FAILED=0
     SQUAD_DEADLINE_AGENT_RC=0
 
     if [[ ! "$deadline" =~ ^[0-9]+$ ]]; then
@@ -359,6 +362,7 @@ squad_deadline_run_agent() {
     set -m
     "$@" &
     agent_pid=$!
+    SQUAD_DEADLINE_AGENT_PID="$agent_pid"
     if (( had_monitor == 0 )); then
         set +m
     fi
@@ -398,9 +402,9 @@ squad_deadline_run_agent() {
 # squad_deadline_run_agent.
 #
 # Not timed out: a non-zero agent status ends the session with that status
-# right here, exactly as the `set -e` subshell it replaces did -- nothing
-# published. That is today's behaviour for a failed agent, and this change
-# keeps it.
+# right here -- nothing published -- UNLESS the agent left work behind
+# (issue #154; see squad_deadline_failed_with_work). A failed agent with no
+# changes, and every refusal status, still publishes nothing.
 #
 # Timed out: returns 0 so the caller goes on to publish. A git index lock
 # left by an agent stopped mid-`git add`/`git commit` is removed first: every
@@ -417,8 +421,45 @@ squad_deadline_settle_agent() {
         return 0
     fi
     if [[ "$rc" -ne 0 ]]; then
+        if squad_deadline_failed_with_work "$repo_dir" "$rc"; then
+            return 0
+        fi
         exit "$rc"
     fi
+    return 0
+}
+
+# Issue #154: an agent that fails before the deadline but has already made
+# commits (or left changes) in the checkout. Discarding that work is what lost
+# a finished, committed squad-hub #271 when the hub stopped its session.
+#
+#   $1  the repository directory     $2  the agent's exit status
+#
+# Returns 0 -- and marks the session SQUAD_SESSION_AGENT_FAILED=1, which the
+# caller publishes exactly like a deadline stop: draft, WIP-labelled, through
+# the same governance checkpoint and pin guards -- only when ALL hold:
+#   * the status is not a refusal: 64 (bad configuration), 75 (nobody could
+#     approve), 77 (the hub refused this device) and 78 (policy or model
+#     refusal) stopped the session on purpose, and must never publish;
+#   * squad_session_has_publishable_work says there is something to publish.
+# Anything left running in the agent's process group is killed first, and a
+# stale .git/index.lock removed, so nothing is writing during the WIP commit.
+squad_deadline_failed_with_work() {
+    local repo_dir="${1:-}" rc="${2:-0}"
+    case "$rc" in
+        0|64|75|77|78) return 1 ;;
+    esac
+    [[ -n "$repo_dir" ]] || return 1
+    declare -F squad_session_has_publishable_work >/dev/null 2>&1 || return 1
+    squad_session_has_publishable_work "$repo_dir" "${SQUAD_SESSION_BASE_COMMIT:-}" || return 1
+    if [[ "${SQUAD_DEADLINE_AGENT_PID:-}" =~ ^[0-9]+$ ]]; then
+        kill -KILL -- "-${SQUAD_DEADLINE_AGENT_PID}" 2>/dev/null || true
+    fi
+    if [[ -f "${repo_dir}/.git/index.lock" ]]; then
+        rm -f "${repo_dir}/.git/index.lock"
+    fi
+    SQUAD_SESSION_AGENT_FAILED=1
+    squad_deadline_log "The agent exited with status ${rc} before the deadline, but left work in the checkout. Publishing it as a draft WIP pull request instead of discarding it (issue #154); the session still ends with status ${rc}."
     return 0
 }
 
@@ -428,6 +469,10 @@ squad_deadline_settle_agent() {
 # the brief was not finished. squad_lease_finish (worker/entrypoint.sh) records
 # the reason as `session-deadline-exit-124`.
 squad_deadline_finish_session() {
+    if [[ "${SQUAD_SESSION_AGENT_FAILED:-0}" -eq 1 ]]; then
+        squad_deadline_log "Session ended with the agent's failure status ${SQUAD_DEADLINE_AGENT_RC}; what it left in the checkout has been published above as WIP."
+        exit "${SQUAD_DEADLINE_AGENT_RC}"
+    fi
     if [[ "${SQUAD_SESSION_TIMED_OUT:-0}" -eq 1 ]]; then
         squad_deadline_log "Session ended at its deadline with the brief unfinished; exiting ${SQUAD_EXIT_DEADLINE} (timed out). Whatever was in the checkout has been published above."
         exit "$SQUAD_EXIT_DEADLINE"
@@ -453,8 +498,13 @@ squad_deadline_wip_commit_message() {
         rest="${base#*$'\n'}"
         rest="${rest#$'\n'}"
     fi
-    printf 'WIP: %s (stopped at session deadline)\n\n%s\n' "$subject" \
-        "The agent was still working when the session reached its deadline (${SQUAD_SESSION_DEADLINE_UTC:-unknown}), so the Squad on ACA worker stopped it and committed what was in the checkout as-is, so the work is not lost when the replica is killed (issue #134). This commit is UNFINISHED: it may not build, and its tests may not pass."
+    if [[ "${SQUAD_SESSION_AGENT_FAILED:-0}" -eq 1 ]]; then
+        printf 'WIP: %s (agent exited %s)\n\n%s\n' "$subject" "${SQUAD_DEADLINE_AGENT_RC}" \
+            "The agent exited with status ${SQUAD_DEADLINE_AGENT_RC} before the session deadline, leaving work in the checkout. The Squad on ACA worker committed what was there as-is so it is not lost (issue #154). This commit is UNFINISHED: it may not build, and its tests may not pass."
+    else
+        printf 'WIP: %s (stopped at session deadline)\n\n%s\n' "$subject" \
+            "The agent was still working when the session reached its deadline (${SQUAD_SESSION_DEADLINE_UTC:-unknown}), so the Squad on ACA worker stopped it and committed what was in the checkout as-is, so the work is not lost when the replica is killed (issue #134). This commit is UNFINISHED: it may not build, and its tests may not pass."
+    fi
     if [[ -n "$rest" ]]; then
         printf '\n%s\n' "$rest"
     fi
@@ -471,8 +521,13 @@ squad_deadline_wip_pr_title() {
 squad_deadline_wip_pr_body() {
     local base="$1" wip_commit="${2:-}" wip_files="${3:-0}"
     printf '> [!WARNING]\n'
-    printf '> **WIP: this session stopped at its deadline (%s) before the agent finished.**\n' "${SQUAD_SESSION_DEADLINE_UTC:-unknown}"
-    printf '> The Squad on ACA worker stopped the agent and published what was in the checkout so the work is not lost (issue #134). It is opened as a draft where the repository allows one; either way, do not merge it as-is.\n\n'
+    if [[ "${SQUAD_SESSION_AGENT_FAILED:-0}" -eq 1 ]]; then
+        printf '> **WIP: the agent exited with status %s before it finished.**\n' "${SQUAD_DEADLINE_AGENT_RC}"
+        printf '> The Squad on ACA worker published what it left in the checkout so the work is not lost (issue #154). It is opened as a draft where the repository allows one; either way, do not merge it as-is.\n\n'
+    else
+        printf '> **WIP: this session stopped at its deadline (%s) before the agent finished.**\n' "${SQUAD_SESSION_DEADLINE_UTC:-unknown}"
+        printf '> The Squad on ACA worker stopped the agent and published what was in the checkout so the work is not lost (issue #134). It is opened as a draft where the repository allows one; either way, do not merge it as-is.\n\n'
+    fi
     printf '%s\n\n' "$base"
     printf '## Remaining\n\n'
     printf -- '- [ ] Finish the brief. The agent did not report completion before the deadline.\n'

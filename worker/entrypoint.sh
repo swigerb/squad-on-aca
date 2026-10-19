@@ -863,6 +863,9 @@ squad_lease_finish() {
   fi
   if [[ "$code" -eq 0 ]]; then
     squad_lease_report complete --state succeeded
+  elif [[ "${SQUAD_SESSION_AGENT_FAILED:-0}" -eq 1 ]]; then
+    # Issue #154: the agent failed but its work was published as draft WIP.
+    squad_lease_report complete --state failed --reason "agent-failed-published-exit-${code}"
   elif [[ "${SQUAD_SESSION_TIMED_OUT:-0}" -eq 1 ]]; then
     # Issue #134: stopped at the session deadline. Its work was published (as
     # a draft WIP pull request) before this exit, so the lease says so rather
@@ -1008,6 +1011,11 @@ commit_and_push_if_needed() {
   # (squad_deadline_wip_*, worker/lib/squad-deadline.sh). For every other
   # session timed_out is 0 and nothing below changes.
   local timed_out="${SQUAD_SESSION_TIMED_OUT:-0}"
+  # Issue #154: a failed agent whose leftover work is being published takes
+  # the same WIP path (draft, WIP labels); squad_deadline_wip_* word it.
+  if [[ "${SQUAD_SESSION_AGENT_FAILED:-0}" -eq 1 ]]; then
+    timed_out=1
+  fi
   local commit_message="${COMMIT_MESSAGE:-Remote Squad session ${SESSION_NAME}}"
   local wip_commit="" wip_files=0
   git checkout -B "$branch"
@@ -1348,8 +1356,9 @@ NODE
           copilot -p "$SQUAD_AGENT_PROMPT" "${COPILOT_ARGV[@]}"
     fi
     # A failed agent that was NOT stopped by the deadline ends the session
-    # here with its own status, publishing nothing -- as before. A stopped one
-    # continues, and publishes as WIP.
+    # here with its own status, publishing nothing -- unless it left work in
+    # the checkout, which is published as draft WIP (issue #154). A stopped
+    # one continues, and publishes as WIP.
     squad_deadline_settle_agent "$REPO_DIR"
     if [[ "$__squad_credential_withheld" -eq 1 ]]; then
       squad_credential_restore

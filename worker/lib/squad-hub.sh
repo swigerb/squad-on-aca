@@ -401,6 +401,21 @@ squad_hub_supports_required_model() {
 # `squad-hub oneshot` is the hub's documented entry point for a job platform.
 # Everything travels by environment because that is what a job platform can
 # set, and the exit codes are the contract.
+# Issue #154: milliseconds for SQUAD_HUB_MAX_SESSION_MS -- the time left until
+# SQUAD_SESSION_DEADLINE_EPOCH plus the watchdog's SIGINT and SIGTERM graces
+# plus SQUAD_HUB_CEILING_MARGIN_SECONDS. Prints nothing without a usable
+# deadline, so the hub keeps whatever the operator configured.
+SQUAD_HUB_CEILING_MARGIN_SECONDS=120
+squad_hub_session_ceiling_ms() {
+  local deadline="${SQUAD_SESSION_DEADLINE_EPOCH:-}" int_grace="${SQUAD_DEADLINE_INT_GRACE_SECONDS:-60}" term_grace="${SQUAD_DEADLINE_TERM_GRACE_SECONDS:-30}" left
+  [[ "$deadline" =~ ^[0-9]+$ ]] || return 0
+  [[ "$int_grace" =~ ^[0-9]+$ ]] || int_grace=60
+  [[ "$term_grace" =~ ^[0-9]+$ ]] || term_grace=30
+  left=$(( deadline - EPOCHSECONDS ))
+  (( left < 0 )) && left=0
+  printf '%s' $(( (left + int_grace + term_grace + SQUAD_HUB_CEILING_MARGIN_SECONDS) * 1000 ))
+}
+
 squad_hub_run() {
   local prompt="$1"
   local policy_json device_name device_meta_json
@@ -470,6 +485,17 @@ squad_hub_run() {
   if [[ -n "$required_model" ]]; then
     hub_oneshot=(env "SQUAD_HUB_MODEL=${required_model}" SQUAD_HUB_REQUIRE_MODEL=1 squad-hub oneshot)
   fi
+  # Issue #154: the hub stops a one-shot session at SQUAD_HUB_MAX_SESSION_MS
+  # (three hours by default). If that falls before this worker's deadline, the
+  # hub ends the agent first and the session fails instead of publishing.
+  # Set it, for this one command, past the deadline and the watchdog's graces.
+  local ceiling_ms
+  local -a hub_ceiling_env=()
+  ceiling_ms="$(squad_hub_session_ceiling_ms)"
+  if [[ -n "$ceiling_ms" ]]; then
+    hub_ceiling_env=(env "SQUAD_HUB_MAX_SESSION_MS=${ceiling_ms}")
+    squad_hub_log "Hub session ceiling: $((ceiling_ms / 1000))s, after this session's deadline so the deadline watchdog always acts first."
+  fi
 
   # Same telemetry wiring as the unsupervised `copilot -p` path in entrypoint.sh.
   # squad-hub spawns `copilot --acp` with its own environment, so without these
@@ -485,7 +511,7 @@ squad_hub_run() {
   SQUAD_HUB_DEVICE_NAME="$device_name" \
   SQUAD_HUB_DEVICE_META_JSON="$device_meta_json" \
   SQUAD_HUB_AGENT_EXTRA_ARGS_JSON="$policy_json" \
-    "${hub_oneshot[@]}" || rc=$?
+    ${hub_ceiling_env[@]+"${hub_ceiling_env[@]}"} "${hub_oneshot[@]}" || rc=$?
 
   case "$rc" in
     0)

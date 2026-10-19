@@ -43,10 +43,12 @@ Session size comes from the job template, so `deploy.ps1 -SessionCpu` sets it fo
 .\scripts\deploy.ps1 -SessionCpu 4.0   # 4 vCPU / 8 GiB sessions
 ```
 
-The session time limit comes from the job template too. `deploy.ps1 -SessionReplicaTimeout` (seconds, default `14400` = 4 h) sets the session job's `replicaTimeout` and its `SQUAD_REPLICA_TIMEOUT_SECONDS` environment variable from the same value, on create and on every redeploy, so the worker always knows the limit ACA enforces. The worker uses it to stop the agent and publish before the hard kill; see [Session deadline](#session-deadline). Before issue #134 the timeout was a hard-coded `7200`.
+The session time limit comes from the job template too. `deploy.ps1 -SessionReplicaTimeout` (seconds, default `3600` = 1 h) sets the session job's `replicaTimeout` and its `SQUAD_REPLICA_TIMEOUT_SECONDS` environment variable from the same value, on create and on every redeploy, so the worker always knows the limit ACA enforces. `-SessionPublishMargin` (default `600`) sets `SQUAD_PUBLISH_MARGIN_SECONDS`, so the agent gets 50 minutes. The worker uses both to stop the agent and publish before the hard kill; see [Session deadline](#session-deadline). The default was `14400` (4 h) until issue #154, and a hard-coded `7200` before issue #134.
+
+Sessions are scoped to one hour on purpose: work that will not fit is split into smaller issues, and the full test suite runs in the pull request's CI rather than inside the session.
 
 ```powershell
-.\scripts\deploy.ps1 -SessionReplicaTimeout 21600   # 6 h sessions
+.\scripts\deploy.ps1 -SessionReplicaTimeout 7200   # 2 h sessions, for an exceptional batch
 ```
 
 ## Scale-to-zero behavior
@@ -127,7 +129,9 @@ In `prompt` and `new-project` mode (direct and Squad Hub `oneshot`), the agent r
 - **The deadline.** At container start the worker computes `SQUAD_SESSION_DEADLINE_UTC` = start + `SQUAD_REPLICA_TIMEOUT_SECONDS` (default `7200` when unset) - `SQUAD_PUBLISH_MARGIN_SECONDS` (default `900`). If `SQUAD_TOKEN_EXPIRES_AT` is set and its expiry minus the margin is earlier, that wins. A malformed value, or a margin that is not smaller than the timeout, exits `64` before any agent starts. The deadline is logged, exported to the agent, and stated in the publishing note at the end of its prompt: by the deadline, commit a coherent, tested slice, list what is left under `Remaining:`, and stop.
 - **At the deadline**, if the agent is still running, the worker sends SIGINT to the agent's process group, SIGTERM 60 s later (`SQUAD_DEADLINE_INT_GRACE_SECONDS`), and SIGKILL 30 s after that (`SQUAD_DEADLINE_TERM_GRACE_SECONDS`). Anything still left in the group is then killed, so nothing writes to the checkout while it is committed. A stale `.git/index.lock` left behind by the agent is removed.
 - **Then the normal publish runs**: the same governance checkpoint, the pin hook and the pin backstop as any other session. A tree with changes is committed as `WIP: <commit message> (stopped at session deadline)`. The branch is pushed to `OUTPUT_BRANCH` (default `squad/<session>`). The pull request is opened with `--draft`, a `WIP:` title, a body that says the session stopped at its deadline, and a `## Remaining` checklist. If the repository cannot have draft pull requests, a regular pull request is opened, still titled and described as WIP. A governance violation or a staged `.squad/memory/config.json` still refuses the publish with `78`, exactly as it would for a finished session.
-- **The session exits `124`** after publishing, and the lease records `session-deadline-exit-124`. An agent that exits by itself before the deadline behaves as before: exit 0 publishes normally, and a non-zero exit ends the session with the agent's status and publishes nothing.
+- **The session exits `124`** after publishing, and the lease records `session-deadline-exit-124`. An agent that exits by itself before the deadline with exit 0 publishes normally.
+- **An agent that fails before the deadline** (issue #154) ends the session with its own status. If it left work in the checkout (commits of its own, or changes), that work is published first exactly like a deadline stop: draft, `WIP: <commit message> (agent exited <status>)`, and a body that says the agent failed. The lease records `agent-failed-published-exit-<status>`. A failure with nothing to publish, and the refusal statuses `64`, `75`, `77` and `78`, publish nothing.
+- **Squad Hub's own ceiling** (`SQUAD_HUB_MAX_SESSION_MS`, three hours by default in `squad-hub oneshot`) is set by the worker for that command to the time left until the deadline plus the SIGINT/SIGTERM graces plus 120 s, so the hub can never end a session before the deadline watchdog does.
 
 With `PUSH_CHANGES=false` the agent is still stopped at the deadline (exit `124`), but nothing is published.
 
@@ -369,8 +373,8 @@ by hand.
 | `AZURE_RESOURCE_GROUP`, `AZURE_CLIENT_ID`, `ACA_SESSION_JOB_NAME` | Used by `ralph` to start session jobs. |
 | `RALPH_LABELS` | Issue labels Ralph dispatches. Default `squad-aca`. |
 | `RALPH_MAX_ISSUES` | Issues per Ralph run. Default `3`. |
-| `SQUAD_REPLICA_TIMEOUT_SECONDS` | The session job's `replicaTimeout`, set by `deploy.ps1 -SessionReplicaTimeout`. Defaults to `7200` when unset. Used to compute the session deadline. |
-| `SQUAD_PUBLISH_MARGIN_SECONDS` | How long before the replica timeout the agent is stopped so its work can be published. Default `900`. |
+| `SQUAD_REPLICA_TIMEOUT_SECONDS` | The session job's `replicaTimeout`, set by `deploy.ps1 -SessionReplicaTimeout` (default `3600`). Defaults to `7200` in the worker when unset. Used to compute the session deadline. |
+| `SQUAD_PUBLISH_MARGIN_SECONDS` | How long before the replica timeout the agent is stopped so its work can be published. Set by `deploy.ps1 -SessionPublishMargin` (default `600`); the worker's own default is `900`. |
 | `SQUAD_TOKEN_EXPIRES_AT` | Optional ISO-8601 expiry of the session's GitHub token. If it is earlier, the deadline becomes this time minus the margin. |
 | `SQUAD_SESSION_DEADLINE_UTC` | Computed by the worker and exported to the agent; never read from the inbound environment. When the agent is stopped and its work published as a draft WIP pull request. |
 | `SQUAD_DEADLINE_INT_GRACE_SECONDS` / `SQUAD_DEADLINE_TERM_GRACE_SECONDS` | Time after SIGINT before SIGTERM (default `60`), and after SIGTERM before SIGKILL (default `30`). |
