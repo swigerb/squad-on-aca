@@ -515,7 +515,7 @@ squad_hub_run() {
 
 # Report the pull request this session opened, if this image knows how.
 #
-# The default image pins squad-hub@0.7.0. Custom builds can still use an older
+# The default image pins squad-hub@0.7.2. Custom builds can still use an older
 # hub, so detect the new verb rather than assuming every image has it.
 #
 # Deliberately NOT squad_hub_enabled: that function `squad_hub_abort`s (exit 78)
