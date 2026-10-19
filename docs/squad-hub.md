@@ -76,10 +76,10 @@ Use a device token with the `sqhd1.` prefix. `deploy.ps1` checks it before deplo
 
 ## PR reporting
 
-After the worker opens a pull request, it tries to report `{url, number, title}` to the hub for that session. This uses `squad-hub report-pr`, available in v0.7.0. New worker images default to the exact `squad-hub@0.7.0` pin. Custom builds can still use older versions, so the worker feature-detects the verb with `squad-hub --help`: if `report-pr` is absent, it logs one line and skips reporting.
+After the worker opens a pull request, it tries to report `{url, number, title}` to the hub for that session. This uses `squad-hub report-pr`, available in v0.7.0. New worker images default to the exact `squad-hub@0.7.2` pin. Custom builds can still use older versions, so the worker feature-detects the verb with `squad-hub --help`: if `report-pr` is absent, it logs one line and skips reporting.
 
 Changing this source pin does not upgrade existing containers. Publish Hub
-v0.7.0 to npm first, then build and deploy a new worker image. Until then, use
+v0.7.2 to npm first, then build and deploy a new worker image. Until then, use
 an immutable Hub commit through `SQUAD_HUB_SPEC` for pre-release acceptance;
 never replace the pin with `latest` or a floating branch.
 
