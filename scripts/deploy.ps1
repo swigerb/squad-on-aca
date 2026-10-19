@@ -51,14 +51,24 @@ param(
     # applied to the job as `--replica-timeout` AND as the environment variable
     # SQUAD_REPLICA_TIMEOUT_SECONDS from this one value, so the two can never
     # drift. The worker uses the variable to compute its own, earlier deadline
-    # (minus SQUAD_PUBLISH_MARGIN_SECONDS, default 900) at which it stops the
-    # agent and publishes what it has as a draft WIP pull request -- if the
-    # variable said 7200 while ACA killed at 3600, the worker would plan to
-    # publish after it was already dead. 14400 (4 h) matches the live job since
-    # 2026-10-05; it was a hard-coded 7200 before. Must exceed the margin.
+    # (minus -SessionPublishMargin) at which it stops the agent and publishes
+    # what it has as a draft WIP pull request -- if the variable said 7200
+    # while ACA killed at 3600, the worker would plan to publish after it was
+    # already dead. 3600 (1 h) since 2026-10-19 (issue #154): sessions are
+    # scoped to an hour of work, and longer ones cost far more than they
+    # delivered. It was 14400 before, and a hard-coded 7200 before issue #134.
     [ValidateRange(1800, 86400)]
-    [int]$SessionReplicaTimeout = 14400
+    [int]$SessionReplicaTimeout = 3600,
+    # How long before the replica timeout the worker stops the agent so its
+    # work can be committed and pushed (SQUAD_PUBLISH_MARGIN_SECONDS). 600 with
+    # the 1 h default leaves the agent 50 minutes. Must be below the timeout.
+    [ValidateRange(300, 3600)]
+    [int]$SessionPublishMargin = 600
 )
+
+if ($SessionPublishMargin -ge $SessionReplicaTimeout) {
+    throw "-SessionPublishMargin ($SessionPublishMargin) must be smaller than -SessionReplicaTimeout ($SessionReplicaTimeout); the worker would refuse every session (exit 64)."
+}
 
 $ErrorActionPreference = "Stop"
 $expectedSessionMemory = [string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:0.0}Gi", [double]::Parse($SessionCpu, [Globalization.CultureInfo]::InvariantCulture) * 2)
@@ -744,6 +754,7 @@ $commonEnv = @(
 # the watch app (no replicaTimeout at all), and telling either of them "14400"
 # would be a lie about its own budget.
 $sessionTimeoutEnv = "SQUAD_REPLICA_TIMEOUT_SECONDS=$SessionReplicaTimeout"
+$sessionMarginEnv = "SQUAD_PUBLISH_MARGIN_SECONDS=$SessionPublishMargin"
 
 $existingJobImage = az containerapp job show --name $jobName --resource-group $ResourceGroupName --query "properties.template.containers[0].image" -o tsv 2>$null
 if ($existingJobImage -and $existingJobImage -ne $image) {
@@ -768,9 +779,9 @@ if (-not $existingJobImage) {
         --registry-server $loginServer `
         --registry-identity $identityId `
         --secrets @jobAndWatcherSecrets `
-        --env-vars @commonEnv $sessionTimeoutEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" "SQUAD_POD_ID=smoke-template" | Out-Null
+        --env-vars @commonEnv $sessionTimeoutEnv $sessionMarginEnv "SQUAD_MODE=smoke" "SESSION_NAME=smoke-template" "SQUAD_POD_ID=smoke-template" | Out-Null
 } else {
-    az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --replica-timeout $SessionReplicaTimeout --cpu $SessionCpu --memory $SessionMemory --set-env-vars @commonEnv $sessionTimeoutEnv | Out-Null
+    az containerapp job update --name $jobName --resource-group $ResourceGroupName --image $image --replica-timeout $SessionReplicaTimeout --cpu $SessionCpu --memory $SessionMemory --set-env-vars @commonEnv $sessionTimeoutEnv $sessionMarginEnv | Out-Null
     az containerapp job secret set --name $jobName --resource-group $ResourceGroupName --secrets @jobAndWatcherSecrets | Out-Null
 }
 

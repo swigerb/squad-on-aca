@@ -4986,10 +4986,20 @@ if ($deployText -match 'Removing the old resource-group Contributor grant') {
 # while ACA kills at 3600 -- the worker plans to publish after it is already
 # dead, which is exactly the lost-work failure #134 fixes.
 # worker/tests/test_session_deadline.sh holds the same checks on Linux.
-if ($deployText -match '\[int\]\$SessionReplicaTimeout = 14400') {
-    Add-Pass "deploy.ps1 has -SessionReplicaTimeout (default 14400) for the session job's replica timeout"
+if ($deployText -match '\[int\]\$SessionReplicaTimeout = 3600') {
+    Add-Pass "deploy.ps1 has -SessionReplicaTimeout (default 3600, one hour; issue #154) for the session job's replica timeout"
 } else {
-    Add-Fail "deploy.ps1 has no -SessionReplicaTimeout parameter defaulting to 14400; the session job's replica timeout is not configurable in one place"
+    Add-Fail "deploy.ps1 has no -SessionReplicaTimeout parameter defaulting to 3600; sessions are scoped to one hour (issue #154)"
+}
+if ($deployText -match '\[int\]\$SessionPublishMargin = 600' -and $deployText -match '\$sessionMarginEnv = "SQUAD_PUBLISH_MARGIN_SECONDS=\$SessionPublishMargin"') {
+    Add-Pass "deploy.ps1 has -SessionPublishMargin (default 600) and builds SQUAD_PUBLISH_MARGIN_SECONDS from it"
+} else {
+    Add-Fail "deploy.ps1 does not set SQUAD_PUBLISH_MARGIN_SECONDS from a -SessionPublishMargin parameter defaulting to 600"
+}
+if ($deployText -match '(?s)if \(\$SessionPublishMargin -ge \$SessionReplicaTimeout\) \{\s*throw') {
+    Add-Pass "deploy.ps1 refuses a publish margin that is not smaller than the replica timeout, before anything is created"
+} else {
+    Add-Fail "deploy.ps1 does not refuse -SessionPublishMargin >= -SessionReplicaTimeout; every session would exit 64"
 }
 if ($deployText -match '\$sessionTimeoutEnv = "SQUAD_REPLICA_TIMEOUT_SECONDS=\$SessionReplicaTimeout"') {
     Add-Pass "deploy.ps1 builds SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout"
@@ -4997,13 +5007,13 @@ if ($deployText -match '\$sessionTimeoutEnv = "SQUAD_REPLICA_TIMEOUT_SECONDS=\$S
     Add-Fail "deploy.ps1 does not build SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout; the worker's deadline could drift from the real replica timeout"
 }
 $sessionCreate = [regex]::Match($deployText, '(?s)az containerapp job create `\s+--name \$jobName `.*?Out-Null').Value
-if ($sessionCreate -match '--replica-timeout \$SessionReplicaTimeout ' -and $sessionCreate -match '\$sessionTimeoutEnv') {
+if ($sessionCreate -match '--replica-timeout \$SessionReplicaTimeout ' -and $sessionCreate -match '\$sessionTimeoutEnv' -and $sessionCreate -match '\$sessionMarginEnv') {
     Add-Pass "deploy.ps1 session job CREATE sets --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from the same parameter"
 } else {
     Add-Fail "deploy.ps1 session job CREATE does not take both --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout"
 }
 $sessionUpdate = [regex]::Match($deployText, 'az containerapp job update --name \$jobName [^\r\n]*').Value
-if ($sessionUpdate -match '--replica-timeout \$SessionReplicaTimeout ' -and $sessionUpdate -match '\$sessionTimeoutEnv') {
+if ($sessionUpdate -match '--replica-timeout \$SessionReplicaTimeout ' -and $sessionUpdate -match '\$sessionTimeoutEnv' -and $sessionUpdate -match '\$sessionMarginEnv') {
     Add-Pass "deploy.ps1 session job UPDATE sets --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from the same parameter, so a redeploy cannot leave them apart"
 } else {
     Add-Fail "deploy.ps1 session job UPDATE does not take both --replica-timeout and SQUAD_REPLICA_TIMEOUT_SECONDS from -SessionReplicaTimeout; an existing job would keep a stale limit"

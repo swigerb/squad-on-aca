@@ -457,6 +457,18 @@ case "${STUB_MODE}" in
   fail)
     echo "broken work" >>src/app.js
     exit 3 ;;
+  fail-committed)
+    # Issue #154: the work is finished and COMMITTED, then the agent fails.
+    echo "finished work" >>src/app.js
+    git add src/app.js && git -c user.name=a -c user.email=a@b commit -qm "agent's own commit"
+    echo $! >/dev/null; sleep 30 >/dev/null 2>&1 &
+    echo $! >"${STUB_DIR}/leftover.pid"
+    exit 1 ;;
+  fail-clean)
+    exit 3 ;;
+  fail-refused)
+    echo "work under a refusal" >>src/app.js
+    exit 78 ;;
   never-exits)
     # Half-done work, a brand new file, and a git index lock as if stopped
     # mid-`git add` -- then never exits, and swallows SIGINT and SIGTERM so
@@ -650,11 +662,45 @@ assert_eq "pr|create|--repo|octo/repo|--base|main|--head|squad/deadline-test|--t
 assert_eq "" "$(git --git-dir="${WORK}/golden/remote.git" diff "$(remote_main golden)" "$branch" -- .squad/memory/config.json)" \
   "golden: no .squad/memory/config.json diff either"
 
-# --- 5c. a failing agent: unchanged -----------------------------------------
+# --- 5c. a failing agent (issue #154) ---------------------------------------
+# A failure that left work publishes it as a draft WIP pull request and still
+# ends with the agent's status; a failure with nothing to publish, and every
+# refusal status, publishes nothing.
 out="$(run_session failing PROMPT_BODY fail 0 7200)"
 assert_contains "$out" "SESSION_EXIT=3" "a failing agent (not timed out) still ends the session with ITS status"
-assert_eq "none" "$(remote_branch failing squad/deadline-test)" "... and still publishes nothing, as before"
-assert_eq "0" "$(ls "${WORK}/failing/stub" | grep -c '^gh-call-' || true)" "... and opens no pull request"
+branch="$(remote_branch failing squad/deadline-test)"
+assert_ne "none" "$branch" "#154: a failing agent that left changes has them pushed instead of discarded"
+if [[ "$branch" != none ]]; then
+  assert_eq "WIP: Remote Squad session deadline-test (agent exited 3)" \
+    "$(git --git-dir="${WORK}/failing/remote.git" log -1 --format=%s "$branch")" "#154: the commit is marked WIP with the agent's status"
+fi
+gh1="$(gh_call failing 1)"
+assert_contains "$gh1" "--draft" "#154: the pull request is a draft"
+assert_contains "$gh1" "WIP: the agent exited with status 3 before it finished." "#154: the body says the agent failed, not that a deadline passed"
+assert_not_contains "$gh1" "stopped at its deadline" "#154: ... and does not claim a deadline stop"
+
+out="$(run_session failcommit PROMPT_BODY fail-committed 0 7200)"
+assert_contains "$out" "SESSION_EXIT=1" "#154: an agent that committed and then failed (the hub ceiling case) ends with its status"
+branch="$(remote_branch failcommit squad/deadline-test)"
+assert_ne "none" "$branch" "#154: the agent's own commit is pushed, not lost with the container"
+if [[ "$branch" != none ]]; then
+  assert_contains "$(git --git-dir="${WORK}/failcommit/remote.git" log --format=%s "$branch")" "agent's own commit" \
+    "#154: the published branch carries the agent's commit"
+fi
+assert_contains "$(gh_call failcommit 1)" "--draft" "#154: and it is a draft pull request"
+assert_eq "1" "$(pid_gone "$(cat "${WORK}/failcommit/stub/leftover.pid" 2>/dev/null)" && echo 1 || echo 0)" \
+  "#154: a process the failed agent left running is killed before the WIP commit"
+assert_contains "$out" "instead of discarding it (issue #154)" "#154: the worker says it is publishing the failed agent's work"
+
+out="$(run_session failclean PROMPT_BODY fail-clean 0 7200)"
+assert_contains "$out" "SESSION_EXIT=3" "a failing agent with no changes ends with its status"
+assert_eq "none" "$(remote_branch failclean squad/deadline-test)" "... and publishes nothing, as before"
+assert_eq "0" "$(ls "${WORK}/failclean/stub" | grep -c '^gh-call-' || true)" "... and opens no pull request"
+
+out="$(run_session failrefused PROMPT_BODY fail-refused 0 7200)"
+assert_contains "$out" "SESSION_EXIT=78" "a refusal (78) ends with 78"
+assert_eq "none" "$(remote_branch failrefused squad/deadline-test)" "#154: a refusal never publishes, even with changes in the checkout"
+assert_eq "0" "$(ls "${WORK}/failrefused/stub" | grep -c '^gh-call-' || true)" "... and opens no pull request"
 
 # --- 5d. the WIP publish is still pin-guarded ------------------------------
 out="$(run_session pin PROMPT_BODY pin-adversary 0 "$TIMED_OUT_OFFSET")"
@@ -748,14 +794,17 @@ assert_eq "pr|edit|https://github.com/octo/repo/pull/42|--repo|octo/repo|--add-r
 
 echo "-- 6. deploy.ps1 and the Dockerfile --"
 deploy="$(cat "$DEPLOY_PS1")"
-assert_contains "$deploy" '[int]$SessionReplicaTimeout = 14400' "deploy.ps1 has -SessionReplicaTimeout, default 14400"
+assert_contains "$deploy" '[int]$SessionReplicaTimeout = 3600' "deploy.ps1 has -SessionReplicaTimeout, default 3600 (one hour; issue #154)"
+assert_contains "$deploy" '[int]$SessionPublishMargin = 600' "deploy.ps1 has -SessionPublishMargin, default 600"
 session_create="$(awk '/az containerapp job create/ {c++} c == 1' "$DEPLOY_PS1" | awk '/Out-Null/ {print; exit} {print}')"
 assert_contains "$session_create" '--name $jobName' "(the first job create in deploy.ps1 is the session job)"
 assert_contains "$session_create" '--replica-timeout $SessionReplicaTimeout' "session job create: --replica-timeout comes from the parameter"
 assert_contains "$session_create" '$sessionTimeoutEnv' "session job create: SQUAD_REPLICA_TIMEOUT_SECONDS is set from the same parameter"
+assert_contains "$session_create" '$sessionMarginEnv' "session job create: SQUAD_PUBLISH_MARGIN_SECONDS is set from -SessionPublishMargin"
 session_update="$(grep 'az containerapp job update --name \$jobName ' "$DEPLOY_PS1")"
 assert_contains "$session_update" '--replica-timeout $SessionReplicaTimeout' "session job update: --replica-timeout comes from the parameter"
 assert_contains "$session_update" '$sessionTimeoutEnv' "session job update: SQUAD_REPLICA_TIMEOUT_SECONDS is set from the same parameter"
+assert_contains "$session_update" '$sessionMarginEnv' "session job update: SQUAD_PUBLISH_MARGIN_SECONDS is set from -SessionPublishMargin"
 assert_contains "$deploy" '$sessionTimeoutEnv = "SQUAD_REPLICA_TIMEOUT_SECONDS=$SessionReplicaTimeout"' \
   "the env value is built from the parameter, so the two cannot drift"
 assert_not_contains "$deploy" '--replica-timeout 7200' "the hard-coded 7200 is gone"

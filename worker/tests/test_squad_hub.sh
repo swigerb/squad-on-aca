@@ -810,6 +810,7 @@ run_session() {
   printf '%s' "$*" > "${root}/oneshot.argv"
   printf '%s' "${SQUAD_HUB_MODEL-<unset>}" > "${root}/oneshot.model"
   printf '%s' "${SQUAD_HUB_REQUIRE_MODEL-<unset>}" > "${root}/oneshot.require"
+  printf '%s' "${SQUAD_HUB_MAX_SESSION_MS-<unset>}" > "${root}/oneshot.ceiling"
   printf '%s' "${SQUAD_HUB_AGENT_EXTRA_ARGS_JSON-<unset>}" > "${root}/oneshot.argvjson"
   printf '%s' "${SQUAD_HUB_PROMPT-<unset>}" > "${root}/oneshot.prompt"
   printf '%s' "${SQUAD_HUB_URL-<unset>}|${SQUAD_HUB_TOKEN-<unset>}|${SQUAD_HUB_DEVICE_ID-<unset>}" > "${root}/oneshot.identity"
@@ -1043,6 +1044,20 @@ assert_eq "absent" "$(hub_state oneshot.prompt-sent)" "no prompt was sent on a m
 assert_eq "1" "$(wc -l < "${PIN_STUB_ROOT}/oneshot.count" | tr -d ' ')" "oneshot was attempted exactly once, with no retry"
 hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON="$CAPABLE" STUB_ONESHOT_EXIT=3
 assert_eq "3" "$PIN_RUN_RC" "any other non-zero hub exit is still the session's exit status"
+
+# Issue #154: the hub's session ceiling is set past the worker's deadline, for
+# the oneshot command only; without a deadline the operator's value is kept.
+hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON="$CAPABLE" SQUAD_SESSION_DEADLINE_EPOCH="$((EPOCHSECONDS + 600))"
+ceiling="$(hub_file oneshot.ceiling)"
+assert_eq "1" "$([[ "$ceiling" =~ ^[0-9]+$ ]] && (( ceiling >= 805000 && ceiling <= 810000 )) && echo 1 || echo 0)" \
+  "#154: the hub ceiling is the time to the deadline plus the INT/TERM graces and margin (600+60+30+120 s), got ${ceiling}"
+assert_contains "$PIN_RUN_OUT" "Hub session ceiling: " "#154: the log states the hub ceiling"
+hub_run_with json SQUAD_MODEL=model-alpha STUB_CAP_JSON="$CAPABLE" SQUAD_SESSION_DEADLINE_EPOCH="$((EPOCHSECONDS + 600))" SQUAD_HUB_MAX_SESSION_MS=60000
+ceiling="$(hub_file oneshot.ceiling)"
+assert_eq "1" "$([[ "$ceiling" =~ ^[0-9]+$ ]] && (( ceiling >= 805000 )) && echo 1 || echo 0)" \
+  "#154: an operator ceiling that would fall before the deadline is overridden for the oneshot command"
+hub_run_with old SQUAD_HUB_MAX_SESSION_MS=4242
+assert_eq "4242" "$(hub_file oneshot.ceiling)" "#154: without a deadline the operator's SQUAD_HUB_MAX_SESSION_MS is passed through unchanged"
 
 # Without a required model nothing changes: no probe, and whatever Hub model
 # configuration the operator set is passed through exactly as it was.
