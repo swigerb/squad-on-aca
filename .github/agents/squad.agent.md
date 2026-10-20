@@ -522,7 +522,7 @@ When the resolved context tier is not `auto` or default, include it in the agent
 
 **Spawn output format — show the model choice and tier:**
 
-Follow `.squad/templates/model-selection-reference.md` for the base model-selection rules. When an agent uses a non-default context tier, append it in the acknowledgment (for example, `🧠 DeepThink (claude-opus-5 · long context) — 1M-token window for deep architecture analysis`).
+Follow `.squad/templates/model-selection-reference.md` for the base model-selection rules. When an agent uses a non-default context tier, append it in the acknowledgment (for example, `🧠 DeepThink (gpt-6.1-sol · long context) — 1M-token window for deep architecture analysis`).
 
 ### Client Compatibility
 
@@ -677,26 +677,17 @@ prompt: |
   `<literal CURRENT_DATETIME value from your prompt>`. Substitute the actual CURRENT_DATETIME value; never write placeholder text.
 ```
 
-**Scribe Spawn Template** (only when durable decisions require merging; background, never wait):
+**Scribe Spawn Template** (only when durable decisions require merging; background, never wait). Read `.squad/templates/after-agent-reference.md` and use its full Scribe spawn prompt unchanged, subject to this repository's existing state and governance rules. This parameter overlay supplies the canonical member name and `model` from `agentModelOverrides.scribe` in `.squad/config.json`; it is not a replacement task list:
 
 ```
-prompt: |
-  You are the Scribe. Read .squad/agents/scribe/charter.md.
-  TEAM ROOT: {team_root}
-  CURRENT_DATETIME: <resolved CURRENT_DATETIME literal>
-  STATE_BACKEND: {state_backend}
-
-  Tasks (in order):
-  0. PRE-CHECK: Run `squad_state_health` when available. If state tools are unavailable, stop without mutating files or git state.
-  0b. PRE-CHECK: Read `decisions.md` and list `decisions/inbox` with state tools. Record measurements.
-  1. DECISION INBOX: Use `squad_state_list` and `squad_state_read` on `decisions/inbox`, merge accepted durable decisions into `decisions.md` with `squad_state_write`, delete processed inbox entries with `squad_state_delete`, and deduplicate. Before splicing an inbox body beneath an `###` entry, DEMOTE its headings so its shallowest heading lands at `####` (`##` -> `####`). Preserve relative structure. Never emit an `##` under an `###`.
-  2. VERIFY: Re-read `decisions.md` and confirm every merged entry is present before deleting its inbox source.
-  3. GIT COMMIT: Do not commit mutable squad state. If non-state repo files changed, report them for coordinator handling.
-
-  Runtime state tools own persistence. Never switch branches, push note refs, reset `.squad/`, or commit mutable squad state from this prompt.
-
-  Never speak to user. End with plain text summary after all tool calls.
+agent_type: "general-purpose"
+model: "claude-haiku-5.5"
+mode: "background"
+name: "scribe"
+description: "📋 Scribe: Log session & merge decisions"
 ```
+
+Keep the reference prompt's spawn manifest, archival safety rules and size gates, orchestration and session logs, permitted cross-agent history updates, history summarization gate, and health report. If the reference is unavailable, stop and report it rather than inventing a shortened prompt. If `claude-haiku-5.5` is unavailable or out of quota, stop and report it; do not spawn Scribe on another model.
 
 **On-demand reference:** Read `.squad/templates/spawn-reference.md` for the full spawn template, Ghost Protocol block, all `STATE_BACKEND` conditionals, and post-work instructions.
 
@@ -717,7 +708,7 @@ when needed, and present compact outcomes. Spawn Scribe only when durable decisi
 merging. Keep the same accountable owner for follow-up work unless a new independently deliverable
 outcome requires rerouting.
 
-**On-demand reference:** Read `.squad/templates/after-agent-reference.md` for the full silent-success rules, Scribe spawn template, and follow-up sequence.
+**On-demand reference:** Read `.squad/templates/after-agent-reference.md` for the full silent-success rules, Scribe spawn template, and follow-up sequence. Preserve its full Scribe prompt and follow-up sequence; override only the canonical `name` and configured `model` parameters using the Scribe Spawn Template above.
 
 ### Ceremonies
 
@@ -969,7 +960,7 @@ Rai is a built-in squad member whose job is Responsible AI review. **Rai ensures
 
 ### Roster Entry
 
-Rai always appears in `team.md`: `| Rai | RAI Reviewer | .squad/agents/Rai/charter.md | 🛡️ RAI |`
+Rai always appears in `team.md`: `| rai | RAI Reviewer | .squad/agents/rai/charter.md | 🛡️ RAI |`
 
 ### Triggers
 
@@ -1029,7 +1020,7 @@ See `.squad/rai/policy.md` for the full taxonomy and terminology standards.
 
 Rai's state is minimal:
 - **Audit trail** (`.squad/rai/audit-trail.md`) — append-only evidence log, redacted
-- **History** (`.squad/agents/Rai/history.md`) — learnings across sessions
+- **History** (`.squad/agents/rai/history.md`) — learnings across sessions
 - **Policy** (`.squad/rai/policy.md`) — authoritative check definitions
 
 ### Integration with Reviewer Rejection Protocol
