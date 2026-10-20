@@ -429,15 +429,19 @@ After routing determines WHO handles work, select a **response MODE** (Direct / 
 
 ### Per-Agent Model Selection
 
-Resolve a model before every spawn with the central resolver precedence (first match wins): **user-override** (explicit per-spawn directive) → **config** (`.squad/config.json` `agentModelOverrides.{agent}`, then `defaultModel`) → **session** (the model picked for this session; every sub-agent spawn inherits it unchanged) → **charter** (`## Model` → `**Preferred:**`) → **task-auto** (task-aware tier under the active quality profile; default `quality-first`, with `balanced` or `economy` only by explicit opt-in) → **default**. `auto` at any layer means no preference; continue to the next. Never hard-code model IDs in spawn guidance; tiers map to IDs only through the catalog appendix of the reference.
+Resolve a model before every spawn. Honor persistent config first, then session directives, charter preferences, and task-aware auto-selection; keep the cost-first rule unless code or prompt architecture is being written.
 
-When the resolved model is unavailable, silently try the next entries after it in its tier fallback chain (source `fallback`), never back toward the head; once no later candidate remains, omit the `model` parameter for the platform default.
+Use silent fallback chains when a chosen model is unavailable, and omit the `model` parameter for the platform default fallback — except for a configured member, which never falls back (see the repository model policy below).
 
-**Repository model policy (authoritative):** `.squad/config.json` pins every member's model. Use the exact lowercase member key from `.squad/agents/{name}/`, including for Scribe. If a configured model is unavailable, stop and report the member and model; do not silently downgrade or omit the `model` parameter. This repository policy overrides the fallback behavior above.
+**On-demand reference:** Read `.squad/templates/model-selection-reference.md` for the full layer hierarchy, role mapping, fallback chains, spawn formatting, and valid models catalog. Where it conflicts with the repository model policy below, the repository policy wins.
 
-Every spawn acknowledgment shows the model, its source and a short rationale: `{emoji} {Name} ({model} · {source}) — {task summary} — {rationale}`.
+**Repository model policy (authoritative — overrides `.squad/templates/*` and the defaults above):** `.squad/config.json` pins every member's model. On every spawn of a member — work agents, ceremony facilitators, Ralph, Rai, Fact Checker, reviewers and the after-agent Scribe — read `agentModelOverrides` and pass that member's value as the `model` parameter, exactly as written, on clients that accept a per-spawn model (Copilot CLI `task`).
 
-**On-demand reference:** Read `.squad/templates/model-selection-reference.md` for the full precedence, role-to-tier mapping, fallback rules, spawn formatting, and the model catalog appendix.
+- **The key is the lowercase member name** — the `.squad/agents/{name}/` folder and the casting registry key, the same string you pass as `name:` (`lead`, `advisor`, `engineer`, `reviewer`, `devrel`, `security`, `docs`, `scribe`, `rai`, `fact-checker`, `ralph`). Display names (`Scribe`, `Rai`, `Fact Checker`) are not keys; a lookup under one never matches and silently falls through to `defaultModel`. `developer` is not a member; that work is `engineer`.
+- **Resolved models:** `gpt-6.1-sol` — lead, advisor, security, rai, fact-checker. `claude-sonnet-5.5` — engineer, reviewer, devrel, ralph (also `defaultModel`, so a member added later lands here). `claude-haiku-5.5` — scribe, docs.
+- **Scribe is not exempt.** A template under `.squad/templates/` may hardcode an older Scribe model or a role default. Never copy one. Spawn Scribe with `model: "claude-haiku-5.5"` (`agentModelOverrides.scribe`), as in the Scribe Spawn Template below.
+- **No silent downgrade.** The fallback chains and the "omit `model`" rule in the reference file do NOT apply to members. If the configured model is unavailable, out of quota, or the spawn is refused, stop and report which member and model. Do not retry on another model and do not omit the `model` parameter.
+- **Say what actually ran.** Show the resolved model in each spawn acknowledgment. On a client that cannot set a per-spawn model (VS Code `runSubagent`), say that the configured model could not be applied; never claim it ran.
 
 ### Per-Agent Reasoning Effort
 
