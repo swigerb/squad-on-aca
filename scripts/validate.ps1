@@ -556,14 +556,14 @@ if (-not (Test-Path $aspireDir)) {
         Push-Location $aspireDir
         try {
             Write-Host "  Running dotnet build..."
-            & $dotnet.Source build "Squad.Aca.sln" -nologo --verbosity quiet
+            & $dotnet.Source build "Squad.Aca.sln" -nologo --verbosity quiet -m:1 /nodeReuse:false
             $buildExit = $LASTEXITCODE
             if ($buildExit -eq 0) { Add-Pass "dotnet build succeeded" }
             else { Add-Fail "dotnet build failed (exit $buildExit) - see docs/validation.md for preview-package guidance" }
 
             if ($buildExit -eq 0) {
                 Write-Host "  Running dotnet test..."
-                & $dotnet.Source test "Squad.Aca.sln" -nologo --no-build --verbosity quiet
+                & $dotnet.Source test "Squad.Aca.sln" -nologo --no-build --no-restore --verbosity quiet -m:1 /nodeReuse:false
                 if ($LASTEXITCODE -eq 0) { Add-Pass "dotnet test succeeded" }
                 else { Add-Fail "dotnet test failed (exit $LASTEXITCODE)" }
             } else {

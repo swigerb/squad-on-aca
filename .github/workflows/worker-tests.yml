@@ -208,6 +208,9 @@ jobs:
     # PowerShell is never downloaded at test time and the `bash -n` section
     # actually runs instead of skipping. See docs/validation.md.
     runs-on: windows-latest
+    env:
+      DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: 'true'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
     defaults:
       run:
         shell: pwsh
@@ -233,7 +236,7 @@ jobs:
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: '10.0.404'
 
       - name: Run static validation (scripts/validate.ps1, .NET gate strict)
         run: ./scripts/validate.ps1 -RunDotnet

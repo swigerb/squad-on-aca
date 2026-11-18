@@ -8,7 +8,7 @@ This runbook explains how to deploy and operate Squad on Azure Container Apps.
 - **GitHub**: `gh` CLI authenticated and `gh auth setup-git` configured. Tokens must support GitHub API work and Copilot CLI headless auth.
 - **Local tooling**: PowerShell 5.1+ or PowerShell 7, Git, Node.js/npm. `bash` is needed for worker syntax validation.
 - **Telemetry sink**: standalone Aspire Dashboard app `ca-squad-aca-aspire`, with browser-token UI auth, OTLP API-key auth, and internal-only OTLP ports.
-- **Optional .NET/Aspire path**: .NET SDK 9.0+ and a .NET 9 runtime. See [../aspire/README.md](../aspire/README.md) and [architecture.md](architecture.md).
+- **Optional .NET/Aspire path**: .NET SDK 10.0.404, a .NET 10 runtime and Aspire CLI 17.0.0. See [../aspire/README.md](../aspire/README.md) for the migrated AppHost's local-only validation package source and separate dashboard-image hold, and [architecture.md](architecture.md).
 
 ## Architecture
 

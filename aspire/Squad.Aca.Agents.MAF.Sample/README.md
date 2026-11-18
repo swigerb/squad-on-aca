@@ -88,7 +88,7 @@ which is where a broken version shows up as a session that is still billing.
 
 ## Prerequisites
 
-- .NET SDK 9.0+ (validated with the 10.0 SDK targeting `net9.0`).
+- .NET SDK 10.0.404 and .NET 10 runtime; the host targets `net10.0`.
 - `pwsh` on `PATH`, and this repository's `scripts/squad-aca.ps1` reachable
   (the locator walks upwards from the working directory; `--cli` overrides it).
 - `squad-aca init` already run — `az` and `gh` authenticated, and
