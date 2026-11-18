@@ -6148,10 +6148,10 @@ if (-not (Test-Path $workerDockerfileLayout)) {
     }
     $sumIdx = $dockerfileText.IndexOf('sha256sum -c')
     $tarIdx = $dockerfileText.IndexOf('tar -xzf')
-    if ($sumIdx -ge 0 -and $tarIdx -gt $sumIdx -and $dockerfileText -match 'releases/download/v\$\{SQUAD_VERSION\}/squad-linux-x64\.tar\.gz') {
-        Add-Pass "worker/Dockerfile downloads the Squad release asset and verifies it with 'sha256sum -c' before extracting it"
+    if ($sumIdx -ge 0 -and $tarIdx -gt $sumIdx -and $dockerfileText -match 'https://github\.com/github/squad/releases/download/v\$\{SQUAD_VERSION\}/squad-linux-x64\.tar\.gz') {
+        Add-Pass "worker/Dockerfile downloads the official github/squad release asset and verifies it with 'sha256sum -c' before extracting it"
     } else {
-        Add-Fail "worker/Dockerfile must download squad-linux-x64.tar.gz from the v`${SQUAD_VERSION} release and run 'sha256sum -c' BEFORE 'tar -xzf' (issue #148)"
+        Add-Fail "worker/Dockerfile must download squad-linux-x64.tar.gz from the official github/squad v`${SQUAD_VERSION} release and run 'sha256sum -c' BEFORE 'tar -xzf' (issue #148)"
     }
     $shellPipes = @([regex]::Matches($dockerfileText, '(?m)^.*\|\s*(ba|da)?sh\b.*$') | ForEach-Object { $_.Value } | Where-Object { $_ -notmatch 'InstallAzureCLIDeb \| bash' })
     if ($shellPipes.Count -eq 0) {

@@ -36,6 +36,12 @@ on:
 jobs:
   worker-tests:
     runs-on: ubuntu-latest
+    env:
+      DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: 'true'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+      DOTNET_NUGET_SIGNATURE_VERIFICATION: 'true'
+      NUGET_PACKAGES: ${{ github.workspace }}/.ci/nuget/packages
+      NUGET_HTTP_CACHE_PATH: ${{ github.workspace }}/.ci/nuget/http
     # Issue #92 sprint 1: baseline observed runs of this job were 00:03:48,
     # 00:05:26 and 00:05:44 (worst case under six minutes). With no
     # timeout-minutes set, a hang inherits GitHub's six-HOUR default and costs
@@ -50,6 +56,28 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
+
+      # Windows validation already builds the solution in Debug. These steps
+      # add explicit signed-source/CLI17/Release evidence without another job.
+      - name: Set up .NET SDK for optional AppHost acceptance
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.404'
+
+      - name: Setup checksum-pinned Aspire 17 CLI bundle
+        run: bash scripts/install-aspire-ci.sh "$GITHUB_WORKSPACE/.ci/aspire"
+
+      - name: Show configured NuGet sources
+        run: dotnet nuget list source --format Detailed
+
+      - name: Restore optional AppHost from configured sources into the isolated cache
+        run: dotnet restore aspire/Squad.Aca.AppHost/Squad.Aca.AppHost.csproj --force --no-http-cache -m:1 /nodeReuse:false
+
+      - name: Verify restored Aspire 17 application package signatures and sources
+        run: python3 scripts/verify-aspire-packages.py aspire/Squad.Aca.AppHost/obj/project.assets.json
+
+      - name: Build optional Aspire 17 AppHost in Release
+        run: dotnet build aspire/Squad.Aca.AppHost/Squad.Aca.AppHost.csproj --configuration Release --no-restore --no-incremental -m:1 /nodeReuse:false
 
       # worker/tests/test_memory_audit_pin_publication.sh's and
       # test_memory_audit_pin_rotation.sh's real-SDK cases need the ACTUAL
@@ -68,7 +96,7 @@ jobs:
           sum="$(sed -n 's/^ARG SQUAD_SHA256=//p' worker/Dockerfile | head -n 1)"
           [[ -n "$ver" && "$sum" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::worker/Dockerfile has no SQUAD_VERSION/SQUAD_SHA256 ARG"; exit 1; }
           tarball="$RUNNER_TEMP/squad-linux-x64.tar.gz"
-          curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" "https://github.com/bradygaster/squad/releases/download/v${ver}/squad-linux-x64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$tarball" "https://github.com/github/squad/releases/download/v${ver}/squad-linux-x64.tar.gz"
           echo "${sum}  ${tarball}" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/squad"
           tar -xzf "$tarball" -C "$RUNNER_TEMP/squad" --strip-components=1
