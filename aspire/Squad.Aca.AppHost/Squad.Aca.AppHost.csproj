@@ -10,16 +10,15 @@
     reason about resources as code. Azure Container Apps remains the production
     execution substrate; Squad remains the orchestration system.
 
-    The Aspire.AppHost.Sdk import below turns this into an Aspire AppHost. If the
-    preview/GA package restore is not feasible in your environment, the project
+    The explicit Aspire.Hosting.AppHost package supplies the AppHost targets.
+    Aspire CLI 17 supplies the dashboard and orchestration bundle. If the
+    package restore is not feasible in your environment, the project
     and AppHost.cs still serve as explicit, reviewable scaffolding. See
     ../README.md and ../../docs/validation.md for restore guidance.
   -->
-  <Sdk Name="Aspire.AppHost.Sdk" Version="9.4.0" />
-
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsAspireHost>true</IsAspireHost>
@@ -27,7 +26,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting.AppHost" Version="9.4.0" />
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="17.0.0" />
+    <PackageReference Include="Aspire.Hosting.Dotnet" Version="17.0.0" />
   </ItemGroup>
 
 </Project>

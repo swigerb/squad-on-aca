@@ -37,8 +37,8 @@ MAF pipeline (host app)
 | | |
 |---|---|
 | Package | `Microsoft.Agents.AI` |
-| Version validated against | `1.16.0` |
-| Target framework | `net9.0` |
+| Version validated against | `1.28.0` |
+| Target framework | `net10.0` (the dependency-free contract remains `net9.0`) |
 
 The adapter suppresses `MEAI001` only in [`SquadBackgroundResponse.cs`](../aspire/Squad.Aca.Agents.MAF/SquadBackgroundResponse.cs). `validate.ps1` asserts the project file does not suppress it globally.
 

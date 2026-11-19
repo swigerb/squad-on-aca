@@ -62,8 +62,11 @@ RUN_BLOCK="$(awk '
   grab { print; if ($0 !~ /\\$/) exit }
 ' "$DOCKERFILE")"
 assert_ne "" "$RUN_BLOCK" "the Squad install RUN block is present in worker/Dockerfile"
-assert_contains "$RUN_BLOCK" 'releases/download/v${SQUAD_VERSION}/squad-linux-x64.tar.gz' \
-  "the RUN block downloads the squad-linux-x64.tar.gz asset of the pinned release"
+assert_contains "$RUN_BLOCK" 'https://github.com/github/squad/releases/download/v${SQUAD_VERSION}/squad-linux-x64.tar.gz' \
+  "the RUN block downloads the squad-linux-x64.tar.gz asset of the pinned official github/squad release"
+assert_contains "$(cat "${WORKER_DIR}/../.github/workflows/worker-tests.yml")" \
+  'https://github.com/github/squad/releases/download/v${ver}/squad-linux-x64.tar.gz' \
+  "CI downloads the same pinned official github/squad release as the worker image"
 assert_not_contains "$(printf '%s' "$RUN_BLOCK" | grep -E 'curl[^|]*\|')" "curl" \
   "the download is never piped anywhere (no curl | sh, no curl | tar)"
 sum_line="$(printf '%s\n' "$RUN_BLOCK" | grep -n 'sha256sum -c' | head -n 1 | cut -d: -f1)"

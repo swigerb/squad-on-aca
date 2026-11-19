@@ -55,9 +55,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG SQUAD_HUB_SPEC=squad-hub@0.7.2
 
 # Squad itself (issue #148). Installed from the official upstream GitHub
-# release, NOT from npm: 1.0.1 is not available through the Microsoft npm
-# proxy, and the standalone bundle is what upstream's own 1.0.1 activation
-# installs. The bundle carries the real @bradygaster/squad-cli and
+# release at github/squad, NOT from npm: 1.0.1 is not available through the
+# Microsoft npm proxy, and the standalone bundle is what upstream's own
+# 1.0.1 activation installs. The bundle carries the real @bradygaster/squad-cli and
 # @bradygaster/squad-sdk 1.0.1 packages (built from source by upstream CI)
 # plus its own Node runtime, under app/node_modules and runtime/.
 #
@@ -170,7 +170,7 @@ RUN apt-get update \
 RUN set -eu \
     && squad_tar="/tmp/squad-linux-x64.tar.gz" \
     && curl -fsSL --retry 5 --retry-delay 5 -o "$squad_tar" \
-         "https://github.com/bradygaster/squad/releases/download/v${SQUAD_VERSION}/squad-linux-x64.tar.gz" \
+         "https://github.com/github/squad/releases/download/v${SQUAD_VERSION}/squad-linux-x64.tar.gz" \
     && echo "${SQUAD_SHA256}  ${squad_tar}" | sha256sum -c - \
     && mkdir -p "/opt/squad-${SQUAD_VERSION}" \
     && tar -xzf "$squad_tar" -C "/opt/squad-${SQUAD_VERSION}" --strip-components=1 --no-same-owner \

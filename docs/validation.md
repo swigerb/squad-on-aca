@@ -201,6 +201,29 @@ Use a checkout path that contains no digits when running redaction assertions.
 
 The `powershell-validation` job runs `scripts/validate.ps1` on `windows-latest`. The check is offline and uses pwsh 7 plus Git Bash preinstalled on the runner.
 
+### Optional AppHost signed-release acceptance
+
+`validate.ps1` builds the **whole** `aspire/Squad.Aca.sln`, including AppHost,
+in its default Debug configuration before running the existing agent-library
+tests. The tests themselves do not compile AppHost; the explicit solution build
+does. A green build/test result alone is not package-signature evidence.
+
+The existing Linux `worker-tests` job also checks the optional AppHost's release
+acceptance, without adding another job or changing the Windows gate. It uses
+the existing .NET `10.0.404` pin and the checksum-pinned official Linux Aspire
+`17.0.0` CLI bootstrap in `scripts/install-aspire-ci.sh`. Application packages
+restore into an isolated cache from normally configured NuGet sources, with
+no source overrides. `scripts/verify-aspire-packages.py` checks the restored
+AppHost graph's actual Aspire 17 archives with `dotnet nuget verify --all` and
+logs each package's source, NuGet content hash and separate archive digest.
+The job then builds AppHost explicitly in Release with `--no-restore` and
+`--no-incremental`.
+
+These are restore/signature/compile checks, not an AppHost runtime smoke or
+deployment. They require real signed-release CI evidence; local static checks
+or unsigned Debug validation packages cannot substitute for it. Existing worker
+tests, no-skip enforcement, timeouts and Windows validation remain in place.
+
 ## Static checklist
 
 - [ ] `.\scripts\validate.ps1` passes.
@@ -296,7 +319,7 @@ Check `worker/Dockerfile` pins:
 
 - base image `node:24-bookworm-slim`;
 - Copilot CLI `@github/copilot@1.0.69-2`;
-- Squad `1.0.1` from the release bundle `squad-linux-x64.tar.gz` (SHA-256 `283a1893be9ddad11056dcc8bd0673eff6b48a789bbf523b3f7ec31994d27ac7`, verified with `sha256sum -c` at build time; `squad --version` and `/opt/squad/BUNDLE-INFO.json` report it);
+- Squad `1.0.1` from the official [`github/squad` release](https://github.com/github/squad/releases/tag/v1.0.1) bundle `squad-linux-x64.tar.gz` (SHA-256 `283a1893be9ddad11056dcc8bd0673eff6b48a789bbf523b3f7ec31994d27ac7`, verified with `sha256sum -c` at build time; `squad --version` and `/opt/squad/BUNDLE-INFO.json` report it). CI downloads that same pinned asset; the former `bradygaster/squad` release URL returns 404;
 - squad-hub `squad-hub@0.7.2` (source default; see `SQUAD_HUB_SPEC` in Dockerfile). Existing deployments retain their installed version until the worker image is rebuilt and rolled out.
 
 Pin the Aspire Dashboard image to a specific tag or digest for production.

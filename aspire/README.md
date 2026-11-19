@@ -14,7 +14,7 @@ plane. These projects add a separate, opt-in path that layers cleanly on top:
 | --- | --- | --- |
 | **Aspire** | Models resources (the Aspire Dashboard OTLP sink + the `squad-worker` container) as code | `Squad.Aca.AppHost` |
 | **Agent contract** | Dispatches a Squad session from .NET over `squad-aca --json` | `Squad.Aca.Agents` (net9.0, zero package references) |
-| **Agent Framework** | Exposes that contract as a MAF `AIAgent` | `Squad.Aca.Agents.MAF` (the only `Microsoft.Agents.AI` reference) |
+| **Agent Framework** | Exposes that contract as a MAF `AIAgent` | `Squad.Aca.Agents.MAF` (net10.0, the only `Microsoft.Agents.AI` reference) |
 | **ACA** | Remains the production execution substrate | `../scripts/deploy.ps1` |
 | **Squad** | Remains the orchestration system inside the worker | `../worker` |
 
@@ -41,7 +41,7 @@ aspire/
     SquadAgentExceptions.cs
     SecretRedactor.cs
   Squad.Aca.Agents.Tests/      # xunit, fully offline
-  Squad.Aca.Agents.MAF/        # net9.0, the ONLY Microsoft.Agents.AI reference
+  Squad.Aca.Agents.MAF/        # net10.0, the ONLY Microsoft.Agents.AI reference
     SquadAcaAIAgent.cs         # AIAgent over ISquadAgent (dispatch, poll, stop)
     SquadAcaAgentOptions.cs    # long-run mode, timeout, backoff, stop budget
     SquadAcaAgentRunOptions.cs # per-run overrides (AgentRunOptions subclass)
@@ -73,10 +73,9 @@ Three properties are deliberate and enforced:
   `<PackageReference>` appears in `Squad.Aca.Agents.csproj`. A restore failure
   in the Agent Framework adapter must not be able to take the contract — and
   everything that depends on it — down with it.
-- **`net9.0`.** The AppHost is `net9.0`, so a `net10.0` contract could not be
-  referenced from it without an unrelated Aspire bump; `Microsoft.Agents.AI`
-  targets `net8.0`+, so the adapter on `net8.0`/`9.0`/`10.0` can reference this
-  without an SDK bump either.
+- **`net9.0`.** The existing dependency-free contract target is retained for
+  compatibility. The optional AppHost, adapter, sample and test hosts now target
+  `net10.0`; this does not change the production shell/worker control plane.
 - **`--json`, not output parsing.** `AcaSquadAgent` talks to the control plane
   through `squad-aca run|status|sessions --json`. The human-readable output is
   pinned byte-for-byte by 22 golden captures whose purpose is to catch
@@ -123,36 +122,127 @@ Full rationale, the pinned version, the polling schedule and the MEAI001 finding
 
 The AppHost pins the following (already in `Squad.Aca.AppHost.csproj`):
 
-- SDK: `Aspire.AppHost.Sdk` `9.4.0`
-- `Aspire.Hosting.AppHost` `9.4.0`
+- SDK: standard `Microsoft.NET.Sdk` (no nested AppHost SDK)
+- `Aspire.Hosting.AppHost` `17.0.0`
+- `Aspire.Hosting.Dotnet` `17.0.0`
 
 The Microsoft **Agent Framework** package `Microsoft.Agents.AI` is pinned at an
-exact **`1.16.0`** in `Squad.Aca.Agents.MAF` and referenced **nowhere else**. It
+exact **`1.28.0`** in `Squad.Aca.Agents.MAF` and referenced **nowhere else**. It
 has since reached GA, but the quarantine stays: a stable package is not a frozen
 one, part of the surface the adapter uses is still `[Experimental]`, and the cost
 of the separation is one `.csproj`. Do not add the package to
 `Squad.Aca.Agents`, which `scripts/validate.ps1` enforces along with the exact
 pin, the one-way dependency, and solution membership.
 
+Other direct packages, verified against the configured `azure-default` NuGet
+feed on 2026-11-18:
+
+| Package | Exact version |
+| --- | --- |
+| Microsoft.Extensions.Hosting | 11.0.0 |
+| Microsoft.Extensions.DependencyInjection / .Abstractions | 11.0.0 |
+| Microsoft.NET.Test.Sdk | 18.12.0 |
+| xunit | 2.9.3 |
+| xunit.runner.visualstudio | 4.0.1 |
+
+These are the latest stable versions returned by that feed. The Extensions
+11.0.0 packages include .NET 10-compatible assets; their major version does not
+require retargeting the host to .NET 11. Exact transitive graphs are recorded in
+the adjacent `packages.lock.json` files.
+Aspire 17 uses the CLI bundle instead of injecting OS-specific dashboard/DCP
+NuGet packages. No AppHost lock is included in this candidate: its local
+validation packages are not the signed release distribution.
+
+### Aspire 17 migration and validation-source limitation
+
+The AppHost follows the [Aspire 17 release guidance](https://aspire.dev/whats-new/aspire-17/) and
+[project-resource migration guide](https://aspire.dev/integrations/dotnet/migrate-dotnet-project-resource/)
+with .NET 10, explicit AppHost/Dotnet 17.0.0 packages, and the **Aspire CLI
+17.0.0 bundle**.
+There are no .NET project resources in this AppHost, so there are no
+`AddProject` registrations or generated `Projects.*` types to migrate.
+Resource names, auth modes, ports, worker references and environment settings
+are unchanged.
+
+The signed Windows CLI came from the official
+[17.0.0 release](https://github.com/microsoft/aspire/releases/tag/v17.0.0);
+its Authenticode signature and SHA-256/SHA-512 checks were verified. The release
+commit is `2d325b13709752ba6d9a943635c5e2940a2530c0`.
+
+The approved NuGet proxy previously returned 13.6.5, not 17.0.0. Local compile
+validation therefore used **unsigned Debug CI nupkgs**, version 17.0.0, from
+the same release commit: [run 44203911604](https://github.com/microsoft/aspire/actions/runs/44203911604),
+artifact `14382652960` (`built-nugets`), archive SHA-256
+`6e522a103ff37924122e9ebea3a8bf33f21b3349e11e0b59bc86ac51cc2a15aa`.
+These are **local API/build validation only**, not signed production release
+package verification. Aspire packages were mapped exclusively to the local
+artifact source, other packages to the approved proxy, and the NuGet cache was
+isolated per repository. No global NuGet configuration or cache was changed.
+**Unsigned Debug CI package hashes differ from signed Release NuGet hashes,
+even for the same 17.0.0 ID/version.** The generated development-only AppHost
+lock was removed from the candidate and archived outside the checkout; it must
+not be committed, described as a signed-release lock, or used to enable CI
+locked-mode restore. No tracked NuGet lock existed in this checkout. The
+independently restored, non-Aspire agent/sample/test locks are retained.
+Generate/review an AppHost release lock only when approved signed 17.0.0 nupkgs
+are available. Existing lock enforcement must not be bypassed to accept CI
+hashes; no signed-package restore is certified here.
+
+The optional dashboard container remains explicitly held at
+`mcr.microsoft.com/dotnet/aspire-dashboard:9.4`: the intended
+`mcr.microsoft.com/aspire/dashboard:17.0` returned `MANIFEST_UNKNOWN`.
+Upgrading the AppHost does not upgrade that separate image. No container was
+launched and no nonexistent tag was substituted. CI/source acquisition and
+runtime/publish validation remain outstanding. Do not install an Aspire workload.
+
+The production worker's existing Squad **1.0.1** release bundle, Copilot
+**1.0.69-2** and optional squad-hub **0.7.2** remain operational holds: their
+compatibility requires separately authorized worker validation, not just a
+NuGet compile. No worker image, deployment script or production default changed.
+No npm install was run; npm-family traffic must use only
+`https://packagefeedproxy.microsoft.io/npm/`, with no public fallbacks.
+
 ## Prerequisites
 
-- .NET SDK 9.0+ (validated with the 10.0 SDK targeting `net9.0`).
-- .NET 9 runtime present (`dotnet --list-runtimes`).
+- .NET SDK **10.0.404**, also pinned in CI; .NET 10 runtime for the sample/tests.
+- The signed **Aspire CLI 17.0.0 bundle** available on the process `PATH`.
 - A container runtime (Docker/Podman) if you want Aspire to actually start the
   dashboard/worker containers. Building the solution does not require one.
-- Network access to `nuget.org` for the first restore.
+- Access to your approved configured NuGet source for the first restore.
 
 ## Build
 
+For the bounded local validation workspace, from the repository root (the
+verified CLI/artifact and source-mapped config must already have been supplied):
+
 ```powershell
-cd aspire
-dotnet build .\Squad.Aca.sln
-dotnet test  .\Squad.Aca.sln
+$validation = (Resolve-Path ..\.tools\aspire17-release).Path
+$env:NUGET_PACKAGES = Join-Path $validation 'validation-cache-squad-on-aca'
+$env:ASPIRE_HOME = Join-Path $validation 'home'
+$env:PATH = (Join-Path $validation 'win-x64') + [IO.Path]::PathSeparator + $env:PATH
+$cli = Join-Path $validation 'win-x64\aspire.exe'
+$bundle = Join-Path $validation 'home\bundle'
+$env:DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE = 'true'
+$env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = 'true'
+dotnet restore .\aspire\Squad.Aca.sln --configfile (Join-Path $validation 'validation.NuGet.config') --disable-parallel -m:1 /nodeReuse:false -p:AspireCliPath="$cli" -p:AspireCliBundlePath="$bundle"
+dotnet build .\aspire\Squad.Aca.sln --no-restore -m:1 /nodeReuse:false -p:AspireCliPath="$cli" -p:AspireCliBundlePath="$bundle"
+dotnet test .\aspire\Squad.Aca.sln --no-build --no-restore -m:1 /nodeReuse:false
 ```
+
+These settings are process-local. For ordinary builds, first provide approved
+signed 17.0.0 packages and generate a release lock as described above; do not
+configure the unsigned validation source globally or in production CI.
+The shared verified bundle is reused read-only; these commands do not run
+`aspire setup`, generate new Aspire locks, or change global tooling.
 
 The tests are fully offline: every one fakes `ISquadCliInvoker`, so none of them
 starts PowerShell, contacts Azure, or opens a socket. `scripts/validate.ps1` runs
 both commands automatically whenever a dotnet SDK is on PATH.
+
+The upgrade checks built the AppHost and sample without launching either and
+passed **67 MAF tests + 47 contract tests**. No container, server, Azure resource
+or live session was started. Runtime telemetry/deployment compatibility was not
+tested and is not implied by those compile/unit checks.
 
 If restore fails in a locked-down environment, the projects still parse and
 review as source; the static structure checks in `scripts/validate.ps1` continue

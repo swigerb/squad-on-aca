@@ -556,14 +556,14 @@ if (-not (Test-Path $aspireDir)) {
         Push-Location $aspireDir
         try {
             Write-Host "  Running dotnet build..."
-            & $dotnet.Source build "Squad.Aca.sln" -nologo --verbosity quiet
+            & $dotnet.Source build "Squad.Aca.sln" -nologo --verbosity quiet -m:1 /nodeReuse:false
             $buildExit = $LASTEXITCODE
             if ($buildExit -eq 0) { Add-Pass "dotnet build succeeded" }
             else { Add-Fail "dotnet build failed (exit $buildExit) - see docs/validation.md for preview-package guidance" }
 
             if ($buildExit -eq 0) {
                 Write-Host "  Running dotnet test..."
-                & $dotnet.Source test "Squad.Aca.sln" -nologo --no-build --verbosity quiet
+                & $dotnet.Source test "Squad.Aca.sln" -nologo --no-build --no-restore --verbosity quiet -m:1 /nodeReuse:false
                 if ($LASTEXITCODE -eq 0) { Add-Pass "dotnet test succeeded" }
                 else { Add-Fail "dotnet test failed (exit $LASTEXITCODE)" }
             } else {
@@ -6148,10 +6148,10 @@ if (-not (Test-Path $workerDockerfileLayout)) {
     }
     $sumIdx = $dockerfileText.IndexOf('sha256sum -c')
     $tarIdx = $dockerfileText.IndexOf('tar -xzf')
-    if ($sumIdx -ge 0 -and $tarIdx -gt $sumIdx -and $dockerfileText -match 'releases/download/v\$\{SQUAD_VERSION\}/squad-linux-x64\.tar\.gz') {
-        Add-Pass "worker/Dockerfile downloads the Squad release asset and verifies it with 'sha256sum -c' before extracting it"
+    if ($sumIdx -ge 0 -and $tarIdx -gt $sumIdx -and $dockerfileText -match 'https://github\.com/github/squad/releases/download/v\$\{SQUAD_VERSION\}/squad-linux-x64\.tar\.gz') {
+        Add-Pass "worker/Dockerfile downloads the official github/squad release asset and verifies it with 'sha256sum -c' before extracting it"
     } else {
-        Add-Fail "worker/Dockerfile must download squad-linux-x64.tar.gz from the v`${SQUAD_VERSION} release and run 'sha256sum -c' BEFORE 'tar -xzf' (issue #148)"
+        Add-Fail "worker/Dockerfile must download squad-linux-x64.tar.gz from the official github/squad v`${SQUAD_VERSION} release and run 'sha256sum -c' BEFORE 'tar -xzf' (issue #148)"
     }
     $shellPipes = @([regex]::Matches($dockerfileText, '(?m)^.*\|\s*(ba|da)?sh\b.*$') | ForEach-Object { $_.Value } | Where-Object { $_ -notmatch 'InstallAzureCLIDeb \| bash' })
     if ($shellPipes.Count -eq 0) {

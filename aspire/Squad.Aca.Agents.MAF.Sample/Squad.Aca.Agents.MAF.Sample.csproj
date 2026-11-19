@@ -19,12 +19,12 @@
     longer builds against the API it documents. scripts/validate.ps1 asserts its
     solution membership alongside the other agent projects.
 
-    TARGET FRAMEWORK — net9.0, matching Squad.Aca.Agents and the adapter.
+    TARGET FRAMEWORK — net10.0, matching the adapter.
   -->
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
@@ -42,7 +42,7 @@
       a floating range lets a routine restore change what a sample demonstrates
       with no diff to review.
     -->
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="11.0.0" />
   </ItemGroup>
 
   <ItemGroup>

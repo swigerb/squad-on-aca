@@ -21,24 +21,23 @@
     precisely the instability this quarantine exists to contain. Bumping it is a
     deliberate, reviewable edit here.
 
-    VERSION VALIDATED: 1.16.0.
+    VERSION VALIDATED: 1.28.0.
 
     A NOTE ON "PREVIEW". The original AgentAbstraction.cs header said the Agent
     Framework packages "are still preview and their surface changes between
     releases". That was true when it was written; as of this sprint
-    Microsoft.Agents.AI ships STABLE — 1.0.0 GA, then 1.1.0 through 1.16.0.
+    Microsoft.Agents.AI ships STABLE — 1.0.0 GA, then 1.1.0 through 1.28.0.
     The quarantine is kept anyway. Its value was never solely "preview": a caller
     who wants only the contract should not be forced to restore
     Microsoft.Extensions.AI, Microsoft.ML.Tokenizers and their transitive graph
     to get it.
 
-    TARGET FRAMEWORK — net9.0, matching Squad.Aca.Agents. Microsoft.Agents.AI
-    ships netstandard2.0, net472, net8.0, net9.0 and net10.0 assets, so net9.0 is
-    a first-class target for it and needs no SDK bump; CI provisions 9.0.x.
+    TARGET FRAMEWORK — net10.0. The dependency-free contract remains net9.0;
+    the adapter and its host use the supported .NET 10 toolchain.
   -->
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
@@ -48,19 +47,18 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Agents.AI" Version="1.16.0" />
+    <PackageReference Include="Microsoft.Agents.AI" Version="1.28.0" />
 
     <!--
-      Declared explicitly, at exactly the version Microsoft.Agents.AI 1.16.0
-      already brings in transitively. AddSquadAcaAgent() is a public API over
+      Declared explicitly because AddSquadAcaAgent() is a public API over
       IServiceCollection, so this project compiles against that assembly whether
       or not the Agent Framework keeps depending on it; leaning on a transitive
       reference for a type in our own public signature is how a minor upstream
       dependency trim becomes our compile break. Pinning it BELOW the transitive
       version fails restore outright (NU1605 under TreatWarningsAsErrors), so
-      the two are kept in lockstep by construction.
+      this direct pin must stay at or above the framework's dependency floor.
     -->
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="11.0.0" />
   </ItemGroup>
 
   <ItemGroup>
